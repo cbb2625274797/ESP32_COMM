@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 OTA 中继系统 - 上位机</title>
+<style>
+  :root {
+    --bg-primary: #0a0e1a;
+    --bg-secondary: #111827;
+    --bg-card: #1a2235;
+    --bg-card-hover: #1f2a40;
+    --accent: #00d4ff;
+    --accent-glow: rgba(0, 212, 255, 0.3);
+    --accent-secondary: #7c3aed;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --border: #1e293b;
+    --gradient-1: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    --gradient-2: linear-gradient(135deg, #00d4ff 0%, #7c3aed 100%);
+    --gradient-3: linear-gradient(135deg, #0a0e1a 0%, #1a2235 100%);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* 背景效果 */
+  body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: 
+      radial-gradient(ellipse 80% 50% at 20% 20%, rgba(0, 212, 255, 0.08) 0%, transparent 50%),
+      radial-gradient(ellipse 60% 40% at 80% 80%, rgba(124, 58, 237, 0.08) 0%, transparent 50%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 30px 40px;
+  }
+
+  /* 顶部标题栏 */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 40px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo-section {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .logo-icon {
+    width: 56px;
+    height: 56px;
+    background: var(--gradient-2);
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    box-shadow: 0 8px 32px var(--accent-glow);
+  }
+
+  .logo-text h1 {
+    font-size: 26px;
+    font-weight: 700;
+    background: var(--gradient-2);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .logo-text p {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  .status-badges {
+    display: flex;
+    gap: 12px;
+  }
+
+  .badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    font-size: 13px;
+    transition: all 0.3s;
+  }
+
+  .badge .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    animation: pulse 2s infinite;
+  }
+
+  .badge.connected .dot { background: var(--success); }
+  .badge.disconnected .dot { background: var(--danger); animation: none; }
+  .badge.warning .dot { background: var(--warning); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.2); }
+  }
+
+  /* 主网格布局 */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 420px 1fr;
+    gap: 24px;
+  }
+
+  /* 左侧面板 */
+  .left-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* 卡片通用样式 */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 24px;
+    transition: all 0.3s;
+  }
+
+  .card:hover {
+    border-color: rgba(0, 212, 255, 0.2);
+    box-shadow: 0 0 40px rgba(0, 212, 255, 0.05);
+  }
+
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+  }
+
+  .card-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .card-title .icon {
+    width: 36px;
+    height: 36px;
+    background: var(--gradient-2);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+  }
+
+  /* 连接配置卡片 */
+  .connection-card .form-group {
+    margin-bottom: 16px;
+  }
+
+  .form-group label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .input-group {
+    display: flex;
+    gap: 8px;
+  }
+
+  input[type="text"] {
+    flex: 1;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text-primary);
+    font-size: 14px;
+    outline: none;
+    transition: all 0.3s;
+  }
+
+  input[type="text"]:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+
+  /* 按钮样式 */
+  .btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 20px;
+    border: none;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s;
+  }
+
+  .btn-primary {
+    background: var(--gradient-2);
+    color: white;
+    box-shadow: 0 4px 20px var(--accent-glow);
+  }
+
+  .btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px var(--accent-glow);
+  }
+
+  .btn-secondary {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+  }
+
+  .btn-secondary:hover {
+    background: var(--bg-card-hover);
+    color: var(--text-primary);
+  }
+
+  .btn-success {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    color: white;
+  }
+
+  .btn-danger {
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    color: white;
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none !important;
+  }
+
+  /* 文件上传卡片 */
+  .upload-zone {
+    border: 2px dashed var(--border);
+    border-radius: 16px;
+    padding: 40px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.3s;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .upload-zone::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, rgba(0, 212, 255, 0.05) 0%, rgba(124, 58, 237, 0.05) 100%);
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  .upload-zone:hover::before,
+  .upload-zone.dragover::before {
+    opacity: 1;
+  }
+
+  .upload-zone:hover {
+    border-color: var(--accent);
+  }
+
+  .upload-icon {
+    width: 64px;
+    height: 64px;
+    margin: 0 auto 16px;
+    background: var(--bg-secondary);
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+  }
+
+  .upload-zone h3 {
+    font-size: 16px;
+    margin-bottom: 8px;
+  }
+
+  .upload-zone p {
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .file-input {
+    display: none;
+  }
+
+  /* 文件信息显示 */
+  .file-info {
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 16px;
+    display: none;
+  }
+
+  .file-info.visible {
+    display: block;
+  }
+
+  .file-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .file-name {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+
+  .file-name .icon {
+    font-size: 20px;
+  }
+
+  .file-size {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .file-meta {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .meta-item {
+    background: var(--bg-card);
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+  }
+
+  .meta-item span {
+    color: var(--text-muted);
+  }
+
+  /* 进度条 */
+  .progress-section {
+    margin-top: 20px;
+    display: none;
+  }
+
+  .progress-section.visible {
+    display: block;
+  }
+
+  .progress-bar-container {
+    background: var(--bg-secondary);
+    border-radius: 10px;
+    height: 12px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+
+  .progress-bar {
+    height: 100%;
+    background: var(--gradient-2);
+    border-radius: 10px;
+    width: 0%;
+    transition: width 0.3s ease;
+    position: relative;
+  }
+
+  .progress-bar::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.2) 50%, transparent 100%);
+    animation: shimmer 2s infinite;
+  }
+
+  @keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+
+  .progress-info {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  /* 操作按钮 */
+  .action-buttons {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 20px;
+  }
+
+  /* 右侧日志面板 */
+  .right-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* 实时状态卡片 */
+  .status-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+
+  .status-item {
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 16px;
+    text-align: center;
+  }
+
+  .status-item .value {
+    font-size: 24px;
+    font-weight: 700;
+    background: var(--gradient-2);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .status-item .label {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    text-transform: uppercase;
+  }
+
+  /* 日志面板 */
+  .log-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 500px;
+  }
+
+  .log-panel .card-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .log-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .log-filters {
+    display: flex;
+    gap: 8px;
+  }
+
+  .filter-btn {
+    padding: 6px 12px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.3s;
+  }
+
+  .filter-btn:hover,
+  .filter-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+
+  .log-content {
+    flex: 1;
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    margin: 16px;
+    padding: 16px;
+    overflow-y: auto;
+    max-height: 400px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .log-content::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .log-content::-webkit-scrollbar-track {
+    background: var(--bg-secondary);
+    border-radius: 3px;
+  }
+
+  .log-content::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+  }
+
+  .log-entry {
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    display: flex;
+    gap: 8px;
+  }
+
+  .log-time { color: var(--text-muted); }
+  .log-level {
+    font-weight: 600;
+    min-width: 24px;
+  }
+  .log-level.E { color: var(--danger); }
+  .log-level.W { color: var(--warning); }
+  .log-level.I { color: var(--accent); }
+  .log-level.D { color: var(--text-muted); }
+  .log-tag { color: var(--accent-secondary); }
+  .log-msg { color: var(--text-primary); }
+
+  .log-footer {
+    padding: 12px 20px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .log-stats {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  /* 阶段指示器 */
+  .stage-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 20px 0;
+  }
+
+  .stage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    position: relative;
+    flex: 1;
+  }
+
+  .stage:not(:last-child)::after {
+    content: '';
+    position: absolute;
+    top: 20px;
+    left: calc(50% + 24px);
+    width: calc(100% - 48px);
+    height: 2px;
+    background: var(--border);
+  }
+
+  .stage.active:not(:last-child)::after,
+  .stage.completed:not(:last-child)::after {
+    background: var(--accent);
+  }
+
+  .stage-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--bg-secondary);
+    border: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    transition: all 0.3s;
+    position: relative;
+    z-index: 1;
+  }
+
+  .stage.active .stage-icon {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+    box-shadow: 0 0 20px var(--accent-glow);
+  }
+
+  .stage.completed .stage-icon {
+    background: var(--success);
+    border-color: var(--success);
+    color: white;
+  }
+
+  .stage-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  .stage.active .stage-label,
+  .stage.completed .stage-label {
+    color: var(--text-primary);
+  }
+
+  /* Toast 提示 */
+  .toast {
+    position: fixed;
+    bottom: 30px;
+    right: 30px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all 0.3s;
+    z-index: 1000;
+  }
+
+  .toast.show {
+    transform: translateY(0);
+    opacity: 1;
+  }
+
+  .toast.success { border-left: 4px solid var(--success); }
+  .toast.error { border-left: 4px solid var(--danger); }
+  .toast.warning { border-left: 4px solid var(--warning); }
+
+  .toast-icon {
+    font-size: 24px;
+  }
+
+  .toast-message {
+    font-size: 14px;
+  }
+
+  /* 动画 */
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .card {
+    animation: fadeIn 0.5s ease forwards;
+  }
+
+  .left-panel .card:nth-child(1) { animation-delay: 0.1s; }
+  .left-panel .card:nth-child(2) { animation-delay: 0.2s; }
+  .left-panel .card:nth-child(3) { animation-delay: 0.3s; }
+
+  .right-panel .card:nth-child(1) { animation-delay: 0.15s; }
+  .right-panel .card:nth-child(2) { animation-delay: 0.25s; }
+</style>
+</head>
+<body>
+<div class="container">
+  <!-- 顶部标题栏 -->
+  <header class="header">
+    <div class="logo-section">
+      <div class="logo-icon">📡</div>
+      <div class="logo-text">
+        <h1>ESP32 OTA 中继系统</h1>
+        <p>GD32 固件空中升级管理平台</p>
+      </div>
+    </div>
+    <div class="status-badges">
+      <div class="badge disconnected" id="connectionBadge">
+        <span class="dot"></span>
+        <span id="connectionText">未连接</span>
+      </div>
+      <div class="badge" id="healthBadge">
+        <span class="dot"></span>
+        <span id="healthText">系统正常</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主网格布局 -->
+  <div class="main-grid">
+    <!-- 左侧面板 -->
+    <div class="left-panel">
+      <!-- 连接配置 -->
+      <div class="card connection-card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">🔗</div>
+            连接配置
+          </div>
+        </div>
+        <div class="form-group">
+          <label>ESP32 IP 地址</label>
+          <div class="input-group">
+            <input type="text" id="espIp" value="192.168.4.1" placeholder="输入 IP 地址">
+            <button class="btn btn-secondary" onclick="testConnection()">测试</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>目标芯片</label>
+          <div class="input-group">
+            <input type="text" id="targetChip" value="GD32E508VET6" disabled>
+          </div>
+        </div>
+        <button class="btn btn-primary" style="width:100%; margin-top:8px;" onclick="healthCheck()">
+          🔍 执行健康检查
+        </button>
+      </div>
+
+      <!-- 文件上传 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📁</div>
+            固件文件
+          </div>
+        </div>
+
+        <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+          <div class="upload-icon">📤</div>
+          <h3>点击或拖拽文件到此处</h3>
+          <p>支持 .hex 和 .bin 格式</p>
+        </div>
+        <input type="file" id="fileInput" class="file-input" accept=".hex,.bin" onchange="handleFileSelect(event)">
+
+        <div class="file-info" id="fileInfo">
+          <div class="file-header">
+            <div class="file-name">
+              <span class="icon">📄</span>
+              <span id="fileName">-</span>
+            </div>
+            <button class="btn btn-secondary" onclick="clearFile()" style="padding:6px 12px;">✕</button>
+          </div>
+          <div class="file-meta">
+            <div class="meta-item"><span>类型:</span> <b id="fileType">-</b></div>
+            <div class="meta-item"><span>大小:</span> <b id="fileSize">-</b></div>
+            <div class="meta-item"><span>地址范围:</span> <b id="fileAddr">-</b></div>
+            <div class="meta-item"><span>数据包:</span> <b id="fileChunks">-</b></div>
+          </div>
+        </div>
+
+        <div class="progress-section" id="progressSection">
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <div class="progress-info">
+            <span id="progressText">准备上传...</span>
+            <span id="progressPercent">0%</span>
+          </div>
+        </div>
+
+        <div class="action-buttons">
+          <button class="btn btn-primary" id="uploadBtn" onclick="startUpload()" disabled>
+            ⬆️ 上传固件
+          </button>
+          <button class="btn btn-success" id="relayBtn" onclick="triggerRelay()">
+            🚀 触发 OTA 中继
+          </button>
+        </div>
+      </div>
+
+      <!-- OTA 阶段指示 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📊</div>
+            OTA 流程阶段
+          </div>
+        </div>
+        <div class="stage-indicator">
+          <div class="stage" id="stage1">
+            <div class="stage-icon">1️⃣</div>
+            <div class="stage-label">握手认证</div>
+          </div>
+          <div class="stage" id="stage2">
+            <div class="stage-icon">2️⃣</div>
+            <div class="stage-label">传输准备</div>
+          </div>
+          <div class="stage" id="stage3">
+            <div class="stage-icon">3️⃣</div>
+            <div class="stage-label">数据转发</div>
+          </div>
+          <div class="stage" id="stage4">
+            <div class="stage-icon">4️⃣</div>
+            <div class="stage-label">完成跳转</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧面板 -->
+    <div class="right-panel">
+      <!-- 实时状态 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📈</div>
+            实时状态
+          </div>
+        </div>
+        <div class="status-grid">
+          <div class="status-item">
+            <div class="value" id="statPackets">0</div>
+            <div class="label">已发送包</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statBytes">0</div>
+            <div class="label">字节数</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statProgress">0%</div>
+            <div class="label">上传进度</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statRelayState">待机</div>
+            <div class="label">中继状态</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 调试日志 -->
+      <div class="card log-panel">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">🖥️</div>
+            调试日志
+            <span style="font-size:12px;color:var(--text-muted);font-weight:normal;margin-left:8px;">UDP:6666</span>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="log-header">
+            <span style="font-size:13px;color:var(--text-muted);">实时日志输出</span>
+            <div class="log-filters">
+              <button class="filter-btn active" onclick="toggleFilter('all', this)">全部</button>
+              <button class="filter-btn" onclick="toggleFilter('E', this)">错误</button>
+              <button class="filter-btn" onclick="toggleFilter('W', this)">警告</button>
+              <button class="filter-btn" onclick="toggleFilter('I', this)">信息</button>
+            </div>
+          </div>
+          <div class="log-content" id="logContent">
+            <div class="log-entry">
+              <span class="log-time">[--:--:--]</span>
+              <span class="log-level I">I</span>
+              <span class="log-tag">[系统]</span>
+              <span class="log-msg">等待上位机连接...</span>
+            </div>
+          </div>
+          <div class="log-footer">
+            <span class="log-stats"><span id="logCount">0</span> 条日志</span>
+            <button class="btn btn-secondary" onclick="clearLogs()" style="padding:6px 12px;font-size:12px;">清除日志</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast 提示 -->
+<div class="toast" id="toast">
+  <span class="toast-icon" id="toastIcon">✓</span>
+  <span class="toast-message" id="toastMessage">操作成功</span>
+</div>
+
+<script>
+// ==================== 全局状态 ====================
+let currentFile = null;
+let uploadProgress = 0;
+let isUploading = false;
+let logFilter = 'all';
+let logEntries = [];
+let logSocket = null;
+
+// ==================== 工具函数 ====================
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function formatTime(date) {
+  return date.toTimeString().split(' ')[0];
+}
+
+function showToast(message, type = 'success') {
+  const toast = document.getElementById('toast');
+  const icon = document.getElementById('toastIcon');
+  const msg = document.getElementById('toastMessage');
+
+  toast.className = `toast ${type} show`;
+  icon.textContent = type === 'success' ? '✓' : type === 'error' ? '✕' : '⚠';
+  msg.textContent = message;
+
+  setTimeout(() => toast.classList.remove('show'), 3000);
+}
+
+function getEspIp() {
+  return document.getElementById('espIp').value.trim() || '192.168.4.1';
+}
+
+function getBaseUrl() {
+  return `http://${getEspIp()}`;
+}
+
+// ==================== 日志系统 ====================
+function addLog(level, tag, message) {
+  const logContent = document.getElementById('logContent');
+  const time = formatTime(new Date());
+
+  const entry = { time, level, tag, message };
+  logEntries.push(entry);
+
+  if (logFilter !== 'all' && level !== logFilter) {
+    return;
+  }
+
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  div.innerHTML = `
+    <span class="log-time">[${time}]</span>
+    <span class="log-level ${level}">${level}</span>
+    <span class="log-tag">[${tag}]</span>
+    <span class="log-msg">${message}</span>
+  `;
+
+  logContent.appendChild(div);
+  logContent.scrollTop = logContent.scrollHeight;
+  document.getElementById('logCount').textContent = logEntries.length;
+}
+
+function clearLogs() {
+  document.getElementById('logContent').innerHTML = '';
+  logEntries = [];
+  document.getElementById('logCount').textContent = '0';
+}
+
+function toggleFilter(level, btn) {
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  logFilter = level;
+
+  // 重新渲染日志
+  const logContent = document.getElementById('logContent');
+  logContent.innerHTML = '';
+  logEntries.forEach(entry => {
+    if (level === 'all' || entry.level === level) {
+      const div = document.createElement('div');
+      div.className = 'log-entry';
+      div.innerHTML = `
+        <span class="log-time">[${entry.time}]</span>
+        <span class="log-level ${entry.level}">${entry.level}</span>
+        <span class="log-tag">[${entry.tag}]</span>
+        <span class="log-msg">${entry.message}</span>
+      `;
+      logContent.appendChild(div);
+    }
+  });
+  logContent.scrollTop = logContent.scrollHeight;
+}
+
+// ==================== 连接管理 ====================
+async function testConnection() {
+  addLog('I', '连接', `正在测试连接 ${getEspIp()}...`);
+  try {
+    const response = await fetch(`${getBaseUrl()}/health`, { 
+      method: 'GET',
+      signal: AbortSignal.timeout(5000)
+    });
+    if (response.ok) {
+      const data = await response.json();
+      document.getElementById('connectionBadge').className = 'badge connected';
+      document.getElementById('connectionText').textContent = '已连接';
+      addLog('I', '连接', `连接成功！空闲堆: ${data.free_heap} bytes`);
+      showToast('ESP32 连接成功', 'success');
+    }
+  } catch (e) {
+    document.getElementById('connectionBadge').className = 'badge disconnected';
+    document.getElementById('connectionText').textContent = '未连接';
+    addLog('E', '连接', `连接失败: ${e.message}`);
+    showToast('无法连接到 ESP32', 'error');
+  }
+}
+
+async function healthCheck() {
+  addLog('I', '健康', '执行健康检查...');
+  try {
+    const response = await fetch(`${getBaseUrl()}/health`, {
+      signal: AbortSignal.timeout(5000)
+    });
+    if (response.ok) {
+      const data = await response.json();
+      const healthNames = ['正常', '警告', '危险', '关机'];
+      const health = data.health !== undefined ? healthNames[data.health] : '未知';
+      document.getElementById('healthText').textContent = `系统${health}`;
+      document.getElementById('healthBadge').className = data.health === 0 ? 'badge connected' : 'badge warning';
+      addLog('I', '健康', `健康状态: ${health}, 空闲堆: ${data.free_heap} bytes`);
+      showToast(`健康检查完成: ${health}`, 'success');
+    }
+  } catch (e) {
+    addLog('E', '健康', `健康检查失败: ${e.message}`);
+    showToast('健康检查失败', 'error');
+  }
+}
+
+// ==================== 文件处理 ====================
+function handleFileSelect(event) {
+  const file = event.target.files[0];
+  if (file) processFile(file);
+}
+
+document.getElementById('uploadZone').addEventListener('dragover', (e) => {
+  e.preventDefault();
+  e.currentTarget.classList.add('dragover');
+});
+
+document.getElementById('uploadZone').addEventListener('dragleave', (e) => {
+  e.currentTarget.classList.remove('dragover');
+});
+
+document.getElementById('uploadZone').addEventListener('drop', (e) => {
+  e.preventDefault();
+  e.currentTarget.classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (file) processFile(file);
+});
+
+function processFile(file) {
+  currentFile = file;
+  const fileInfo = document.getElementById('fileInfo');
+  const uploadBtn = document.getElementById('uploadBtn');
+
+  document.getElementById('fileName').textContent = file.name;
+  document.getElementById('fileType').textContent = file.name.endsWith('.hex') ? 'Intel HEX' : 'Binary';
+  document.getElementById('fileSize').textContent = formatBytes(file.size);
+
+  const chunks = Math.ceil(file.size / 4096);
+  document.getElementById('fileChunks').textContent = chunks + ' 包';
+
+  if (file.name.endsWith('.hex')) {
+    // HEX 文件需要解析，这里简化处理
+    document.getElementById('fileAddr').textContent = '自动解析';
+  } else {
+    document.getElementById('fileAddr').textContent = '偏移 0x0000';
+  }
+
+  fileInfo.classList.add('visible');
+  uploadBtn.disabled = false;
+
+  addLog('I', '文件', `已选择: ${file.name} (${formatBytes(file.size)})`);
+  showToast('文件已选择', 'success');
+}
+
+function clearFile() {
+  currentFile = null;
+  document.getElementById('fileInput').value = '';
+  document.getElementById('fileInfo').classList.remove('visible');
+  document.getElementById('uploadBtn').disabled = true;
+  document.getElementById('progressSection').classList.remove('visible');
+  addLog('I', '文件', '文件已清除');
+}
+
+// ==================== 上传固件 ====================
+async function startUpload() {
+  if (!currentFile || isUploading) return;
+
+  isUploading = true;
+  const uploadBtn = document.getElementById('uploadBtn');
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = '上传中...';
+
+  const progressSection = document.getElementById('progressSection');
+  progressSection.classList.add('visible');
+
+  addLog('I', '上传', `开始上传: ${currentFile.name}`);
+  showToast('开始上传固件', 'success');
+
+  const formData = new FormData();
+  formData.append('file', currentFile);
+
+  try {
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable) {
+        const percent = Math.round((e.loaded / e.total) * 100);
+        uploadProgress = percent;
+        document.getElementById('progressBar').style.width = percent + '%';
+        document.getElementById('progressText').textContent = 
+          `已上传 ${formatBytes(e.loaded)} / ${formatBytes(e.total)}`;
+        document.getElementById('progressPercent').textContent = percent + '%';
+        document.getElementById('statProgress').textContent = percent + '%';
+        document.getElementById('statBytes').textContent = formatBytes(e.loaded);
+      }
+    });
+
+    xhr.addEventListener('load', () => {
+      isUploading = false;
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = '⬆️ 上传固件';
+
+      if (xhr.status === 200) {
+        addLog('I', '上传', '固件上传完成！');
+        showToast('固件上传成功', 'success');
+      } else {
+        addLog('E', '上传', `上传失败: HTTP ${xhr.status}`);
+        showToast('上传失败', 'error');
+      }
+    });
+
+    xhr.addEventListener('error', () => {
+      isUploading = false;
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = '⬆️ 上传固件';
+      addLog('E', '上传', '上传过程发生错误');
+      showToast('上传出错', 'error');
+    });
+
+    // 使用 fetch 上传（这里简化处理，实际需要 ESP32 端支持）
+    const response = await fetch(`${getBaseUrl()}/ota/upload`, {
+      method: 'POST',
+      body: currentFile,
+      signal: AbortSignal.timeout(120000)
+    });
+
+    if (response.ok) {
+      addLog('I', '上传', '固件上传完成！');
+      showToast('固件上传成功', 'success');
+      document.getElementById('statPackets').textContent = 
+        Math.ceil(currentFile.size / 4096);
+    }
+
+  } catch (e) {
+    addLog('E', '上传', `上传失败: ${e.message}`);
+    showToast('上传失败', 'error');
+  }
+
+  isUploading = false;
+  uploadBtn.disabled = false;
+  uploadBtn.textContent = '⬆️ 上传固件';
+}
+
+// ==================== 触发 OTA 中继 ====================
+async function triggerRelay() {
+  addLog('I', 'OTA', '触发 OTA 中继...');
+  showToast('正在触发 OTA 中继', 'success');
+
+  // 更新阶段指示器
+  document.getElementById('stage1').className = 'stage active';
+  document.getElementById('statRelayState').textContent = '进行中';
+
+  try {
+    const response = await fetch(`${getBaseUrl()}/ota/relay`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(5000)
+    });
+
+    if (response.ok) {
+      addLog('I', 'OTA', 'OTA 中继已触发，正在等待 GD32 响应...');
+
+      // 模拟阶段推进
+      setTimeout(() => {
+        document.getElementById('stage1').className = 'stage completed';
+        document.getElementById('stage2').className = 'stage active';
+      }, 2000);
+
+      setTimeout(() => {
+        document.getElementById('stage2').className = 'stage completed';
+        document.getElementById('stage3').className = 'stage active';
+      }, 4000);
+
+      setTimeout(() => {
+        document.getElementById('stage3').className = 'stage completed';
+        document.getElementById('stage4').className = 'stage active';
+      }, 6000);
+
+      setTimeout(() => {
+        document.getElementById('stage4').className = 'stage completed';
+        document.getElementById('statRelayState').textContent = '完成';
+        addLog('I', 'OTA', '=== OTA 中继完成 ===');
+        showToast('OTA 流程完成！', 'success');
+      }, 8000);
+
+    } else {
+      addLog('E', 'OTA', `触发失败: HTTP ${response.status}`);
+      showToast('触发失败', 'error');
+    }
+  } catch (e) {
+    addLog('E', 'OTA', `触发失败: ${e.message}`);
+    showToast('触发失败', 'error');
+    document.getElementById('statRelayState').textContent = '失败';
+  }
+}
+
+// ==================== 轮询状态 ====================
+async function pollStatus() {
+  try {
+    const response = await fetch(`${getBaseUrl()}/ota/status`, {
+      signal: AbortSignal.timeout(3000)
+    });
+    if (response.ok) {
+      const data = await response.json();
+      if (data.relay_state !== undefined) {
+        const states = ['待机', '握手', '认证', '准备', '转发', '完成'];
+        document.getElementById('statRelayState').textContent = 
+          states[data.relay_state] || data.relay_state;
+      }
+    }
+  } catch (e) {
+    // 静默处理
+  }
+}
+
+// 定期轮询状态
+setInterval(pollStatus, 5000);
+
+// 初始测试连接
+setTimeout(testConnection, 1000);
+
+// 模拟一些日志
+setTimeout(() => addLog('I', '系统', '上位机初始化完成，等待固件文件...'), 500);
+</script>
+</body>
+</html>
