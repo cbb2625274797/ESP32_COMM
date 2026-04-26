@@ -1,7 +1,7 @@
 /*
  * protocol.h - 帧格式、CRC16、AES 加密解密
  * T2.2, T1.3
- * ESP-IDF 6.0 适配版本 - 使用软件 AES 实现 + 硬件 RNG
+ * ESP-IDF 6.0 适配版本 - 使用硬件 AES-128-CBC + 硬件 RNG
  */
 #ifndef PROTOCOL_H
 #define PROTOCOL_H

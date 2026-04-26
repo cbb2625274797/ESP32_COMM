@@ -30,4 +30,5 @@ idf_component_register(
         esp_blockdev
         nvs_flash
         freertos
+        mbedtls
 )

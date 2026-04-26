@@ -1,60 +1,68 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- |
+# ESP32-C3 OTA Relay
 
-# Wi-Fi SoftAP Example
+ESP32-C3FH4 OTA 中继固件，通过 WiFi / BLE 接收上位机 OTA 固件包，通过 SPI 转发给下位机（GD32）。
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+## 硬件平台
 
-This example shows how to use the Wi-Fi SoftAP functionality of the Wi-Fi driver of ESP for serving as an Access Point.
+- **芯片:** ESP32-C3FH4 (RISC-V, 单核)
+- **Flash:** 4MB
+- **编译工具链:** ESP-IDF v6.0, riscv32-esp-elf
 
-## How to use example
+## 功能模块
 
-SoftAP supports Protected Management Frames(PMF). Necessary configurations can be set using pmf flags. Please refer [Wifi-Security](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi-security.html) for more info.
+| 模块 | 描述 |
+|------|------|
+| `health_monitor` | 温度 + 电压 + WiFi RSSI 监控 |
+| `ota_relay` | OTA 数据包接收与转发 |
+| `wifi_ota` | WiFi OTA 服务器 (HTTP) |
+| `ble_ota` | BLE OTA 服务器 (GATT) |
+| `spi_master` | SPI 主站，与下位机通信 |
+| `protocol` | CRC 校验 + AES 解密 |
 
-### Configure the project
-
-Open the project configuration menu (`idf.py menuconfig`).
-
-In the `Example Configuration` menu:
-
-* Set the Wi-Fi configuration.
-    * Set `WiFi SSID`.
-    * Set `WiFi Password`.
-
-Optional: If you need, change the other options according to your requirements.
-
-### Build and Flash
-
-Build the project and flash it to the board, then run the monitor tool to view the serial output:
-
-Run `idf.py -p PORT flash monitor` to build, flash and monitor the project.
-
-(To exit the serial monitor, type ``Ctrl-]``.)
-
-See the Getting Started Guide for all the steps to configure and use the ESP-IDF to build projects.
-
-* [ESP-IDF Getting Started Guide on ESP32](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html)
-* [ESP-IDF Getting Started Guide on ESP32-S2](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
-* [ESP-IDF Getting Started Guide on ESP32-C3](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/get-started/index.html)
-
-## Example Output
-
-There is the console output for this example:
+## 目录结构
 
 ```
-I (917) phy: phy_version: 3960, 5211945, Jul 18 2018, 10:40:07, 0, 0
-I (917) wifi: mode : softAP (30:ae:a4:80:45:69)
-I (917) wifi softAP: wifi_init_softap finished.SSID:myssid password:mypassword
-I (26457) wifi: n:1 0, o:1 0, ap:1 1, sta:255 255, prof:1
-I (26457) wifi: station: 70:ef:00:43:96:67 join, AID=1, bg, 20
-I (26467) wifi softAP: station:70:ef:00:43:96:67 join, AID=1
-I (27657) esp_netif_lwip: DHCP server assigned IP to a station, IP is: 192.168.4.2
+main/
+├── CMakeLists.txt
+├── core/main.cpp          # 任务创建入口
+├── relay/ota_relay.cpp   # OTA 中继逻辑
+├── transport/
+│   ├── spi_master.cpp    # SPI 主站
+│   └── protocol.cpp       # 协议层 (CRC/AES)
+├── server/
+│   ├── wifi_ota.cpp      # WiFi OTA HTTP 服务器
+│   └── ble_ota.cpp       # BLE OTA GATT 服务器
+└── monitor/
+    ├── health_monitor.cpp # 健康监控
+    └── debug_log.cpp     # UDP 调试日志
 ```
 
-## Running the example on ESP Chips without Wi-Fi
+## 任务配置 (单核 ESP32-C3)
 
-This example can run on ESP Chips without Wi-Fi using ESP-Hosted. See the [Two-Chip Solution](../../README.md#wi-fi-examples-with-two-chip-solution) section in the upper level `README.md` for information.
+所有任务固定运行在 CPU 核 0：
 
-## Troubleshooting
+| 任务 | 优先级 | 栈大小 | 说明 |
+|------|--------|--------|------|
+| health_mon | configMAX_PRIORITIES - 4 | 4096 | 健康监控 |
+| ota_relay | configMAX_PRIORITIES - 2 | 8192 | OTA 中继 |
+| wifi_ota | configMAX_PRIORITIES - 3 | 8192 | WiFi OTA |
+| ble_ota | configMAX_PRIORITIES - 3 | 8192 | BLE OTA |
 
-For any technical queries, please open an [issue](https://github.com/espressif/esp-idf/issues) on GitHub. We will get back to you soon.
+## 待确认参数
+
+- AES-128 主密钥 (MASTER_KEY_HERE)
+- 搅伴算法种子 (SCRAMBLE_CONST_HERE)
+- 芯片唯一码 (CHIP_UID_HERE)
+- OTA Service UUID (需与 APP 侧协商)
+
+## 编译
+
+```bash
+idf.py set-target esp32c3
+idf.py build
+idf.py flash monitor
+```
+
+## 调试日志
+
+UDP 输出到上位机，默认 IP: `DEBUG_LOG_IP`，端口: `DEBUG_LOG_PORT`。
