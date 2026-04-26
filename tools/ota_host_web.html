@@ -868,6 +868,46 @@
         </div>
       </div>
 
+      <!-- CAN 帧发送面板 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📨</div>
+            CAN 帧发送
+          </div>
+        </div>
+        <div style="display:grid; grid-template-columns:80px 1fr 80px 1fr; gap:12px; margin-bottom:16px;">
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">通道</label>
+            <select id="canChannel" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+              <option value="0">CH0</option>
+              <option value="1">CH1</option>
+              <option value="2">CH2</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">扩展帧 ID</label>
+            <input type="text" id="canId" value="0x18DA00F1" placeholder="例如: 0x18DA00F1" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">DLC</label>
+            <input type="number" id="canDlc" value="8" min="1" max="64" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">数据 (HEX)</label>
+            <input type="text" id="canData" value="0102030405060708" placeholder="01020304..." style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+          </div>
+        </div>
+        <div style="display:flex;gap:12px;">
+          <button class="btn btn-primary" style="flex:1;" onclick="sendCanFrame()">📤 发送</button>
+          <button class="btn btn-secondary" onclick="clearCanFields()">清空</button>
+        </div>
+        <div id="canResponse" style="margin-top:16px;background:var(--bg-secondary);border-radius:10px;padding:12px 16px;font-family:monospace;font-size:12px;display:none;">
+          <div style="color:var(--text-muted);margin-bottom:6px;">响应:</div>
+          <div id="canRespContent" style="color:var(--accent);"></div>
+        </div>
+      </div>
+
       <!-- 调试日志 -->
       <div class="card log-panel">
         <div class="card-header">
@@ -1049,6 +1089,79 @@ async function healthCheck() {
     addLog('E', '健康', `健康检查失败: ${e.message}`);
     showToast('健康检查失败', 'error');
   }
+}
+
+// ==================== CAN 帧发送 ====================
+async function sendCanFrame() {
+  const ch = parseInt(document.getElementById('canChannel').value);
+  const idStr = document.getElementById('canId').value.trim();
+  const dlc = parseInt(document.getElementById('canDlc').value) || 8;
+  const dataStr = document.getElementById('canData').value.trim();
+
+  // 解析 ID (支持 0x 前缀)
+  let extId = 0;
+  if (idStr.startsWith('0x') || idStr.startsWith('0X')) {
+    extId = parseInt(idStr, 16);
+  } else {
+    extId = parseInt(idStr, 10);
+    if (isNaN(extId)) extId = parseInt(idStr, 16);
+  }
+
+  if (isNaN(extId)) {
+    showToast('ID 格式错误', 'error');
+    return;
+  }
+
+  // 解析 data (hex 字符串)
+  let dataHex = dataStr.replace(/\s/g, '');
+  if (dataHex.length % 2 !== 0) {
+    showToast('数据长度必须为偶数', 'error');
+    return;
+  }
+
+  addLog('I', 'CAN', `发送 CH${ch} ID=0x${extId.toString(16).toUpperCase()} DLC=${dlc}`);
+
+  try {
+    const response = await fetch(`${getBaseUrl()}/can/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ch: ch,
+        id: extId,
+        dlc: dlc,
+        data: dataHex
+      }),
+      signal: AbortSignal.timeout(5000)
+    });
+
+    const result = await response.json();
+
+    if (result.status === 'ok') {
+      addLog('I', 'CAN', `响应: ${result.recv || '(无数据)'} (${result.recv_len || 0}B)`);
+
+      const respDiv = document.getElementById('canResponse');
+      const respContent = document.getElementById('canRespContent');
+      respDiv.style.display = 'block';
+      respContent.textContent = result.recv
+        ? `0x${result.recv} (${result.recv_len} 字节)`
+        : '无响应数据';
+
+      showToast(`CH${ch} 发送成功`, 'success');
+    } else {
+      addLog('E', 'CAN', `发送失败: code=${result.code}`);
+      showToast(`发送失败: code=${result.code}`, 'error');
+    }
+  } catch (e) {
+    addLog('E', 'CAN', `发送失败: ${e.message}`);
+    showToast('发送失败', 'error');
+  }
+}
+
+function clearCanFields() {
+  document.getElementById('canId').value = '0x18DA00F1';
+  document.getElementById('canDlc').value = '8';
+  document.getElementById('canData').value = '0102030405060708';
+  document.getElementById('canResponse').style.display = 'none';
 }
 
 // ==================== 文件处理 ====================

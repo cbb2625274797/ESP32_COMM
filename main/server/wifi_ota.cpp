@@ -21,6 +21,8 @@
 #include "ota_relay.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
+#include "spi_master.h"
+#include "cJSON.h"
 
 static ota_wifi_mode_t s_wifi_mode = OTA_WIFI_MODE_AP;
 static bool s_ota_storage_done = false;
@@ -252,6 +254,98 @@ static esp_err_t health_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// HTTP POST /can/send 处理器
+// 上位机发送 CAN 帧，经 ESP32 转发到 GD32
+// 请求体: {"ch": 0, "id": 123456, "data": "0102030405060708", "dlc": 8}
+// data 为 hex 字符串（可不填，自动用 dlc 决定实际发送长度）
+static esp_err_t can_send_handler(httpd_req_t *req)
+{
+    char buf[256] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "接收数据失败");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON 解析失败");
+        return ESP_FAIL;
+    }
+
+    cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
+    cJSON *id_item = cJSON_GetObjectItem(root, "id");
+    cJSON *data_item = cJSON_GetObjectItem(root, "data");
+    cJSON *dlc_item = cJSON_GetObjectItem(root, "dlc");
+
+    if (!ch_item || !id_item) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 ch 或 id 字段");
+        return ESP_FAIL;
+    }
+
+    can_channel_t ch = (can_channel_t)cJSON_GetNumberValue(ch_item);
+    uint32_t ext_id = (uint32_t)cJSON_GetNumberValue(id_item);
+    uint8_t dlc = dlc_item ? (uint8_t)cJSON_GetNumberValue(dlc_item) : 0;
+
+    uint8_t tx_data[CAN_MAX_DLC] = {0};
+    uint8_t tx_dlc = 0;
+
+    if (data_item && cJSON_IsString(data_item)) {
+        const char *hex_str = cJSON_GetStringValue(data_item);
+        size_t hex_len = strlen(hex_str);
+        for (size_t i = 0; i < hex_len / 2 && i < CAN_MAX_DLC; i++) {
+            char byte_str[3] = { hex_str[i * 2], hex_str[i * 2 + 1], '\0' };
+            tx_data[i] = (uint8_t)strtol(byte_str, NULL, 16);
+            tx_dlc++;
+        }
+    }
+
+    if (tx_dlc == 0 && dlc > 0) {
+        tx_dlc = (dlc > CAN_MAX_DLC) ? CAN_MAX_DLC : dlc;
+    }
+
+    cJSON_Delete(root);
+
+    // 发送 CAN 帧到 GD32
+    uint8_t resp_data[CAN_MAX_DLC] = {0};
+    int resp_len = gd32_can_send(ch, ext_id, tx_data, tx_dlc,
+                                   resp_data, sizeof(resp_data), 1000);
+
+    char resp[512];
+    if (resp_len >= 0) {
+        // 将响应 data 转为 hex 字符串
+        char resp_hex[CAN_MAX_DLC * 2 + 1] = {0};
+        for (int i = 0; i < resp_len; i++) {
+            sprintf(&resp_hex[i * 2], "%02X", resp_data[i]);
+        }
+        snprintf(resp, sizeof(resp),
+            "{\"status\": \"ok\", \"ch\": %d, \"id\": %lu, \"sent\": %d, \"recv_len\": %d, \"recv\": \"%s\"}",
+            ch, (unsigned long)ext_id, tx_dlc, resp_len, resp_hex);
+    } else {
+        snprintf(resp, sizeof(resp),
+            "{\"status\": \"error\", \"code\": %d}", resp_len);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
+
+// HTTP GET /can/status 处理器
+static esp_err_t can_status_handler(httpd_req_t *req)
+{
+    char resp[128];
+    snprintf(resp, sizeof(resp),
+        "{\"channels\": 3, \"max_dlc\": %d, \"spi_init\": %s}",
+        CAN_MAX_DLC,
+        g_spi_device != NULL ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
+
 // HTTP GET /wifi/status 处理器
 static esp_err_t wifi_status_handler(httpd_req_t *req)
 {
@@ -339,6 +433,23 @@ static esp_err_t http_ota_server_start(void)
         .user_ctx = NULL
     };
     httpd_register_uri_handler(s_http_server, &wifi_status_uri);
+
+    // CAN 帧转发
+    httpd_uri_t can_send_uri = {
+        .uri = "/can/send",
+        .method = HTTP_POST,
+        .handler = can_send_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(s_http_server, &can_send_uri);
+
+    httpd_uri_t can_status_uri = {
+        .uri = "/can/status",
+        .method = HTTP_GET,
+        .handler = can_status_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(s_http_server, &can_status_uri);
 
     DEBUG_INFO("WIFI", "HTTP 服务器已启动");
 
