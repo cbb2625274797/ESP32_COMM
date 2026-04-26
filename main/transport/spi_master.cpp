@@ -10,7 +10,7 @@
 #include "soc/spi_struct.h"
 
 #include "spi_master.h"
-#include "debug_log.h"
+#include "monitor/debug_log.h"
 
 spi_device_handle_t g_spi_device = NULL;
 

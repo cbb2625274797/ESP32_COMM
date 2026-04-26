@@ -15,7 +15,7 @@
 #include "ble_ota.h"
 #include "ota_relay.h"
 #include "health_monitor.h"
-#include "debug_log.h"
+#include "monitor/debug_log.h"
 
 static bool s_ble_connected = false;
 

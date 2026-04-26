@@ -13,5 +13,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=g:\\Robot_v2\\DFU\\ESP32_COMM\\build"
-  ]
+],
+"idf.flashType": "UART"
 }

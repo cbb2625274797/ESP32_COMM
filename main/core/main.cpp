@@ -8,17 +8,15 @@
 #include "esp_log.h"
 #include "esp_chip_info.h"
 
-#include "core/app_main.h"
-#include "ota_relay.h"
-#include "spi_master.h"
-#include "wifi_ota.h"
-#include "ble_ota.h"
-#include "protocol.h"
-#include "debug_log.h"
+#include "monitor/health_monitor.h"
+#include "relay/ota_relay.h"
+#include "transport/spi_master.h"
+#include "server/wifi_ota.h"
+#include "server/ble_ota.h"
+#include "transport/protocol.h"
+#include "monitor/debug_log.h"
 
-extern "C" void app_main(void);
-
-void app_main(void)
+extern "C" void app_main(void)
 {
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
@@ -30,6 +28,17 @@ void app_main(void)
     DEBUG_INFO("MAIN", "Chip: %s, Rev %d", CONFIG_IDF_TARGET, chip_info.revision);
     DEBUG_INFO("MAIN", "Free heap: %lu bytes", esp_get_free_heap_size());
     DEBUG_INFO("MAIN", "========================================");
+
+    // 健康监控任务（温度 + 电压 + WiFi RSSI）
+    xTaskCreatePinnedToCore(
+        health_monitor_task,
+        "health_mon",
+        4096,
+        NULL,
+        configMAX_PRIORITIES - 4,
+        NULL,
+        0
+    );
 
     // 初始化协议层（CRC、AES）
     protocol_init();
@@ -45,20 +54,6 @@ void app_main(void)
 
     // 创建 FreeRTOS 任务
     BaseType_t xRet;
-
-    // 系统监控任务（最高优先级）
-    xRet = xTaskCreatePinnedToCore(
-        system_monitor_task,
-        "sys_monitor",
-        4096,
-        NULL,
-        configMAX_PRIORITIES - 1,
-        NULL,
-        1  // 核1
-    );
-    if (xRet != pdPASS) {
-        DEBUG_ERR("MAIN", "创建 system_monitor_task 失败");
-    }
 
     // OTA 中继任务（中高优先级）
     xRet = xTaskCreatePinnedToCore(
@@ -96,7 +91,7 @@ void app_main(void)
         NULL,
         configMAX_PRIORITIES - 3,
         NULL,
-        1
+        0  // ESP32-C3 单核，固定核0
     );
     if (xRet != pdPASS) {
         DEBUG_ERR("MAIN", "创建 ble_ota_task 失败");

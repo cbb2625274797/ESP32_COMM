@@ -20,7 +20,7 @@
 #include "wifi_ota.h"
 #include "ota_relay.h"
 #include "health_monitor.h"
-#include "debug_log.h"
+#include "monitor/debug_log.h"
 
 static ota_wifi_mode_t s_wifi_mode = OTA_WIFI_MODE_AP;
 static bool s_ota_storage_done = false;
@@ -39,9 +39,9 @@ static esp_err_t wifi_init_ap(void)
     s_wifi_mode = OTA_WIFI_MODE_AP;
 
     wifi_config_t wifi_config = {};
-    memcpy(wifi_config.ap.ssid, WIFI_AP_SSID, strlen(WIFI_AP_SSID));
+    memcpy(wifi_config.ap.ssid, WIFI_AP_SSID, strlen(WIFI_AP_SSID) + 1);
     wifi_config.ap.ssid_len = strlen(WIFI_AP_SSID);
-    memcpy(wifi_config.ap.password, WIFI_AP_PASSWORD, strlen(WIFI_AP_PASSWORD));
+    memcpy(wifi_config.ap.password, WIFI_AP_PASSWORD, strlen(WIFI_AP_PASSWORD) + 1);
     wifi_config.ap.max_connection = WIFI_AP_MAX_CONNECT;
     wifi_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     wifi_config.ap.channel = WIFI_AP_CHANNEL;
@@ -69,8 +69,8 @@ static esp_err_t wifi_init_sta(void)
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
-    memcpy(wifi_config.sta.ssid, WIFI_STA_SSID, sizeof(wifi_config.sta.ssid));
-    memcpy(wifi_config.sta.password, WIFI_STA_PASSWORD, sizeof(wifi_config.sta.password));
+    memcpy(wifi_config.sta.ssid, WIFI_STA_SSID, strlen(WIFI_STA_SSID) + 1);
+    memcpy(wifi_config.sta.password, WIFI_STA_PASSWORD, strlen(WIFI_STA_PASSWORD) + 1);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -107,7 +107,7 @@ static esp_err_t wifi_wait_sta_connected(char *ip_str, size_t len)
 // 设置 STA 静态 IP
 static void wifi_set_static_ip(void)
 {
-#if WIFI_STA_USE_STATIC_IP
+#if WIFI_STA_STATIC_IP_IS_ENABLED
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta_netif) {
         ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
@@ -405,7 +405,7 @@ void wifi_ota_task(void *pvParameters)
     ESP_ERROR_CHECK(esp_netif_init());
 
     // STA 优先，失败自动切 AP
-#ifdef CONFIG_WIFI_MODE_STA
+#if CONFIG_WIFI_MODE_IS_STA
     err = wifi_init_sta();
     if (err == ESP_OK) {
         char ip_str[16] = {0};

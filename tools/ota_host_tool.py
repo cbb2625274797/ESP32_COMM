@@ -448,6 +448,8 @@ class OTAToolGUI:
 
     def _health_check(self):
         """查询 ESP32 健康状态"""
+        ip = self.esp_ip.get().strip()
+        self.ota_client = OTAClient(esp_ip=ip)
         ok, msg = self.ota_client.health_check()
         if ok:
             self._log_info("健康检查", msg)
@@ -605,6 +607,8 @@ class OTAToolGUI:
 
     def _trigger_relay(self):
         """触发 OTA 中继"""
+        ip = self.esp_ip.get().strip()
+        self.ota_client = OTAClient(esp_ip=ip)
         ok, msg = self.ota_client.trigger_relay()
         if ok:
             self._log_info("触发", msg)

@@ -15,7 +15,7 @@
 #include "spi_master.h"
 #include "protocol.h"
 #include "health_monitor.h"
-#include "debug_log.h"
+#include "monitor/debug_log.h"
 
 relay_state_t g_relay_state = RELAY_IDLE;
 

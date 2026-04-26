@@ -1,8 +1,7 @@
 /*
  * health_monitor.h - 系统健康监控头文件
  */
-#ifndef HEALTH_MONITOR_H
-#define HEALTH_MONITOR_H
+#pragma once
 
 #include <stdint.h>
 #include "app_config.h"
@@ -30,9 +29,9 @@ extern health_state_t g_health_state;
 #define WIFI_RSSI_WEAK     WIFI_RSSI_CRITICAL
 
 // 函数声明
-extern health_status_t health_check_before_ota(void);
-extern void health_log_event(const char *event, int value);
-extern health_state_t health_get_current(void);
-extern health_status_t health_update_from_wifi_rssi(int8_t rssi);
-
-#endif // HEALTH_MONITOR_H
+void health_monitor_init(void);
+void health_monitor_task(void *pvParameters);
+health_status_t health_check_before_ota(void);
+void health_log_event(const char *event, int value);
+health_state_t health_get_current(void);
+health_status_t health_update_from_wifi_rssi(int8_t rssi);

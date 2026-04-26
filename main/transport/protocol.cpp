@@ -7,7 +7,7 @@
 #include "esp_random.h"
 #include "app_config.h"
 #include "protocol.h"
-#include "debug_log.h"
+#include "monitor/debug_log.h"
 
 static bool s_protocol_initialized = false;
 

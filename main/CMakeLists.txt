@@ -1,14 +1,13 @@
 idf_component_register(
     SRCS
         "core/main.cpp"
-        "core/app_main.cpp"
         "relay/ota_relay.cpp"
         "transport/spi_master.cpp"
         "transport/protocol.cpp"
         "server/wifi_ota.cpp"
         "server/ble_ota.cpp"
         "monitor/health_monitor.cpp"
-        "debug/debug_log.cpp"
+        "monitor/debug_log.cpp"
     INCLUDE_DIRS
         "."
         "core"
@@ -16,17 +15,19 @@ idf_component_register(
         "transport"
         "server"
         "monitor"
-        "debug"
         "include"
     REQUIRES
+        cjson
         esp_driver_spi
+        esp_driver_tsens
+        esp_driver_uart
         esp_wifi
-        esp_http_server
-        nvs_flash
-        esp_timer
-        esp_partition
         esp_netif
         esp_event
-        esp_system
-        cjson
+        esp_partition
+        esp_timer
+        esp_http_server
+        esp_blockdev
+        nvs_flash
+        freertos
 )
