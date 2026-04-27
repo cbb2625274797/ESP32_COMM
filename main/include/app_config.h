@@ -12,8 +12,7 @@
 // ============================================================
 // 0 = AP 模式（设备当热点）
 // 1 = STA 模式（连接路由器）
-#define CONFIG_WIFI_MODE_IS_STA  1
-inline constexpr uint8_t CONFIG_WIFI_MODE = 1;
+inline constexpr uint8_t CONFIG_WIFI_MODE = 0;
 
 // ============================================================
 // WiFi STA 模式配置（连接路由器）
@@ -23,10 +22,9 @@ inline constexpr const char* WIFI_STA_PASSWORD = "q13362875622";
 inline constexpr uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 30000;
 
 // STA 静态 IP
-inline constexpr uint8_t WIFI_STA_USE_STATIC_IP = 0;  // 设为 1 启用静态 IP
-#define WIFI_STA_STATIC_IP_IS_ENABLED  0
+inline constexpr uint8_t WIFI_STA_USE_STATIC_IP = 1;  // 设为 1 启用静态 IP
 
-#if WIFI_STA_STATIC_IP_IS_ENABLED
+#if WIFI_STA_USE_STATIC_IP
 inline constexpr const char* WIFI_STA_STATIC_IP      = "192.168.1.100";
 inline constexpr const char* WIFI_STA_STATIC_GW      = "192.168.1.1";
 inline constexpr const char* WIFI_STA_STATIC_NETMASK = "255.255.255.0";

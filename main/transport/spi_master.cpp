@@ -20,7 +20,7 @@ spi_device_handle_t g_spi_device = NULL;
 // SPI2 总线初始化
 esp_err_t spi_master_init(void)
 {
-    DEBUG_INFO("SPI", "初始化 SPI2 (VSPI)...");
+    DEBUG_INFO("SPI", "=== 初始化 SPI2 (VSPI) ===");
 
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = 8;
@@ -29,6 +29,10 @@ esp_err_t spi_master_init(void)
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = 256;
+
+    DEBUG_INFO("SPI", "SPI2 引脚: MOSI=GPIO8, MISO=GPIO7, SCLK=GPIO6");
+    DEBUG_INFO("SPI", "SPI2 配置: CLK=%d MHz, CS=GPIO%d, 最大传输=%d 字节",
+               SPI_CLOCK_HZ / 1000000, SPI_MASTER_CS_GPIO, bus_cfg.max_transfer_sz);
 
     esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK) {
@@ -53,7 +57,9 @@ esp_err_t spi_master_init(void)
         return ret;
     }
 
-    DEBUG_INFO("SPI", "SPI2 已初始化: CLK=40MHz, CS=GPIO4");
+    DEBUG_INFO("SPI", "SPI2 已初始化: CLK=%dMHz, CS=GPIO%d, 模式=%d",
+               SPI_CLOCK_HZ / 1000000, SPI_MASTER_CS_GPIO, SPI_MODE);
+    DEBUG_INFO("SPI", "SPI 设备句柄: %p", g_spi_device);
     return ESP_OK;
 }
 
@@ -69,6 +75,9 @@ esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
         return ESP_ERR_INVALID_STATE;
     }
 
+    DEBUG_DBG("SPI", "SPI 传输: cmd=0x%02X, 发送=%zu 字节, 接收=%zu 字节",
+              cmd, payload_len, recv_len);
+
     spi_transaction_t t = {};
     t.cmd = cmd;
     t.length = payload_len * 8;
@@ -83,6 +92,8 @@ esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
     esp_err_t ret = spi_device_transmit(g_spi_device, &t);
     if (ret != ESP_OK) {
         DEBUG_WARN("SPI", "SPI 发送 cmd=0x%02X 失败: %s", cmd, esp_err_to_name(ret));
+    } else {
+        DEBUG_DBG("SPI", "SPI 传输完成: cmd=0x%02X", cmd);
     }
 
     return ret;
@@ -110,18 +121,21 @@ static int can_frame_send(can_channel_t channel, uint32_t ext_id,
                           uint32_t timeout_ms)
 {
     if (g_spi_device == NULL) {
+        DEBUG_ERR("SPI", "CAN 发送: SPI 设备未初始化");
         return -1;
     }
 
     if (dlc == 0 || dlc > CAN_MAX_DLC) {
-        DEBUG_ERR("SPI", "DLC 无效: %d", dlc);
+        DEBUG_ERR("SPI", "CAN[ch%d] DLC 无效: %d (范围 1~%d)", channel, dlc, CAN_MAX_DLC);
         return -2;
     }
 
     if (channel >= CAN_CHANNEL_MAX) {
-        DEBUG_ERR("SPI", "通道号无效: %d", channel);
+        DEBUG_ERR("SPI", "CAN 通道号无效: %d (范围 0~%d)", channel, CAN_CHANNEL_MAX - 1);
         return -3;
     }
+
+    DEBUG_DBG("SPI", "CAN[ch%d] ID=0x%08X 发送: DLC=%d", channel, ext_id, dlc);
 
     // 构建 CANFD 帧: [通道(1B)] [EXT_ID(4B)] [DATA(dlc B)]
     uint8_t tx_buf[1 + 4 + CAN_MAX_DLC] = {0};
@@ -159,11 +173,12 @@ static int can_frame_send(can_channel_t channel, uint32_t ext_id,
         uint8_t copy_len = (resp_dlc < recv_max) ? resp_dlc : recv_max;
         memcpy(recv_buf, &rx_buf[5], copy_len);
 
-        DEBUG_INFO("SPI", "CAN[ch%d] ID=0x%08X 响应 DLC=%d",
-                   resp_channel, resp_id, copy_len);
+        DEBUG_INFO("SPI", "CAN[ch%d] ID=0x%08X 响应: DLC=%d, 接收=%d 字节",
+                   resp_channel, resp_id, copy_len, copy_len);
         return copy_len;
     }
 
+    DEBUG_DBG("SPI", "CAN[ch%d] ID=0x%08X 发送完成 (无响应)", channel, ext_id);
     return 0;
 }
 
@@ -192,18 +207,24 @@ esp_err_t spi_transfer_with_retry(uint8_t cmd, const uint8_t *payload,
     esp_err_t ret;
     int retry_count = 0;
 
+    DEBUG_INFO("SPI", "SPI 传输 (带重试): cmd=0x%02X, 最大重试=%d", cmd, max_retries);
+
     while (retry_count < max_retries) {
         ret = spi_sync_transfer(cmd, payload, payload_len,
                                 recv_buf, recv_len, 3000);
         if (ret == ESP_OK) {
+            if (retry_count > 0) {
+                DEBUG_INFO("SPI", "SPI 传输成功 (重试 %d 次后成功)", retry_count);
+            }
             return ESP_OK;
         }
 
         retry_count++;
-        DEBUG_WARN("SPI", "SPI 重试 %d/%d, cmd=0x%02X", retry_count, max_retries, cmd);
+        DEBUG_WARN("SPI", "SPI 重试 %d/%d, cmd=0x%02X, err=%s", 
+                   retry_count, max_retries, cmd, esp_err_to_name(ret));
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    DEBUG_ERR("SPI", "SPI 传输 %d 次重试后失败", max_retries);
+    DEBUG_ERR("SPI", "SPI 传输 %d 次重试后失败, cmd=0x%02X", max_retries, cmd);
     return ESP_ERR_TIMEOUT;
 }

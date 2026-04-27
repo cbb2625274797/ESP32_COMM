@@ -152,6 +152,7 @@ esp_err_t flash_read_chunk(uint32_t offset, uint8_t *data, size_t len)
 static ota_result_t send_handshake_req(void)
 {
     DEBUG_INFO("OTA", "=== 阶段1: 握手开始 ===");
+    DEBUG_INFO("OTA", "发送 HANDSHAKE_REQ (0x00 0xAC)");
 
     uint8_t tx_frame[32];
     uint8_t rx_frame[32];
@@ -160,11 +161,12 @@ static ota_result_t send_handshake_req(void)
     frame_build(CMD_HANDSHAKE_REQ, payload, sizeof(payload), tx_frame);
 
     g_relay_state = RELAY_HANDSHAKE_SENT;
+    DEBUG_INFO("OTA", "状态: RELAY_HANDSHAKE_SENT");
 
     esp_err_t err = spi_sync_transfer(CMD_HANDSHAKE_REQ, payload, sizeof(payload),
                                       rx_frame, sizeof(rx_frame), 3000);
     if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "HANDSHAKE_REQ 失败");
+        DEBUG_ERR("OTA", "HANDSHAKE_REQ 失败, err=%d", err);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
@@ -188,38 +190,45 @@ static ota_result_t send_nonce_and_authenticate(void)
 
     scramble_generate(timestamp, mem_addr, rand_seed, nonce_server);
 
-    DEBUG_INFO("OTA", "发送 CHALLENGE，包含 nonce_server (16B)");
+    DEBUG_INFO("OTA", "--- 认证步骤 1: 发送 CHALLENGE ---");
+    DEBUG_INFO("OTA", "发送 nonce_server (16B), timestamp=0x%08X", timestamp);
     g_relay_state = RELAY_CHALLENGE_SENT;
+    DEBUG_INFO("OTA", "状态: RELAY_CHALLENGE_SENT");
 
     frame_build(CMD_CHALLENGE, nonce_server, 16, tx_frame);
 
     esp_err_t err = spi_sync_transfer(CMD_CHALLENGE, nonce_server, 16,
                                       rx_frame, sizeof(rx_frame), 5000);
     if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "CHALLENGE 发送失败");
+        DEBUG_ERR("OTA", "CHALLENGE 发送失败, err=%d", err);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
 
     g_relay_state = RELAY_CHALLENGE_RESPOND;
     DEBUG_INFO("OTA", "已收到 GD32 握手数据包");
+    DEBUG_INFO("OTA", "状态: RELAY_CHALLENGE_RESPOND");
 
     // 发送 SESSION_KEY（带变换后的随机数）
     uint8_t transformed_nonce[16];
     memcpy(transformed_nonce, nonce_server, 16);
 
-    DEBUG_INFO("OTA", "发送 SESSION_KEY（带变换后的随机数）");
+    DEBUG_INFO("OTA", "--- 认证步骤 2: 发送 SESSION_KEY ---");
+    DEBUG_INFO("OTA", "发送变换后的随机数 (16B)");
     g_relay_state = RELAY_SESSION_KEY_SENT;
+    DEBUG_INFO("OTA", "状态: RELAY_SESSION_KEY_SENT");
 
     frame_build(CMD_SESSION_KEY, transformed_nonce, 16, tx_frame);
     esp_err_t err2 = spi_sync_transfer(CMD_SESSION_KEY, transformed_nonce, 16,
                                        rx_frame, sizeof(rx_frame), 3000);
     if (err2 != ESP_OK) {
+        DEBUG_ERR("OTA", "SESSION_KEY 发送失败, err=%d", err2);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
 
     g_relay_state = RELAY_AUTH_COMPLETE;
+    DEBUG_INFO("OTA", "状态: RELAY_AUTH_COMPLETE");
     DEBUG_INFO("OTA", "=== 阶段1 认证完成: 安全通道已建立 ===");
 
     uint8_t k_session[16] = {0};
@@ -234,7 +243,8 @@ static ota_result_t send_firmware_size(uint32_t size)
     uint8_t tx_frame[32];
     uint8_t rx_frame[32];
 
-    DEBUG_INFO("OTA", "=== 阶段2: 发送大小 ===");
+    DEBUG_INFO("OTA", "=== 阶段2: 发送固件大小 ===");
+    DEBUG_INFO("OTA", "固件大小: %u 字节", size);
 
     uint8_t size_payload[4];
     size_payload[0] = (uint8_t)(size & 0xFF);
@@ -243,18 +253,20 @@ static ota_result_t send_firmware_size(uint32_t size)
     size_payload[3] = (uint8_t)((size >> 24) & 0xFF);
 
     g_relay_state = RELAY_SIZE_SENT;
+    DEBUG_INFO("OTA", "状态: RELAY_SIZE_SENT");
 
     frame_build(CMD_SEND_SIZE, size_payload, 4, tx_frame);
     esp_err_t err = spi_sync_transfer(CMD_SEND_SIZE, size_payload, 4,
                                       rx_frame, sizeof(rx_frame), 3000);
     if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "SEND_SIZE 失败");
+        DEBUG_ERR("OTA", "SEND_SIZE 失败, err=%d", err);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
 
     DEBUG_INFO("OTA", "大小已发送: %u 字节，等待 GD32 确认...", size);
     g_relay_state = RELAY_SIZE_ACK;
+    DEBUG_INFO("OTA", "状态: RELAY_SIZE_ACK");
 
     return OTA_RESULT_OK;
 }
@@ -266,6 +278,7 @@ static ota_result_t relay_packets_from_flash(void)
 
     ota_meta_t meta;
     if (meta_load(&meta) != ESP_OK) {
+        DEBUG_ERR("OTA", "元数据加载失败");
         return OTA_RESULT_ERR_STORAGE;
     }
 
@@ -275,7 +288,9 @@ static ota_result_t relay_packets_from_flash(void)
     uint8_t rx_buf[32];
     ota_result_t result = OTA_RESULT_OK;
 
-    DEBUG_INFO("OTA", "准备转发 %u 包，每包 48 字节", total_packets);
+    DEBUG_INFO("OTA", "总包数: %u, 每包 48 字节", total_packets);
+    DEBUG_INFO("OTA", "状态: RELAY_RELAY_ACTIVE");
+    g_relay_state = RELAY_RELAY_ACTIVE;
 
     for (uint32_t seq = 0; seq < total_packets; seq++) {
         // 发送每个包前检查健康状态
@@ -292,7 +307,7 @@ static ota_result_t relay_packets_from_flash(void)
 
         esp_err_t err = flash_read_chunk(flash_offset, &tx_buf[2], chunk_size);
         if (err != ESP_OK) {
-            DEBUG_ERR("OTA", "Flash 读取失败，偏移=%u", flash_offset);
+            DEBUG_ERR("OTA", "Flash 读取失败, offset=%u, err=%d", flash_offset, err);
             return OTA_RESULT_ERR_STORAGE;
         }
 
@@ -310,7 +325,7 @@ static ota_result_t relay_packets_from_flash(void)
 
         err = spi_sync_transfer(cmd, tx_buf, tx_len, rx_buf, sizeof(rx_buf), 3000);
         if (err != ESP_OK) {
-            DEBUG_WARN("OTA", "数据包 %u 发送失败，重试中...", seq);
+            DEBUG_WARN("OTA", "数据包 %u 发送失败, err=%d, 重试中...", seq, err);
             result = OTA_RESULT_ERR_TIMEOUT;
             break;
         }
@@ -320,12 +335,14 @@ static ota_result_t relay_packets_from_flash(void)
 
         // 每 10% 记录一次进度
         if (seq % (total_packets / 10 + 1) == 0) {
+            uint32_t progress = (seq * 100) / total_packets;
             DEBUG_INFO("OTA", "转发进度: %u/%u 包 (%u%%)",
-                       seq, total_packets, (seq * 100) / total_packets);
+                       seq, total_packets, progress);
         }
     }
 
     g_relay_state = RELAY_RECEIVE_DONE;
+    DEBUG_INFO("OTA", "状态: RELAY_RECEIVE_DONE");
     return result;
 }
 
@@ -333,6 +350,7 @@ static ota_result_t relay_packets_from_flash(void)
 static ota_result_t finish_ota(void)
 {
     DEBUG_INFO("OTA", "=== 阶段4: 结束 OTA ===");
+    DEBUG_INFO("OTA", "发送 FINISH_OTA (0x0A 0xAC)");
 
     uint8_t tx_frame[16];
     uint8_t rx_frame[16];
@@ -341,11 +359,12 @@ static ota_result_t finish_ota(void)
     frame_build(CMD_FINISH_OTA, payload, sizeof(payload), tx_frame);
 
     g_relay_state = RELAY_FINISH_SENT;
+    DEBUG_INFO("OTA", "状态: RELAY_FINISH_SENT");
 
     esp_err_t err = spi_sync_transfer(CMD_FINISH_OTA, payload, sizeof(payload),
                                       rx_frame, sizeof(rx_frame), 5000);
     if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "FINISH_OTA 失败");
+        DEBUG_ERR("OTA", "FINISH_OTA 失败, err=%d", err);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
@@ -356,6 +375,7 @@ static ota_result_t finish_ota(void)
     memset(&g_session_ctx, 0, sizeof(session_ctx_t));
 
     g_relay_state = RELAY_DONE;
+    DEBUG_INFO("OTA", "状态: RELAY_DONE");
     DEBUG_INFO("OTA", "=== OTA 完成 ===");
 
     meta_clear();

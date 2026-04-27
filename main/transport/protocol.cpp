@@ -19,7 +19,8 @@ void protocol_init(void)
 {
     if (s_protocol_initialized) return;
 
-    DEBUG_INFO("PROT", "初始化协议层（CRC16、硬件AES-CBC）...");
+    DEBUG_INFO("PROT", "=== 初始化协议层 ===");
+    DEBUG_INFO("PROT", "协议层功能: CRC16 Modbus + 硬件 AES-128-CBC");
 
     s_protocol_initialized = true;
     DEBUG_INFO("PROT", "协议层就绪");
@@ -65,6 +66,8 @@ int frame_build(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_fr
     out_frame[idx++] = (uint8_t)(crc & 0xFF);
     out_frame[idx++] = (uint8_t)((crc >> 8) & 0xFF);
 
+    DEBUG_DBG("PROT", "帧构建: cmd=0x%02X, len=%zu, crc=0x%04X", cmd, len, crc);
+
     return idx;
 }
 
@@ -73,13 +76,14 @@ int frame_parse(const uint8_t *frame, size_t frame_len,
                 uint8_t *out_cmd, uint8_t *out_payload, size_t *out_len)
 {
     if (frame_len < 6) {
+        DEBUG_WARN("PROT", "帧太短: %zu < 6", frame_len);
         return -1;
     }
 
     size_t idx = 0;
 
     if (frame[idx++] != FRAME_SOF) {
-        DEBUG_WARN("PROT", "无效 SOF: 0x%02X", frame[0]);
+        DEBUG_WARN("PROT", "无效 SOF: 0x%02X (期望 0x%02X)", frame[0], FRAME_SOF);
         return -1;
     }
 
@@ -89,13 +93,13 @@ int frame_parse(const uint8_t *frame, size_t frame_len,
     idx += 2;
 
     if (payload_len > FRAME_MAX_PAYLOAD) {
-        DEBUG_ERR("PROT", "Payload 长度太大: %zu", payload_len);
+        DEBUG_ERR("PROT", "Payload 长度太大: %zu > %d", payload_len, FRAME_MAX_PAYLOAD);
         return -1;
     }
 
     size_t expected_len = 1 + 1 + 2 + payload_len + 2;
     if (frame_len < expected_len) {
-        DEBUG_WARN("PROT", "帧太短: %zu < %zu", frame_len, expected_len);
+        DEBUG_WARN("PROT", "帧太短: %zu < %zu (期望)", frame_len, expected_len);
         return -1;
     }
 
@@ -103,9 +107,11 @@ int frame_parse(const uint8_t *frame, size_t frame_len,
     uint16_t calc_crc = crc16_modbus(frame, idx + payload_len);
 
     if (received_crc != calc_crc) {
-        DEBUG_WARN("PROT", "CRC 不匹配: 0x%04X vs 0x%04X", received_crc, calc_crc);
+        DEBUG_WARN("PROT", "CRC 不匹配: 收到=0x%04X, 计算=0x%04X", received_crc, calc_crc);
         return -1;
     }
+
+    DEBUG_DBG("PROT", "帧解析: cmd=0x%02X, len=%zu, crc=0x%04X OK", cmd, payload_len, calc_crc);
 
     if (out_payload && out_len) {
         memcpy(out_payload, &frame[idx], payload_len);
@@ -124,6 +130,7 @@ int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
                          uint8_t *ciphertext_out)
 {
     if (!plaintext || !key || !iv || !ciphertext_out) {
+        DEBUG_ERR("PROT", "AES 加密参数无效");
         return -1;
     }
 
@@ -135,6 +142,8 @@ int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
     uint8_t pad = (uint8_t)(16 - (len % 16));
     if (pad == 0) pad = 16;
     memset(&padded[len], pad, pad);
+
+    DEBUG_DBG("PROT", "AES 加密: 明文=%zu 字节, 填充后=%zu 字节, 填充值=0x%02X", len, padded_len, pad);
 
     // 硬件 AES-CBC 加密（使用 ESP32-C3 硬件 AES 加速器）
     esp_aes_context aes_ctx;
@@ -155,6 +164,7 @@ int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
     esp_aes_free(&aes_ctx);
 
     if (ret == 0) {
+        DEBUG_DBG("PROT", "AES 加密成功: %zu -> %zu 字节", len, padded_len);
         return padded_len;
     } else {
         DEBUG_ERR("PROT", "esp_aes_crypt_cbc 加密失败: %d", ret);
@@ -168,13 +178,16 @@ int protocol_aes_decrypt(const uint8_t *ciphertext, size_t len,
                          uint8_t *plaintext_out)
 {
     if (!ciphertext || !key || !iv || !plaintext_out) {
+        DEBUG_ERR("PROT", "AES 解密参数无效");
         return -1;
     }
 
     if (len % 16 != 0 || len == 0) {
-        DEBUG_ERR("PROT", "Ciphertext 长度无效: %zu", len);
+        DEBUG_ERR("PROT", "Ciphertext 长度无效: %zu (必须为 16 的倍数)", len);
         return -1;
     }
+
+    DEBUG_DBG("PROT", "AES 解密: 密文=%zu 字节", len);
 
     // 硬件 AES-CBC 解密（使用 ESP32-C3 硬件 AES 加速器）
     esp_aes_context aes_ctx;
@@ -206,7 +219,10 @@ int protocol_aes_decrypt(const uint8_t *ciphertext, size_t len,
         return -1;
     }
 
-    return len - pad;
+    size_t orig_len = len - pad;
+    DEBUG_DBG("PROT", "AES 解密成功: %zu -> %zu 字节 (填充=%d)", len, orig_len, pad);
+
+    return orig_len;
 }
 
 // 搅伴算法 - 生成随机数

@@ -1,9 +1,9 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
   "idf.openOcdConfigs": [
-    "board/esp32c3-bridge.cfg"
-  ],
-  "idf.portWin": "detect",
+	"board/esp32c3-bridge.cfg"
+],
+  "idf.portWin": "COM11",
   "idf.currentSetup": "F:\\software\\.espressif\\v6.0\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c3"
