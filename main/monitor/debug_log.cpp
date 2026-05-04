@@ -1,11 +1,17 @@
 /*
  * debug_log.c - WiFi 调试日志输出实现
  *
- * 通过 UDP socket 发送调试日志到上位机
+ * 通过 UDP socket 将调试日志发送到上位机
  * 上位机需监听 <DEBUG_LOG_IP>:<DEBUG_LOG_PORT>
  * 
  * 支持双通道输出：UDP + UART0 串口
  * UART0: TX=GPIO21, RX=GPIO20, 115200 波特率
+ *
+ * 时序说明：
+ *   esp_netif_init() 创建 tcpip 线程后才可安全使用 socket
+ *   本模块在首次 debug_log_send() 时才创建 socket（延迟创建）
+ *   WiFi 连接前 sendto() 会失败（无路由），日志仅走 UART
+ *   WiFi 连接后 UDP 立即生效，无需额外操作
  */
 #include <string.h>
 #include <stdio.h>
@@ -13,6 +19,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "driver/uart.h"
@@ -26,6 +33,116 @@ debug_log_level_t g_debug_log_level = DEBUG_LOG_ALL;
 static int s_udp_sock = -1;
 static struct sockaddr_in s_debug_addr;
 static bool s_initialized = false;
+
+// ============================================================
+// 日志环形缓冲区（供 HTTP /logs 拉取）
+// ============================================================
+#define LOG_RING_SLOTS  64
+#define LOG_RING_SIZE   256
+static char  s_log_ring[LOG_RING_SLOTS][LOG_RING_SIZE];
+static int   s_log_ring_lens[LOG_RING_SLOTS];
+static int   s_log_ring_head  = 0;  // 下次写入位置
+static int   s_log_ring_count = 0;  // 已存条数（超过 LOG_RING_SLOTS 后不再增长，覆盖旧数据）
+static SemaphoreHandle_t s_log_ring_mutex = NULL;
+
+// 获取日志缓冲区中的条数
+int debug_log_ring_count(void)
+{
+    if (!s_log_ring_mutex) return 0;
+    xSemaphoreTake(s_log_ring_mutex, portMAX_DELAY);
+    int count = s_log_ring_count;
+    xSemaphoreGive(s_log_ring_mutex);
+    return count;
+}
+
+// 读取并清空日志缓冲区，返回 JSON 数组字符串
+// 调用者负责 free 返回值
+char *debug_log_ring_drain_json(int *out_len)
+{
+    if (!s_log_ring_mutex) {
+        *out_len = 0;
+        return NULL;
+    }
+
+    xSemaphoreTake(s_log_ring_mutex, portMAX_DELAY);
+
+    int count = s_log_ring_count;
+    if (count == 0) {
+        xSemaphoreGive(s_log_ring_mutex);
+        *out_len = 0;
+        return NULL;
+    }
+
+    // 估算 JSON 大小：每条 ~280 字节（转义 + JSON 包装）
+    size_t buf_size = (size_t)count * 280 + 16;
+    char *json = (char *)malloc(buf_size);
+    if (!json) {
+        xSemaphoreGive(s_log_ring_mutex);
+        *out_len = 0;
+        return NULL;
+    }
+
+    int pos = 0;
+    json[pos++] = '[';
+
+    // 从最旧的开始读
+    int start = (count < LOG_RING_SLOTS) ? 0 : s_log_ring_head;
+    for (int i = 0; i < count && pos < (int)buf_size - 200; i++) {
+        int idx = (start + i) % LOG_RING_SLOTS;
+        int len = s_log_ring_lens[idx];
+        if (len <= 0) continue;
+
+        if (i > 0) json[pos++] = ',';
+
+        // JSON 转义日志内容
+        pos += snprintf(json + pos, buf_size - pos, "\"");
+        for (int j = 0; j < len && pos < (int)buf_size - 10; j++) {
+            char c = s_log_ring[idx][j];
+            if (c == '"' || c == '\\') {
+                json[pos++] = '\\';
+                json[pos++] = c;
+            } else if (c == '\n') {
+                json[pos++] = '\\';
+                json[pos++] = 'n';
+            } else if (c >= 32) {
+                json[pos++] = c;
+            }
+        }
+        pos += snprintf(json + pos, buf_size - pos, "\"");
+    }
+
+    json[pos++] = ']';
+    json[pos] = '\0';
+
+    // 清空缓冲区
+    s_log_ring_head = 0;
+    s_log_ring_count = 0;
+
+    xSemaphoreGive(s_log_ring_mutex);
+
+    *out_len = pos;
+    return json;
+}
+
+// 写入一条日志到环形缓冲区
+static void log_ring_push(const char *data, int len)
+{
+    if (!s_log_ring_mutex || len <= 0) return;
+
+    xSemaphoreTake(s_log_ring_mutex, portMAX_DELAY);
+
+    int copy_len = len;
+    if (copy_len >= LOG_RING_SIZE) copy_len = LOG_RING_SIZE - 1;
+
+    memcpy(s_log_ring[s_log_ring_head], data, copy_len);
+    s_log_ring[s_log_ring_head][copy_len] = '\0';
+    s_log_ring_lens[s_log_ring_head] = copy_len;
+
+    s_log_ring_head = (s_log_ring_head + 1) % LOG_RING_SLOTS;
+    if (s_log_ring_count < LOG_RING_SLOTS) s_log_ring_count++;
+
+    xSemaphoreGive(s_log_ring_mutex);
+}
 
 // UART0 状态
 static bool s_uart_initialized = false;
@@ -95,37 +212,37 @@ esp_err_t uart_debug_send(const uint8_t *data, size_t len)
 // UDP 调试日志
 // ============================================================
 
-// 初始化 UDP socket（注意：socket 创建延迟到 debug_log_send 首次调用时）
-// 因为 esp_netif_init() 会在 wifi_ota_task 里调用，提前创建 socket 会导致 tcpip 线程未就绪而崩溃
+// 初始化（UART 立即可用，UDP socket 延迟到首次发送时创建）
 esp_err_t debug_log_init(void)
 {
     if (s_initialized) {
         return ESP_OK;
     }
 
-    // 初始化 UART0（不需要网络）
     uart_debug_init();
 
-    // 延迟创建 socket：先只初始化目标地址，socket 在 debug_log_send 首次发 UDP 时创建
+    // 日志环形缓冲区互斥锁
+    s_log_ring_mutex = xSemaphoreCreateMutex();
+
+    // 目标地址：单播到上位机
     memset(&s_debug_addr, 0, sizeof(s_debug_addr));
     s_debug_addr.sin_family = AF_INET;
     s_debug_addr.sin_port = htons(DEBUG_LOG_PORT);
     s_debug_addr.sin_addr.s_addr = inet_addr(DEBUG_LOG_IP);
 
     s_initialized = true;
-    ESP_LOGI(TAG, "调试日志已初始化（UDP socket 延迟创建），上位机 IP=%s:%d", DEBUG_LOG_IP, DEBUG_LOG_PORT);
+    ESP_LOGI(TAG, "调试日志已初始化，上位机 %s:%d", DEBUG_LOG_IP, DEBUG_LOG_PORT);
 
     return ESP_OK;
 }
 
-// 延迟创建 UDP socket（仅在首次发送 UDP 时调用）
+// 延迟创建 UDP socket（首次发送时调用）
 static esp_err_t ensure_udp_socket(void)
 {
     if (s_udp_sock >= 0) {
-        return ESP_OK;  // 已创建
+        return ESP_OK;
     }
 
-    // 创建 UDP socket
     s_udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (s_udp_sock < 0) {
         ESP_LOGE(TAG, "创建 UDP socket 失败");
@@ -136,49 +253,39 @@ static esp_err_t ensure_udp_socket(void)
     return ESP_OK;
 }
 
-// 发送原始数据到上位机（UDP + UART 双通道）
+// 发送原始数据（UDP 单播 + UART 双通道）
 esp_err_t debug_log_send(const uint8_t *data, size_t len)
 {
     esp_err_t udp_ret = ESP_FAIL;
     esp_err_t uart_ret = ESP_FAIL;
 
-    // UART 通道发送
+    // UART 通道
     if (s_uart_initialized) {
         uart_ret = uart_debug_send(data, len);
     }
 
-    // UDP 通道发送（延迟创建 socket）
+    // UDP 通道（WiFi 未连接时 sendto 失败，静默跳过）
     if (s_initialized) {
-        // 首次 UDP 发送前才创建 socket
         if (s_udp_sock < 0) {
-            if (ensure_udp_socket() != ESP_OK) {
-                // socket 创建失败，走 UART 通道
-            } else {
-                udp_ret = ESP_OK;  // 标记为已就绪
-            }
+            ensure_udp_socket();
         }
 
         if (s_udp_sock >= 0) {
-            if (len > 1024) {
-                len = 1024;  // 限制单次发送大小
-            }
-
-            int ret = sendto(s_udp_sock, data, len, 0,
+            size_t send_len = len > 1024 ? 1024 : len;
+            int ret = sendto(s_udp_sock, data, send_len, 0,
                              (struct sockaddr *)&s_debug_addr, sizeof(s_debug_addr));
-
-            if (ret < 0) {
-                udp_ret = ESP_FAIL;
-            } else {
+            if (ret >= 0) {
                 udp_ret = ESP_OK;
             }
         }
     }
 
-    // 至少一个通道成功即返回成功
+    // 同时写入环形缓冲区（供 HTTP /logs 拉取）
+    log_ring_push((const char *)data, (int)len);
+
     if (udp_ret == ESP_OK || uart_ret == ESP_OK) {
         return ESP_OK;
     }
-
     return ESP_FAIL;
 }
 
@@ -193,7 +300,6 @@ void debug_log(debug_log_level_t level, const char *tag, const char *fmt, ...)
         return;
     }
 
-    // 格式化日志头
     char prefix[32];
     const char *level_str;
     switch (level) {
@@ -205,17 +311,14 @@ void debug_log(debug_log_level_t level, const char *tag, const char *fmt, ...)
     }
     snprintf(prefix, sizeof(prefix), "[%s][%s]", level_str, tag);
 
-    // 格式化消息体
     va_list args;
     va_start(args, fmt);
     char msg[512];
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
-    // 组装完整日志帧
     char log_buf[600];
     int total = snprintf(log_buf, sizeof(log_buf), "%s %s\n", prefix, msg);
 
-    // 发送（末尾 \n 会被保留）
     debug_log_send((const uint8_t *)log_buf, total);
 }

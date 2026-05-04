@@ -19,6 +19,8 @@ health_state_t g_health_state = SYS_NORMAL;
 
 static SemaphoreHandle_t g_health_mutex = NULL;
 static temperature_sensor_handle_t s_temp_handle = NULL;
+static float s_last_temperature = 0.0f;
+static float s_last_voltage = 3.30f;
 
 // ----------------------------------------
 // 健康状态管理
@@ -44,6 +46,16 @@ health_state_t health_get_current(void)
     return state;
 }
 
+float health_get_last_temperature(void)
+{
+    return s_last_temperature;
+}
+
+float health_get_last_voltage(void)
+{
+    return s_last_voltage;
+}
+
 // ----------------------------------------
 // 温度监控（定时器回调）
 // ----------------------------------------
@@ -56,7 +68,7 @@ static void temp_monitor_callback(void *arg)
         return;
     }
 
-    DEBUG_DBG("TEMP", "芯片温度: %.1f°C", temp);
+    s_last_temperature = temp;
 
     if (temp >= TEMP_CRITICAL) {
         g_health_state = SYS_SAFE_SHUTDOWN;
@@ -77,7 +89,7 @@ static void temp_monitor_callback(void *arg)
 static void voltage_monitor_callback(void *arg)
 {
     float voltage = 3.30f;  // ESP32-C3 无内置电压传感器，使用估算
-    DEBUG_DBG("VOLT", "VDD 电压: %.2fV (估算)", voltage);
+    s_last_voltage = voltage;
 
     if (voltage < 2.3f) {
         g_health_state = SYS_SAFE_SHUTDOWN;
@@ -89,8 +101,6 @@ static void voltage_monitor_callback(void *arg)
             DEBUG_WARN("VOLT", "警告: 电压 %.2fV < 2.5V", voltage);
             DEBUG_WARN("VOLT", "健康状态变更为: SYS_WARNING");
         }
-    } else {
-        DEBUG_INFO("VOLT", "电压正常: %.2fV", voltage);
     }
 }
 
@@ -111,7 +121,7 @@ void health_monitor_task(void *pvParameters)
         DEBUG_INFO("MON", "温度传感器已启用 (范围 20°C ~ 80°C)");
     }
 
-    // 定时器，每5秒读取一次温度
+    // 定时器，每1秒读取一次温度
     esp_timer_handle_t temp_timer;
     esp_timer_create_args_t timer_args = {};
     timer_args.callback = &temp_monitor_callback;
@@ -120,40 +130,35 @@ void health_monitor_task(void *pvParameters)
     timer_args.dispatch_method = ESP_TIMER_TASK;
     timer_args.skip_unhandled_events = false;
     esp_timer_create(&timer_args, &temp_timer);
-    esp_timer_start_periodic(temp_timer, 5 * 1000000);  // 5秒
+    esp_timer_start_periodic(temp_timer, 1 * 1000000);  // 1秒
 
-    DEBUG_INFO("MON", "温度监控定时器已启动 (间隔 5 秒)");
+    DEBUG_INFO("MON", "温度监控定时器已启动 (间隔 1 秒)");
 
     // 启动时检查一次电压
     voltage_monitor_callback(NULL);
 
-    // 每5秒打印一次健康状态
-    uint32_t loop_count = 0;
+    // 每1秒刷新一次估算电压
+    esp_timer_handle_t volt_timer;
+    esp_timer_create_args_t volt_timer_args = {};
+    volt_timer_args.callback = &voltage_monitor_callback;
+    volt_timer_args.arg = nullptr;
+    volt_timer_args.name = "volt_monitor";
+    volt_timer_args.dispatch_method = ESP_TIMER_TASK;
+    volt_timer_args.skip_unhandled_events = false;
+    esp_timer_create(&volt_timer_args, &volt_timer);
+    esp_timer_start_periodic(volt_timer, 1 * 1000000);  // 1秒
+    DEBUG_INFO("MON", "电压监控定时器已启动 (间隔 1 秒)");
+
+    // 保活循环：定时器由 esp_timer 任务驱动，此任务只需保持存活
+    // 状态汇报已由 status_monitor_task 负责，此处只在异常时告警
     while (1) {
-        loop_count++;
-        
         uint32_t free_heap = esp_get_free_heap_size();
-        
-        const char *state_str;
-        switch (g_health_state) {
-            case SYS_NORMAL:       state_str = "正常"; break;
-            case SYS_WARNING:      state_str = "警告"; break;
-            case SYS_CRITICAL:     state_str = "危险"; break;
-            case SYS_SAFE_SHUTDOWN: state_str = "安全关机"; break;
-            default:               state_str = "未知"; break;
-        }
-        
-        DEBUG_INFO("MON", "--- 健康状态 #%lu ---", (unsigned long)loop_count);
-        DEBUG_INFO("MON", "健康状态: %s (%d)", state_str, g_health_state);
-        DEBUG_INFO("MON", "空闲堆: %lu 字节", (unsigned long)free_heap);
-        
-        // 堆内存警告
         if (free_heap < HEAP_WARNING_MIN) {
             DEBUG_WARN("MON", "空闲堆内存不足: %lu < %d", (unsigned long)free_heap, HEAP_WARNING_MIN);
         }
-        
-        DEBUG_INFO("MON", "===================");
-        
+        if (g_health_state >= SYS_CRITICAL) {
+            DEBUG_ERR("MON", "健康状态危险: %d", g_health_state);
+        }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }

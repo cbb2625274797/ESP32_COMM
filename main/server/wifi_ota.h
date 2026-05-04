@@ -16,6 +16,11 @@ typedef enum {
 // WiFi OTA 任务入口
 void wifi_ota_task(void *pvParameters);
 
+// ★ WiFi 早期初始化（app_main 调度前调用）
+// 包括 NVS、WiFi driver、netif、event handler、配置、连接尝试
+// 返回 true = STA 模式启动中，false = 需要在 task 中切换 AP
+bool wifi_early_init(void);
+
 // 信号通知 OTA 中继开始（存储完成后调用）
 void wifi_ota_signal_relay(void);
 

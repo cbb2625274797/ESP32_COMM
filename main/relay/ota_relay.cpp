@@ -40,7 +40,7 @@ esp_err_t meta_load(ota_meta_t *meta)
 
     FILE *f = fopen(META_FILE, "r");
     if (!f) {
-        DEBUG_WARN("OTA", "元数据文件不存在，返回默认值");
+        // 文件不存在是正常状态（首次使用，未刷过 GD32）
         return ESP_OK;
     }
 

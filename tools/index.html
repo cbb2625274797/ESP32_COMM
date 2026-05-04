@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 OTA 中继系统 - 上位机</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+  <!-- 顶部标题栏 -->
+  <header class="header">
+    <div class="logo-section">
+      <div class="logo-icon">📡</div>
+      <div class="logo-text">
+        <h1>ESP32 OTA 中继系统</h1>
+        <p>GD32 固件空中升级管理平台</p>
+      </div>
+    </div>
+    <div class="status-badges">
+      <div class="badge disconnected" id="connectionBadge">
+        <span class="dot"></span>
+        <span id="connectionText">未连接</span>
+      </div>
+      <div class="badge" id="healthBadge">
+        <span class="dot"></span>
+        <span id="healthText">系统正常</span>
+      </div>
+      <div class="badge">
+        <span id="fwVersion">v--</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主网格布局 -->
+  <div class="main-grid">
+    <!-- 左侧面板 -->
+    <div class="left-panel">
+      <!-- 连接配置 -->
+      <div class="card connection-card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">🔗</div>
+            连接配置
+          </div>
+        </div>
+        <div class="form-group">
+          <label>ESP32 IP 地址</label>
+          <div class="input-group">
+            <input type="text" id="espIp" value="192.168.31.127" placeholder="输入 IP 地址">
+            <button class="btn btn-secondary" onclick="testConnection()">测试</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>目标芯片</label>
+          <select id="targetChip" onchange="onTargetChipChange()" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+            <option value="gd32">GD32（Flash 中继）</option>
+            <option value="esp32">ESP32（自身升级）</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" style="width:100%; margin-top:8px;" onclick="healthCheck()">
+          🔍 执行健康检查
+        </button>
+      </div>
+
+      <!-- 文件上传 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📁</div>
+            固件文件
+          </div>
+        </div>
+
+        <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+          <div class="upload-icon">📤</div>
+          <h3>点击或拖拽文件到此处</h3>
+          <p>支持 .hex 和 .bin 格式</p>
+        </div>
+        <input type="file" id="fileInput" class="file-input" accept=".hex,.bin" onchange="handleFileSelect(event)">
+
+        <div class="file-info" id="fileInfo">
+          <div class="file-header">
+            <div class="file-name">
+              <span class="icon">📄</span>
+              <span id="fileName">-</span>
+            </div>
+            <button class="btn btn-secondary" onclick="clearFile()" style="padding:6px 12px;">✕</button>
+          </div>
+          <div class="file-meta">
+            <div class="meta-item"><span>类型:</span> <b id="fileType">-</b></div>
+            <div class="meta-item"><span>大小:</span> <b id="fileSize">-</b></div>
+            <div class="meta-item"><span>数据包:</span> <b id="fileChunks">-</b></div>
+          </div>
+        </div>
+
+        <div class="progress-section" id="progressSection">
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <div class="progress-info">
+            <span id="progressText">准备上传...</span>
+            <span id="progressPercent">0%</span>
+          </div>
+        </div>
+
+        <div class="action-buttons">
+          <button class="btn btn-primary" id="uploadBtn" onclick="startUpload()" disabled>
+            ⬆️ 上传固件
+          </button>
+          <button class="btn btn-success" id="relayBtn" onclick="triggerRelay()">
+            🚀 触发 OTA
+          </button>
+        </div>
+        <div id="esp32Actions" style="display:none; margin-top:12px;">
+          <button class="btn btn-primary" style="width:100%;" onclick="triggerEsp32Update()">
+            🔄 完成 ESP32 升级（重启）
+          </button>
+        </div>
+      </div>
+
+      <!-- OTA 阶段指示 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📊</div>
+            OTA 流程阶段
+          </div>
+        </div>
+        <div class="stage-indicator">
+          <div class="stage" id="stage1">
+            <div class="stage-icon">1️⃣</div>
+            <div class="stage-label">握手认证</div>
+          </div>
+          <div class="stage" id="stage2">
+            <div class="stage-icon">2️⃣</div>
+            <div class="stage-label">传输准备</div>
+          </div>
+          <div class="stage" id="stage3">
+            <div class="stage-icon">3️⃣</div>
+            <div class="stage-label">数据转发</div>
+          </div>
+          <div class="stage" id="stage4">
+            <div class="stage-icon">4️⃣</div>
+            <div class="stage-label">完成跳转</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧面板 -->
+    <div class="right-panel">
+      <!-- 实时状态 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📈</div>
+            实时状态
+          </div>
+        </div>
+        <div class="status-grid">
+          <div class="status-item">
+            <div class="value" id="statTemperature">--</div>
+            <div class="label">芯片温度</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statVoltage">--</div>
+            <div class="label">电源电压</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statWifi">--</div>
+            <div class="label">WiFi 状态</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statSignal">--</div>
+            <div class="label">信号强度</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statHeap">0</div>
+            <div class="label">空闲堆</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statMinHeap">0</div>
+            <div class="label">最低空闲堆</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statProgress">0%</div>
+            <div class="label">上传进度</div>
+          </div>
+          <div class="status-item">
+            <div class="value" id="statRelayState">待机</div>
+            <div class="label">中继状态</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CAN 帧发送面板 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">📨</div>
+            CAN 帧发送
+          </div>
+        </div>
+        <div style="display:grid; grid-template-columns:80px 1fr 80px 1fr; gap:12px; margin-bottom:16px;">
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">通道</label>
+            <select id="canChannel" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+              <option value="0">CH0</option>
+              <option value="1">CH1</option>
+              <option value="2">CH2</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">扩展帧 ID</label>
+            <input type="text" id="canId" value="0x18DA00F1" placeholder="例如: 0x18DA00F1" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">DLC</label>
+            <input type="number" id="canDlc" value="8" min="1" max="64" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">数据 (HEX)</label>
+            <input type="text" id="canData" value="0102030405060708" placeholder="01020304..." style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+          </div>
+        </div>
+        <div style="display:flex;gap:12px;">
+          <button class="btn btn-primary" style="flex:1;" onclick="sendCanFrame()">📤 发送</button>
+          <button class="btn btn-secondary" onclick="clearCanFields()">清空</button>
+        </div>
+        <div id="canResponse" style="margin-top:16px;background:var(--bg-secondary);border-radius:10px;padding:12px 16px;font-family:monospace;font-size:12px;display:none;">
+          <div style="color:var(--text-muted);margin-bottom:6px;">响应:</div>
+          <div id="canRespContent" style="color:var(--accent);"></div>
+        </div>
+      </div>
+
+      <!-- 调试日志 -->
+      <div class="card log-panel">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="icon">🖥️</div>
+            调试日志
+            <span style="font-size:12px;color:var(--text-muted);font-weight:normal;margin-left:8px;">UDP:6666</span>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="log-header">
+            <span style="font-size:13px;color:var(--text-muted);">实时日志输出</span>
+            <div class="log-filters">
+              <button class="filter-btn active" onclick="toggleFilter('all', this)">全部</button>
+              <button class="filter-btn" onclick="toggleFilter('E', this)">错误</button>
+              <button class="filter-btn" onclick="toggleFilter('W', this)">警告</button>
+              <button class="filter-btn" onclick="toggleFilter('I', this)">信息</button>
+            </div>
+          </div>
+          <div class="log-content" id="logContent">
+            <div class="log-entry">
+              <span class="log-time">[--:--:--]</span>
+              <span class="log-level I">I</span>
+              <span class="log-tag">[系统]</span>
+              <span class="log-msg">等待上位机连接...</span>
+            </div>
+          </div>
+          <div class="log-footer">
+            <span class="log-stats"><span id="logCount">0</span> 条日志</span>
+            <button class="btn btn-secondary" onclick="clearLogs()" style="padding:6px 12px;font-size:12px;">清除日志</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast 提示 -->
+<div class="toast" id="toast">
+  <span class="toast-icon" id="toastIcon">✓</span>
+  <span class="toast-message" id="toastMessage">操作成功</span>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

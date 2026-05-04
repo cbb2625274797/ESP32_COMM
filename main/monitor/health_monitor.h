@@ -35,3 +35,5 @@ health_status_t health_check_before_ota(void);
 void health_log_event(const char *event, int value);
 health_state_t health_get_current(void);
 health_status_t health_update_from_wifi_rssi(int8_t rssi);
+float health_get_last_temperature(void);
+float health_get_last_voltage(void);

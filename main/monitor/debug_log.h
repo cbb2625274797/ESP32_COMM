@@ -1,8 +1,8 @@
 /*
  * debug_log.h - WiFi 调试日志输出
  *
- * 通过 UDP socket 将调试信息发送到上位机
- * 上位机监听 <udp_ip>/<udp_port> 接收日志
+ * 通过 UDP socket 将调试日志发送到上位机
+ * 上位机监听 <DEBUG_LOG_PORT> 接收日志
  * 
  * 支持双通道输出：UDP + UART0 串口
  * UART0: TX=GPIO21, RX=GPIO20, 115200 波特率
@@ -49,6 +49,10 @@ esp_err_t debug_log_send(const uint8_t *data, size_t len);
 
 // 格式化日志输出（类似 printf）
 void debug_log(debug_log_level_t level, const char *tag, const char *fmt, ...);
+
+// 日志环形缓冲区（供 HTTP /logs 拉取）
+int debug_log_ring_count(void);
+char *debug_log_ring_drain_json(int *out_len);  // 调用者 free
 
 // 宏定义方便调用
 #define DEBUG_ERR(tag, fmt, ...)   debug_log(DEBUG_LOG_ERR,   tag, fmt, ##__VA_ARGS__)

@@ -17,6 +17,7 @@ idf_component_register(
         "monitor"
         "include"
     REQUIRES
+        app_update
         cjson
         esp_driver_spi
         esp_driver_tsens
@@ -31,4 +32,5 @@ idf_component_register(
         nvs_flash
         freertos
         mbedtls
+        bt
 )

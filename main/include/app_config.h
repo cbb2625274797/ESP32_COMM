@@ -8,11 +8,16 @@
 #include <cstdint>
 
 // ============================================================
+// 固件版本
+// ============================================================
+inline constexpr const char *FW_VERSION = "0.0.6";
+
+// ============================================================
 // WiFi 工作模式选择
 // ============================================================
 // 0 = AP 模式（设备当热点）
 // 1 = STA 模式（连接路由器）
-inline constexpr uint8_t CONFIG_WIFI_MODE = 0;
+inline constexpr uint8_t CONFIG_WIFI_MODE = 1;
 
 // ============================================================
 // WiFi STA 模式配置（连接路由器）
@@ -20,16 +25,16 @@ inline constexpr uint8_t CONFIG_WIFI_MODE = 0;
 inline constexpr const char* WIFI_STA_SSID = "004舰桥";
 inline constexpr const char* WIFI_STA_PASSWORD = "q13362875622";
 inline constexpr uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 30000;
+inline constexpr uint8_t  WIFI_STA_MAX_RETRY = 5;  // 最大重连次数，超过后切换 AP 模式
 
 // STA 静态 IP
-inline constexpr uint8_t WIFI_STA_USE_STATIC_IP = 1;  // 设为 1 启用静态 IP
+inline constexpr uint8_t WIFI_STA_USE_STATIC_IP = 0;  // 先关闭静态 IP，使用 DHCP 排查连接问题
 
-#if WIFI_STA_USE_STATIC_IP
-inline constexpr const char* WIFI_STA_STATIC_IP      = "192.168.1.100";
-inline constexpr const char* WIFI_STA_STATIC_GW      = "192.168.1.1";
+// 静态 IP 配置（始终定义，由 WIFI_STA_USE_STATIC_IP 在运行时决定是否使用）
+inline constexpr const char* WIFI_STA_STATIC_IP      = "192.168.31.32";
+inline constexpr const char* WIFI_STA_STATIC_GW      = "192.168.31.1";
 inline constexpr const char* WIFI_STA_STATIC_NETMASK = "255.255.255.0";
-inline constexpr const char* WIFI_STA_STATIC_DNS     = "192.168.1.1";
-#endif
+inline constexpr const char* WIFI_STA_STATIC_DNS     = "192.168.31.1";
 
 // ============================================================
 // WiFi AP 模式配置（设备当热点）
@@ -54,8 +59,8 @@ inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE   = 2 * 1024 * 1024;  // 2MB
 // ============================================================
 // 健康监控阈值
 // ============================================================
-inline constexpr int32_t WIFI_RSSI_CRITICAL = -75;
-inline constexpr int32_t WIFI_RSSI_WARNING  = -65;
+inline constexpr int32_t WIFI_RSSI_CRITICAL = -85;
+inline constexpr int32_t WIFI_RSSI_WARNING  = -75;
 inline constexpr int32_t TEMP_WARNING       = 80;
 inline constexpr int32_t TEMP_CRITICAL      = 100;
 inline constexpr size_t  HEAP_WARNING_MIN   = 10240;

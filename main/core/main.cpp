@@ -9,8 +9,8 @@
 #include "freertos/task.h"
 #include "esp_chip_info.h"
 #include "esp_system.h"
-#include "esp_clk_tree.h"
 #include "esp_netif.h"
+#include "esp_event.h"
 
 #include "monitor/health_monitor.h"
 #include "relay/ota_relay.h"
@@ -25,23 +25,30 @@ static void status_monitor_task(void *pvParameters);
 
 extern "C" void app_main(void)
 {
-    // 【关键】在所有任务创建之前初始化网络接口
-    // esp_timer 内部依赖 tcpip 线程，health_monitor_task 的 esp_timer_create
-    // 会在 scheduler 启动后立即执行。如果 esp_netif_init() 没有提前调用，
-    // tcpip 线程的 mailbox 还未创建，此时 esp_timer 发消息给 tcpip 线程就会崩溃。
-    // esp_netif_init() 可以安全调用多次，后续 wifi_ota_task 中的调用是多余的但不报错。
-    ESP_ERROR_CHECK(esp_netif_init());
-
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
-	
-    // 初始化调试日志（UDP 输出到上位机 + UART0 串口）
+
+    // 初始化网络接口 + 事件循环（必须最早）
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // 初始化调试日志（UART0 先就绪，UDP socket 延迟到首次发送时创建）
+    // 必须在 wifi_early_init 之前，这样 WiFi 初始化日志也能输出到上位机
     debug_log_init();
+
+    // ★ WiFi 提前初始化（调度器启动前）
+    // 包括：NVS → netif 创建 → event handler 注册 → WiFi driver init → 配置 → connect
+    // 连接尝试立即开始，事件排队等调度器启动后处理
+    bool wifi_sta_ok = wifi_early_init();
+
+    health_monitor_init();
+    DEBUG_INFO("MAIN", "健康监控状态已初始化");
     DEBUG_INFO("MAIN", "========================================");
     DEBUG_INFO("MAIN", "ESP32-C3 OTA Relay v1.0 启动");
     DEBUG_INFO("MAIN", "Chip: %s, Rev %d", CONFIG_IDF_TARGET, chip_info.revision);
     DEBUG_INFO("MAIN", "Free heap: %lu bytes", esp_get_free_heap_size());
     DEBUG_INFO("MAIN", "CPU Freq: %d MHz", CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+    DEBUG_INFO("MAIN", "WiFi: %s", wifi_sta_ok ? "STA 连接中" : "将使用 AP 模式");
     DEBUG_INFO("MAIN", "========================================");
 
     // 健康监控任务（温度 + 电压 + WiFi RSSI）

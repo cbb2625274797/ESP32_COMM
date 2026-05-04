@@ -50,7 +50,7 @@ ESP32_COMM/
 CONFIG_WIFI_MODE_IS_STA = 0
 WIFI_AP_SSID = "ESP32_OTA_RELAY"   // 默认热点名称
 WIFI_AP_PASSWORD = "12345678"      // 默认密码
-// 上位机连接热点后访问: http://192.168.4.1
+// 上位机连接热点后访问: http://192.168.31.1
 
 // STA 模式（连接路由器）
 CONFIG_WIFI_MODE_IS_STA = 1
@@ -98,7 +98,7 @@ GD32 通信帧格式：`[通道编号: 1B] [扩展帧ID: 4B BE] [数据: 1~64B]`
 ### CAN 帧发送示例
 
 ```bash
-curl -X POST http://192.168.4.1/can/send \
+curl -X POST http://192.168.31.1/can/send \
   -H "Content-Type: application/json" \
   -d '{"ch": 0, "id": 12345678, "dlc": 8, "data": "0102030405060708"}'
 ```
