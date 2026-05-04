@@ -15,9 +15,13 @@
 #include "spi_master.h"
 #include "monitor/debug_log.h"
 
+/** @brief SPI2 从设备句柄。 */
 spi_device_handle_t g_spi_device = NULL;
 
-// SPI2 总线初始化
+/**
+ * @brief SPI2 总线初始化
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t spi_master_init(void)
 {
     DEBUG_INFO("SPI", "=== 初始化 SPI2 (VSPI) ===");
@@ -100,12 +104,27 @@ esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
 }
 
 // 仅发送
+/**
+ * @brief 调用同步传输接口发送数据，不要求接收返回内容。
+ * @param cmd SPI 命令码。
+ * @param payload 发送数据指针。
+ * @param len 发送数据长度。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t spi_send(uint8_t cmd, const uint8_t *payload, size_t len)
 {
     return spi_sync_transfer(cmd, payload, len, NULL, 0, 3000);
 }
 
 // 仅接收
+/**
+ * @brief 发送哑数据产生时钟，从从设备同步读取指定长度数据。
+ * @param cmd SPI 命令码。
+ * @param recv_buf 接收缓冲区。
+ * @param len 接收长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t spi_recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_ms)
 {
     uint8_t dummy[64] = {0};
@@ -182,6 +201,7 @@ static int can_frame_send(can_channel_t channel, uint32_t ext_id,
     return 0;
 }
 
+// 对外暴露的 GD32 CAN 发送接口，会在必要时修正默认 DLC。
 int gd32_can_send(can_channel_t channel, uint32_t ext_id,
                   const uint8_t *data, uint8_t dlc,
                   uint8_t *recv_buf, uint8_t recv_max,
@@ -193,6 +213,7 @@ int gd32_can_send(can_channel_t channel, uint32_t ext_id,
     return can_frame_send(channel, ext_id, data, dlc, recv_buf, recv_max, timeout_ms);
 }
 
+// 对外暴露的无响应 GD32 CAN 发送接口。
 int gd32_can_send_no_reply(can_channel_t channel, uint32_t ext_id,
                             const uint8_t *data, uint8_t dlc)
 {

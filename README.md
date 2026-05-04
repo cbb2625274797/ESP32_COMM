@@ -113,9 +113,24 @@ curl -X POST http://192.168.31.1/can/send \
 | ota_relay | configMAX_PRIORITIES - 2 | 8192 | OTA 中继 |
 | wifi_ota | configMAX_PRIORITIES - 3 | 8192 | WiFi OTA |
 
-## 调试日志
+## 调试日志与上位机通信
 
-UDP 输出到上位机，端口 6666。上位机 WebUI 自动监听并显示。
+当前与上位机相关的通信分成两类：
+
+1. **业务通信：HTTP**
+   - WebUI 通过 HTTP 接口与 ESP32 通信
+   - 典型接口：`/system/status`、`/logs`、`/can/send`、`/ota/*`
+   - 其中日志面板实际通过 **轮询 `GET /logs`** 获取日志
+
+2. **调试镜像：UART0 + UDP**
+   - 所有 `DEBUG_*` 日志会同时写到 UART0、UDP、以及内部环形缓冲区
+   - UDP 目标端口为 `6666`，适合独立调试接收器使用
+   - 但 **当前 tools WebUI 不直接监听 UDP 6666**
+
+因此，当前 WebUI 场景下：
+- `/system/status` 用于在线状态/健康状态展示
+- `/logs` 用于日志展示
+- 不再需要额外的 `{"t":"hb"}` 假日志心跳包
 
 ## 编译
 

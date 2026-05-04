@@ -15,24 +15,36 @@
 #include "health_monitor.h"
 #include "debug_log.h"
 
+/** @brief 全局健康状态，受互斥锁保护。 */
 health_state_t g_health_state = SYS_NORMAL;
 
+/** @brief 健康状态互斥锁。 */
 static SemaphoreHandle_t g_health_mutex = NULL;
+/** @brief 内置温度传感器句柄。 */
 static temperature_sensor_handle_t s_temp_handle = NULL;
+/** @brief 最近一次采样的芯片温度（摄氏度）。 */
 static float s_last_temperature = 0.0f;
+/** @brief 最近一次估算的系统电压（伏特）。 */
 static float s_last_voltage = 3.30f;
 
 // ----------------------------------------
 // 健康状态管理
-// ----------------------------------------
+/**
+  * @brief 初始化健康监控模块，创建互斥锁和基础状态。
+ */
 void health_monitor_init(void)
 {
+    /** @brief 健康状态互斥锁。 */
     g_health_mutex = xSemaphoreCreateMutex();
     if (g_health_mutex == NULL) {
         DEBUG_ERR("HEALTH", "创建健康状态互斥锁失败");
     }
 }
 
+/**
+  * @brief 获取当前系统健康状态。
+ * @return 当前健康状态枚举值。
+ */
 health_state_t health_get_current(void)
 {
     health_state_t state;
@@ -46,19 +58,32 @@ health_state_t health_get_current(void)
     return state;
 }
 
+/**
+  * @brief 返回最近一次采样到的芯片温度（摄氏度）。
+ * @return 最近一次温度采样值（摄氏度）。
+ */
 float health_get_last_temperature(void)
 {
+    /** @brief 最近一次采样的芯片温度（摄氏度）。 */
     return s_last_temperature;
 }
 
+/**
+  * @brief 返回最近一次记录的系统电压估算值。
+ * @return 最近一次电压估算值（伏特）。
+ */
 float health_get_last_voltage(void)
 {
+    /** @brief 最近一次估算的系统电压（伏特）。 */
     return s_last_voltage;
 }
 
 // ----------------------------------------
 // 温度监控（定时器回调）
-// ----------------------------------------
+/**
+  * @brief 温度定时回调，采样并根据阈值更新健康状态。
+ * @param arg
+ */
 static void temp_monitor_callback(void *arg)
 {
     float temp = 0.0f;
@@ -68,14 +93,17 @@ static void temp_monitor_callback(void *arg)
         return;
     }
 
+    /** @brief 最近一次采样的芯片温度（摄氏度）。 */
     s_last_temperature = temp;
 
     if (temp >= TEMP_CRITICAL) {
+        /** @brief 全局健康状态，受互斥锁保护。 */
         g_health_state = SYS_SAFE_SHUTDOWN;
         DEBUG_ERR("TEMP", "!!! 危险 !!! 温度 %.1f°C >= %d°C，触发安全关机", temp, TEMP_CRITICAL);
         DEBUG_ERR("TEMP", "健康状态变更为: SYS_SAFE_SHUTDOWN");
     } else if (temp >= TEMP_WARNING) {
         if (g_health_state < SYS_WARNING) {
+            /** @brief 全局健康状态，受互斥锁保护。 */
             g_health_state = SYS_WARNING;
             DEBUG_WARN("TEMP", "警告: 温度 %.1f°C >= %d°C", temp, TEMP_WARNING);
             DEBUG_WARN("TEMP", "健康状态变更为: SYS_WARNING");
@@ -85,18 +113,24 @@ static void temp_monitor_callback(void *arg)
 
 // ----------------------------------------
 // 电压监控（启动时调用一次）
-// ----------------------------------------
+/**
+  * @brief 电压定时回调，采样估算电压并根据阈值更新健康状态。
+ * @param arg
+ */
 static void voltage_monitor_callback(void *arg)
 {
     float voltage = 3.30f;  // ESP32-C3 无内置电压传感器，使用估算
+    /** @brief 最近一次估算的系统电压（伏特）。 */
     s_last_voltage = voltage;
 
     if (voltage < 2.3f) {
+        /** @brief 全局健康状态，受互斥锁保护。 */
         g_health_state = SYS_SAFE_SHUTDOWN;
         DEBUG_ERR("VOLT", "!!! 危险 !!! 电压 %.2fV < 2.3V，触发安全关机", voltage);
         DEBUG_ERR("VOLT", "健康状态变更为: SYS_SAFE_SHUTDOWN");
     } else if (voltage < 2.5f) {
         if (g_health_state < SYS_WARNING) {
+            /** @brief 全局健康状态，受互斥锁保护。 */
             g_health_state = SYS_WARNING;
             DEBUG_WARN("VOLT", "警告: 电压 %.2fV < 2.5V", voltage);
             DEBUG_WARN("VOLT", "健康状态变更为: SYS_WARNING");
@@ -106,12 +140,14 @@ static void voltage_monitor_callback(void *arg)
 
 // ----------------------------------------
 // 温度电压监控任务入口
-// ----------------------------------------
+/**
+  * @brief 启动温度和电压监控定时器，周期性巡检系统健康。
+ * @param pvParameters FreeRTOS 任务参数，未使用。
+ */
 void health_monitor_task(void *pvParameters)
 {
     DEBUG_INFO("MON", "=== 健康监控任务启动 ===");
 
-    // 初始化内置温度传感器（测量范围 20°C ~ 80°C）
     temperature_sensor_config_t temp_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 80);
     esp_err_t err = temperature_sensor_install(&temp_config, &s_temp_handle);
     if (err != ESP_OK) {
@@ -134,7 +170,6 @@ void health_monitor_task(void *pvParameters)
 
     DEBUG_INFO("MON", "温度监控定时器已启动 (间隔 1 秒)");
 
-    // 启动时检查一次电压
     voltage_monitor_callback(NULL);
 
     // 每1秒刷新一次估算电压
@@ -165,7 +200,11 @@ void health_monitor_task(void *pvParameters)
 
 // ----------------------------------------
 // 健康事件日志
-// ----------------------------------------
+/**
+  * @brief 记录一条健康监控事件日志。
+ * @param event 事件名称字符串。
+ * @param value 事件关联的数值。
+ */
 void health_log_event(const char *event, int value)
 {
     DEBUG_INFO("HEALTH", "[健康事件] %s: %d", event, value);
@@ -173,7 +212,10 @@ void health_log_event(const char *event, int value)
 
 // ----------------------------------------
 // OTA 传输前的健康检查
-// ----------------------------------------
+/**
+  * @brief OTA 传输前执行健康检查，决定是否允许传输。
+ * @return 健康检查结果，决定是否允许 OTA。
+ */
 health_status_t health_check_before_ota(void)
 {
     health_status_t status = HEALTH_MON_OK;
@@ -192,6 +234,7 @@ health_status_t health_check_before_ota(void)
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         if (ap_info.rssi < WIFI_RSSI_CRITICAL) {
+            /** @brief 全局健康状态，受互斥锁保护。 */
             g_health_state = SYS_CRITICAL;
             DEBUG_WARN("HEALTH", "OTA 前检查: WiFi RSSI %d < %d (危险阈值)", 
                        ap_info.rssi, WIFI_RSSI_CRITICAL);
@@ -212,15 +255,22 @@ health_status_t health_check_before_ota(void)
     return status;
 }
 
+/**
+  * @brief 根据 WiFi RSSI 更新健康状态并返回检查结果。
+ * @param rssi 当前 WiFi 信号强度（dBm）。
+ * @return 健康检查结果。
+ */
 health_status_t health_update_from_wifi_rssi(int8_t rssi)
 {
     if (rssi < WIFI_RSSI_CRITICAL) {
+        /** @brief 全局健康状态，受互斥锁保护。 */
         g_health_state = SYS_CRITICAL;
         DEBUG_WARN("HEALTH", "WiFi RSSI 危险: %d dBm < %d dBm", rssi, WIFI_RSSI_CRITICAL);
         health_log_event("WIFI危险", rssi);
         return HEALTH_MON_CRITICAL;
     } else if (rssi < WIFI_RSSI_NORMAL) {
         if (g_health_state < SYS_WARNING) {
+            /** @brief 全局健康状态，受互斥锁保护。 */
             g_health_state = SYS_WARNING;
             DEBUG_WARN("HEALTH", "WiFi RSSI 警告: %d dBm < %d dBm", rssi, WIFI_RSSI_NORMAL);
             health_log_event("WIFI警告", rssi);
@@ -229,6 +279,7 @@ health_status_t health_update_from_wifi_rssi(int8_t rssi)
     }
 
     if (g_health_state == SYS_WARNING && rssi >= WIFI_RSSI_NORMAL) {
+        /** @brief 全局健康状态，受互斥锁保护。 */
         g_health_state = SYS_NORMAL;
         DEBUG_INFO("HEALTH", "WiFi RSSI 恢复: %d dBm >= %d dBm", rssi, WIFI_RSSI_NORMAL);
         health_log_event("WIFI恢复", rssi);

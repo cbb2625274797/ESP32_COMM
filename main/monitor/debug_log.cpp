@@ -1,16 +1,18 @@
 /*
- * debug_log.c - WiFi 调试日志输出实现
+ * debug_log.c - 调试日志输出实现
  *
- * 通过 UDP socket 将调试日志发送到上位机
- * 上位机需监听 <DEBUG_LOG_IP>:<DEBUG_LOG_PORT>
- * 
- * 支持双通道输出：UDP + UART0 串口
+ * 日志会同时写入三处：
+ * 1. UART0 串口（本地串口调试）
+ * 2. UDP 单播到指定上位机（独立 UDP 调试接收端可选）
+ * 3. 内部环形缓冲区（供 HTTP /logs 拉取，WebUI 实际使用这一条）
+ *
  * UART0: TX=GPIO21, RX=GPIO20, 115200 波特率
+ * UDP:   <DEBUG_LOG_IP>:<DEBUG_LOG_PORT>
  *
  * 时序说明：
  *   esp_netif_init() 创建 tcpip 线程后才可安全使用 socket
  *   本模块在首次 debug_log_send() 时才创建 socket（延迟创建）
- *   WiFi 连接前 sendto() 会失败（无路由），日志仅走 UART
+ *   WiFi 连接前 sendto() 会失败（无路由），日志仍可写入 UART 与 HTTP 日志缓冲
  *   WiFi 连接后 UDP 立即生效，无需额外操作
  */
 #include <string.h>
@@ -28,10 +30,14 @@
 
 static const char *TAG = "DEBUG_LOG";
 
+/** @brief 当前调试日志过滤级别，运行时可动态调整。 */
 debug_log_level_t g_debug_log_level = DEBUG_LOG_ALL;
 
+/** @brief UDP 调试日志 socket 句柄，首次发送时延迟创建。 */
 static int s_udp_sock = -1;
+/** @brief UDP 调试日志目标地址。 */
 static struct sockaddr_in s_debug_addr;
+/** @brief 日志模块初始化标志。 */
 static bool s_initialized = false;
 
 // ============================================================
@@ -43,9 +49,13 @@ static char  s_log_ring[LOG_RING_SLOTS][LOG_RING_SIZE];
 static int   s_log_ring_lens[LOG_RING_SLOTS];
 static int   s_log_ring_head  = 0;  // 下次写入位置
 static int   s_log_ring_count = 0;  // 已存条数（超过 LOG_RING_SLOTS 后不再增长，覆盖旧数据）
+/** @brief 环形缓冲区互斥锁，保护多线程并发读写。 */
 static SemaphoreHandle_t s_log_ring_mutex = NULL;
 
-// 获取日志缓冲区中的条数
+/**
+ * @brief 获取日志缓冲区中的条数
+ * @return 当前日志条数。
+ */
 int debug_log_ring_count(void)
 {
     if (!s_log_ring_mutex) return 0;
@@ -94,7 +104,6 @@ char *debug_log_ring_drain_json(int *out_len)
 
         if (i > 0) json[pos++] = ',';
 
-        // JSON 转义日志内容
         pos += snprintf(json + pos, buf_size - pos, "\"");
         for (int j = 0; j < len && pos < (int)buf_size - 10; j++) {
             char c = s_log_ring[idx][j];
@@ -116,6 +125,7 @@ char *debug_log_ring_drain_json(int *out_len)
 
     // 清空缓冲区
     s_log_ring_head = 0;
+    /** @brief 环形缓冲区中已存储的日志条数。 */
     s_log_ring_count = 0;
 
     xSemaphoreGive(s_log_ring_mutex);
@@ -124,7 +134,11 @@ char *debug_log_ring_drain_json(int *out_len)
     return json;
 }
 
-// 写入一条日志到环形缓冲区
+/**
+ * @brief 写入一条日志到环形缓冲区
+ * @param data
+ * @param len
+ */
 static void log_ring_push(const char *data, int len)
 {
     if (!s_log_ring_mutex || len <= 0) return;
@@ -138,6 +152,7 @@ static void log_ring_push(const char *data, int len)
     s_log_ring[s_log_ring_head][copy_len] = '\0';
     s_log_ring_lens[s_log_ring_head] = copy_len;
 
+    /** @brief 环形缓冲区下一个写入位置。 */
     s_log_ring_head = (s_log_ring_head + 1) % LOG_RING_SLOTS;
     if (s_log_ring_count < LOG_RING_SLOTS) s_log_ring_count++;
 
@@ -146,12 +161,16 @@ static void log_ring_push(const char *data, int len)
 
 // UART0 状态
 static bool s_uart_initialized = false;
+/** @brief 调试串口使用的 UART 端口号。 */
 static uart_port_t s_uart_port = UART_NUM_0;
 
 // ============================================================
 // UART0 串口调试
 // ============================================================
-
+/**
+  * @brief 初始化 UART0 调试串口，配置波特率和引脚映射。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t uart_debug_init(void)
 {
     if (s_uart_initialized) {
@@ -187,6 +206,7 @@ esp_err_t uart_debug_init(void)
         return ret;
     }
 
+    /** @brief UART0 初始化标志。 */
     s_uart_initialized = true;
     ESP_LOGI(TAG, "UART0 调试输出已初始化 (TX=GPIO%d, RX=GPIO%d, %d baud)",
              UART_DEBUG_TX_GPIO, UART_DEBUG_RX_GPIO, UART_DEBUG_BAUD_RATE);
@@ -194,6 +214,12 @@ esp_err_t uart_debug_init(void)
     return ESP_OK;
 }
 
+/**
+  * @brief 通过 UART0 发送一段原始字节数据。
+ * @param data 待发送的数据指针。
+ * @param len 数据长度。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t uart_debug_send(const uint8_t *data, size_t len)
 {
     if (!s_uart_initialized) {
@@ -212,7 +238,10 @@ esp_err_t uart_debug_send(const uint8_t *data, size_t len)
 // UDP 调试日志
 // ============================================================
 
-// 初始化（UART 立即可用，UDP socket 延迟到首次发送时创建）
+/**
+ * @brief 初始化（UART 立即可用，UDP socket 延迟到首次发送时创建）
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t debug_log_init(void)
 {
     if (s_initialized) {
@@ -221,7 +250,7 @@ esp_err_t debug_log_init(void)
 
     uart_debug_init();
 
-    // 日志环形缓冲区互斥锁
+    /** @brief 环形缓冲区互斥锁，保护多线程并发读写。 */
     s_log_ring_mutex = xSemaphoreCreateMutex();
 
     // 目标地址：单播到上位机
@@ -230,19 +259,24 @@ esp_err_t debug_log_init(void)
     s_debug_addr.sin_port = htons(DEBUG_LOG_PORT);
     s_debug_addr.sin_addr.s_addr = inet_addr(DEBUG_LOG_IP);
 
+    /** @brief 日志模块初始化标志。 */
     s_initialized = true;
     ESP_LOGI(TAG, "调试日志已初始化，上位机 %s:%d", DEBUG_LOG_IP, DEBUG_LOG_PORT);
 
     return ESP_OK;
 }
 
-// 延迟创建 UDP socket（首次发送时调用）
+/**
+ * @brief 延迟创建 UDP socket（首次发送时调用）
+ * @return
+ */
 static esp_err_t ensure_udp_socket(void)
 {
     if (s_udp_sock >= 0) {
         return ESP_OK;
     }
 
+    /** @brief UDP 调试日志 socket 句柄，首次发送时延迟创建。 */
     s_udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (s_udp_sock < 0) {
         ESP_LOGE(TAG, "创建 UDP socket 失败");
@@ -253,7 +287,12 @@ static esp_err_t ensure_udp_socket(void)
     return ESP_OK;
 }
 
-// 发送原始数据（UDP 单播 + UART 双通道）
+/**
+ * @brief 发送原始数据（UDP 单播 + UART 双通道）
+ * @param data 日志数据指针。
+ * @param len 数据长度。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t debug_log_send(const uint8_t *data, size_t len)
 {
     esp_err_t udp_ret = ESP_FAIL;
@@ -289,7 +328,12 @@ esp_err_t debug_log_send(const uint8_t *data, size_t len)
     return ESP_FAIL;
 }
 
-// 格式化日志输出
+/**
+ * @brief 格式化日志输出
+ * @param level 日志级别。
+ * @param tag 日志标签。
+ * @param fmt 格式化字符串。
+ */
 void debug_log(debug_log_level_t level, const char *tag, const char *fmt, ...)
 {
     if (!s_initialized) {

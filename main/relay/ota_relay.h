@@ -70,29 +70,79 @@ typedef enum {
 extern QueueHandle_t g_ota_dispatch_queue;   // 从 WiFi/BLE 到 OTA 中继
 extern QueueHandle_t g_ota_result_queue;    // OTA 结果到 WiFi/BLE
 
-// OTA 中继任务入口
+/**
+ * @brief OTA 中继任务入口，负责执行握手、认证、分包转发和结束流程。
+ * @param pvParameters FreeRTOS 任务参数，未使用。
+ */
 void ota_relay_task(void *pvParameters);
 
-// T2.3: 发起与 GD32 的握手
+/**
+ * @brief 发起与 GD32 的握手流程，建立 OTA 传输前的安全会话。
+ * @return 操作结果码。
+ */
 ota_result_t ota_relay_start_handshake(void);
 
-// T3.4: 从 Flash 向 GD32 转发存储的固件（48B/包）
+/**
+ * @brief 从 Flash 中读取已缓存固件并按协议转发给 GD32。
+ * @return 操作结果码。
+ */
 ota_result_t ota_relay_forward_firmware(void);
 
-// T3.7: 获取当前中继状态
+/**
+ * @brief 获取当前 OTA 中继状态机状态。
+ * @return 当前中继状态枚举值。
+ */
 relay_state_t ota_relay_get_state(void);
 
-// T3.7: 重置中继状态机
+/**
+ * @brief 重置 OTA 中继状态机，清理当前状态以便重新开始流程。
+ */
 void ota_relay_reset(void);
 
-// T4.2: Flash 写入接口
+/**
+ * @brief 向 OTA 缓存分区写入一段固件数据。
+ * @param offset 分区内写入偏移。
+ * @param data 待写入的数据指针。
+ * @param len 数据长度（字节）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t flash_write_chunk(uint32_t offset, const uint8_t *data, size_t len);
+
+/**
+ * @brief 从 OTA 缓存分区读取一段固件数据。
+ * @param offset 分区内读取偏移。
+ * @param data 读取缓冲区指针。
+ * @param len 读取长度（字节）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t flash_read_chunk(uint32_t offset, uint8_t *data, size_t len);
 
-// T3.3: 元数据文件管理
+/**
+ * @brief 从持久化文件中加载 OTA 元数据。
+ * @param meta 输出参数，加载后的元数据结构体。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_load(ota_meta_t *meta);
+
+/**
+ * @brief 将 OTA 元数据保存到持久化文件。
+ * @param meta 待保存的元数据结构体。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_save(const ota_meta_t *meta);
+
+/**
+ * @brief 更新已存储大小与最后分块序号等 OTA 进度信息。
+ * @param stored_size 已存储的固件大小（字节）。
+ * @param last_seq 最后成功的分块序号。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_update(uint32_t stored_size, uint32_t last_seq);
+
+/**
+ * @brief 清空 OTA 元数据，通常在完成或中止后调用。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_clear(void);
 
 // 当前中继状态（供健康监控外部访问）

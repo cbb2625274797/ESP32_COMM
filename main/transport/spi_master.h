@@ -38,47 +38,74 @@ typedef enum {
 typedef struct {
     can_channel_t channel;      // CAN 通道 (0~2)
     uint32_t      ext_id;      // 扩展帧 ID (29bit, Big-Endian 存储)
-    uint8_t       data[CAN_MAX_DLC];
+    uint8_t       data[CAN_MAX_DLC];  // CAN 数据负载 (最大 64 字节)
     uint8_t       dlc;         // 数据长度 (1~64)
 } can_frame_t;
 
-// ============================================================
-// 发送 CANFD 帧
-// channel:  CAN 通道 (0, 1, 2)
-// ext_id:   扩展帧 ID (29bit)
-// data:     数据内容 (1~64 字节)
-// dlc:      数据长度 (自动识别，可传 0 由 data 长度决定)
-// recv_buf: 接收缓冲区 (可传 NULL)
-// recv_max: 期望接收最大字节数
-// timeout_ms: 超时时间 (ms)
-// 返回: >= 0 成功(实际接收字节数), < 0 失败
-// ============================================================
+/**
+ * @brief 发送一帧 CANFD 数据，可选等待并读取响应内容。
+ * @param channel CAN 通道（0~2）。
+ * @param ext_id 29 位扩展帧 ID。
+ * @param data 数据负载指针。
+ * @param dlc 数据长度，0 则自动推断。
+ * @param recv_buf 接收缓冲区，可为 NULL。
+ * @param recv_max 期望最大接收字节数。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return >= 0 接收字节数，< 0 失败。
+ */
 int gd32_can_send(can_channel_t channel, uint32_t ext_id,
                   const uint8_t *data, uint8_t dlc,
                   uint8_t *recv_buf, uint8_t recv_max,
                   uint32_t timeout_ms);
 
-// 快速发送接口（不带响应接收）
-// 用于广播/通知类 CAN 帧
+/**
+ * @brief 发送一帧无需响应的 CANFD 数据，适合广播或通知场景。
+ * @param channel CAN 通道（0~2）。
+ * @param ext_id 29 位扩展帧 ID。
+ * @param data 数据负载指针。
+ * @param dlc 数据长度。
+ * @return >= 0 成功，< 0 失败。
+ */
 int gd32_can_send_no_reply(can_channel_t channel, uint32_t ext_id,
                             const uint8_t *data, uint8_t dlc);
 
-// ============================================================
-
-// 初始化 SPI2 (VSPI) 总线和设备
+/**
+ * @brief 初始化 SPI2 总线与目标从设备。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t spi_master_init(void);
 
-// 同步 SPI 传输（阻塞式）
-// 发送 cmd + payload，接收响应到 recv_buf
-// 返回: ESP_OK 成功, ESP_ERR_TIMEOUT 超时
+/**
+ * @brief 执行一次同步 SPI 传输，发送命令和负载并可选接收返回数据。
+ * @param cmd SPI 命令码。
+ * @param payload 发送数据指针。
+ * @param payload_len 发送数据长度。
+ * @param recv_buf 接收缓冲区，可为 NULL。
+ * @param recv_len 期望接收长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
                             size_t payload_len, uint8_t *recv_buf,
                             size_t recv_len, uint32_t timeout_ms);
 
-// 仅发送（不期望接收）
+/**
+ * @brief 仅发送 SPI 数据，不关心返回内容。
+ * @param cmd SPI 命令码。
+ * @param payload 发送数据指针。
+ * @param len 发送数据长度。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t spi_send(uint8_t cmd, const uint8_t *payload, size_t len);
 
-// 仅接收（发送哑数据）
+/**
+ * @brief 仅接收 SPI 数据，底层会发送哑数据产生时钟。
+ * @param cmd SPI 命令码。
+ * @param recv_buf 接收缓冲区。
+ * @param len 接收长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t spi_recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_ms);
 
 #endif // SPI_MASTER_H

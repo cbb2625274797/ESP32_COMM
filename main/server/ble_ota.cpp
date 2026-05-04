@@ -42,12 +42,19 @@
 
 static bool   s_ble_ready     = false;            // NimBLE 同步完成
 static bool   s_ble_connected = false;            // GATT 客户端已连接
+/** @brief 当前 BLE 连接句柄。 */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_data_out_val_handle = 0;        // DATA_OUT 值句柄 (供通知用)
 
 // ============================================================
 // NimBLE 工具: 从 mbuf 读取原始数据
-// ============================================================
+/**
+  * @brief 将 NimBLE mbuf 中的数据拷贝到普通字节缓冲区。
+ * @param om NimBLE mbuf 数据指针。
+ * @param buf 输出缓冲区。
+ * @param buf_len 缓冲区最大长度。
+ * @return 拷贝的字节数，失败返回 -1。
+ */
 static int ble_ota_mbuf_to_buf(struct os_mbuf *om, uint8_t *buf, size_t buf_len)
 {
     if (!om || !buf) return -1;
@@ -184,7 +191,6 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    // --- 更新元数据 ---
     err = meta_update(flash_offset + data_len, seq);
     if (err != ESP_OK) {
         DEBUG_WARN(TAG, "元数据更新失败 (seq=%u)", seq);
@@ -241,11 +247,16 @@ static int ble_ota_data_out_access(uint16_t conn_handle, uint16_t attr_handle,
 // ============================================================
 
 // BLE_UUID16_DECLARE 在 C++ 中产生 "taking address of rvalue" 编译错误。
-// ESP-IDF 6.0 NimBLE 的 C++ 兼容写法: 先定义 static ble_uuid16_t 变量, 再取 .u 地址。
+// 改用 static ble_uuid16_t 变量，再取 .u 地址。
+/** @brief OTA GATT 服务 UUID */
 static const ble_uuid16_t GATT_SVC_UUID      = BLE_UUID16_INIT(BLE_OTA_SERVICE_UUID);
+/** @brief CTRL 特征 UUID，写入 0xF7 触发中继 */
 static const ble_uuid16_t GATT_CTRL_UUID     = BLE_UUID16_INIT(BLE_OTA_CTRL_UUID);
+/** @brief DATA_IN 特征 UUID，接收固件数据块 */
 static const ble_uuid16_t GATT_DATA_IN_UUID  = BLE_UUID16_INIT(BLE_OTA_DATA_IN_UUID);
+/** @brief DATA_OUT 特征 UUID，Notify 推送 GD32 响应 */
 static const ble_uuid16_t GATT_DATA_OUT_UUID = BLE_UUID16_INIT(BLE_OTA_DATA_OUT_UUID);
+/** @brief VERSION 特征 UUID，返回固件版本字符串 */
 static const ble_uuid16_t GATT_VERSION_UUID  = BLE_UUID16_INIT(BLE_OTA_VERSION_UUID);
 
 // NimBLE C 结构体在 C++ designated initializer 不能显式初始化全部字段。
@@ -296,7 +307,12 @@ static const struct ble_gatt_svc_def gatt_ota_svcs[] = {
 // ============================================================
 // GAP 事件回调
 // ============================================================
-
+/**
+   * @brief BLE GAP 事件回调，处理连接和断开事件。
+ * @param event
+ * @param arg
+ * @return 0 成功。
+ */
 static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -307,10 +323,12 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             // 连接成功
             s_ble_connected = true;
+            /** @brief 当前 BLE 连接句柄。 */
             s_conn_handle   = event->connect.conn_handle;
             DEBUG_INFO(TAG, "BLE 客户端已连接: handle=%d", s_conn_handle);
         } else {
             DEBUG_WARN(TAG, "BLE 连接失败: status=%d", event->connect.status);
+            /** @brief BLE GATT 客户端连接状态。 */
             s_ble_connected = false;
         }
         return 0;
@@ -318,7 +336,9 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         DEBUG_INFO(TAG, "BLE 客户端已断开: reason=%d",
                    event->disconnect.reason);
+        /** @brief BLE GATT 客户端连接状态。 */
         s_ble_connected = false;
+        /** @brief 当前 BLE 连接句柄。 */
         s_conn_handle   = BLE_HS_CONN_HANDLE_NONE;
         // 恢复广播以接受新连接
         ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
@@ -352,7 +372,9 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
 // ============================================================
 // BLE 广播
 // ============================================================
-
+/**
+   * @brief 启动 BLE 广播，使设备可被发现和连接。
+ */
 static void ble_ota_start_advertising(void)
 {
     uint8_t adv_data[31] = {0};
@@ -420,7 +442,9 @@ static void ble_ota_start_advertising(void)
 // ============================================================
 // NimBLE 同步/重置回调
 // ============================================================
-
+/**
+   * @brief NimBLE 协议栈同步完成回调，初始化广播。
+ */
 static void ble_ota_on_sync(void)
 {
     DEBUG_INFO(TAG, "NimBLE 协议栈同步完成");
@@ -432,21 +456,28 @@ static void ble_ota_on_sync(void)
     ble_ota_start_advertising();
 }
 
+/**
+  * @brief NimBLE 协议栈重置回调。
+ * @param reason
+ */
 static void ble_ota_on_reset(int reason)
 {
     DEBUG_WARN(TAG, "NimBLE 协议栈重置: reason=%d", reason);
+    /** @brief NimBLE 协议栈同步完成标志。 */
     s_ble_ready = false;
 }
 
 // ============================================================
 // NimBLE Host 任务（独立 FreeRTOS 任务）
 // ============================================================
-
+/**
+   * @brief NimBLE 主机任务入口，处理协议栈事件循环。
+ * @param param
+ */
 static void ble_ota_nimble_host_task(void *param)
 {
     (void)param;
     DEBUG_INFO(TAG, "NimBLE Host 任务启动");
-    // nimble_port_run() 阻塞运行 NimBLE 事件循环
     nimble_port_run();
     // 正常情况下不会到达这里
     DEBUG_INFO(TAG, "NimBLE Host 任务退出");
@@ -455,7 +486,10 @@ static void ble_ota_nimble_host_task(void *param)
 // ============================================================
 // 公开 API
 // ============================================================
-
+/**
+  * @brief 启动 BLE GATT 服务器并注册 OTA 服务。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t ble_ota_server_start(void)
 {
     int rc;
@@ -465,7 +499,6 @@ esp_err_t ble_ota_server_start(void)
     DEBUG_INFO(TAG, "  MTU:    %" PRIu16, BLE_MTU_SIZE);
     DEBUG_INFO(TAG, "  Svc:    0x%04X", BLE_OTA_SERVICE_UUID);
 
-    // 1. 初始化 NimBLE 底层
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "nimble_port_init 失败: %s", esp_err_to_name(err));
@@ -473,11 +506,9 @@ esp_err_t ble_ota_server_start(void)
     }
     DEBUG_INFO(TAG, "nimble_port_init 完成");
 
-    // 2. 初始化 GAP / GATT 服务（无需 BLE 存储回调 — 不做 bonding）
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
-    // 4. 设置设备名称
     rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
     if (rc != 0) {
         DEBUG_WARN(TAG, "设置设备名称失败: %d", rc);
@@ -490,7 +521,6 @@ esp_err_t ble_ota_server_start(void)
     ble_hs_cfg.reset_cb = ble_ota_on_reset;
     // 不做 bonding，不需要 store 回调
 
-    // 6. 预注册 GATT 服务（在 sync 回调中也会再注册一次确保）
     rc = ble_gatts_count_cfg(gatt_ota_svcs);
     if (rc != 0) {
         DEBUG_ERR(TAG, "GATT 服务计数失败: %d", rc);
@@ -503,13 +533,18 @@ esp_err_t ble_ota_server_start(void)
         return ESP_FAIL;
     }
 
-    // 7. 启动 NimBLE Host 任务（内部创建 FreeRTOS 任务跑 nimble_port_run）
     nimble_port_freertos_init(ble_ota_nimble_host_task);
 
     DEBUG_INFO(TAG, "BLE OTA 服务器初始化完成");
     return ESP_OK;
 }
 
+/**
+  * @brief 通过 BLE Notify 将 GD32 响应推送给上位机。
+ * @param data 待推送的数据指针。
+ * @param len 数据长度（字节）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t ble_ota_notify_response(const uint8_t *data, size_t len)
 {
     if (!s_ble_connected) {
@@ -522,7 +557,6 @@ esp_err_t ble_ota_notify_response(const uint8_t *data, size_t len)
 
     if (len == 0) return ESP_OK;
 
-    // 通过 NimBLE mbuf 发送通知
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     if (om == NULL) {
         DEBUG_ERR(TAG, "分配 mbuf 失败 (%zu 字节)", len);
@@ -539,11 +573,19 @@ esp_err_t ble_ota_notify_response(const uint8_t *data, size_t len)
     return ESP_OK;
 }
 
+/**
+  * @brief 检查当前是否有 BLE 客户端连接。
+ * @return true 已连接，false 未连接。
+ */
 bool ble_ota_is_connected(void)
 {
+    /** @brief BLE GATT 客户端连接状态。 */
     return s_ble_connected;
 }
 
+/**
+  * @brief 通知中继模块开始向 GD32 转发固件。
+ */
 void ble_ota_signal_relay(void)
 {
     if (g_ota_dispatch_queue == NULL) {
@@ -568,13 +610,15 @@ void ble_ota_signal_relay(void)
 // 实际的 BLE 事件循环在独立的 NimBLE Host 任务中运行。
 // 为避免与 ota_relay_task 竞争，此任务不从 g_ota_dispatch_queue 消费。
 // ============================================================
-
+/**
+  * @brief BLE OTA FreeRTOS 任务，初始化 NimBLE 并运行 GATT 服务。
+ * @param pvParameters FreeRTOS 任务参数，未使用。
+ */
 void ble_ota_task(void *pvParameters)
 {
     (void)pvParameters;
     DEBUG_INFO(TAG, "=== BLE OTA 任务启动 ===");
 
-    // 初始化并启动 BLE 服务器（同步操作，完成后广播开始）
     esp_err_t err = ble_ota_server_start();
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "BLE 服务器启动失败: %s → BLE OTA 不可用",

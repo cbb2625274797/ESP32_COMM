@@ -46,48 +46,119 @@ inline constexpr size_t CHIP_UID_LEN = 12;
 typedef struct {
     uint8_t key[16];          // 会话密钥 K_session
     uint8_t iv[16];           // CBC 模式 IV
-    int used;
+    int used;               // 会话是否已初始化标志
 } session_ctx_t;
 
-// 初始化协议层
+/**
+ * @brief 初始化协议层资源，建立 CRC/AES 等基础能力的可用状态。
+ */
 void protocol_init(void);
 
-// CRC16 Modbus 计算（低字节在前，LE）
+/**
+ * @brief 计算一段数据的 CRC16-Modbus 校验值。
+ * @param data 待校验的数据指针。
+ * @param len 数据长度（字节）。
+ * @return CRC16 校验值。
+ */
 uint16_t crc16_modbus(const uint8_t *data, size_t len);
 
-// 构建帧: 返回总帧长度
-// 输出格式: SOF + CMD + LEN(2) + PAYLOAD + CRC16(2)
+/**
+ * @brief 按协议格式构建一帧数据，返回生成后的总帧长度。
+ * @param cmd 命令码。
+ * @param payload 负载数据指针，可为 NULL。
+ * @param len 负载长度（字节）。
+ * @param out_frame 输出帧缓冲区。
+ * @return 帧总长度，失败返回 -1。
+ */
 int frame_build(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_frame);
 
-// 解析帧: 返回 payload 起始偏移，失败返回 -1
-// 检查 SOF，验证 CRC16，提取 CMD 和 LEN
+/**
+ * @brief 解析一帧协议数据，提取命令字、负载和长度，失败返回 -1。
+ * @param frame 待解析的帧数据。
+ * @param frame_len 帧数据总长度。
+ * @param out_cmd 输出参数，解析出的命令码。
+ * @param out_payload 输出缓冲区，存放解析出的负载。
+ * @param out_len 输出参数，负载实际长度。
+ * @return 0 成功，-1 失败。
+ */
 int frame_parse(const uint8_t *frame, size_t frame_len,
                 uint8_t *out_cmd, uint8_t *out_payload, size_t *out_len);
 
-// T2.2: AES-128 CBC 加密
-// 使用预设主密钥或会话密钥
-// 注意: 函数名带 protocol_ 前缀以避免与 ESP-IDF wpa_supplicant 组件冲突
+/**
+ * @brief 使用 AES-128-CBC 对明文进行加密，返回密文长度，失败返回负值。
+ * @param plaintext 明文数据。
+ * @param len 明文长度（字节）。
+ * @param key 128 位 AES 密钥。
+ * @param iv 128 位 CBC 初始向量。
+ * @param ciphertext_out 输出缓冲区，存放密文。
+ * @return 密文长度，失败返回 -1。
+ */
 int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
                          const uint8_t *key, const uint8_t *iv,
                          uint8_t *ciphertext_out);
 
+/**
+ * @brief 使用 AES-128-CBC 对密文进行解密，返回去除填充后的明文长度。
+ * @param ciphertext 密文数据。
+ * @param len 密文长度（字节，须为 16 的倍数）。
+ * @param key 128 位 AES 密钥。
+ * @param iv 128 位 CBC 初始向量。
+ * @param plaintext_out 输出缓冲区，存放解密后的明文。
+ * @return 明文长度，失败返回 -1。
+ */
 int protocol_aes_decrypt(const uint8_t *ciphertext, size_t len,
                          const uint8_t *key, const uint8_t *iv,
                          uint8_t *plaintext_out);
 
-// T2.1: 搅伴算法 - 生成随机数
-// 输入: 时间戳 + 内存地址 + rand_seed
-// 输出: 16 字节 nonce_server
+/**
+ * @brief 根据时间戳、内存地址和随机种子生成 16 字节随机数。
+ * @param timestamp 时间戳种子。
+ * @param mem_addr 内存地址种子。
+ * @param rand_seed 随机数种子。
+ * @param nonce_out 输出缓冲区，存放生成的 16 字节随机数。
+ */
 void scramble_generate(uint32_t timestamp, uint32_t mem_addr,
                       uint32_t rand_seed, uint8_t *nonce_out);
 
-// T2.4: 会话密钥管理
+/**
+ * @brief 用给定会话密钥初始化会话上下文。
+ * @param sess 待初始化的会话上下文。
+ * @param k_session 128 位会话密钥。
+ * @return 0 成功，-1 失败。
+ */
 int session_key_init(session_ctx_t *sess, const uint8_t *k_session);
+
+/**
+ * @brief 清除会话上下文中的密钥与状态信息。
+ * @param sess 待清除的会话上下文。
+ */
 void session_key_clear(session_ctx_t *sess);
+
+/**
+ * @brief 使用当前会话上下文对输入数据执行加密。
+ * @param sess 会话上下文。
+ * @param in 输入明文。
+ * @param len 数据长度。
+ * @param out 输出密文缓冲区。
+ * @return 密文长度，失败返回 -1。
+ */
 int session_encrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out);
+
+/**
+ * @brief 使用当前会话上下文对输入数据执行解密。
+ * @param sess 会话上下文。
+ * @param in 输入密文。
+ * @param len 数据长度。
+ * @param out 输出明文缓冲区。
+ * @return 明文长度，失败返回 -1。
+ */
 int session_decrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out);
 
-// 使用 ESP-IDF 硬件 RNG 生成随机数
+/**
+ * @brief 使用 ESP-IDF 硬件 RNG 生成指定长度的随机数。
+ * @param nonce 输出缓冲区。
+ * @param len 随机数字节数。
+ */
 void generate_random_nonce(uint8_t *nonce, size_t len);
 
 #endif // PROTOCOL_H

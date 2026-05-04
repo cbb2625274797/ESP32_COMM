@@ -20,9 +20,15 @@
 #include "transport/protocol.h"
 #include "monitor/debug_log.h"
 
-// 状态监控任务
+/**
+ * @brief 状态监控任务
+ * @param pvParameters
+ */
 static void status_monitor_task(void *pvParameters);
 
+/**
+  * @brief 程序主入口，初始化系统组件并创建各 FreeRTOS 任务。
+ */
 extern "C" void app_main(void)
 {
     esp_chip_info_t chip_info;
@@ -33,12 +39,10 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     // 初始化调试日志（UART0 先就绪，UDP socket 延迟到首次发送时创建）
-    // 必须在 wifi_early_init 之前，这样 WiFi 初始化日志也能输出到上位机
     debug_log_init();
 
     // ★ WiFi 提前初始化（调度器启动前）
     // 包括：NVS → netif 创建 → event handler 注册 → WiFi driver init → 配置 → connect
-    // 连接尝试立即开始，事件排队等调度器启动后处理
     bool wifi_sta_ok = wifi_early_init();
 
     health_monitor_init();
@@ -68,11 +72,9 @@ extern "C" void app_main(void)
         DEBUG_INFO("MAIN", "健康监控任务已创建");
     }
 
-    // 初始化协议层（CRC、AES）
     protocol_init();
     DEBUG_INFO("MAIN", "协议层初始化完成");
 
-    // 初始化 SPI 总线
     esp_err_t ret = spi_master_init();
     if (ret != ESP_OK) {
         DEBUG_ERR("MAIN", "SPI 总线初始化失败: %d", ret);
@@ -153,7 +155,10 @@ extern "C" void app_main(void)
 
 // ============================================================
 // 状态监控任务 - 每 10 秒打印系统状态
-// ============================================================
+/**
+  * @brief 周期性打印系统运行状态，包括内存、WiFi 和 OTA 中继信息。
+ * @param pvParameters
+ */
 static void status_monitor_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -164,7 +169,6 @@ static void status_monitor_task(void *pvParameters)
     while (1) {
         loop_count++;
         
-        // 获取系统信息
         uint32_t free_heap = esp_get_free_heap_size();
         uint32_t min_free_heap = esp_get_minimum_free_heap_size();
         health_state_t health = health_get_current();

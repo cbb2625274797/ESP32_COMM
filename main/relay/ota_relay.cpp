@@ -17,21 +17,54 @@
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
 
+/** @brief 当前 OTA 中继状态机状态。 */
 relay_state_t g_relay_state = RELAY_IDLE;
 
 static const esp_partition_t *g_gd32_partition = NULL;
+/** @brief OTA 认证会话上下文，包含会话密钥和 IV。 */
 static session_ctx_t g_session_ctx;
 
+/** @brief OTA 命令分发队列，从 WiFi/BLE 任务接收指令。 */
 QueueHandle_t g_ota_dispatch_queue = NULL;
+/** @brief OTA 结果回传队列，将执行结果返回给调用方。 */
 QueueHandle_t g_ota_result_queue = NULL;
 
+/**
+ * @brief OTA 握手阶段：向 GD32 发送握手请求并等待进入认证流程。
+ * @return 操作结果码。
+ */
 static ota_result_t send_handshake_req(void);
+
+/**
+ * @brief 认证阶段：生成随机数并完成与 GD32 的双向认证。
+ * @return 操作结果码。
+ */
 static ota_result_t send_nonce_and_authenticate(void);
+
+/**
+ * @brief 向 GD32 发送待升级固件的总大小。
+ * @param size 固件总字节数。
+ * @return 操作结果码。
+ */
 static ota_result_t send_firmware_size(uint32_t size);
+
+/**
+ * @brief 从 Flash 逐包读取固件并中继转发给 GD32。
+ * @return 操作结果码。
+ */
 static ota_result_t relay_packets_from_flash(void);
+
+/**
+ * @brief OTA 收尾阶段：发送结束命令并等待 GD32 确认。
+ * @return 操作结果码。
+ */
 static ota_result_t finish_ota(void);
 
-// 从 Flash 加载元数据
+/**
+ * @brief 从 Flash 加载元数据
+ * @param meta 输出参数，加载后的元数据结构体。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_load(ota_meta_t *meta)
 {
     if (!meta) return ESP_ERR_INVALID_ARG;
@@ -73,7 +106,11 @@ esp_err_t meta_load(ota_meta_t *meta)
     return ESP_OK;
 }
 
-// 保存元数据到 Flash
+/**
+ * @brief 保存元数据到 Flash
+ * @param meta 待保存的元数据结构体。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_save(const ota_meta_t *meta)
 {
     if (!meta) return ESP_ERR_INVALID_ARG;
@@ -98,7 +135,12 @@ esp_err_t meta_save(const ota_meta_t *meta)
     return ESP_OK;
 }
 
-// 传输过程中更新元数据
+/**
+ * @brief 传输过程中更新元数据
+ * @param stored_size 已存储的固件大小（字节）。
+ * @param last_seq 最后成功的分块序号。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_update(uint32_t stored_size, uint32_t last_seq)
 {
     ota_meta_t meta;
@@ -111,7 +153,10 @@ esp_err_t meta_update(uint32_t stored_size, uint32_t last_seq)
     return meta_save(&meta);
 }
 
-// OTA 完成后或中止时清除元数据
+/**
+ * @brief OTA 完成后或中止时清除元数据
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t meta_clear(void)
 {
     DEBUG_INFO("OTA", "清除 OTA 元数据");
@@ -119,7 +164,13 @@ esp_err_t meta_clear(void)
     return meta_save(&meta);
 }
 
-// Flash 写入接口
+/**
+ * @brief Flash 写入接口
+ * @param offset 分区内写入偏移。
+ * @param data 待写入的数据指针。
+ * @param len 数据长度（字节）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t flash_write_chunk(uint32_t offset, const uint8_t *data, size_t len)
 {
     if (!g_gd32_partition) {
@@ -134,6 +185,13 @@ esp_err_t flash_write_chunk(uint32_t offset, const uint8_t *data, size_t len)
     return esp_partition_write(g_gd32_partition, offset, data, len);
 }
 
+/**
+ * @brief 从 OTA 缓存分区读取指定偏移和长度的数据块。
+ * @param offset 分区内读取偏移。
+ * @param data 读取缓冲区指针。
+ * @param len 读取长度（字节）。
+ * @return ESP_OK 成功，其他失败。
+ */
 esp_err_t flash_read_chunk(uint32_t offset, uint8_t *data, size_t len)
 {
     if (!g_gd32_partition) {
@@ -148,7 +206,10 @@ esp_err_t flash_read_chunk(uint32_t offset, uint8_t *data, size_t len)
     return esp_partition_read(g_gd32_partition, offset, data, len);
 }
 
-// 阶段1 - 发起与 GD32 的握手
+/**
+ * @brief 阶段1 - 发起与 GD32 的握手
+ * @return 操作结果码。
+ */
 static ota_result_t send_handshake_req(void)
 {
     DEBUG_INFO("OTA", "=== 阶段1: 握手开始 ===");
@@ -160,6 +221,7 @@ static ota_result_t send_handshake_req(void)
     uint8_t payload[] = {0x00, 0xAC};
     frame_build(CMD_HANDSHAKE_REQ, payload, sizeof(payload), tx_frame);
 
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_HANDSHAKE_SENT;
     DEBUG_INFO("OTA", "状态: RELAY_HANDSHAKE_SENT");
 
@@ -167,6 +229,7 @@ static ota_result_t send_handshake_req(void)
                                       rx_frame, sizeof(rx_frame), 3000);
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "HANDSHAKE_REQ 失败, err=%d", err);
+        /** @brief 当前 OTA 中继状态机状态。 */
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
@@ -177,7 +240,10 @@ static ota_result_t send_handshake_req(void)
     return OTA_RESULT_OK;
 }
 
-// 发送随机数并与 GD32 相互认证
+/**
+ * @brief 发送随机数并与 GD32 相互认证
+ * @return 操作结果码。
+ */
 static ota_result_t send_nonce_and_authenticate(void)
 {
     uint8_t tx_frame[64];
@@ -192,6 +258,7 @@ static ota_result_t send_nonce_and_authenticate(void)
 
     DEBUG_INFO("OTA", "--- 认证步骤 1: 发送 CHALLENGE ---");
     DEBUG_INFO("OTA", "发送 nonce_server (16B), timestamp=0x%08X", timestamp);
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_CHALLENGE_SENT;
     DEBUG_INFO("OTA", "状态: RELAY_CHALLENGE_SENT");
 
@@ -201,10 +268,12 @@ static ota_result_t send_nonce_and_authenticate(void)
                                       rx_frame, sizeof(rx_frame), 5000);
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "CHALLENGE 发送失败, err=%d", err);
+        /** @brief 当前 OTA 中继状态机状态。 */
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
 
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_CHALLENGE_RESPOND;
     DEBUG_INFO("OTA", "已收到 GD32 握手数据包");
     DEBUG_INFO("OTA", "状态: RELAY_CHALLENGE_RESPOND");
@@ -215,6 +284,7 @@ static ota_result_t send_nonce_and_authenticate(void)
 
     DEBUG_INFO("OTA", "--- 认证步骤 2: 发送 SESSION_KEY ---");
     DEBUG_INFO("OTA", "发送变换后的随机数 (16B)");
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_SESSION_KEY_SENT;
     DEBUG_INFO("OTA", "状态: RELAY_SESSION_KEY_SENT");
 
@@ -223,10 +293,12 @@ static ota_result_t send_nonce_and_authenticate(void)
                                        rx_frame, sizeof(rx_frame), 3000);
     if (err2 != ESP_OK) {
         DEBUG_ERR("OTA", "SESSION_KEY 发送失败, err=%d", err2);
+        /** @brief 当前 OTA 中继状态机状态。 */
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
 
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_AUTH_COMPLETE;
     DEBUG_INFO("OTA", "状态: RELAY_AUTH_COMPLETE");
     DEBUG_INFO("OTA", "=== 阶段1 认证完成: 安全通道已建立 ===");
@@ -237,7 +309,11 @@ static ota_result_t send_nonce_and_authenticate(void)
     return OTA_RESULT_OK;
 }
 
-// 向 GD32 发送固件总大小
+/**
+ * @brief 向 GD32 发送固件总大小
+ * @param size 固件总字节数。
+ * @return 操作结果码。
+ */
 static ota_result_t send_firmware_size(uint32_t size)
 {
     uint8_t tx_frame[32];
@@ -252,6 +328,7 @@ static ota_result_t send_firmware_size(uint32_t size)
     size_payload[2] = (uint8_t)((size >> 16) & 0xFF);
     size_payload[3] = (uint8_t)((size >> 24) & 0xFF);
 
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_SIZE_SENT;
     DEBUG_INFO("OTA", "状态: RELAY_SIZE_SENT");
 
@@ -260,18 +337,23 @@ static ota_result_t send_firmware_size(uint32_t size)
                                       rx_frame, sizeof(rx_frame), 3000);
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "SEND_SIZE 失败, err=%d", err);
+        /** @brief 当前 OTA 中继状态机状态。 */
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
 
     DEBUG_INFO("OTA", "大小已发送: %u 字节，等待 GD32 确认...", size);
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_SIZE_ACK;
     DEBUG_INFO("OTA", "状态: RELAY_SIZE_ACK");
 
     return OTA_RESULT_OK;
 }
 
-// 从 Flash 向 GD32 转发存储的固件（48B/包）
+/**
+ * @brief 从 Flash 向 GD32 转发存储的固件（48B/包）
+ * @return 操作结果码。
+ */
 static ota_result_t relay_packets_from_flash(void)
 {
     DEBUG_INFO("OTA", "=== 阶段3: 从 Flash 转发固件 ===");
@@ -290,10 +372,10 @@ static ota_result_t relay_packets_from_flash(void)
 
     DEBUG_INFO("OTA", "总包数: %u, 每包 48 字节", total_packets);
     DEBUG_INFO("OTA", "状态: RELAY_RELAY_ACTIVE");
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_RELAY_ACTIVE;
 
     for (uint32_t seq = 0; seq < total_packets; seq++) {
-        // 发送每个包前检查健康状态
         health_status_t health = health_check_before_ota();
         if (health == HEALTH_MON_SHUTDOWN || health == HEALTH_MON_CRITICAL) {
             DEBUG_ERR("OTA", "健康检查危险，中止 OTA");
@@ -318,6 +400,7 @@ static ota_result_t relay_packets_from_flash(void)
         tx_buf[2 + chunk_size] = (uint8_t)(crc & 0xFF);
         tx_buf[2 + chunk_size + 1] = (uint8_t)((crc >> 8) & 0xFF);
 
+        /** @brief 当前 OTA 中继状态机状态。 */
         g_relay_state = RELAY_PACKET_SENT;
 
         uint8_t cmd = (seq == total_packets - 1) ? CMD_DATA_END : CMD_DATA_PACKET;
@@ -331,6 +414,7 @@ static ota_result_t relay_packets_from_flash(void)
         }
 
         flash_offset += chunk_size;
+        /** @brief 当前 OTA 中继状态机状态。 */
         g_relay_state = RELAY_PACKET_ACK_OK;
 
         // 每 10% 记录一次进度
@@ -341,12 +425,16 @@ static ota_result_t relay_packets_from_flash(void)
         }
     }
 
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_RECEIVE_DONE;
     DEBUG_INFO("OTA", "状态: RELAY_RECEIVE_DONE");
     return result;
 }
 
-// 结束 OTA - 发送 0x0A AC 并清理
+/**
+ * @brief 结束 OTA - 发送 0x0A AC 并清理
+ * @return 操作结果码。
+ */
 static ota_result_t finish_ota(void)
 {
     DEBUG_INFO("OTA", "=== 阶段4: 结束 OTA ===");
@@ -358,6 +446,7 @@ static ota_result_t finish_ota(void)
     uint8_t payload[] = {0x0A, 0xAC};
     frame_build(CMD_FINISH_OTA, payload, sizeof(payload), tx_frame);
 
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_FINISH_SENT;
     DEBUG_INFO("OTA", "状态: RELAY_FINISH_SENT");
 
@@ -365,6 +454,7 @@ static ota_result_t finish_ota(void)
                                       rx_frame, sizeof(rx_frame), 5000);
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "FINISH_OTA 失败, err=%d", err);
+        /** @brief 当前 OTA 中继状态机状态。 */
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
     }
@@ -374,6 +464,7 @@ static ota_result_t finish_ota(void)
     session_key_clear(&g_session_ctx);
     memset(&g_session_ctx, 0, sizeof(session_ctx_t));
 
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_DONE;
     DEBUG_INFO("OTA", "状态: RELAY_DONE");
     DEBUG_INFO("OTA", "=== OTA 完成 ===");
@@ -383,7 +474,10 @@ static ota_result_t finish_ota(void)
     return OTA_RESULT_OK;
 }
 
-// 启动完整 OTA 流程的主入口
+/**
+ * @brief 启动完整 OTA 流程的主入口
+ * @return 操作结果码。
+ */
 ota_result_t ota_relay_start_handshake(void)
 {
     ota_result_t res;
@@ -407,7 +501,10 @@ ota_result_t ota_relay_start_handshake(void)
     return res;
 }
 
-// 从 Flash 向 GD32 转发固件
+/**
+ * @brief 从 Flash 向 GD32 转发固件
+ * @return 操作结果码。
+ */
 ota_result_t ota_relay_forward_firmware(void)
 {
     ota_meta_t meta;
@@ -435,25 +532,37 @@ ota_result_t ota_relay_forward_firmware(void)
     return res;
 }
 
-// 获取当前状态
+/**
+ * @brief 获取当前状态
+ * @return 当前中继状态枚举值。
+ */
 relay_state_t ota_relay_get_state(void)
 {
+    /** @brief 当前 OTA 中继状态机状态。 */
     return g_relay_state;
 }
 
-// 重置状态机
+/**
+ * @brief 重置状态机
+ */
 void ota_relay_reset(void)
 {
+    /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_IDLE;
     session_key_clear(&g_session_ctx);
 }
 
-// OTA 中继 FreeRTOS 任务
+/**
+ * @brief OTA 中继 FreeRTOS 任务
+ * @param pvParameters FreeRTOS 任务参数，未使用。
+ */
 void ota_relay_task(void *pvParameters)
 {
     DEBUG_INFO("OTA", "OTA 中继任务启动");
 
+    /** @brief OTA 命令分发队列，从 WiFi/BLE 任务接收指令。 */
     g_ota_dispatch_queue = xQueueCreate(4, sizeof(uint32_t));
+    /** @brief OTA 结果回传队列，将执行结果返回给调用方。 */
     g_ota_result_queue = xQueueCreate(4, sizeof(uint32_t));
 
     uint32_t msg;

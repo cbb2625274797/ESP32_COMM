@@ -13,8 +13,12 @@
 #include "protocol.h"
 #include "monitor/debug_log.h"
 
+/** @brief 协议层初始化标志。 */
 static bool s_protocol_initialized = false;
 
+/**
+  * @brief 初始化协议层，准备 CRC 和 AES 模块。
+ */
 void protocol_init(void)
 {
     if (s_protocol_initialized) return;
@@ -22,11 +26,17 @@ void protocol_init(void)
     DEBUG_INFO("PROT", "=== 初始化协议层 ===");
     DEBUG_INFO("PROT", "协议层功能: CRC16 Modbus + 硬件 AES-128-CBC");
 
+    /** @brief 协议层初始化标志。 */
     s_protocol_initialized = true;
     DEBUG_INFO("PROT", "协议层就绪");
 }
 
-// CRC16 Modbus（LE，低字节在前）
+/**
+ * @brief CRC16 Modbus（LE，低字节在前）
+ * @param data 待校验的数据指针。
+ * @param len 数据长度（字节）。
+ * @return CRC16 校验值。
+ */
 uint16_t crc16_modbus(const uint8_t *data, size_t len)
 {
     uint16_t crc = 0xFFFF;
@@ -43,7 +53,14 @@ uint16_t crc16_modbus(const uint8_t *data, size_t len)
     return (crc >> 8) | (crc << 8);
 }
 
-// 构建 SPI 帧: SOF + CMD + LEN(2LE) + PAYLOAD + CRC16(2LE)
+/**
+ * @brief 构建 SPI 帧: SOF + CMD + LEN(2LE) + PAYLOAD + CRC16(2LE)
+ * @param cmd 命令码。
+ * @param payload 负载数据指针，可为 NULL。
+ * @param len 负载长度（字节）。
+ * @param out_frame 输出帧缓冲区。
+ * @return 帧总长度，失败返回 -1。
+ */
 int frame_build(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_frame)
 {
     if (len > FRAME_MAX_PAYLOAD) {
@@ -253,7 +270,12 @@ void scramble_generate(uint32_t timestamp, uint32_t mem_addr,
     memcpy(nonce_out, state, 16);
 }
 
-// 会话密钥初始化
+/**
+ * @brief 会话密钥初始化
+ * @param sess 待初始化的会话上下文。
+ * @param k_session 128 位会话密钥。
+ * @return 0 成功，-1 失败。
+ */
 int session_key_init(session_ctx_t *sess, const uint8_t *k_session)
 {
     if (!sess || !k_session) return -1;
@@ -266,6 +288,10 @@ int session_key_init(session_ctx_t *sess, const uint8_t *k_session)
     return 0;
 }
 
+/**
+  * @brief 清除会话上下文中的密钥和状态。
+ * @param sess 待清除的会话上下文。
+ */
 void session_key_clear(session_ctx_t *sess)
 {
     if (sess) {
@@ -275,6 +301,14 @@ void session_key_clear(session_ctx_t *sess)
     }
 }
 
+/**
+  * @brief 使用会话上下文加密数据。
+ * @param sess 会话上下文。
+ * @param in 输入明文。
+ * @param len 数据长度。
+ * @param out 输出密文缓冲区。
+ * @return 密文长度，失败返回 -1。
+ */
 int session_encrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out)
 {
     if (!sess || !in || !out) return -1;
@@ -291,6 +325,14 @@ int session_encrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t 
     return ret;
 }
 
+/**
+  * @brief 使用会话上下文解密数据。
+ * @param sess 会话上下文。
+ * @param in 输入密文。
+ * @param len 数据长度。
+ * @param out 输出明文缓冲区。
+ * @return 明文长度，失败返回 -1。
+ */
 int session_decrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out)
 {
     if (!sess || !in || !out) return -1;
@@ -307,7 +349,11 @@ int session_decrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t 
     return ret;
 }
 
-// 使用 ESP-IDF 硬件 RNG 生成随机数
+/**
+ * @brief 使用 ESP-IDF 硬件 RNG 生成随机数
+ * @param nonce 输出缓冲区。
+ * @param len 随机数字节数。
+ */
 void generate_random_nonce(uint8_t *nonce, size_t len)
 {
     esp_fill_random(nonce, len);
