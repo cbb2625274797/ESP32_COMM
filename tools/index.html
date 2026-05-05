@@ -58,8 +58,8 @@
             <option value="esp32">ESP32（自身升级）</option>
           </select>
         </div>
-        <button class="btn btn-primary" style="width:100%; margin-top:8px;" onclick="healthCheck()">
-          🔍 执行健康检查
+        <button class="btn btn-primary" style="width:100%; margin-top:8px;" onclick="restartEsp32()">
+          🔄 重启 ESP32
         </button>
       </div>
 
@@ -113,9 +113,6 @@
           </button>
         </div>
         <div id="esp32Actions" style="display:none; margin-top:12px;">
-          <button class="btn btn-primary" style="width:100%;" onclick="triggerEsp32Update()">
-            🔄 完成 ESP32 升级（重启）
-          </button>
         </div>
       </div>
 
@@ -156,16 +153,13 @@
           <div class="card-title">
             <div class="icon">📈</div>
             实时状态
+            <span style="font-size:12px;color:var(--text-muted);font-weight:normal;margin-left:8px;">运行: <span id="statUptime">--</span></span>
           </div>
         </div>
         <div class="status-grid">
           <div class="status-item">
             <div class="value" id="statTemperature">--</div>
             <div class="label">芯片温度</div>
-          </div>
-          <div class="status-item">
-            <div class="value" id="statVoltage">--</div>
-            <div class="label">电源电压</div>
           </div>
           <div class="status-item">
             <div class="value" id="statWifi">--</div>

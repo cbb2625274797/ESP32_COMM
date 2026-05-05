@@ -55,7 +55,7 @@ extern "C" void app_main(void)
     DEBUG_INFO("MAIN", "WiFi: %s", wifi_sta_ok ? "STA 连接中" : "将使用 AP 模式");
     DEBUG_INFO("MAIN", "========================================");
 
-    // 健康监控任务（温度 + 电压 + WiFi RSSI）
+    // 健康监控任务（温度 + WiFi RSSI）
     BaseType_t xRet;
     xRet = xTaskCreatePinnedToCore(
         health_monitor_task,

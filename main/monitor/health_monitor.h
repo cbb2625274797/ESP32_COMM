@@ -34,7 +34,7 @@ extern health_state_t g_health_state;
 void health_monitor_init(void);
 
 /**
- * @brief 健康监控任务入口，负责启动温度/电压定时检测并周期性巡检系统状态。
+ * @brief 健康监控任务入口，负责启动温度定时检测并周期性巡检系统状态。
  * @param pvParameters FreeRTOS 任务参数，未使用。
  */
 void health_monitor_task(void *pvParameters);
@@ -72,7 +72,9 @@ health_status_t health_update_from_wifi_rssi(int8_t rssi);
 float health_get_last_temperature(void);
 
 /**
- * @brief 获取最近一次记录的系统电压估算值（伏特）。
- * @return 最近一次电压估算值（伏特）。
+ * @brief 获取最近一次健康监控采样得到的 WiFi RSSI。
+ * @param out_rssi 输出 RSSI。
+ * @param out_age_ms 输出样本距今时长（毫秒）。
+ * @return true 有有效样本，false 当前无有效样本。
  */
-float health_get_last_voltage(void);
+bool health_get_last_wifi_rssi(int8_t *out_rssi, uint32_t *out_age_ms);

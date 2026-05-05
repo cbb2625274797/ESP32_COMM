@@ -1,6 +1,6 @@
 /*
  * health_monitor.cpp - 系统健康监控
- * 包含：健康状态管理 + WiFi RSSI 监控 + 温度监控 + 电压监控
+ * 包含：健康状态管理 + WiFi RSSI 监控 + 温度监控
  */
 #include <stdio.h>
 #include <string.h>
@@ -14,6 +14,7 @@
 
 #include "health_monitor.h"
 #include "debug_log.h"
+#include "server/wifi_ota.h"
 
 /** @brief 全局健康状态，受互斥锁保护。 */
 health_state_t g_health_state = SYS_NORMAL;
@@ -24,8 +25,10 @@ static SemaphoreHandle_t g_health_mutex = NULL;
 static temperature_sensor_handle_t s_temp_handle = NULL;
 /** @brief 最近一次采样的芯片温度（摄氏度）。 */
 static float s_last_temperature = 0.0f;
-/** @brief 最近一次估算的系统电压（伏特）。 */
-static float s_last_voltage = 3.30f;
+/** @brief 最近一次健康监控采样得到的 WiFi RSSI。 */
+static int8_t s_last_wifi_rssi = -127;
+/** @brief 最近一次 WiFi RSSI 采样时间（毫秒）。 */
+static int64_t s_last_wifi_rssi_ms = 0;
 
 // ----------------------------------------
 // 健康状态管理
@@ -68,14 +71,18 @@ float health_get_last_temperature(void)
     return s_last_temperature;
 }
 
-/**
-  * @brief 返回最近一次记录的系统电压估算值。
- * @return 最近一次电压估算值（伏特）。
- */
-float health_get_last_voltage(void)
+bool health_get_last_wifi_rssi(int8_t *out_rssi, uint32_t *out_age_ms)
 {
-    /** @brief 最近一次估算的系统电压（伏特）。 */
-    return s_last_voltage;
+    if (s_last_wifi_rssi_ms <= 0) {
+        return false;
+    }
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    uint32_t age_ms = (now_ms > s_last_wifi_rssi_ms) ? (uint32_t)(now_ms - s_last_wifi_rssi_ms) : 0;
+
+    if (out_rssi) *out_rssi = s_last_wifi_rssi;
+    if (out_age_ms) *out_age_ms = age_ms;
+    return true;
 }
 
 // ----------------------------------------
@@ -112,36 +119,9 @@ static void temp_monitor_callback(void *arg)
 }
 
 // ----------------------------------------
-// 电压监控（启动时调用一次）
+// 温度监控任务入口
 /**
-  * @brief 电压定时回调，采样估算电压并根据阈值更新健康状态。
- * @param arg
- */
-static void voltage_monitor_callback(void *arg)
-{
-    float voltage = 3.30f;  // ESP32-C3 无内置电压传感器，使用估算
-    /** @brief 最近一次估算的系统电压（伏特）。 */
-    s_last_voltage = voltage;
-
-    if (voltage < 2.3f) {
-        /** @brief 全局健康状态，受互斥锁保护。 */
-        g_health_state = SYS_SAFE_SHUTDOWN;
-        DEBUG_ERR("VOLT", "!!! 危险 !!! 电压 %.2fV < 2.3V，触发安全关机", voltage);
-        DEBUG_ERR("VOLT", "健康状态变更为: SYS_SAFE_SHUTDOWN");
-    } else if (voltage < 2.5f) {
-        if (g_health_state < SYS_WARNING) {
-            /** @brief 全局健康状态，受互斥锁保护。 */
-            g_health_state = SYS_WARNING;
-            DEBUG_WARN("VOLT", "警告: 电压 %.2fV < 2.5V", voltage);
-            DEBUG_WARN("VOLT", "健康状态变更为: SYS_WARNING");
-        }
-    }
-}
-
-// ----------------------------------------
-// 温度电压监控任务入口
-/**
-  * @brief 启动温度和电压监控定时器，周期性巡检系统健康。
+  * @brief 启动温度监控定时器，周期性巡检系统健康。
  * @param pvParameters FreeRTOS 任务参数，未使用。
  */
 void health_monitor_task(void *pvParameters)
@@ -170,23 +150,15 @@ void health_monitor_task(void *pvParameters)
 
     DEBUG_INFO("MON", "温度监控定时器已启动 (间隔 1 秒)");
 
-    voltage_monitor_callback(NULL);
-
-    // 每1秒刷新一次估算电压
-    esp_timer_handle_t volt_timer;
-    esp_timer_create_args_t volt_timer_args = {};
-    volt_timer_args.callback = &voltage_monitor_callback;
-    volt_timer_args.arg = nullptr;
-    volt_timer_args.name = "volt_monitor";
-    volt_timer_args.dispatch_method = ESP_TIMER_TASK;
-    volt_timer_args.skip_unhandled_events = false;
-    esp_timer_create(&volt_timer_args, &volt_timer);
-    esp_timer_start_periodic(volt_timer, 1 * 1000000);  // 1秒
-    DEBUG_INFO("MON", "电压监控定时器已启动 (间隔 1 秒)");
-
     // 保活循环：定时器由 esp_timer 任务驱动，此任务只需保持存活
     // 状态汇报已由 status_monitor_task 负责，此处只在异常时告警
     while (1) {
+        int8_t rssi = wifi_get_rssi();
+        if (wifi_is_connected() && rssi != -127) {
+            s_last_wifi_rssi = rssi;
+            s_last_wifi_rssi_ms = esp_timer_get_time() / 1000;
+        }
+
         uint32_t free_heap = esp_get_free_heap_size();
         if (free_heap < HEAP_WARNING_MIN) {
             DEBUG_WARN("MON", "空闲堆内存不足: %lu < %d", (unsigned long)free_heap, HEAP_WARNING_MIN);
@@ -231,20 +203,26 @@ health_status_t health_check_before_ota(void)
         DEBUG_WARN("HEALTH", "OTA 前检查: SYS_WARNING，继续传输但需注意");
     }
 
-    wifi_ap_record_t ap_info;
-    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-        if (ap_info.rssi < WIFI_RSSI_CRITICAL) {
-            /** @brief 全局健康状态，受互斥锁保护。 */
-            g_health_state = SYS_CRITICAL;
-            DEBUG_WARN("HEALTH", "OTA 前检查: WiFi RSSI %d < %d (危险阈值)", 
-                       ap_info.rssi, WIFI_RSSI_CRITICAL);
-            return HEALTH_MON_CRITICAL;
-        } else if (ap_info.rssi < WIFI_RSSI_NORMAL) {
-            if (status < HEALTH_MON_WARNING) {
-                status = HEALTH_MON_WARNING;
+    if (!wifi_is_connected()) {
+        DEBUG_WARN("HEALTH", "OTA 前检查: WiFi 未连接");
+        return HEALTH_MON_CRITICAL;
+    }
+
+    int8_t last_rssi = -127;
+    uint32_t age_ms = 0;
+    if (health_get_last_wifi_rssi(&last_rssi, &age_ms)) {
+        if (age_ms <= OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS) {
+            if (last_rssi < OTA_WIFI_RSSI_CRITICAL) {
+                DEBUG_WARN("HEALTH", "OTA 前检查: 最近 RSSI %d < %d (样本年龄 %lu ms)",
+                           last_rssi, OTA_WIFI_RSSI_CRITICAL, (unsigned long)age_ms);
+                return HEALTH_MON_CRITICAL;
+            } else if (last_rssi < WIFI_RSSI_NORMAL) {
+                if (status < HEALTH_MON_WARNING) {
+                    status = HEALTH_MON_WARNING;
+                }
+                DEBUG_WARN("HEALTH", "OTA 前检查: 最近 RSSI %d < %d (样本年龄 %lu ms)",
+                           last_rssi, WIFI_RSSI_NORMAL, (unsigned long)age_ms);
             }
-            DEBUG_WARN("HEALTH", "OTA 前检查: WiFi RSSI %d < %d (警告阈值)", 
-                       ap_info.rssi, WIFI_RSSI_NORMAL);
         }
     }
 

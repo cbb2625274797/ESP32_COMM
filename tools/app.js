@@ -18,6 +18,18 @@ function formatTime(date) {
   return date.toTimeString().split(' ')[0];
 }
 
+function formatUptime(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return '--';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 function showToast(message, type = 'success') {
   const toast = document.getElementById('toast');
   const icon = document.getElementById('toastIcon');
@@ -150,7 +162,8 @@ function updateSystemStatusUi(data) {
   }
 
   document.getElementById('statTemperature').textContent = Number.isFinite(data.temperature) ? `${data.temperature.toFixed(1)}°C` : '--';
-  document.getElementById('statVoltage').textContent = Number.isFinite(data.voltage) ? `${data.voltage.toFixed(2)}V` : '--';
+  const uptimeEl = document.getElementById('statUptime');
+  if (uptimeEl) uptimeEl.textContent = formatUptime(data.uptime_sec);
   document.getElementById('statWifi').textContent = wifi.connected ? (wifi.ip || '已连接') : '未连接';
   document.getElementById('statSignal').textContent = (wifi.rssi !== undefined && wifi.rssi !== -127) ? `${wifi.rssi} dBm` : '--';
   document.getElementById('statHeap').textContent = data.free_heap !== undefined ? formatBytes(data.free_heap) : '--';
@@ -179,20 +192,6 @@ async function testConnection() {
   showToast(connected ? 'ESP32 当前在线' : 'ESP32 当前未连接', connected ? 'success' : 'warning');
 }
 
-async function healthCheck() {
-  if (!latestSystemStatus) {
-    addLog('W', '健康', '暂无同步数据，请等待 1 秒自动同步');
-    showToast('暂无同步数据，请稍等 1 秒', 'warning');
-    return;
-  }
-
-  updateSystemStatusUi(latestSystemStatus);
-  const data = latestSystemStatus;
-  const healthNames = ['正常', '警告', '危险', '关机'];
-  const health = data.health !== undefined ? (healthNames[data.health] || '未知') : '未知';
-  addLog('I', '健康', `当前状态: ${health}, 空闲堆: ${data.free_heap} bytes, 温度: ${data.temperature}°C, 电压: ${data.voltage}V`);
-  showToast(`当前健康状态: ${health}`, 'success');
-}
 
 // ==================== CAN 帧发送 ====================
 async function sendCanFrame() {
@@ -311,7 +310,7 @@ function processFile(file) {
   document.getElementById('fileType').textContent = file.name.endsWith('.hex') ? 'Intel HEX' : 'Binary';
   document.getElementById('fileSize').textContent = formatBytes(file.size);
 
-  const chunks = Math.ceil(file.size / 4096);
+  const chunks = Math.ceil(file.size / 8192);
   document.getElementById('fileChunks').textContent = chunks + ' 包';
 
   fileInfo.classList.add('visible');
@@ -450,12 +449,34 @@ async function triggerEsp32Update() {
     if (response.ok) {
       const data = await response.json();
       addLog('I', 'OTA', `升级完成: ${data.message}`);
-      addLog('I', 'OTA', 'ESP32 即将重启，新固件将生效，页面将继续通过 1 秒状态同步自动恢复显示');
       showToast('ESP32 重启中...', 'success');
     }
   } catch (e) {
     addLog('E', 'OTA', `升级失败: ${e.message}`);
     showToast('升级失败', 'error');
+  }
+}
+
+async function restartEsp32() {
+  if (!confirm('确定要重启 ESP32 吗？')) return;
+
+  addLog('I', '系统', '=== 请求重启 ESP32 ===');
+  showToast('ESP32 正在重启...', 'success');
+
+  try {
+    const response = await fetch(`${getBaseUrl()}/restart`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(5000)
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      addLog('I', '系统', `重启已触发: ${data.message}`);
+      showToast('ESP32 重启中，页面将自动恢复...', 'success');
+    }
+  } catch (e) {
+    addLog('E', '系统', `重启请求失败: ${e.message}`);
+    showToast('重启失败', 'error');
   }
 }
 

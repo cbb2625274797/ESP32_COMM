@@ -10,7 +10,7 @@
 // ============================================================
 // 固件版本
 // ============================================================
-inline constexpr const char *FW_VERSION = "0.0.6";
+inline constexpr const char *FW_VERSION = "0.1.4";
 
 // ============================================================
 // WiFi 工作模式选择
@@ -53,7 +53,7 @@ inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;
 // ============================================================
 // OTA 配置
 // ============================================================
-inline constexpr size_t  OTA_BLOCK_SIZE         = 4096;
+inline constexpr size_t  OTA_BLOCK_SIZE         = 8192;
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE   = 2 * 1024 * 1024;  // 2MB
 
 // ============================================================
@@ -61,6 +61,9 @@ inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE   = 2 * 1024 * 1024;  // 2MB
 // ============================================================
 inline constexpr int32_t WIFI_RSSI_CRITICAL = -85;
 inline constexpr int32_t WIFI_RSSI_WARNING  = -75;
+inline constexpr int32_t OTA_WIFI_RSSI_CRITICAL = -88;   // OTA 期间更宽松，避免瞬时波动误判
+inline constexpr uint32_t OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS = 15000;  // OTA 最多接受 15 秒内的 RSSI 样本
+inline constexpr uint32_t OTA_PACKET_HEALTH_CHECK_INTERVAL = 32;     // 每 32 个 48B 包做一次 OTA 健康检查
 inline constexpr int32_t TEMP_WARNING       = 80;
 inline constexpr int32_t TEMP_CRITICAL      = 100;
 inline constexpr size_t  HEAP_WARNING_MIN   = 10240;

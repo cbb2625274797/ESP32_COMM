@@ -12,7 +12,7 @@ ESP32-C3FH4 OTA 中继固件，通过 WiFi 接收上位机 OTA 固件包，通�
 
 | 模块 | 描述 |
 |------|------|
-| `health_monitor` | 温度 + 电压 + WiFi RSSI 监控 |
+| `health_monitor` | 温度 + WiFi RSSI 监控 |
 | `ota_relay` | OTA 数据包接收与转发 |
 | `wifi_ota` | WiFi OTA HTTP 服务器 + CAN 帧转发 |
 | `spi_master` | SPI 主站，与 GD32 通信 |

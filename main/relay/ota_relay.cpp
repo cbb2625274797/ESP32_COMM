@@ -376,10 +376,12 @@ static ota_result_t relay_packets_from_flash(void)
     g_relay_state = RELAY_RELAY_ACTIVE;
 
     for (uint32_t seq = 0; seq < total_packets; seq++) {
-        health_status_t health = health_check_before_ota();
-        if (health == HEALTH_MON_SHUTDOWN || health == HEALTH_MON_CRITICAL) {
-            DEBUG_ERR("OTA", "健康检查危险，中止 OTA");
-            return OTA_RESULT_ERR_HEALTH;
+        if ((seq % OTA_PACKET_HEALTH_CHECK_INTERVAL) == 0 || seq == 0 || seq == total_packets - 1) {
+            health_status_t health = health_check_before_ota();
+            if (health == HEALTH_MON_SHUTDOWN || health == HEALTH_MON_CRITICAL) {
+                DEBUG_ERR("OTA", "健康检查危险，中止 OTA");
+                return OTA_RESULT_ERR_HEALTH;
+            }
         }
 
         size_t chunk_size = 48;

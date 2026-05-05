@@ -446,6 +446,27 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
 }
 
 /**
+ * @brief HTTP POST /restart - 立即重启 ESP32
+ * @param req
+ * @return
+ */
+static esp_err_t restart_handler(httpd_req_t *req)
+{
+    (void)req;
+    http_set_cors_headers(req);
+
+    DEBUG_INFO("OTA", "收到重启请求，500ms 后重启...");
+
+    const char resp[] = "{\"status\": \"ok\", \"message\": \"rebooting\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+/**
  * @brief HTTP GET /ota/update - 查询 ESP32 OTA 状态
  * @param req
  * @return
@@ -558,7 +579,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         }
 
         // 堆分配缓冲区，避免栈溢出（HTTP server 栈仅 8KB）
-        uint8_t *fw_buf = (uint8_t *)malloc(1024);
+        uint8_t *fw_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
         if (!fw_buf) {
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存分配失败");
             return ESP_FAIL;
@@ -570,7 +591,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
         while (total_received < req->content_len) {
             size_t to_read = req->content_len - total_received;
-            if (to_read > 1024) to_read = 1024;
+            if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
 
             int ret = httpd_req_recv(req, (char *)fw_buf, to_read);
             if (ret <= 0) break;
@@ -628,7 +649,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         uint32_t fw_size = gd32_header[2] | (gd32_header[3] << 8) | (gd32_header[4] << 16) | (gd32_header[5] << 24);
         if (seq == 0) {
             ota_meta_t meta = { .total_size = fw_size, .stored_size = 0, .last_seq = 0,
-                                .chunk_count = (fw_size + 4095) / 4096, .checksum = {0} };
+                                .chunk_count = (fw_size + OTA_BLOCK_SIZE - 1) / OTA_BLOCK_SIZE, .checksum = {0} };
             meta_save(&meta);
             DEBUG_INFO("WIFI", "开始 GD32 固件存储: %u 字节", fw_size);
         }
@@ -943,14 +964,14 @@ static esp_err_t system_status_handler(httpd_req_t *req)
     memset(&meta, 0, sizeof(meta));
     meta_load(&meta);
 
-    char resp[640];
+    char resp[700];
     int len = snprintf(resp, sizeof(resp),
-        "{\"version\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"voltage\": %.2f, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d}}",
+        "{\"version\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d}}",
         FW_VERSION,health_get_current(),
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
         (double)health_get_last_temperature(),
-        (double)health_get_last_voltage(),
+        (unsigned long)(esp_timer_get_time() / 1000000),
         s_wifi_mode == OTA_WIFI_MODE_AP ? "AP" : "STA",
         ip_str,
         rssi,
@@ -1046,6 +1067,21 @@ static esp_err_t http_ota_server_start(void)
         .user_ctx = NULL
     };
     httpd_register_uri_handler(s_http_server, &esp32_update_options_uri);
+
+    httpd_uri_t restart_uri = {
+        .uri = "/restart",
+        .method = HTTP_POST,
+        .handler = restart_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(s_http_server, &restart_uri);
+    httpd_uri_t restart_options_uri = {
+        .uri = "/restart",
+        .method = HTTP_OPTIONS,
+        .handler = http_options_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(s_http_server, &restart_options_uri);
 
     httpd_uri_t esp32_status_uri = {
         .uri = "/ota/esp32_status",

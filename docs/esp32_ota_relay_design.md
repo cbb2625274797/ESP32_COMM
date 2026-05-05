@@ -604,7 +604,6 @@ ESP32-C3FH4 利用芯片内置传感器实现运行安全监控，不外挂额�
 | 检测项 | 来源 | 阈值范围 | 处理动作 |
 |---|---|---|---|
 | 芯片温度 | 内部温度传感器 | 正常: < 80°C / 警告: 80-100°C / 停机: > 100°C | 警告时降频，停机时中止 OTA |
-| 供电电压 | VDD 电压传感器 | 正常: 2.5V - 3.6V / 警告: < 2.5V / 停机: < 2.3V | 警告时提示，停机时挂起任务 |
 | Flash 空间 | 系统 API | 可用 > 16KB（存储分区元数据） | 空间不足时拒绝 OTA 请求 |
 | WiFi 信号强度 | WiFi RSSI | 正常: > -70 dBm / 弱: -70 ~ -85 dBm / 断开: < -85 dBm | 弱时降低 OTA 速度，断开时暂停 |
 | BLE 连接状态 | BLE stack | 连接中 / 断开 | 断开时通知 APP 重连 |
@@ -614,7 +613,6 @@ ESP32-C3FH4 利用芯片内置传感器实现运行安全监控，不外挂额�
 | 检测项 | 频率 | 方式 |
 |---|---|---|
 | 芯片温度 | 每 1 秒 | FreeRTOS Timer |
-| 供电电压 | 每 5 秒 | FreeRTOS Timer |
 | Flash 空间 | OTA 开始前检查 | 一次性 |
 | WiFi RSSI | 每 10 秒 | 轮询 |
 | BLE 连接 | 事件驱动 | BLE GAP 回调 |
@@ -648,7 +646,6 @@ typedef enum {
 
 ```
 [TIMESTAMP] TEMP_WARNING: 85°C
-[TIMESTAMP] VOLT_WARNING: 2.45V
 [TIMESTAMP] OTA_PAUSED: temp_critical
 [TIMESTAMP] OTA_RESUMED
 ```
@@ -663,7 +660,6 @@ typedef enum {
 │  (FreeRTOS Task, Priority High) │
 ├──────────────────────────────────┤
 │  temp_monitor   (1s timer)       │
-│  voltage_monitor (5s timer)      │
 │  wifi_monitor   (10s timer)     │
 │  ble_monitor    (event-driven)   │
 ├──────────────────────────────────┤

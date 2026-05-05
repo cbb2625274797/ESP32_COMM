@@ -6,7 +6,7 @@
 
 ### WebUI 实际在用的接口
 
-- `GET /system/status`：每 1 秒轮询一次，用于在线状态、WiFi、heap、温度、电压、OTA 状态展示
+- `GET /system/status`：每 1 秒轮询一次，用于在线状态、WiFi、heap、温度、OTA 状态展示
 - `GET /logs`：每 1 秒轮询一次，用于拉取并清空日志环形缓冲区
 - `POST /can/send`：发送 CAN 请求到 GD32
 - `POST /ota/upload` / `POST /ota/relay` / `POST /ota/update`：OTA 相关
