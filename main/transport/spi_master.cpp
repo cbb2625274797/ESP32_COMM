@@ -15,6 +15,63 @@
 #include "spi_master.h"
 #include "monitor/debug_log.h"
 
+static uint8_t spi_ota_crc8(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+    }
+    return crc;
+}
+
+static bool spi_ota_build_frame(uint8_t type, const uint8_t *payload, size_t payload_len,
+                                uint8_t *out, size_t *out_len)
+{
+    if (!out || !out_len) return false;
+    size_t total = 5 + payload_len;
+    if (total > SPI_OTA_FRAME_MAX) return false;
+    out[0] = SPI_OTA_SOF;
+    out[1] = type;
+    out[2] = (uint8_t)(payload_len & 0xFF);
+    out[3] = (uint8_t)((payload_len >> 8) & 0xFF);
+    if (payload && payload_len > 0) {
+        memcpy(&out[4], payload, payload_len);
+    }
+    out[4 + payload_len] = spi_ota_crc8(out, 4 + payload_len);
+    *out_len = total;
+    return true;
+}
+
+static bool spi_ota_parse_frame(const uint8_t *frame, size_t frame_len,
+                                uint8_t *type, const uint8_t **payload, size_t *payload_len)
+{
+    if (!frame || frame_len < 5 || frame[0] != SPI_OTA_SOF) return false;
+    size_t len = (size_t)frame[2] | ((size_t)frame[3] << 8);
+    size_t expected = 5 + len;
+    if (expected > frame_len) return false;
+    uint8_t crc = spi_ota_crc8(frame, 4 + len);
+    if (crc != frame[4 + len]) return false;
+    if (type) *type = frame[1];
+    if (payload) *payload = &frame[4];
+    if (payload_len) *payload_len = len;
+    return true;
+}
+
+static bool spi_ota_find_frame(const uint8_t *buf, size_t buf_len,
+                               uint8_t *type, const uint8_t **payload, size_t *payload_len,
+                               size_t *frame_offset)
+{
+    if (!buf || buf_len < 5) return false;
+    for (size_t i = 0; i + 5 <= buf_len; ++i) {
+        if (buf[i] != SPI_OTA_SOF) continue;
+        if (spi_ota_parse_frame(&buf[i], buf_len - i, type, payload, payload_len)) {
+            if (frame_offset) *frame_offset = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 /** @brief SPI2 从设备句柄。 */
 spi_device_handle_t g_spi_device = NULL;
 
@@ -130,6 +187,100 @@ esp_err_t spi_recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_
     uint8_t dummy[64] = {0};
     memset(dummy, 0xFF, sizeof(dummy));
     return spi_sync_transfer(cmd, dummy, len, recv_buf, len, timeout_ms);
+}
+
+esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
+                                size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
+{
+    if (g_spi_device == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (resp_len) *resp_len = 0;
+    if (resp_type) *resp_type = 0;
+
+    uint8_t rx_raw[SPI_OTA_FRAME_MAX] = {0};
+    uint8_t dummy[SPI_OTA_FRAME_MAX];
+    memset(dummy, 0xFF, sizeof(dummy));
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    uint32_t attempt = 0;
+    while (xTaskGetTickCount() <= deadline) {
+        ++attempt;
+        memset(rx_raw, 0xFF, sizeof(rx_raw));
+        spi_transaction_t rsp = {};
+        rsp.length = SPI_OTA_FRAME_MAX * 8;
+        rsp.rxlength = SPI_OTA_FRAME_MAX * 8;
+        rsp.tx_buffer = dummy;
+        rsp.rx_buffer = rx_raw;
+        esp_err_t ret = spi_device_transmit(g_spi_device, &rsp);
+        if (ret != ESP_OK) {
+            DEBUG_WARN("SPI", "SPI OTA 响应读取失败[%u]: %s", attempt, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        uint8_t parsed_type = 0;
+        const uint8_t *parsed_payload = nullptr;
+        size_t parsed_len = 0;
+        size_t frame_offset = 0;
+        if (spi_ota_find_frame(rx_raw, sizeof(rx_raw), &parsed_type, &parsed_payload, &parsed_len, &frame_offset)) {
+            DEBUG_INFO("SPI", "OTA响应: type=0x%02X len=%u offset=%u attempt=%u",
+                       parsed_type, (unsigned)parsed_len, (unsigned)frame_offset, (unsigned)attempt);
+            if (resp_type) *resp_type = parsed_type;
+            if (resp_payload && resp_max > 0) {
+                size_t copy_len = (parsed_len < resp_max) ? parsed_len : resp_max;
+                memcpy(resp_payload, parsed_payload, copy_len);
+                if (resp_len) *resp_len = copy_len;
+            } else if (resp_len) {
+                *resp_len = parsed_len;
+            }
+            return ESP_OK;
+        }
+
+        bool all_ff = true;
+        for (size_t i = 0; i < sizeof(rx_raw); ++i) {
+            if (rx_raw[i] != 0xFF) {
+                all_ff = false;
+                break;
+            }
+        }
+        DEBUG_DBG("SPI", "OTA响应未就绪[%u]: %s", attempt, all_ff ? "all-FF" : "no-valid-SOF");
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    DEBUG_ERR("SPI", "OTA响应超时: timeout=%ums", (unsigned)timeout_ms);
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t spi_ota_transfer(uint8_t type, const uint8_t *payload, size_t payload_len,
+                           uint8_t *resp_type, uint8_t *resp_payload,
+                           size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
+{
+    if (g_spi_device == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (resp_len) *resp_len = 0;
+    if (resp_type) *resp_type = 0;
+
+    uint8_t tx_frame[SPI_OTA_FRAME_MAX] = {0};
+    size_t tx_len = 0;
+    if (!spi_ota_build_frame(type, payload, payload_len, tx_frame, &tx_len)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    DEBUG_INFO("SPI", "OTA事务: req_type=0x%02X req_len=%u", type, (unsigned)payload_len);
+
+    spi_transaction_t req = {};
+    req.length = tx_len * 8;
+    req.tx_buffer = tx_frame;
+    esp_err_t ret = spi_device_transmit(g_spi_device, &req);
+    if (ret != ESP_OK) {
+        DEBUG_ERR("SPI", "SPI OTA 请求事务失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+    return spi_ota_poll_response(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
 }
 
 // CANFD 帧发送

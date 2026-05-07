@@ -10,7 +10,7 @@
 // ============================================================
 // 固件版本
 // ============================================================
-inline constexpr const char *FW_VERSION = "0.1.4";
+inline constexpr const char *FW_VERSION = "0.2.0";
 
 // ============================================================
 // WiFi 工作模式选择
@@ -54,7 +54,8 @@ inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;
 // OTA 配置
 // ============================================================
 inline constexpr size_t  OTA_BLOCK_SIZE         = 8192;
-inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE   = 2 * 1024 * 1024;  // 2MB
+inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB，对齐 GD32 APP_MAX_SIZE (0x36000)
+inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
 
 // ============================================================
 // 健康监控阈值
@@ -85,6 +86,12 @@ inline constexpr uint16_t    BLE_OTA_CTRL_UUID   = 0x0001;
 inline constexpr uint16_t    BLE_OTA_DATA_IN_UUID  = 0x0002;
 inline constexpr uint16_t    BLE_OTA_DATA_OUT_UUID = 0x0003;
 inline constexpr uint16_t    BLE_OTA_VERSION_UUID  = 0x0004;
+inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_GD32  = 0xF7;
+inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_ESP32 = 0xF8;
+inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;
+inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;
+inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;   // 默认目标 payload；ATT Write Command 可写值≈(MTU-3)，当前 512 MTU 下协议 payload 建议 ≤ 498B
+inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;  // cmd(1)+seq(2)+size(4)+crc(4)
 
 // ============================================================
 // 安全常量（需与 GD32 固件团队确认）

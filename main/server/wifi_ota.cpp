@@ -629,7 +629,34 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    if (g_relay_state != RELAY_IDLE) {
+        DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", g_relay_state);
+        ota_relay_reset();
+    }
+    s_gd32_storage_done = false;
+    s_relay_triggered = false;
+
+    const esp_partition_t *gd32_partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "gd32_ota");
+    if (!gd32_partition) {
+        DEBUG_ERR("WIFI", "找不到 gd32_ota 分区");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "找不到 gd32_ota 分区");
+        return ESP_FAIL;
+    }
+    esp_err_t erase_err = esp_partition_erase_range(gd32_partition, 0, gd32_partition->size);
+    if (erase_err != ESP_OK) {
+        DEBUG_ERR("WIFI", "擦除 gd32_ota 分区失败: %s", esp_err_to_name(erase_err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "擦除分区失败");
+        return ESP_FAIL;
+    }
+    meta_clear();
+
     uint8_t *buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存分配失败");
+        return ESP_FAIL;
+    }
+
     int received = 0;
 
     // peek 字节是 GD32 数据的第一字节，先放回缓冲区
@@ -643,10 +670,17 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         if (got > 0) header_read += got;
     }
 
-    // 先处理已读的 header
+    uint32_t expected_fw_size = 0;
     if (header_read >= 6) {
         uint16_t seq = gd32_header[0] | (gd32_header[1] << 8);
         uint32_t fw_size = gd32_header[2] | (gd32_header[3] << 8) | (gd32_header[4] << 16) | (gd32_header[5] << 24);
+        expected_fw_size = fw_size;
+        if (fw_size > OTA_MAX_FIRMWARE_SIZE) {
+            DEBUG_ERR("WIFI", "GD32 固件头声明大小超限: %u > %u", fw_size, OTA_MAX_FIRMWARE_SIZE);
+            free(buf);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "GD32 固件大小超限");
+            return ESP_FAIL;
+        }
         if (seq == 0) {
             ota_meta_t meta = { .total_size = fw_size, .stored_size = 0, .last_seq = 0,
                                 .chunk_count = (fw_size + OTA_BLOCK_SIZE - 1) / OTA_BLOCK_SIZE, .checksum = {0} };
@@ -655,7 +689,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         }
     }
 
-    // 继续读剩余数据
+    // 首包已经读走 6 字节头，因此后续 body 全部按 header_read 为偏移基准顺序落盘
     while (received + header_read < req->content_len) {
         size_t to_read = req->content_len - received - header_read;
         if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
@@ -663,30 +697,39 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         int ret = httpd_req_recv(req, (char *)buf, to_read);
         if (ret <= 0) break;
 
-        uint32_t flash_offset = ((received + header_read) / OTA_BLOCK_SIZE) * OTA_BLOCK_SIZE;
+        uint32_t flash_offset = (uint32_t)received;
         esp_err_t err = flash_write_chunk(flash_offset, buf, ret);
-        if (err == ESP_OK) {
-            meta_update(flash_offset + ret, (received + header_read) / OTA_BLOCK_SIZE);
+        if (err != ESP_OK) {
+            DEBUG_ERR("WIFI", "Flash 写入失败: offset=%u len=%d err=%s",
+                      flash_offset, ret, esp_err_to_name(err));
+            free(buf);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "写入 gd32_ota 失败");
+            return ESP_FAIL;
         }
-        received += ret;
 
-        uint32_t progress = ((received + header_read) * 100) / req->content_len;
+        received += ret;
+        if (expected_fw_size > 0) {
+            meta_update((uint32_t)received, (uint32_t)(received / OTA_BLOCK_SIZE));
+        }
+
+        uint32_t progress = expected_fw_size > 0
+            ? ((uint32_t)received * 100U) / expected_fw_size
+            : ((uint32_t)(received + header_read) * 100U) / (uint32_t)req->content_len;
         if (progress % 10 == 0) {
-            DEBUG_INFO("WIFI", "GD32 上传进度: %d / %d (%u%%)",
-                       received + header_read, req->content_len, progress);
+            DEBUG_INFO("WIFI", "GD32 上传进度: %d / %u (%u%%)",
+                       received, expected_fw_size, progress);
         }
     }
 
     free(buf);
-    DEBUG_INFO("WIFI", "GD32 固件存储完成: %d 字节", received + header_read);
+    DEBUG_INFO("WIFI", "GD32 固件存储完成: payload=%d 字节, 头=%d 字节", received, header_read);
 
     ota_meta_t meta;
     meta_load(&meta);
-    if (meta.stored_size >= meta.total_size) {
+    if (meta.total_size > 0 && meta.stored_size >= meta.total_size) {
         /** @brief GD32 固件存储完成标志。 */
         s_gd32_storage_done = true;
-        DEBUG_INFO("WIFI", "GD32 固件已存储，触发转发...");
-        wifi_ota_signal_relay();
+        DEBUG_INFO("WIFI", "GD32 固件已存储完成，等待触发转发...");
     }
 
     const char resp[] = "{\"status\": \"ok\", \"progress\": 100, \"target\": \"gd32\"}";
@@ -1202,6 +1245,14 @@ static esp_err_t http_ota_server_start(void)
  */
 void wifi_ota_signal_relay(void)
 {
+    ota_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+    if (meta_load(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
+        DEBUG_WARN("WIFI", "GD32 固件未完整存储，拒绝触发转发: stored=%lu total=%lu",
+                   (unsigned long)meta.stored_size, (unsigned long)meta.total_size);
+        return;
+    }
+
     if (s_relay_triggered) {
         DEBUG_WARN("WIFI", "转发已经触发过");
         return;
@@ -1214,6 +1265,9 @@ void wifi_ota_signal_relay(void)
         uint32_t msg = 1;
         xQueueSend(g_ota_dispatch_queue, &msg, pdMS_TO_TICKS(100));
         DEBUG_INFO("WIFI", "OTA 调度信号已发送到中继任务");
+    } else {
+        DEBUG_ERR("WIFI", "OTA 中继队列尚未就绪");
+        s_relay_triggered = false;
     }
 }
 

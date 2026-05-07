@@ -10,9 +10,19 @@
 
 // SPI 配置常量
 #define SPI_MASTER_CS_GPIO    (4)           // CS 片选引脚
-#define SPI_CLOCK_HZ          (40 * 1000 * 1000)  // 40MHz
+#define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 先降到 4MHz 便于联调
 #define SPI_MODE              (0)           // CPOL=0, CPHA=0
 #define SPI_QUEUE_SIZE        (1)
+#define SPI_OTA_FRAME_MAX     (96)
+
+// GD32 SPI OTA 帧类型
+#define SPI_OTA_SOF           (0xA5)
+#define SPI_OTA_CMD_REQ       (0x01)
+#define SPI_OTA_CMD_DATA      (0x02)
+#define SPI_OTA_CMD_CANCEL    (0x03)
+#define SPI_OTA_RSP_ACK       (0x80)
+#define SPI_OTA_RSP_WAIT      (0x81)
+#define SPI_OTA_RSP_ERROR     (0x82)
 
 // SPI 设备句柄（外部引用）
 extern spi_device_handle_t g_spi_device;
@@ -107,5 +117,26 @@ esp_err_t spi_send(uint8_t cmd, const uint8_t *payload, size_t len);
  * @return ESP_OK 成功，其他失败。
  */
 esp_err_t spi_recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_ms);
+
+/**
+ * @brief 按 GD32 SPI OTA 最小协议执行一次请求事务 + 一次响应读取事务。
+ * @param type 请求帧类型（REQ/DATA/CANCEL）。
+ * @param payload 请求负载。
+ * @param payload_len 负载长度。
+ * @param resp_type 输出响应类型（ACK/WAIT/ERROR）。
+ * @param resp_payload 输出响应负载缓冲区。
+ * @param resp_max 输出响应负载最大长度。
+ * @param resp_len 输出实际响应负载长度。
+ * @param timeout_ms 超时。
+ */
+esp_err_t spi_ota_transfer(uint8_t type, const uint8_t *payload, size_t payload_len,
+                           uint8_t *resp_type, uint8_t *resp_payload,
+                           size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
+
+/**
+ * @brief 仅执行 SPI OTA 响应读取事务，不重复发送请求帧。
+ */
+esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
+                                size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
 
 #endif // SPI_MASTER_H

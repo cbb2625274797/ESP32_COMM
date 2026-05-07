@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 BLE OTA 刷写台</title>
+<style>
+  :root {
+    --bg: #07111f;
+    --panel: rgba(15, 27, 47, 0.84);
+    --line: rgba(126, 231, 255, 0.14);
+    --line-strong: rgba(126, 231, 255, 0.28);
+    --text: #eaf7ff;
+    --muted: #8fa8bb;
+    --cyan: #76e7ff;
+    --blue: #4f8cff;
+    --violet: #9785ff;
+    --green: #21d19f;
+    --amber: #ffb84d;
+    --red: #ff6b7a;
+    --shadow: 0 20px 70px rgba(0,0,0,.45);
+    --radius: 20px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; min-height:100%; }
+  body {
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background:
+      radial-gradient(circle at top left, rgba(118,231,255,.12), transparent 34%),
+      radial-gradient(circle at 90% 14%, rgba(151,133,255,.16), transparent 26%),
+      linear-gradient(160deg, var(--bg), #06101c 44%, #050b14 100%);
+    color: var(--text);
+  }
+  body::before {
+    content:"";
+    position:fixed; inset:0;
+    background-image:
+      linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px);
+    background-size: 24px 24px;
+    mask-image: radial-gradient(circle at center, black, transparent 82%);
+    pointer-events:none;
+  }
+  .wrap { max-width: 1380px; margin: 0 auto; padding: 28px; position: relative; }
+  .hero { display:grid; grid-template-columns: 1.2fr .8fr; gap: 20px; margin-bottom: 20px; }
+  .hero-card, .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(18px);
+  }
+  .hero-card { padding: 28px; overflow:hidden; position:relative; }
+  .hero-card::after {
+    content:"";
+    position:absolute; right:-60px; top:-60px; width:200px; height:200px;
+    background: radial-gradient(circle, rgba(118,231,255,.26), transparent 64%);
+    pointer-events:none;
+  }
+  .eyebrow {
+    display:inline-flex; align-items:center; gap:8px;
+    font-size:12px; letter-spacing:.12em; text-transform:uppercase;
+    color: var(--cyan); padding:8px 12px; border:1px solid var(--line-strong);
+    border-radius:999px; background:rgba(118,231,255,.07);
+  }
+  h1 { margin: 18px 0 10px; font-size: 42px; line-height: 1.05; }
+  .hero p { margin: 0; color: var(--muted); line-height: 1.7; font-size: 15px; }
+  .hero-points { display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 22px; }
+  .mini { padding: 14px 16px; border-radius: 16px; border:1px solid var(--line); background: rgba(255,255,255,.03); }
+  .mini b { display:block; font-size: 18px; margin-bottom: 4px; }
+  .mini span { color: var(--muted); font-size: 12px; }
+  .status-stack { display:grid; gap: 14px; padding: 20px; }
+  .status-pill {
+    display:flex; justify-content:space-between; align-items:center;
+    border:1px solid var(--line); border-radius:16px; padding:14px 16px;
+    background: rgba(255,255,255,.03);
+    gap: 12px;
+  }
+  .status-pill .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing:.12em; }
+  .status-pill .value { font-weight:700; font-size: 15px; }
+  .ok { color: var(--green); }
+  .warn { color: var(--amber); }
+  .bad { color: var(--red); }
+  .grid { display:grid; grid-template-columns: 1.05fr .95fr; gap: 20px; }
+  .card { padding: 22px; }
+  .card h2 { margin: 0 0 18px; font-size: 18px; }
+  .section { margin-bottom: 18px; }
+  .section:last-child { margin-bottom: 0; }
+  .label { display:block; margin-bottom: 8px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .12em; }
+  .row-2, .row-3, .row-4 { display:grid; gap: 12px; }
+  .row-2 { grid-template-columns: 1fr 1fr; }
+  .row-3 { grid-template-columns: repeat(3, 1fr); }
+  .row-4 { grid-template-columns: repeat(4, 1fr); }
+  input[type="text"], input[type="number"], input[type="file"], select, textarea {
+    width:100%; border-radius: 14px; border:1px solid var(--line);
+    background: rgba(255,255,255,.04); color: var(--text);
+    padding: 13px 14px; outline: none; font-size: 14px;
+  }
+  select option { background:#0b1828; color:var(--text); }
+  input:focus, textarea:focus, select:focus { border-color: var(--cyan); box-shadow: 0 0 0 4px rgba(118,231,255,.08); }
+  textarea { min-height: 110px; resize: vertical; }
+  button, .btn-link {
+    border:0; border-radius: 14px; padding: 13px 16px; cursor:pointer;
+    color:#03111d; font-weight:700; font-size:14px; text-decoration:none;
+    background: linear-gradient(135deg, var(--cyan), #9df5ff);
+    transition: transform .18s ease, box-shadow .18s ease, opacity .18s ease;
+    box-shadow: 0 12px 28px rgba(118,231,255,.18);
+    display:inline-flex; align-items:center; justify-content:center; gap:8px;
+  }
+  button:hover:not(:disabled), .btn-link:hover { transform: translateY(-1px); }
+  button:disabled { opacity:.45; cursor:not-allowed; box-shadow:none; }
+  .secondary { background: linear-gradient(135deg, #ccd7e2, #e9f0f6); }
+  .ghost {
+    color: var(--text); background: rgba(255,255,255,.05);
+    border:1px solid var(--line); box-shadow:none;
+  }
+  .danger { background: linear-gradient(135deg, #ff8393, #ffb1bb); }
+  .top-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:18px; }
+  .progress-shell { margin-top: 12px; padding: 16px; border-radius: 16px; background: rgba(255,255,255,.03); border:1px solid var(--line); }
+  .progress-bar { width:100%; height: 14px; border-radius:999px; overflow:hidden; background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.06); }
+  .progress-fill { width:0%; height:100%; border-radius:999px; background: linear-gradient(90deg, var(--cyan), var(--blue), var(--violet)); transition: width .18s linear; }
+  .progress-meta { display:flex; justify-content:space-between; gap:12px; margin-top:10px; color: var(--muted); font-size: 12px; }
+  .metric-grid { display:grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .metric { padding: 14px; border-radius: 16px; border:1px solid var(--line); background: rgba(255,255,255,.03); }
+  .metric .k { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .metric .v { font-size: 20px; font-weight: 700; word-break: break-word; }
+  .hint { padding: 12px 14px; border-radius: 14px; border:1px solid rgba(255,184,77,.18); background: rgba(255,184,77,.08); color: #ffd7a3; font-size: 13px; line-height: 1.7; }
+  .noti-box, .log-box { border-radius: 16px; border:1px solid var(--line); background: rgba(255,255,255,.03); }
+  .noti-box { padding: 14px; min-height: 110px; }
+  .noti-line {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; color: #bfefff; padding: 8px 10px; border-radius: 10px;
+    background: rgba(118,231,255,.06); margin-bottom: 8px; word-break: break-all;
+  }
+  .log-box {
+    height: 420px; overflow:auto; padding: 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+  }
+  .log-line { margin-bottom: 8px; line-height: 1.6; color: #cfe3f3; }
+  .log-line .t { color: #7aa2bd; }
+  .log-line .tag { color: var(--cyan); }
+  .footer-note { margin-top: 16px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+  .accent { color: var(--cyan); font-weight: 700; }
+  code { color: #ccf5ff; }
+  @media (max-width: 1120px) {
+    .hero, .grid { grid-template-columns: 1fr; }
+    .metric-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 720px) {
+    .wrap { padding: 16px; }
+    h1 { font-size: 30px; }
+    .row-2, .row-3, .row-4, .hero-points, .metric-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="hero">
+    <div class="hero-card">
+      <div class="eyebrow">BLE • OTA • Dual Target</div>
+      <h1>ESP32 Web Bluetooth 刷写台</h1>
+      <p>这个页面专门走 BLE GATT，不依赖 WiFi。它能扫描并连接 <b>ESP32-OTA-RELAY</b>，读取版本，订阅通知，把固件按协议分包写入 <b>DATA_IN</b>，并在完成后自动向 <b>CTRL</b> 写入对应命令：<span class="accent">GD32 = 0xF7</span>，<span class="accent">ESP32 = 0xF8</span>。</p>
+      <div class="top-actions">
+        <button id="connectBtn">连接设备</button>
+        <button id="disconnectBtn" class="secondary" disabled>断开</button>
+        <button id="versionBtn" class="ghost" disabled>读取版本</button>
+        <button id="subscribeBtn" class="ghost" disabled>开启通知</button>
+        <a class="btn-link ghost" href="index.html">回 WiFi 页面</a>
+      </div>
+      <div class="hero-points">
+        <div class="mini"><b>GD32 / ESP32</b><span>双目标 BLE 刷写</span></div>
+        <div class="mini"><b>480B</b><span>默认 Payload</span></div>
+        <div class="mini"><b>一键刷写</b><span>写入完成后自动触发</span></div>
+      </div>
+    </div>
+    <div class="hero-card status-stack">
+      <div class="status-pill"><div><div class="label">连接状态</div><div class="value" id="connState">未连接</div></div><div class="value bad" id="connBadge">offline</div></div>
+      <div class="status-pill"><div><div class="label">设备名称</div><div class="value" id="deviceName">-</div></div><div class="value" id="deviceId">-</div></div>
+      <div class="status-pill"><div><div class="label">GATT/MTU 提示</div><div class="value" id="gattState">未就绪</div></div><div class="value warn" id="mtuHint">浏览器决定</div></div>
+      <div class="status-pill"><div><div class="label">版本</div><div class="value" id="versionText">未读取</div></div><div class="value ok" id="notifyState">notify off</div></div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>刷写控制台</h2>
+      <div class="section">
+        <label class="label" for="firmwareFile">固件文件</label>
+        <input id="firmwareFile" type="file" accept=".bin,.hex,application/octet-stream">
+      </div>
+      <div class="section row-3">
+        <div>
+          <label class="label" for="targetChip">目标芯片</label>
+          <select id="targetChip">
+            <option value="gd32">GD32（写入后触发中继）</option>
+            <option value="esp32">ESP32（写入后重启升级）</option>
+          </select>
+        </div>
+        <div>
+          <label class="label" for="payloadSize">每包 Payload 大小</label>
+          <input id="payloadSize" type="number" min="32" max="498" value="480">
+        </div>
+        <div>
+          <label class="label" for="ctrlHex">触发命令（HEX）</label>
+          <input id="ctrlHex" type="text" value="F7" maxlength="8">
+        </div>
+      </div>
+      <div class="section hint" id="protocolHint">
+        当前目标：<b>GD32</b>。页面会使用 <b>cmd=0x00</b> 发送数据，最后自动写 <b>CTRL=0xF7</b>。协议格式：<b>cmd(1) + seq(2) + total_size(4) + payload + crc占位4</b>。
+      </div>
+      <div class="section progress-shell">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-meta">
+          <span id="progressText">等待选择文件</span>
+          <span id="progressPercent">0%</span>
+        </div>
+      </div>
+      <div class="section row-4" style="margin-top:16px;">
+        <button id="uploadBtn" disabled>仅写入 DATA_IN</button>
+        <button id="finishBtn" class="ghost" disabled>仅发送 CTRL</button>
+        <button id="autoFlashBtn" disabled>一键刷写</button>
+        <button id="abortBtn" class="danger" disabled>中止当前任务</button>
+      </div>
+      <div class="footer-note">
+        浏览器要求：建议用 <b>Chrome / Edge / Android Chromium</b>，并通过 <b>http(s)</b> 页面打开。某些桌面浏览器的 <code>file://</code> 下 Web Bluetooth 会被拒绝。若目标为 <b>ESP32</b>，一键刷写最后一步会触发设备重启，BLE 断开属于正常现象。<br>
+        默认 payload 已提高到 <b>480B</b>；如果首包就失败，说明当前系统实际协商到的 ATT MTU 较小，把 payload 手动降回 <b>240B</b> 或更低再试。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>文件与进度</h2>
+      <div class="metric-grid">
+        <div class="metric"><div class="k">文件名</div><div class="v" id="fileName">-</div></div>
+        <div class="metric"><div class="k">文件大小</div><div class="v" id="fileSize">0 B</div></div>
+        <div class="metric"><div class="k">总包数</div><div class="v" id="packetCount">0</div></div>
+        <div class="metric"><div class="k">已写包</div><div class="v" id="sentCount">0</div></div>
+      </div>
+      <div class="section" style="margin-top:16px;">
+        <label class="label">DATA_OUT 通知</label>
+        <div class="noti-box" id="notifyBox"><div class="noti-line">暂无通知</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top:20px;">
+    <h2>运行日志</h2>
+    <div class="log-box" id="logBox"></div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const UUIDS = {
+    service: 0xFFFF,
+    ctrl: 0x0001,
+    dataIn: 0x0002,
+    dataOut: 0x0003,
+    version: 0x0004,
+  };
+
+  const UI_BUILD = '2026-05-07-ble-finishnotify-v15';
+  const BLE_OTA_NOTIFY_ACK = 0xA1;
+  const BLE_OTA_NOTIFY_FINISH = 0xB1;
+  const BLE_OTA_ACK_WINDOW = 8;
+
+  const TARGETS = {
+    gd32: {
+      label: 'GD32',
+      packetCmd: 0x00,
+      ctrlHex: 'F7',
+      recommendedPayload: 480,
+      finishText: '发送 CTRL(F7)',
+      hint: '当前目标：<b>GD32</b>。页面会使用 <b>cmd=0x00</b> 发送数据，最后自动写 <b>CTRL=0xF7</b>，由 ESP32 触发 SPI OTA 中继。'
+    },
+    esp32: {
+      label: 'ESP32',
+      packetCmd: 0x01,
+      ctrlHex: 'F8',
+      recommendedPayload: 480,
+      finishText: '发送 CTRL(F8)',
+      hint: '当前目标：<b>ESP32</b>。页面会使用 <b>cmd=0x01</b> 发送数据，最后自动写 <b>CTRL=0xF8</b>，由 ESP32 完成 OTA 并重启。'
+    }
+  };
+
+  const state = {
+    device: null,
+    server: null,
+    service: null,
+    ctrlChar: null,
+    dataInChar: null,
+    dataOutChar: null,
+    versionChar: null,
+    notificationsEnabled: false,
+    selectedFile: null,
+    selectedFileBytes: null,
+    selectedFileKey: '',
+    abortRequested: false,
+    uploading: false,
+    autoFlashing: false,
+    lastNotificationHex: '',
+    lastAckCmd: null,
+    lastAckSeq: -1,
+    lastAckBytes: 0,
+    ackWaiter: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    connectBtn: $('connectBtn'),
+    disconnectBtn: $('disconnectBtn'),
+    versionBtn: $('versionBtn'),
+    subscribeBtn: $('subscribeBtn'),
+    uploadBtn: $('uploadBtn'),
+    finishBtn: $('finishBtn'),
+    autoFlashBtn: $('autoFlashBtn'),
+    abortBtn: $('abortBtn'),
+    firmwareFile: $('firmwareFile'),
+    payloadSize: $('payloadSize'),
+    targetChip: $('targetChip'),
+    ctrlHex: $('ctrlHex'),
+    protocolHint: $('protocolHint'),
+    connState: $('connState'),
+    connBadge: $('connBadge'),
+    deviceName: $('deviceName'),
+    deviceId: $('deviceId'),
+    gattState: $('gattState'),
+    mtuHint: $('mtuHint'),
+    versionText: $('versionText'),
+    notifyState: $('notifyState'),
+    progressFill: $('progressFill'),
+    progressText: $('progressText'),
+    progressPercent: $('progressPercent'),
+    fileName: $('fileName'),
+    fileSize: $('fileSize'),
+    packetCount: $('packetCount'),
+    sentCount: $('sentCount'),
+    notifyBox: $('notifyBox'),
+    logBox: $('logBox'),
+  };
+
+  function currentTarget() {
+    return TARGETS[els.targetChip.value] || TARGETS.gd32;
+  }
+
+  function log(tag, message, level = 'I') {
+    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const line = document.createElement('div');
+    line.className = 'log-line';
+    line.innerHTML = `<span class="t">[${time}]</span> <span class="tag">[${level}/${tag}]</span> ${escapeHtml(message)}`;
+    els.logBox.appendChild(line);
+    els.logBox.scrollTop = els.logBox.scrollHeight;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
+  function toHex(uint8) {
+    return Array.from(uint8).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+  }
+
+  function hexToBytes(hex) {
+    const clean = hex.replace(/[^0-9a-fA-F]/g, '');
+    if (clean.length === 0 || clean.length % 2 !== 0) throw new Error('HEX 长度必须为偶数');
+    const out = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < clean.length; i += 2) out[i / 2] = parseInt(clean.slice(i, i + 2), 16);
+    return out;
+  }
+
+  function setProgress(percent, text) {
+    const p = Math.max(0, Math.min(100, percent));
+    els.progressFill.style.width = `${p}%`;
+    els.progressPercent.textContent = `${p.toFixed(0)}%`;
+    els.progressText.textContent = text;
+  }
+
+  function setConnectionState(connected) {
+    const idle = connected && state.selectedFile && !state.uploading;
+    const isEsp32Target = currentTarget().label === 'ESP32';
+    els.connState.textContent = connected ? '已连接' : '未连接';
+    els.connBadge.textContent = connected ? 'online' : 'offline';
+    els.connBadge.className = `value ${connected ? 'ok' : 'bad'}`;
+    els.gattState.textContent = connected ? 'GATT 已就绪' : '未就绪';
+    els.disconnectBtn.disabled = !connected;
+    els.versionBtn.disabled = !connected;
+    els.subscribeBtn.disabled = !connected;
+    els.uploadBtn.disabled = !idle;
+    els.finishBtn.disabled = !connected || state.uploading || isEsp32Target;
+    els.autoFlashBtn.disabled = !idle;
+    els.abortBtn.disabled = !state.uploading;
+  }
+
+  function resetUiAfterDisconnect() {
+    state.server = null;
+    state.service = null;
+    state.ctrlChar = null;
+    state.dataInChar = null;
+    state.dataOutChar = null;
+    state.versionChar = null;
+    state.notificationsEnabled = false;
+    state.uploading = false;
+    state.autoFlashing = false;
+    els.deviceName.textContent = '-';
+    els.deviceId.textContent = '-';
+    els.versionText.textContent = '未读取';
+    els.notifyState.textContent = 'notify off';
+    els.notifyState.className = 'value ok';
+    setConnectionState(false);
+  }
+
+  function refreshTargetUi() {
+    const cfg = currentTarget();
+    els.ctrlHex.value = cfg.ctrlHex;
+    els.payloadSize.value = String(cfg.recommendedPayload);
+    els.finishBtn.textContent = cfg.label === 'ESP32' ? 'ESP32 自动完成' : `仅发送 CTRL(${cfg.ctrlHex})`;
+    els.protocolHint.innerHTML = `${cfg.hint} 推荐 payload：<b>${cfg.recommendedPayload}B</b>。协议格式：<b>cmd(1) + seq(2) + total_size(4) + payload + crc占位4</b>。<br><b>传输机制：</b>每 <b>${BLE_OTA_ACK_WINDOW}</b> 包等待一次 DATA_OUT ACK。${cfg.label === 'ESP32' ? ' <br><b>ESP32 模式：</b>最后一包到齐后由设备端自动完成 OTA 并重启，不再发送 CTRL。': ''}`;
+    if (state.selectedFile) updateFileInfo(state.selectedFile);
+    setConnectionState(!!state.server);
+    log('CFG', `目标切换为 ${cfg.label}: packetCmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, ctrl=${cfg.ctrlHex}, payload=${cfg.recommendedPayload}`);
+  }
+
+  async function connectBle() {
+    if (!navigator.bluetooth) {
+      log('BLE', '当前浏览器不支持 Web Bluetooth', 'E');
+      alert('当前浏览器不支持 Web Bluetooth，请使用 Chrome / Edge。');
+      return;
+    }
+
+    try {
+      log('BLE', '打开设备选择器...');
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'ESP32-OTA' }],
+        optionalServices: [UUIDS.service],
+      });
+
+      state.device = device;
+      state.device.addEventListener('gattserverdisconnected', onDisconnected);
+      els.deviceName.textContent = device.name || '未知设备';
+      els.deviceId.textContent = device.id || '-';
+
+      log('BLE', `已选择设备: ${device.name || 'unknown'}`);
+      const server = await device.gatt.connect();
+      state.server = server;
+      state.service = await server.getPrimaryService(UUIDS.service);
+      state.ctrlChar = await state.service.getCharacteristic(UUIDS.ctrl);
+      state.dataInChar = await state.service.getCharacteristic(UUIDS.dataIn);
+      state.dataOutChar = await state.service.getCharacteristic(UUIDS.dataOut);
+      state.versionChar = await state.service.getCharacteristic(UUIDS.version);
+
+      els.mtuHint.textContent = '实际 ATT MTU 由系统协商';
+      setConnectionState(true);
+      log('BLE', 'GATT 服务与特征获取完成');
+    } catch (err) {
+      log('BLE', `连接失败: ${err.message}`, 'E');
+      resetUiAfterDisconnect();
+    }
+  }
+
+  function onDisconnected() {
+    log('BLE', '设备已断开', 'W');
+    resetUiAfterDisconnect();
+  }
+
+  async function disconnectBle() {
+    try {
+      if (state.dataOutChar && state.notificationsEnabled) {
+        await state.dataOutChar.stopNotifications();
+      }
+    } catch (_) {}
+    if (state.device && state.device.gatt && state.device.gatt.connected) {
+      state.device.gatt.disconnect();
+    }
+    resetUiAfterDisconnect();
+  }
+
+  async function readVersion() {
+    try {
+      const value = await state.versionChar.readValue();
+      const text = new TextDecoder().decode(value.buffer).replace(/\0/g, '').trim() || '(空)';
+      els.versionText.textContent = text;
+      log('BLE', `版本: ${text}`);
+    } catch (err) {
+      log('BLE', `读取版本失败: ${err.message}`, 'E');
+    }
+  }
+
+  function handleNotify(event) {
+    const view = event.target.value;
+    const bytes = new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+    const hex = toHex(bytes);
+    state.lastNotificationHex = hex;
+
+    if (bytes.length >= 8 && bytes[0] === BLE_OTA_NOTIFY_ACK) {
+      const ackCmd = bytes[1];
+      const ackSeq = bytes[2] | (bytes[3] << 8);
+      const ackBytes = (bytes[4]) | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24);
+      state.lastAckCmd = ackCmd;
+      state.lastAckSeq = ackSeq;
+      state.lastAckBytes = ackBytes >>> 0;
+
+      if (state.ackWaiter && state.ackWaiter.cmd === ackCmd && ackSeq >= state.ackWaiter.expectedSeq) {
+        const waiter = state.ackWaiter;
+        state.ackWaiter = null;
+        clearTimeout(waiter.timer);
+        waiter.resolve({ seq: ackSeq, bytes: state.lastAckBytes });
+      }
+      return;
+    }
+
+    if (bytes.length >= 6 && bytes[0] === BLE_OTA_NOTIFY_FINISH) {
+      const stage = bytes[1];
+      const value = (bytes[2]) | (bytes[3] << 8) | (bytes[4] << 16) | (bytes[5] << 24);
+      const finishMap = {
+        0x01: '[FINISH] 即将执行 esp_ota_end()',
+        0x02: `[FINISH] esp_ota_end 完成 (耗时=${value} ms)`,
+        0x03: '[FINISH] 即将执行 esp_ota_set_boot_partition()',
+        0x04: `[FINISH] esp_ota_set_boot_partition 完成 (耗时=${value} ms)`,
+        0x05: `[FINISH] 即将进入重启前等待 (${value} ms)`,
+        0x06: `[FINISH] 重启前等待结束 (实际耗时=${value} ms)`,
+        0x07: '[FINISH] ESP32 即将重启',
+        0x81: `[FINISH] esp_ota_end 失败: err=${value}`,
+        0x82: `[FINISH] esp_ota_set_boot_partition 失败: err=${value}`,
+      };
+      log('FINISH', finishMap[stage] || `[FINISH] 未知阶段 stage=0x${stage.toString(16).padStart(2, '0').toUpperCase()} value=${value}`);
+      return;
+    }
+
+    if (els.notifyBox.firstElementChild && els.notifyBox.firstElementChild.textContent === '暂无通知') {
+      els.notifyBox.innerHTML = '';
+    }
+    const div = document.createElement('div');
+    div.className = 'noti-line';
+    div.textContent = hex;
+    els.notifyBox.prepend(div);
+    while (els.notifyBox.children.length > 10) els.notifyBox.removeChild(els.notifyBox.lastChild);
+    log('NOTIFY', hex);
+  }
+
+  function waitForAck(cmd, expectedSeq, timeoutMs = 8000) {
+    if (state.lastAckCmd === cmd && state.lastAckSeq >= expectedSeq) {
+      return Promise.resolve({ seq: state.lastAckSeq, bytes: state.lastAckBytes });
+    }
+    if (state.ackWaiter) {
+      clearTimeout(state.ackWaiter.timer);
+      state.ackWaiter.reject(new Error('ACK waiter 被新的窗口覆盖'));
+      state.ackWaiter = null;
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (state.ackWaiter && state.ackWaiter.expectedSeq === expectedSeq && state.ackWaiter.cmd === cmd) {
+          state.ackWaiter = null;
+        }
+        reject(new Error(`等待 ACK 超时: cmd=0x${cmd.toString(16).padStart(2, '0').toUpperCase()} seq=${expectedSeq}`));
+      }, timeoutMs);
+      state.ackWaiter = { cmd, expectedSeq, resolve, reject, timer };
+    });
+  }
+
+  async function enableNotifications() {
+    try {
+      await state.dataOutChar.startNotifications();
+      state.dataOutChar.removeEventListener('characteristicvaluechanged', handleNotify);
+      state.dataOutChar.addEventListener('characteristicvaluechanged', handleNotify);
+      state.notificationsEnabled = true;
+      els.notifyState.textContent = 'notify on';
+      els.notifyState.className = 'value ok';
+      log('BLE', '已开启 DATA_OUT 通知');
+    } catch (err) {
+      log('BLE', `开启通知失败: ${err.message}`, 'E');
+    }
+  }
+
+  function updateFileInfo(file) {
+    els.fileName.textContent = file ? file.name : '-';
+    els.fileSize.textContent = file ? formatBytes(file.size) : '0 B';
+    const payloadSize = Number(els.payloadSize.value) || 480;
+    const packets = file ? Math.ceil(file.size / payloadSize) : 0;
+    els.packetCount.textContent = String(packets);
+    els.sentCount.textContent = '0';
+
+    state.selectedFileBytes = null;
+    state.selectedFileKey = file ? `${file.name}|${file.size}|${file.lastModified || 0}` : '';
+    state.selectedFile = file || null;
+    setConnectionState(!!state.server);
+    if (file) {
+      setProgress(0, `已选择 ${file.name}`);
+      log('FILE', `已选择: ${file.name} (${formatBytes(file.size)}), 目标=${currentTarget().label}`);
+      preloadSelectedFileBytes().catch((err) => {
+        log('FILE', `预读文件失败: ${err.message}`, 'W');
+      });
+    }
+  }
+
+  async function preloadSelectedFileBytes() {
+    if (!state.selectedFile) {
+      throw new Error('未选择固件文件');
+    }
+    if (state.selectedFileBytes && state.selectedFileBytes.length === state.selectedFile.size) {
+      return state.selectedFileBytes;
+    }
+    const bytes = new Uint8Array(await state.selectedFile.arrayBuffer());
+    state.selectedFileBytes = bytes;
+    log('FILE', `固件已缓存到内存: ${bytes.length} bytes`);
+    return bytes;
+  }
+
+  function buildPacket(seq, totalSize, payload, cmd) {
+    const packet = new Uint8Array(1 + 2 + 4 + payload.length + 4);
+    packet[0] = cmd;
+    packet[1] = seq & 0xFF;
+    packet[2] = (seq >> 8) & 0xFF;
+    packet[3] = totalSize & 0xFF;
+    packet[4] = (totalSize >> 8) & 0xFF;
+    packet[5] = (totalSize >> 16) & 0xFF;
+    packet[6] = (totalSize >> 24) & 0xFF;
+    packet.set(payload, 7);
+    return packet;
+  }
+
+  async function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+  }
+
+  async function drainGattQueue() {
+    // writeValueWithoutResponse 在浏览器/系统蓝牙栈里通常还有内部发送队列。
+    // 方案 B 已对尾包做轻微收油，这里只保留较短的排空等待，避免切 CTRL 太急。
+    await sleep(120);
+  }
+
+  function getTailDelayMs(seq, packetTotal) {
+    const tailPackets = Math.min(24, packetTotal);
+    const tailStart = Math.max(0, packetTotal - tailPackets);
+    if (seq < tailStart) return 0;
+
+    const remaining = packetTotal - (seq + 1);
+    if (remaining >= 12) return 1;
+    if (remaining >= 6) return 2;
+    if (remaining >= 3) return 4;
+    return 8;
+  }
+
+  async function writeCtrlWithRetry(cmd, cfg) {
+    const maxAttempts = 8;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await state.ctrlChar.writeValue(cmd);
+        log('CTRL', `已写入 ${cfg.label} CTRL: ${toHex(cmd)}`);
+        return true;
+      } catch (err) {
+        const msg = String(err && err.message ? err.message : err);
+        if (/GATT operation already in progress/i.test(msg) && attempt < maxAttempts) {
+          const waitMs = Math.min(1200, 120 * attempt);
+          log('CTRL', `CTRL busy，${waitMs}ms 后重试 (${attempt}/${maxAttempts - 1})`, 'W');
+          await sleep(waitMs);
+          continue;
+        }
+        log('CTRL', `写 CTRL 失败: ${msg}`, 'E');
+        return false;
+      }
+    }
+    return false;
+  }
+
+  async function uploadFirmware() {
+    if (!state.selectedFile || !state.dataInChar) return false;
+
+    const cfg = currentTarget();
+    const payloadSize = Math.max(32, Math.min(498, Number(els.payloadSize.value) || 480));
+    const file = state.selectedFile;
+    const totalSize = file.size;
+    const packetTotal = Math.ceil(totalSize / payloadSize);
+
+    state.abortRequested = false;
+    state.uploading = true;
+    state.lastAckCmd = null;
+    state.lastAckSeq = -1;
+    state.lastAckBytes = 0;
+    if (state.ackWaiter) {
+      clearTimeout(state.ackWaiter.timer);
+      state.ackWaiter = null;
+    }
+    setConnectionState(true);
+
+    try {
+      if (!state.notificationsEnabled) {
+        log('BLE', '上传前自动开启 DATA_OUT 通知...');
+        await enableNotifications();
+      }
+      if (!state.notificationsEnabled) {
+        throw new Error('DATA_OUT 通知未开启，无法使用 ACK 模式');
+      }
+
+      log('OTA', `开始准备固件: target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, cmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, ackWindow=${BLE_OTA_ACK_WINDOW}`);
+      let fileBytes = state.selectedFileBytes;
+      if (!fileBytes || fileBytes.length !== totalSize) {
+        setProgress(0, `[${cfg.label}] 正在读取固件文件到内存...`);
+        fileBytes = await preloadSelectedFileBytes();
+      } else {
+        setProgress(0, `[${cfg.label}] 使用已缓存的固件数据...`);
+        log('OTA', `使用缓存固件: ${fileBytes.length} bytes`);
+      }
+      log('OTA', `开始写入 DATA_IN: target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`);
+
+      for (let windowStart = 0; windowStart < packetTotal; windowStart += BLE_OTA_ACK_WINDOW) {
+        if (state.abortRequested) throw new Error('用户中止');
+
+        const endSeq = Math.min(windowStart + BLE_OTA_ACK_WINDOW, packetTotal) - 1;
+        for (let seq = windowStart; seq <= endSeq; seq++) {
+          const start = seq * payloadSize;
+          const end = Math.min(start + payloadSize, totalSize);
+          const payload = fileBytes.slice(start, end);
+          const packet = buildPacket(seq, totalSize, payload, cfg.packetCmd);
+
+          await state.dataInChar.writeValueWithoutResponse(packet);
+
+          const percent = ((seq + 1) / packetTotal) * 100;
+          els.sentCount.textContent = String(seq + 1);
+          setProgress(percent, `[${cfg.label}] 已写 ${seq + 1}/${packetTotal} 包，等待窗口 ACK`);
+
+          if (seq === 0 || seq === endSeq || (seq + 1) % 40 === 0 || seq === packetTotal - 1) {
+            log('OTA', `${cfg.label} 分包 ${seq + 1}/${packetTotal} 已发送`);
+          }
+        }
+
+        const ack = await waitForAck(cfg.packetCmd, endSeq, 10000);
+        if (ack.seq + 1 === packetTotal || ((ack.seq + 1) % (BLE_OTA_ACK_WINDOW * 5)) === 0) {
+          log('OTA', `${cfg.label} 窗口 ACK 已确认: seq=${ack.seq}, bytes=${ack.bytes}`);
+        }
+        await sleep(0);
+      }
+
+      setProgress(100, `[${cfg.label}] 固件数据已全部写入 DATA_IN`);
+      if (cfg.label === 'ESP32') {
+        log('OTA', 'ESP32 数据已写完，设备端将自动完成 OTA 并重启，无需再发 CTRL F8');
+        return true;
+      }
+      log('OTA', `${cfg.label} 数据写入完成，等待 GATT 队列排空...`);
+      await drainGattQueue();
+      log('OTA', `${cfg.label} 数据写入完成，可发送 CTRL ${cfg.ctrlHex}`);
+      return true;
+    } catch (err) {
+      log('OTA', `写入失败: ${err.message}`, 'E');
+      setProgress(0, `写入失败: ${err.message}`);
+      return false;
+    } finally {
+      if (state.ackWaiter) {
+        clearTimeout(state.ackWaiter.timer);
+        state.ackWaiter = null;
+      }
+      state.uploading = false;
+      setConnectionState(!!state.server);
+    }
+  }
+
+  async function sendFinish(explicitHex = '', force = false) {
+    try {
+      const cfg = currentTarget();
+      if (cfg.label === 'ESP32') {
+        log('CTRL', 'ESP32 模式已改为设备端自动完成 OTA，不再发送 CTRL');
+        return true;
+      }
+      const cmdHex = explicitHex || els.ctrlHex.value || cfg.ctrlHex;
+      const cmd = hexToBytes(cmdHex);
+      await drainGattQueue();
+      return await writeCtrlWithRetry(cmd, cfg);
+    } catch (err) {
+      log('CTRL', `写 CTRL 失败: ${err.message}`, 'E');
+      return false;
+    }
+  }
+
+  async function autoFlash() {
+    if (!state.selectedFile || !state.server) return;
+    const cfg = currentTarget();
+    state.autoFlashing = true;
+    try {
+      log('AUTO', `开始一键刷写 -> ${cfg.label}`);
+      const ok = await uploadFirmware();
+      if (!ok || state.abortRequested) {
+        log('AUTO', '一键刷写中止', 'W');
+        return;
+      }
+      if (cfg.label === 'ESP32') {
+        setProgress(100, '[ESP32] 数据已写入，等待设备自动完成 OTA 并重启');
+        log('AUTO', 'ESP32 只走新固件流程：设备端自动完成 OTA 并重启，不再回退发送 CTRL F8');
+        return;
+      }
+      setProgress(100, `[${cfg.label}] 数据已写入，正在发送 CTRL ${cfg.ctrlHex}`);
+      const finishOk = await sendFinish(cfg.ctrlHex);
+      if (finishOk) {
+        log('AUTO', 'GD32 CTRL 已发送，已触发 OTA 中继');
+      }
+    } catch (err) {
+      log('AUTO', `一键刷写异常: ${err && err.message ? err.message : err}`, 'E');
+      setProgress(0, `一键刷写异常: ${err && err.message ? err.message : err}`);
+    } finally {
+      state.autoFlashing = false;
+      setConnectionState(!!state.server);
+    }
+  }
+
+  function abortTask() {
+    state.abortRequested = true;
+    log('OTA', '已请求中止，等待当前分包返回');
+  }
+
+  els.connectBtn.addEventListener('click', connectBle);
+  els.disconnectBtn.addEventListener('click', disconnectBle);
+  els.versionBtn.addEventListener('click', readVersion);
+  els.subscribeBtn.addEventListener('click', enableNotifications);
+  els.uploadBtn.addEventListener('click', uploadFirmware);
+  els.finishBtn.addEventListener('click', () => sendFinish());
+  els.autoFlashBtn.addEventListener('click', autoFlash);
+  els.abortBtn.addEventListener('click', abortTask);
+  els.firmwareFile.addEventListener('change', (e) => updateFileInfo(e.target.files[0] || null));
+  els.payloadSize.addEventListener('change', () => updateFileInfo(state.selectedFile));
+  els.targetChip.addEventListener('change', refreshTargetUi);
+
+  refreshTargetUi();
+  setConnectionState(false);
+  log('SYS', `Web Bluetooth 刷写台已就绪 (${UI_BUILD})`);
+})();
+</script>
+</body>
+</html>

@@ -2,14 +2,15 @@
  * ble_ota.cpp - BLE OTA GATT 服务器实现 (ESP-IDF 6.0 NimBLE)
  * T5.1 - T5.5
  *
- * 通过 BLE GATT 接收上位机固件，存储到 Flash (gd32_ota 分区)，
- * 接收完成后触发 OTA 中继任务转发到 GD32。
+ * 通过 BLE GATT 接收上位机固件，支持两种目标:
+ *   - GD32: 存入 Flash → 触发 SPI 中继转发到 GD32
+ *   - ESP32: 直接写入 OTA 分区 → 触发重启升级自身
  *
  * GATT 服务:
  *   Service UUID: 0xFFFF
- *   - CTRL (0x0001, Write):     写入 0xF7 触发中继
- *   - DATA_IN (0x0002, Write):  接收固件数据块
- *   - DATA_OUT (0x0003, Notify): 推送 GD32 响应
+ *   - CTRL (0x0001, Write):     0xF7=触发GD32中继, 0xF8=触发ESP32 OTA升级
+ *   - DATA_IN (0x0002, Write):  cmd=0x00=GD32数据, cmd=0x01=ESP32数据
+ *   - DATA_OUT (0x0003, Notify): 推送响应
  *   - VERSION (0x0004, Read):   固件版本
  */
 #include <string.h>
@@ -19,6 +20,9 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_err.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 
 // NimBLE 协议栈
 #include "nimble/nimble_port.h"
@@ -27,6 +31,7 @@
 #include "host/ble_gap.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "host/ble_att.h"
 
 #include "app_config.h"
 #include "ble_ota.h"
@@ -35,6 +40,25 @@
 #include "monitor/debug_log.h"
 
 #define TAG "BLE_OTA"
+#define BLE_OTA_NOTIFY_ACK 0xA1
+#define BLE_OTA_NOTIFY_FINISH 0xB1
+#define BLE_OTA_FINISH_BEGIN_OTA_END 0x01
+#define BLE_OTA_FINISH_DONE_OTA_END 0x02
+#define BLE_OTA_FINISH_BEGIN_SET_BOOT 0x03
+#define BLE_OTA_FINISH_DONE_SET_BOOT 0x04
+#define BLE_OTA_FINISH_BEGIN_DELAY 0x05
+#define BLE_OTA_FINISH_DONE_DELAY 0x06
+#define BLE_OTA_FINISH_REBOOT_NOW 0x07
+#define BLE_OTA_FINISH_ERR_OTA_END 0x81
+#define BLE_OTA_FINISH_ERR_SET_BOOT 0x82
+#define BLE_OTA_ACK_WINDOW 8
+
+// ============================================================
+// 前向声明（GAP event handler 在广播函数之前定义，需要声明）
+// ============================================================
+static void ble_ota_start_advertising(void);
+static void ble_ota_send_window_ack(uint8_t cmd, uint16_t seq, uint32_t completed_bytes);
+static void ble_ota_send_finish_event(uint8_t stage, uint32_t value);
 
 // ============================================================
 // 静态状态
@@ -45,6 +69,97 @@ static bool   s_ble_connected = false;            // GATT 客户端已连接
 /** @brief 当前 BLE 连接句柄。 */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_data_out_val_handle = 0;        // DATA_OUT 值句柄 (供通知用)
+
+// ESP32 自身 OTA 状态
+static bool s_esp32_ota_active = false;
+static esp_ota_handle_t s_esp32_ota_handle = 0;
+static const esp_partition_t *s_esp32_update_partition = NULL;
+static size_t s_esp32_received = 0;
+static bool s_esp32_reboot_pending = false;
+static uint8_t s_esp32_last_cmd = 0;
+static uint16_t s_esp32_last_seq = 0xFFFFU;
+
+static void ble_esp32_finish_and_reboot_task(void *pvParameters)
+{
+    (void)pvParameters;
+    DEBUG_INFO(TAG, "ESP32 OTA 异步收尾任务启动");
+
+    if (s_esp32_last_seq != 0xFFFFU) {
+        ble_ota_send_window_ack(s_esp32_last_cmd, s_esp32_last_seq, (uint32_t)s_esp32_received);
+        DEBUG_INFO(TAG, "ESP32 最终 ACK 已补发: seq=%u", s_esp32_last_seq);
+    }
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    if (!s_esp32_ota_active || s_esp32_update_partition == NULL) {
+        DEBUG_WARN(TAG, "异步收尾时 OTA 状态无效，放弃重启");
+        s_esp32_reboot_pending = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    DEBUG_INFO(TAG, "ESP32 OTA 收尾: 共 %u 字节, 设置启动分区...", (unsigned int)s_esp32_received);
+
+    int64_t t0_us = esp_timer_get_time();
+    DEBUG_INFO(TAG, "[FINISH] 即将执行 esp_ota_end()");
+    ble_ota_send_finish_event(BLE_OTA_FINISH_BEGIN_OTA_END, 0);
+    esp_err_t err = esp_ota_end(s_esp32_ota_handle);
+    int64_t t1_us = esp_timer_get_time();
+    if (err != ESP_OK) {
+        DEBUG_ERR(TAG, "[FINISH] esp_ota_end 失败: %s (耗时=%lld ms)",
+                  esp_err_to_name(err), (long long)((t1_us - t0_us) / 1000));
+        ble_ota_send_finish_event(BLE_OTA_FINISH_ERR_OTA_END, (uint32_t)err);
+        esp_ota_abort(s_esp32_ota_handle);
+        s_esp32_ota_active = false;
+        s_esp32_ota_handle = 0;
+        s_esp32_update_partition = NULL;
+        s_esp32_received = 0;
+        s_esp32_reboot_pending = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    DEBUG_INFO(TAG, "[FINISH] esp_ota_end 完成 (耗时=%lld ms)",
+               (long long)((t1_us - t0_us) / 1000));
+    ble_ota_send_finish_event(BLE_OTA_FINISH_DONE_OTA_END, (uint32_t)((t1_us - t0_us) / 1000));
+
+    int64_t t2_us = esp_timer_get_time();
+    DEBUG_INFO(TAG, "[FINISH] 即将执行 esp_ota_set_boot_partition()");
+    ble_ota_send_finish_event(BLE_OTA_FINISH_BEGIN_SET_BOOT, 0);
+    err = esp_ota_set_boot_partition(s_esp32_update_partition);
+    int64_t t3_us = esp_timer_get_time();
+    if (err != ESP_OK) {
+        DEBUG_ERR(TAG, "[FINISH] 设置启动分区失败: %s (耗时=%lld ms)",
+                  esp_err_to_name(err), (long long)((t3_us - t2_us) / 1000));
+        ble_ota_send_finish_event(BLE_OTA_FINISH_ERR_SET_BOOT, (uint32_t)err);
+        s_esp32_ota_active = false;
+        s_esp32_ota_handle = 0;
+        s_esp32_update_partition = NULL;
+        s_esp32_received = 0;
+        s_esp32_reboot_pending = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    DEBUG_INFO(TAG, "[FINISH] esp_ota_set_boot_partition 完成 (耗时=%lld ms)",
+               (long long)((t3_us - t2_us) / 1000));
+    ble_ota_send_finish_event(BLE_OTA_FINISH_DONE_SET_BOOT, (uint32_t)((t3_us - t2_us) / 1000));
+
+    s_esp32_ota_active = false;
+    s_esp32_ota_handle = 0;
+    s_esp32_update_partition = NULL;
+    s_esp32_received = 0;
+
+    DEBUG_INFO(TAG, "ESP32 OTA 收尾完成，800ms 后重启...");
+    int64_t t4_us = esp_timer_get_time();
+    DEBUG_INFO(TAG, "[FINISH] 即将进入 800ms 重启前等待");
+    ble_ota_send_finish_event(BLE_OTA_FINISH_BEGIN_DELAY, 800);
+    vTaskDelay(pdMS_TO_TICKS(800));
+    int64_t t5_us = esp_timer_get_time();
+    DEBUG_INFO(TAG, "[FINISH] 800ms 等待结束 (实际耗时=%lld ms)",
+               (long long)((t5_us - t4_us) / 1000));
+    ble_ota_send_finish_event(BLE_OTA_FINISH_DONE_DELAY, (uint32_t)((t5_us - t4_us) / 1000));
+    DEBUG_INFO(TAG, "ESP32 即将重启");
+    ble_ota_send_finish_event(BLE_OTA_FINISH_REBOOT_NOW, 0);
+    esp_restart();
+}
 
 // ============================================================
 // NimBLE 工具: 从 mbuf 读取原始数据
@@ -63,6 +178,116 @@ static int ble_ota_mbuf_to_buf(struct os_mbuf *om, uint8_t *buf, size_t buf_len)
     os_mbuf_copydata(om, 0, copy_len, buf);
     return (int)copy_len;
 }
+
+static esp_err_t ble_esp32_ota_begin(size_t total_size)
+{
+    const esp_partition_t *boot_partition = esp_ota_get_running_partition();
+    DEBUG_INFO(TAG, "当前启动分区: %s, size=%u, address=0x%lx",
+               boot_partition->label, boot_partition->size, boot_partition->address);
+
+    if (s_esp32_ota_active) {
+        DEBUG_WARN(TAG, "检测到未完成的 ESP32 OTA，会先中止旧会话");
+        esp_ota_abort(s_esp32_ota_handle);
+        s_esp32_ota_active = false;
+        s_esp32_ota_handle = 0;
+        s_esp32_update_partition = NULL;
+        s_esp32_received = 0;
+        s_esp32_reboot_pending = false;
+        s_esp32_last_seq = 0xFFFFU;
+    }
+
+    s_esp32_update_partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    if (s_esp32_update_partition == NULL ||
+        s_esp32_update_partition->address == boot_partition->address) {
+        s_esp32_update_partition = esp_partition_find_first(
+            ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+    }
+
+    if (s_esp32_update_partition == NULL) {
+        DEBUG_ERR(TAG, "找不到可用的 OTA 分区");
+        return ESP_FAIL;
+    }
+
+    DEBUG_INFO(TAG, "ESP32 OTA 目标分区: %s, size=%u, address=0x%lx",
+               s_esp32_update_partition->label,
+               s_esp32_update_partition->size,
+               s_esp32_update_partition->address);
+
+    if (total_size > s_esp32_update_partition->size) {
+        DEBUG_ERR(TAG, "ESP32 固件太大: %u > 分区大小: %u",
+                  total_size, s_esp32_update_partition->size);
+        s_esp32_update_partition = NULL;
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_ota_begin(s_esp32_update_partition, total_size, &s_esp32_ota_handle);
+    if (err != ESP_OK) {
+        DEBUG_ERR(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(err));
+        s_esp32_update_partition = NULL;
+        s_esp32_ota_handle = 0;
+        return err;
+    }
+
+    s_esp32_received = 0;
+    s_esp32_ota_active = true;
+    s_esp32_reboot_pending = false;
+    s_esp32_last_cmd = 0;
+    s_esp32_last_seq = 0xFFFFU;
+    DEBUG_INFO(TAG, "ESP32 OTA 开始，目标分区: %s", s_esp32_update_partition->label);
+    return ESP_OK;
+}
+
+static esp_err_t ble_esp32_ota_write(const uint8_t *data, size_t len)
+{
+    if (!s_esp32_ota_active || s_esp32_update_partition == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = esp_ota_write(s_esp32_ota_handle, data, len);
+    if (err == ESP_OK) {
+        s_esp32_received += len;
+    }
+    return err;
+}
+
+static void ble_ota_send_window_ack(uint8_t cmd, uint16_t seq, uint32_t completed_bytes)
+{
+    uint8_t ack[8] = {0};
+    ack[0] = BLE_OTA_NOTIFY_ACK;
+    ack[1] = cmd;
+    ack[2] = (uint8_t)(seq & 0xFFU);
+    ack[3] = (uint8_t)((seq >> 8) & 0xFFU);
+    ack[4] = (uint8_t)(completed_bytes & 0xFFU);
+    ack[5] = (uint8_t)((completed_bytes >> 8) & 0xFFU);
+    ack[6] = (uint8_t)((completed_bytes >> 16) & 0xFFU);
+    ack[7] = (uint8_t)((completed_bytes >> 24) & 0xFFU);
+
+    esp_err_t err = ble_ota_notify_response(ack, sizeof(ack));
+    if (err != ESP_OK) {
+        DEBUG_WARN(TAG, "发送 ACK 失败: cmd=0x%02X seq=%u err=%s",
+                   cmd, seq, esp_err_to_name(err));
+    } else {
+        DEBUG_DBG(TAG, "已发送 ACK: cmd=0x%02X seq=%u bytes=%lu",
+                  cmd, seq, (unsigned long)completed_bytes);
+    }
+}
+
+static void ble_ota_send_finish_event(uint8_t stage, uint32_t value)
+{
+    uint8_t pkt[6] = {0};
+    pkt[0] = BLE_OTA_NOTIFY_FINISH;
+    pkt[1] = stage;
+    pkt[2] = (uint8_t)(value & 0xFFU);
+    pkt[3] = (uint8_t)((value >> 8) & 0xFFU);
+    pkt[4] = (uint8_t)((value >> 16) & 0xFFU);
+    pkt[5] = (uint8_t)((value >> 24) & 0xFFU);
+    esp_err_t err = ble_ota_notify_response(pkt, sizeof(pkt));
+    if (err != ESP_OK) {
+        DEBUG_WARN(TAG, "发送 FINISH 事件失败: stage=0x%02X err=%s",
+                   stage, esp_err_to_name(err));
+    }
+}
+
 
 // ============================================================
 // GATT 访问回调
@@ -92,19 +317,42 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
 
     DEBUG_INFO(TAG, "CTRL 写入: cmd=0x%02X", buf[0]);
 
-    if (buf[0] == 0xF7) {
-        // 检查固件是否存储完毕
+    if (buf[0] == BLE_OTA_CTRL_TRIGGER_GD32) {
+        // 检查固件是否存储完毕 → 触发 GD32 OTA 中继
         ota_meta_t meta;
         esp_err_t err = meta_load(&meta);
         if (err == ESP_OK &&
             meta.total_size > 0 &&
             meta.stored_size >= meta.total_size) {
-            DEBUG_INFO(TAG, "固件就绪 (%" PRIu32 " / %" PRIu32 " 字节)，触发中继",
+            DEBUG_INFO(TAG, "GD32 固件就绪 (%" PRIu32 " / %" PRIu32 " 字节)，触发中继",
                        meta.stored_size, meta.total_size);
             ble_ota_signal_relay();
         } else {
-            DEBUG_WARN(TAG, "固件未就绪, 未触发中继 (stored=%" PRIu32 ", total=%" PRIu32 ")",
+            DEBUG_WARN(TAG, "GD32 固件未就绪 (stored=%" PRIu32 ", total=%" PRIu32 ")",
                        meta.stored_size, meta.total_size);
+        }
+    } else if (buf[0] == BLE_OTA_CTRL_TRIGGER_ESP32) {
+        if (!s_esp32_ota_active || s_esp32_update_partition == NULL) {
+            DEBUG_WARN(TAG, "ESP32 OTA 未激活，无法触发升级");
+            return 0;
+        }
+        if (s_esp32_reboot_pending) {
+            DEBUG_WARN(TAG, "ESP32 OTA 收尾已在进行中，忽略重复 CTRL");
+            return 0;
+        }
+
+        s_esp32_reboot_pending = true;
+        BaseType_t ok = xTaskCreate(ble_esp32_finish_and_reboot_task,
+                                    "ble_ota_finish",
+                                    4096,
+                                    NULL,
+                                    5,
+                                    NULL);
+        if (ok != pdPASS) {
+            DEBUG_ERR(TAG, "创建 ESP32 OTA 收尾任务失败");
+            s_esp32_reboot_pending = false;
+        } else {
+            DEBUG_INFO(TAG, "ESP32 OTA 收尾任务已创建（由设备端异步完成）");
         }
     }
 
@@ -158,7 +406,78 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
     DEBUG_DBG(TAG, "DATA_IN: cmd=0x%02X seq=%u total=%" PRIu32 " payload=%zu",
               cmd, seq, total_size, data_len);
 
-    // --- 首个分块: 创建存储元数据 ---
+    // --- ESP32 自身 OTA：直接写 OTA 分区 ---
+    if (cmd == BLE_OTA_CMD_ESP32_DATA) {
+        if (seq == 0) {
+            if (total_size == 0) {
+                DEBUG_ERR(TAG, "ESP32 固件大小非法: %" PRIu32, total_size);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            const esp_partition_t *boot_partition = esp_ota_get_running_partition();
+            const esp_partition_t *check_partition = esp_partition_find_first(
+                ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+            if (check_partition == NULL || check_partition->address == boot_partition->address) {
+                check_partition = esp_partition_find_first(
+                    ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+            }
+            if (check_partition == NULL) {
+                DEBUG_ERR(TAG, "找不到 ESP32 OTA 目标分区");
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            if (total_size > check_partition->size) {
+                DEBUG_ERR(TAG, "ESP32 固件太大: %" PRIu32 " > OTA分区 %u",
+                          total_size, check_partition->size);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            esp_err_t err = ble_esp32_ota_begin(total_size);
+            if (err != ESP_OK) {
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+        }
+
+        esp_err_t err = ble_esp32_ota_write(&buf[data_offset], data_len);
+        if (err != ESP_OK) {
+            DEBUG_ERR(TAG, "ESP32 OTA 写入失败: seq=%u err=%s",
+                      seq, esp_err_to_name(err));
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+
+        DEBUG_DBG(TAG, "ESP32 OTA 写入成功: seq=%u received=%u",
+                  seq, (unsigned int)s_esp32_received);
+
+        if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
+            (total_size > 0 && s_esp32_received >= total_size)) {
+            ble_ota_send_window_ack(cmd, seq, (uint32_t)s_esp32_received);
+        }
+
+        if (total_size > 0 && s_esp32_received >= total_size) {
+            DEBUG_INFO(TAG, "★ ESP32 固件接收完毕: %u / %" PRIu32 " 字节 (共 %u 块)",
+                       (unsigned int)s_esp32_received, total_size, seq + 1);
+            s_esp32_last_cmd = cmd;
+            s_esp32_last_seq = seq;
+
+            if (!s_esp32_reboot_pending) {
+                s_esp32_reboot_pending = true;
+                BaseType_t ok = xTaskCreate(ble_esp32_finish_and_reboot_task,
+                                            "ble_ota_finish",
+                                            4096,
+                                            NULL,
+                                            5,
+                                            NULL);
+                if (ok != pdPASS) {
+                    DEBUG_ERR(TAG, "创建 ESP32 OTA 收尾任务失败");
+                    s_esp32_reboot_pending = false;
+                    return BLE_ATT_ERR_UNLIKELY;
+                }
+                DEBUG_INFO(TAG, "ESP32 OTA 收尾任务已创建，等待设备端自动重启");
+            } else {
+                DEBUG_WARN(TAG, "ESP32 OTA 收尾任务已存在，忽略重复完成触发");
+            }
+        }
+        return 0;
+    }
+
+    // --- GD32 OTA：首个分块时创建存储元数据 ---
     if (seq == 0 && total_size > 0) {
         if (total_size > OTA_MAX_FIRMWARE_SIZE) {
             DEBUG_ERR(TAG, "固件太大: %" PRIu32 " > %zu",
@@ -170,7 +489,7 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
         meta.total_size  = total_size;
         meta.stored_size = 0;
         meta.last_seq    = 0;
-        meta.chunk_count = (total_size + (OTA_BLOCK_SIZE - 1)) / OTA_BLOCK_SIZE;
+        meta.chunk_count = (total_size + (uint32_t)data_len - 1U) / (uint32_t)data_len;
 
         esp_err_t err = meta_save(&meta);
         if (err != ESP_OK) {
@@ -178,12 +497,31 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
             return BLE_ATT_ERR_UNLIKELY;
         }
 
-        DEBUG_INFO(TAG, "固件存储开始: total=%" PRIu32 " chunk_count=%" PRIu32,
-                   meta.total_size, meta.chunk_count);
+        DEBUG_INFO(TAG, "GD32 固件存储开始: total=%" PRIu32 " chunk_count=%" PRIu32 ", payload=%zu",
+                   meta.total_size, meta.chunk_count, data_len);
     }
 
-    // --- 写入 Flash ---
-    uint32_t flash_offset = seq * OTA_BLOCK_SIZE;
+    ota_meta_t meta = {};
+    if (meta_load(&meta) != ESP_OK || meta.total_size == 0) {
+        DEBUG_ERR(TAG, "GD32 元数据无效，拒绝写入: seq=%u", seq);
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    if (seq > 0 && meta.last_seq != (uint32_t)(seq - 1)) {
+        DEBUG_ERR(TAG, "GD32 分包序号不连续: seq=%u last_seq=%" PRIu32,
+                  seq, meta.last_seq);
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    // --- GD32 写入 Flash ---
+    // 按已存储字节数顺序追加，兼容更大的 BLE payload，避免把步长硬编码死。
+    uint32_t flash_offset = meta.stored_size;
+    if (flash_offset + (uint32_t)data_len > meta.total_size) {
+        DEBUG_ERR(TAG, "GD32 写入越界: offset=%" PRIu32 " len=%zu total=%" PRIu32,
+                  flash_offset, data_len, meta.total_size);
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
     esp_err_t err = flash_write_chunk(flash_offset, &buf[data_offset], data_len);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "Flash 写入失败: seq=%u offset=%" PRIu32 " err=%s",
@@ -191,17 +529,25 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    err = meta_update(flash_offset + data_len, seq);
+    uint32_t stored_size = flash_offset + (uint32_t)data_len;
+    err = meta_update(stored_size, seq);
     if (err != ESP_OK) {
         DEBUG_WARN(TAG, "元数据更新失败 (seq=%u)", seq);
     }
 
-    // --- 检查是否接收完毕 ---
-    ota_meta_t meta;
+    if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
+        (meta.total_size > 0 && stored_size >= meta.total_size)) {
+        ble_ota_send_window_ack(cmd, seq, stored_size);
+    }
+
+    DEBUG_DBG(TAG, "Flash 写入成功: seq=%u offset=%" PRIu32 " stored=%" PRIu32,
+              seq, flash_offset, stored_size);
+
+    // --- 检查 GD32 固件是否接收完毕 ---
     if (meta_load(&meta) == ESP_OK &&
         meta.total_size > 0 &&
         meta.stored_size >= meta.total_size) {
-        DEBUG_INFO(TAG, "★ 固件接收完毕: %" PRIu32 " / %" PRIu32 " 字节 (共 %u 块)",
+        DEBUG_INFO(TAG, "★ GD32 固件接收完毕: %" PRIu32 " / %" PRIu32 " 字节 (共 %u 块)",
                    meta.stored_size, meta.total_size, seq + 1);
     }
 
@@ -223,7 +569,7 @@ static int ble_ota_version_access(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
     }
 
-    const char *version = "1.0.0";
+    const char *version = FW_VERSION;
     int rc = os_mbuf_append(ctxt->om, version, strlen(version));
     return (rc == 0) ? 0 : BLE_ATT_ERR_UNLIKELY;
 }
@@ -326,6 +672,22 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
             /** @brief 当前 BLE 连接句柄。 */
             s_conn_handle   = event->connect.conn_handle;
             DEBUG_INFO(TAG, "BLE 客户端已连接: handle=%d", s_conn_handle);
+
+            // 向对端请求更快的连接参数，提升 OTA 吞吐
+            struct ble_gap_upd_params up = {};
+            up.itvl_min        = 6;      // 7.5 ms 最小连接间隔
+            up.itvl_max        = 12;     // 15 ms 最大连接间隔
+            up.latency         = 0;      // 无延迟
+            up.supervision_timeout = 2000; // 2 秒监控超时
+            up.min_ce_len      = 0;      // 控制器自行决定
+            up.max_ce_len      = 0;
+            int rc = ble_gap_update_params(s_conn_handle, &up);
+            if (rc != 0) {
+                DEBUG_WARN(TAG, "请求更新连接参数失败: rc=%d（对端不一定接受，继续运行）", rc);
+            } else {
+                DEBUG_INFO(TAG, "已请求更快的连接参数: itvl=%.1f-%.1fms latency=0",
+                           up.itvl_min * 1.25f, up.itvl_max * 1.25f);
+            }
         } else {
             DEBUG_WARN(TAG, "BLE 连接失败: status=%d", event->connect.status);
             /** @brief BLE GATT 客户端连接状态。 */
@@ -341,14 +703,12 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
         /** @brief 当前 BLE 连接句柄。 */
         s_conn_handle   = BLE_HS_CONN_HANDLE_NONE;
         // 恢复广播以接受新连接
-        ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                          NULL, ble_ota_gap_event, NULL);
+        ble_ota_start_advertising();
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
         DEBUG_INFO(TAG, "广播周期结束，重新开始");
-        ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                          NULL, ble_ota_gap_event, NULL);
+        ble_ota_start_advertising();
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -377,6 +737,26 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
  */
 static void ble_ota_start_advertising(void)
 {
+    int rc;
+
+    // 自动推断可用地址类型（优先 Public，不可用则生成 Random）
+    uint8_t own_addr_type;
+    rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    if (rc != 0) {
+        DEBUG_ERR(TAG, "推断地址类型失败: rc=%d, 尝试生成随机地址", rc);
+        // 生成不可解析随机地址作为 fallback
+        ble_addr_t rnd_addr;
+        rc = ble_hs_id_gen_rnd(0, &rnd_addr);
+        if (rc != 0) {
+            DEBUG_ERR(TAG, "生成随机地址也失败: rc=%d, BLE 广播无法启动", rc);
+            return;
+        }
+        own_addr_type = rnd_addr.type;
+    }
+
+    DEBUG_INFO(TAG, "使用地址类型: %s", own_addr_type == BLE_OWN_ADDR_PUBLIC ? "Public" : "Random");
+
+    // --- 构建广播数据 ---
     uint8_t adv_data[31] = {0};
     int     adv_pos = 0;
 
@@ -396,7 +776,7 @@ static void ble_ota_start_advertising(void)
     memcpy(&adv_data[adv_pos], name, name_len);
     adv_pos += name_len;
 
-    int rc = ble_gap_adv_set_data(adv_data, adv_pos);
+    rc = ble_gap_adv_set_data(adv_data, adv_pos);
     if (rc != 0) {
         DEBUG_ERR(TAG, "设置广播数据失败: %d", rc);
         return;
@@ -423,12 +803,7 @@ static void ble_ota_start_advertising(void)
     struct ble_gap_adv_params adv_params = {};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    // 从 kconfig 获取 BLE 地址类型，默认 Public
-#ifdef CONFIG_BLE_ADDR_TYPE_PUBLIC
-    uint8_t own_addr_type = BLE_OWN_ADDR_PUBLIC;
-#else
-    uint8_t own_addr_type = BLE_OWN_ADDR_RANDOM;
-#endif
+    // own_addr_type 已在上面由 ble_hs_id_infer_auto 推断
 
     rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, ble_ota_gap_event, NULL);
@@ -512,6 +887,13 @@ esp_err_t ble_ota_server_start(void)
     rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
     if (rc != 0) {
         DEBUG_WARN(TAG, "设置设备名称失败: %d", rc);
+    }
+
+    rc = ble_att_set_preferred_mtu(BLE_MTU_SIZE);
+    if (rc != 0) {
+        DEBUG_WARN(TAG, "设置首选 MTU 失败: %d", rc);
+    } else {
+        DEBUG_INFO(TAG, "首选 ATT MTU 已设置: %u", (unsigned)BLE_MTU_SIZE);
     }
 
     // 5. 配置 Host 回调
