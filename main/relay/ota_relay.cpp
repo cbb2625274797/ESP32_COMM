@@ -9,7 +9,8 @@
 #include "freertos/queue.h"
 #include "esp_err.h"
 #include "esp_partition.h"
-#include "cJSON.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "aes/esp_aes.h"
 
 #include "ota_relay.h"
@@ -26,6 +27,11 @@ static const esp_partition_t *g_gd32_partition = NULL;
 static session_ctx_t g_session_ctx;
 static uint8_t g_nonce_server[16] = {0};
 static uint8_t g_k_session[16] = {0};
+static uint8_t g_gd32_uid_runtime[12] = {0};
+
+static constexpr size_t GD32_UID_LEN = 12;
+static constexpr size_t GD32_CHALLENGE_CIPHER_LEN = 32;
+static constexpr size_t GD32_CHALLENGE_PAYLOAD_WITH_SESSION = 36;
 
 /** @brief OTA 命令分发队列，从 WiFi/BLE 任务接收指令。 */
 QueueHandle_t g_ota_dispatch_queue = NULL;
@@ -62,7 +68,161 @@ static ota_result_t relay_packets_from_flash(void);
  * @return 操作结果码。
  */
 static ota_result_t finish_ota(void);
+static int aes128_ecb_encrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out);
+static int aes128_ecb_decrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out);
 
+/**
+ * @brief 判断响应负载是否为带序号的结构化 ACK。
+ * @param payload 响应负载指针。
+ * @param len 负载长度。
+ * @param expected_seq 期望的序号。
+ * @return 匹配返回 true，否则返回 false。
+ */
+static bool is_structured_ack_with_seq(const uint8_t *payload, size_t len, uint32_t expected_seq)
+{
+    if (!payload || len < 6) return false;
+    if (payload[0] != 0xBA || payload[1] != 0xC0) return false;
+    uint32_t seq = (uint32_t)payload[2] | ((uint32_t)payload[3] << 8) |
+                   ((uint32_t)payload[4] << 16) | ((uint32_t)payload[5] << 24);
+    return seq == expected_seq;
+}
+
+/**
+ * @brief 解析结构化错误响应中的序号和错误码。
+ * @param payload 响应负载指针。
+ * @param len 负载长度。
+ * @param seq_out 输出错误对应序号，可为 NULL。
+ * @param err_out 输出错误码，可为 NULL。
+ * @return 解析成功返回 true，否则返回 false。
+ */
+static bool parse_structured_error(const uint8_t *payload, size_t len, uint32_t *seq_out, uint8_t *err_out)
+{
+    if (!payload || len < 7) return false;
+    if (payload[0] != 0xBA || payload[1] != 0xC0) return false;
+    if (seq_out) {
+        *seq_out = (uint32_t)payload[2] | ((uint32_t)payload[3] << 8) |
+                   ((uint32_t)payload[4] << 16) | ((uint32_t)payload[5] << 24);
+    }
+    if (err_out) *err_out = payload[6];
+    return true;
+}
+
+/**
+ * @brief 判断缓冲区是否全部由指定字节值组成。
+ * @param buf 输入缓冲区。
+ * @param len 缓冲区长度。
+ * @param value 目标字节值。
+ * @return 全部匹配返回 true，否则返回 false。
+ */
+static bool bytes_all_value(const uint8_t *buf, size_t len, uint8_t value)
+{
+    if (!buf || len == 0) return false;
+    for (size_t i = 0; i < len; ++i) {
+        if (buf[i] != value) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief 按小端序读取 4 字节无符号整数。
+ * @param p 输入字节指针（至少 4 字节）。
+ * @return 读取出的 uint32_t 数值。
+ */
+static uint32_t read_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+/**
+ * @brief 解析并校验 GD32 Challenge 响应，提取会话密钥和 UID。
+ * @param resp_payload Challenge 响应数据。
+ * @param resp_len 响应长度。
+ * @param out_k_session 输出会话密钥（16 字节）。
+ * @param out_uid 输出 UID（GD32_UID_LEN 字节）。
+ * @return 校验通过返回 true，否则返回 false。
+ */
+static bool parse_and_verify_challenge_payload(const uint8_t *resp_payload, size_t resp_len,
+                                               uint8_t *out_k_session, uint8_t *out_uid)
+{
+    if (!resp_payload || !out_k_session || !out_uid) return false;
+
+    const uint8_t *cipher_blob = resp_payload;
+    size_t cipher_len = resp_len;
+    if (resp_len == GD32_CHALLENGE_PAYLOAD_WITH_SESSION) {
+        uint32_t session_num = read_u32_le(resp_payload);
+        DEBUG_INFO("OTA", "CHALLENGE session_num=0x%08" PRIX32, session_num);
+        cipher_blob = resp_payload + 4;
+        cipher_len = GD32_CHALLENGE_CIPHER_LEN;
+    }
+
+    if (cipher_len != GD32_CHALLENGE_CIPHER_LEN) {
+        DEBUG_ERR("OTA", "CHALLENGE validate failed: invalid payload length=%u", (unsigned)resp_len);
+        return false;
+    }
+/*
+    if (cipher_len != GD32_CHALLENGE_CIPHER_LEN) {
+        DEBUG_ERR("OTA", "CHALLENGE payload长度异常: %u", (unsigned)resp_len);
+        return false;
+    }
+
+*/
+    uint8_t expected_nonce_block[16] = {0};
+    if (aes128_ecb_encrypt_block_local(MASTER_KEY, g_nonce_server, expected_nonce_block) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE validate failed: nonce block encrypt failed");
+        return false;
+    }
+/*
+    if (aes128_ecb_encrypt_block_local(MASTER_KEY, g_nonce_server, expected_nonce_block) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: 计算nonce加密块失败");
+        return false;
+    }
+
+*/
+    if (memcmp(cipher_blob, expected_nonce_block, sizeof(expected_nonce_block)) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: nonce加密块不匹配");
+        return false;
+    }
+
+    memcpy(out_k_session, expected_nonce_block, sizeof(expected_nonce_block));
+
+    uint8_t device_info[16] = {0};
+    if (aes128_ecb_decrypt_block_local(out_k_session, &cipher_blob[16], device_info) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: device_info解密失败");
+        return false;
+    }
+
+    // device_info[0..11] maps to contiguous GD32 UID bytes from
+    // DEVICE_SERIAL_ADDR_LSB (0x1FFFF7E8) to 0x1FFFF7F3.
+    memcpy(out_uid, device_info, GD32_UID_LEN);
+    if (bytes_all_value(out_uid, GD32_UID_LEN, 0x00U) ||
+        bytes_all_value(out_uid, GD32_UID_LEN, 0xFFU)) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: UID无效(全00/全FF)");
+        return false;
+    }
+
+    char uid_hex[GD32_UID_LEN * 2 + 1] = {0};
+    for (size_t i = 0; i < GD32_UID_LEN; ++i) {
+        snprintf(&uid_hex[i * 2], sizeof(uid_hex) - i * 2, "%02X", out_uid[i]);
+    }
+    DEBUG_INFO("OTA",
+               "GD32 UID(%uB @0x%08" PRIX32 "/0x%08" PRIX32 "/0x%08" PRIX32 "): %s",
+               (unsigned)GD32_UID_LEN,
+               DEVICE_SERIAL_ADDR_LSB, DEVICE_SERIAL_ADDR_MID, DEVICE_SERIAL_ADDR_MSB,
+               uid_hex);
+
+    return true;
+}
+
+/**
+ * @brief 使用 AES-128 ECB 加密单个 16 字节分组。
+ * @param key 16 字节密钥。
+ * @param in 输入明文分组（16 字节）。
+ * @param out 输出密文分组（16 字节）。
+ * @return 0 表示成功，非 0 表示失败。
+ */
 static int aes128_ecb_encrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
     esp_aes_context aes;
@@ -75,6 +235,13 @@ static int aes128_ecb_encrypt_block_local(const uint8_t *key, const uint8_t *in,
     return ret;
 }
 
+/**
+ * @brief 使用 AES-128 ECB 解密单个 16 字节分组。
+ * @param key 16 字节密钥。
+ * @param in 输入密文分组（16 字节）。
+ * @param out 输出明文分组（16 字节）。
+ * @return 0 表示成功，非 0 表示失败。
+ */
 static int aes128_ecb_decrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
     esp_aes_context aes;
@@ -87,6 +254,13 @@ static int aes128_ecb_decrypt_block_local(const uint8_t *key, const uint8_t *in,
     return ret;
 }
 
+/**
+ * @brief 按 3 个分组对 48 字节数据执行 AES-128 ECB 加密。
+ * @param key 16 字节密钥。
+ * @param in 输入明文（48 字节）。
+ * @param out 输出密文（48 字节）。
+ * @return 全部分组加密成功返回 true，否则返回 false。
+ */
 static bool aes128_ecb_encrypt_48bytes_local(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
     for (int i = 0; i < 3; ++i) {
@@ -97,6 +271,12 @@ static bool aes128_ecb_encrypt_48bytes_local(const uint8_t *key, const uint8_t *
     return true;
 }
 
+/**
+ * @brief 计算带 key 前缀的 CRC32（key + 48B 数据），输出小端 4 字节。
+ * @param key 16 字节会话密钥。
+ * @param data48 输入数据（48 字节）。
+ * @param output 输出 CRC32（4 字节）。
+ */
 static void calculate_crc32_with_key_local(const uint8_t *key, const uint8_t *data48, uint8_t *output)
 {
     uint32_t crc = 0xFFFFFFFFU;
@@ -119,6 +299,13 @@ static void calculate_crc32_with_key_local(const uint8_t *key, const uint8_t *da
     output[3] = (uint8_t)((crc >> 24) & 0xFFU);
 }
 
+/**
+ * @brief 记录响应类型和负载十六进制摘要，便于 OTA 阶段诊断。
+ * @param stage 当前阶段名称。
+ * @param resp_type 响应类型。
+ * @param payload 响应负载。
+ * @param len 响应负载长度。
+ */
 static void log_resp_payload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len)
 {
     char hex[193] = {0};
@@ -132,6 +319,17 @@ static void log_resp_payload(const char *stage, uint8_t resp_type, const uint8_t
                len > n ? "..." : "");
 }
 
+/**
+ * @brief 当收到 WAIT 响应时进行只读轮询，直到响应变为非 WAIT 或达到轮询上限。
+ * @param stage 当前阶段名称（用于日志）。
+ * @param resp_type 输入/输出响应类型。
+ * @param resp_payload 输出响应负载缓冲区。
+ * @param resp_max 响应缓冲区大小。
+ * @param resp_len 输出响应长度指针，可为 NULL。
+ * @param timeout_ms 每次轮询的超时毫秒。
+ * @param max_wait_rounds 最多轮询次数。
+ * @return ESP_OK 或底层 SPI 轮询错误码。
+ */
 static esp_err_t wait_until_not_wait(const char *stage, uint8_t *resp_type,
                                      uint8_t *resp_payload, size_t resp_max,
                                      size_t *resp_len, uint32_t timeout_ms, uint32_t max_wait_rounds)
@@ -158,39 +356,22 @@ static esp_err_t wait_until_not_wait(const char *stage, uint8_t *resp_type,
 esp_err_t meta_load(ota_meta_t *meta)
 {
     if (!meta) return ESP_ERR_INVALID_ARG;
-
     memset(meta, 0, sizeof(ota_meta_t));
 
-    FILE *f = fopen(META_FILE, "r");
-    if (!f) {
-        // 文件不存在是正常状态（首次使用，未刷过 GD32）
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_META_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        // NVS 中没有元数据是正常状态（首次使用）
         return ESP_OK;
     }
 
-    char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = '\0';
-    fclose(f);
+    uint32_t val = 0;
+    if (nvs_get_u32(handle, "total_size", &val) == ESP_OK) meta->total_size = val;
+    if (nvs_get_u32(handle, "stored_size", &val) == ESP_OK) meta->stored_size = val;
+    if (nvs_get_u32(handle, "last_seq", &val) == ESP_OK) meta->last_seq = val;
+    if (nvs_get_u32(handle, "chunk_count", &val) == ESP_OK) meta->chunk_count = val;
 
-    cJSON *json = cJSON_Parse(buf);
-    if (!json) {
-        DEBUG_ERR("OTA", "元数据 JSON 解析失败");
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    cJSON *item = cJSON_GetObjectItem(json, "total_size");
-    if (item) meta->total_size = (uint32_t)item->valueint;
-
-    item = cJSON_GetObjectItem(json, "stored_size");
-    if (item) meta->stored_size = (uint32_t)item->valueint;
-
-    item = cJSON_GetObjectItem(json, "last_seq");
-    if (item) meta->last_seq = (uint32_t)item->valueint;
-
-    item = cJSON_GetObjectItem(json, "chunk_count");
-    if (item) meta->chunk_count = (uint32_t)item->valueint;
-
-    cJSON_Delete(json);
+    nvs_close(handle);
     DEBUG_INFO("OTA", "元数据已加载: total=%u, stored=%u, seq=%u",
                meta->total_size, meta->stored_size, meta->last_seq);
     return ESP_OK;
@@ -205,24 +386,26 @@ esp_err_t meta_save(const ota_meta_t *meta)
 {
     if (!meta) return ESP_ERR_INVALID_ARG;
 
-    FILE *f = fopen(META_FILE, "w");
-    if (!f) {
-        DEBUG_ERR("OTA", "无法打开元数据文件写入");
-        return ESP_FAIL;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_META_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        DEBUG_ERR("OTA", "无法打开 NVS 写入: %s", esp_err_to_name(err));
+        return err;
     }
 
-    fprintf(f,
-        "{\n"
-        "  \"total_size\": %" PRIu32 ",\n"
-        "  \"stored_size\": %" PRIu32 ",\n"
-        "  \"last_seq\": %" PRIu32 ",\n"
-        "  \"chunk_count\": %" PRIu32 "\n"
-        "}",
-        meta->total_size, meta->stored_size, meta->last_seq, meta->chunk_count);
+    nvs_set_u32(handle, "total_size", meta->total_size);
+    nvs_set_u32(handle, "stored_size", meta->stored_size);
+    nvs_set_u32(handle, "last_seq", meta->last_seq);
+    nvs_set_u32(handle, "chunk_count", meta->chunk_count);
+    err = nvs_commit(handle);
+    nvs_close(handle);
 
-    fclose(f);
-    DEBUG_INFO("OTA", "元数据已保存到 Flash");
-    return ESP_OK;
+    if (err != ESP_OK) {
+        DEBUG_ERR("OTA", "NVS commit 失败: %s", esp_err_to_name(err));
+    } else {
+        DEBUG_INFO("OTA", "元数据已保存到 NVS");
+    }
+    return err;
 }
 
 /**
@@ -300,6 +483,18 @@ esp_err_t flash_read_chunk(uint32_t offset, uint8_t *data, size_t len)
  * @brief 阶段1 - 发起与 GD32 的握手
  * @return 操作结果码。
  */
+static void request_gd32_app_enter_bootloader(void)
+{
+    DEBUG_INFO("OTA", "尝试通知 GD32 APP 进入 Bootloader OTA 窗口");
+    esp_err_t err = gd32_app_request_bootloader(500);
+    if (err == ESP_OK) {
+        DEBUG_INFO("OTA", "GD32 APP 已确认进入 Bootloader，等待复位完成");
+        vTaskDelay(pdMS_TO_TICKS(3500));
+    } else {
+        DEBUG_WARN("OTA", "GD32 APP 未确认进入 Bootloader，继续尝试直接握手: %s", esp_err_to_name(err));
+    }
+}
+
 static ota_result_t send_handshake_req(void)
 {
     DEBUG_INFO("OTA", "=== 阶段1: 握手开始 ===");
@@ -358,7 +553,7 @@ static ota_result_t send_nonce_and_authenticate(void)
     if (err == ESP_OK) {
         err = wait_until_not_wait("CHALLENGE", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 12);
     }
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len != 36) {
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
         DEBUG_ERR("OTA", "CHALLENGE 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
@@ -368,8 +563,8 @@ static ota_result_t send_nonce_and_authenticate(void)
     DEBUG_INFO("OTA", "已收到 GD32 握手数据包");
     DEBUG_INFO("OTA", "状态: RELAY_CHALLENGE_RESPOND");
 
-    if (aes128_ecb_encrypt_block_local(MASTER_KEY, g_nonce_server, g_k_session) != 0) {
-        DEBUG_ERR("OTA", "计算 K_session 失败");
+    if (!parse_and_verify_challenge_payload(resp_payload, resp_len, g_k_session, g_gd32_uid_runtime)) {
+        DEBUG_ERR("OTA", "CHALLENGE 解包/校验失败");
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_AUTH;
     }
@@ -440,8 +635,7 @@ static ota_result_t send_firmware_size(uint32_t size)
     if (err == ESP_OK) {
         err = wait_until_not_wait("SEND_SIZE", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1500, 12);
     }
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 2 ||
-        resp_payload[0] != 0xBA || resp_payload[1] != 0xC0) {
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !is_structured_ack_with_seq(resp_payload, resp_len, 0U)) {
         DEBUG_ERR("OTA", "SEND_SIZE 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
@@ -481,6 +675,7 @@ static ota_result_t relay_packets_from_flash(void)
     g_relay_state = RELAY_RELAY_ACTIVE;
 
     for (uint32_t seq = 0; seq < total_packets; seq++) {
+        uint32_t retry_count = 0;
         if ((seq % OTA_PACKET_HEALTH_CHECK_INTERVAL) == 0 || seq == 0 || seq == total_packets - 1) {
             health_status_t health = health_check_before_ota();
             if (health == HEALTH_MON_SHUTDOWN || health == HEALTH_MON_CRITICAL) {
@@ -526,32 +721,48 @@ static ota_result_t relay_packets_from_flash(void)
 
         g_relay_state = RELAY_PACKET_SENT;
 
-        resp_len = 0;
-        err = spi_ota_transfer(SPI_OTA_CMD_DATA, tx_buf, sizeof(tx_buf),
-                               &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
-        log_resp_payload("DATA_PACKET", resp_type, resp_payload, resp_len);
-        if (err == ESP_OK) {
-            err = wait_until_not_wait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 10);
-        }
-        if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 4) {
-            DEBUG_WARN("OTA", "数据包 %u 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu", seq, err, resp_type, resp_len);
-            result = OTA_RESULT_ERR_TIMEOUT;
-            break;
-        }
+        while (1) {
+            resp_len = 0;
+            err = spi_ota_transfer(SPI_OTA_CMD_DATA, tx_buf, sizeof(tx_buf),
+                                   &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
+            log_resp_payload("DATA_PACKET", resp_type, resp_payload, resp_len);
+            if (err == ESP_OK) {
+                err = wait_until_not_wait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 10);
+            }
+            if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
+                DEBUG_WARN("OTA", "数据包 %u 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu", seq, err, resp_type, resp_len);
+                result = OTA_RESULT_ERR_TIMEOUT;
+                break;
+            }
 
-        uint32_t ack_value = (uint32_t)resp_payload[0] |
-                             ((uint32_t)resp_payload[1] << 8) |
-                             ((uint32_t)resp_payload[2] << 16) |
-                             ((uint32_t)resp_payload[3] << 24);
-        uint32_t expected_ack = (seq == total_packets - 1) ? 0xFFFFFFFFU : (seq + 1U);
-        if (ack_value != expected_ack) {
-            DEBUG_ERR("OTA", "包 %u ACK 不匹配: got=0x%08X expected=0x%08X", seq, ack_value, expected_ack);
+            uint32_t expected_ack = (seq == total_packets - 1) ? 0xFFFFFFFFU : (seq + 1U);
+            if (is_structured_ack_with_seq(resp_payload, resp_len, expected_ack)) {
+                flash_offset += (uint32_t)chunk_size;
+                g_relay_state = RELAY_PACKET_ACK_OK;
+                break;
+            }
+
+            uint32_t err_seq = 0;
+            uint8_t err_code = 0;
+            if (parse_structured_error(resp_payload, resp_len, &err_seq, &err_code) && err_seq == seq) {
+                DEBUG_WARN("OTA", "包 %u 收到结构化错误 err=0x%02X，准备重发", seq, err_code);
+                g_relay_state = RELAY_PACKET_ACK_RETRY;
+                if (++retry_count >= 3U) {
+                    DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
+                    result = (err_code == 0x04U) ? OTA_RESULT_ERR_CRC : OTA_RESULT_ERR_GD32;
+                    break;
+                }
+                continue;
+            }
+
+            DEBUG_ERR("OTA", "包 %u ACK/ERROR 不匹配，len=%zu", seq, resp_len);
             result = OTA_RESULT_ERR_GD32;
             break;
         }
 
-        flash_offset += (uint32_t)chunk_size;
-        g_relay_state = RELAY_PACKET_ACK_OK;
+        if (result != OTA_RESULT_OK) {
+            break;
+        }
 
         if (seq % (total_packets / 10 + 1) == 0) {
             uint32_t progress = (seq * 100U) / total_packets;
@@ -571,14 +782,34 @@ static ota_result_t relay_packets_from_flash(void)
 static ota_result_t finish_ota(void)
 {
     DEBUG_INFO("OTA", "=== 阶段4: 结束 OTA ===");
-    DEBUG_INFO("OTA", "GD32 当前实现已在最后一个 DATA 包后自行 ACK 并跳转，无需额外 FINISH 命令");
+    DEBUG_INFO("OTA", "发送 FINISH_OTA (0x0A 0xAC)，等待 GD32 确认即将跳转 APP");
 
+    uint8_t resp_type = 0;
+    uint8_t resp_payload[32] = {0};
+    size_t resp_len = 0;
+    uint8_t finish_payload[2] = {0x0A, 0xAC};
+
+    g_relay_state = RELAY_FINISH_SENT;
+    esp_err_t err = spi_ota_transfer(SPI_OTA_CMD_DATA, finish_payload, sizeof(finish_payload),
+                                     &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
+    log_resp_payload("FINISH_OTA", resp_type, resp_payload, resp_len);
+    if (err == ESP_OK) {
+        err = wait_until_not_wait("FINISH_OTA", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 10);
+    }
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 2 ||
+        resp_payload[0] != 0x0A || resp_payload[1] != 0xAC) {
+        DEBUG_ERR("OTA", "FINISH_OTA 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
+        g_relay_state = RELAY_ERROR;
+        return OTA_RESULT_ERR_GD32;
+    }
+
+    g_relay_state = RELAY_DONE;
     session_key_clear(&g_session_ctx);
     memset(&g_session_ctx, 0, sizeof(session_ctx_t));
     memset(g_k_session, 0, sizeof(g_k_session));
     memset(g_nonce_server, 0, sizeof(g_nonce_server));
+    memset(g_gd32_uid_runtime, 0, sizeof(g_gd32_uid_runtime));
 
-    g_relay_state = RELAY_DONE;
     DEBUG_INFO("OTA", "状态: RELAY_DONE");
     DEBUG_INFO("OTA", "=== OTA 完成 ===");
 
@@ -593,6 +824,8 @@ static ota_result_t finish_ota(void)
 ota_result_t ota_relay_start_handshake(void)
 {
     ota_result_t res;
+
+    request_gd32_app_enter_bootloader();
 
     res = send_handshake_req();
     if (res != OTA_RESULT_OK) return res;
@@ -626,6 +859,8 @@ ota_result_t ota_relay_forward_firmware(void)
 
     DEBUG_INFO("OTA", "开始固件转发: %u 字节, %u 块",
                meta.total_size, meta.chunk_count);
+
+    request_gd32_app_enter_bootloader();
 
     ota_result_t res = send_handshake_req();
     if (res != OTA_RESULT_OK) return res;
@@ -662,6 +897,7 @@ void ota_relay_reset(void)
     /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_IDLE;
     session_key_clear(&g_session_ctx);
+    memset(g_gd32_uid_runtime, 0, sizeof(g_gd32_uid_runtime));
 }
 
 /**

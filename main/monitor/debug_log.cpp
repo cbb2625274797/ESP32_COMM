@@ -67,6 +67,11 @@ int debug_log_ring_count(void)
 
 // 读取并清空日志缓冲区，返回 JSON 数组字符串
 // 调用者负责 free 返回值
+/**
+ * @brief 读取并清空环形日志缓冲区，返回 JSON 数组字符串。
+ * @param out_len 输出 JSON 字符串长度（不含末尾 '\0'）。
+ * @return 成功返回需由调用者 free 的字符串；无日志或失败返回 NULL。
+ */
 char *debug_log_ring_drain_json(int *out_len)
 {
     if (!s_log_ring_mutex) {

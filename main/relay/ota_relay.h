@@ -9,8 +9,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
-// T4.3: OTA 元数据结构，用于 Flash 存储
-#define META_FILE "/spiffs/ota_meta.json"
+// T4.3: OTA 元数据结构，用于 NVS 存储
+#define OTA_META_NVS_NAMESPACE "ota_meta"
+#define OTA_META_NVS_KEY "meta"
 
 typedef struct {
     uint32_t total_size;      // 固件总大小（字节）

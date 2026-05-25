@@ -71,6 +71,12 @@ float health_get_last_temperature(void)
     return s_last_temperature;
 }
 
+/**
+ * @brief 获取最近一次采样到的 WiFi RSSI 及其年龄。
+ * @param out_rssi 输出 RSSI 指针，可为 NULL。
+ * @param out_age_ms 输出采样距今毫秒数指针，可为 NULL。
+ * @return 有有效采样返回 true，否则返回 false。
+ */
 bool health_get_last_wifi_rssi(int8_t *out_rssi, uint32_t *out_age_ms)
 {
     if (s_last_wifi_rssi_ms <= 0) {

@@ -10,7 +10,7 @@
 // ============================================================
 // 固件版本
 // ============================================================
-inline constexpr const char *FW_VERSION = "0.2.0";
+inline constexpr const char *FW_VERSION = "0.2.7";
 
 // ============================================================
 // WiFi 工作模式选择
@@ -98,8 +98,8 @@ inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;  // cmd(1)+seq(2)+siz
 // ⚠️ 请填入实际密钥
 // ============================================================
 inline constexpr uint8_t MASTER_KEY[] = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+    0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10
 };
 
 inline constexpr uint8_t SCRAMBLE_CONST[] = {
@@ -107,7 +107,11 @@ inline constexpr uint8_t SCRAMBLE_CONST[] = {
     0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00
 };
 
-// ⚠️ 请填入实际的 GD32 芯片唯一码（12字节）
+// GD32_CHIP_UID 仅保留为默认占位，运行时以握手包解出的芯片地址 UID 为准。
+inline constexpr uint32_t DEVICE_SERIAL_ADDR_LSB = 0x1FFFF7E8U;
+inline constexpr uint32_t DEVICE_SERIAL_ADDR_MID = 0x1FFFF7ECU;
+inline constexpr uint32_t DEVICE_SERIAL_ADDR_MSB = 0x1FFFF7F0U;
+
 inline constexpr uint8_t GD32_CHIP_UID[] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
     0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B

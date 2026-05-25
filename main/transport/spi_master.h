@@ -10,7 +10,7 @@
 
 // SPI 配置常量
 #define SPI_MASTER_CS_GPIO    (4)           // CS 片选引脚
-#define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 先降到 4MHz 便于联调
+#define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 4MHz
 #define SPI_MODE              (0)           // CPOL=0, CPHA=0
 #define SPI_QUEUE_SIZE        (1)
 #define SPI_OTA_FRAME_MAX     (96)
@@ -20,6 +20,8 @@
 #define SPI_OTA_CMD_REQ       (0x01)
 #define SPI_OTA_CMD_DATA      (0x02)
 #define SPI_OTA_CMD_CANCEL    (0x03)
+#define SPI_APP_ENTER_BOOT_CMD (0xB0)
+#define SPI_APP_ENTER_BOOT_ACK_OK (0xA5)
 #define SPI_OTA_RSP_ACK       (0x80)
 #define SPI_OTA_RSP_WAIT      (0x81)
 #define SPI_OTA_RSP_ERROR     (0x82)
@@ -57,7 +59,7 @@ typedef struct {
  * @param channel CAN 通道（0~2）。
  * @param ext_id 29 位扩展帧 ID。
  * @param data 数据负载指针。
- * @param dlc 数据长度，0 则自动推断。
+ * @param dlc 数据长度，范围 1~64。
  * @param recv_buf 接收缓冲区，可为 NULL。
  * @param recv_max 期望最大接收字节数。
  * @param timeout_ms 超时时间（毫秒）。
@@ -73,7 +75,7 @@ int gd32_can_send(can_channel_t channel, uint32_t ext_id,
  * @param channel CAN 通道（0~2）。
  * @param ext_id 29 位扩展帧 ID。
  * @param data 数据负载指针。
- * @param dlc 数据长度。
+ * @param dlc 数据长度，范围 1~64。
  * @return >= 0 成功，< 0 失败。
  */
 int gd32_can_send_no_reply(can_channel_t channel, uint32_t ext_id,
@@ -86,12 +88,12 @@ int gd32_can_send_no_reply(can_channel_t channel, uint32_t ext_id,
 esp_err_t spi_master_init(void);
 
 /**
- * @brief 执行一次同步 SPI 传输，发送命令和负载并可选接收返回数据。
- * @param cmd SPI 命令码。
+ * @brief 执行一次同步 SPI 事务，先发送请求，再读取请求之后的响应字节。
+ * @param cmd SPI 命令码；为 0 时不额外插入命令字节。
  * @param payload 发送数据指针。
  * @param payload_len 发送数据长度。
  * @param recv_buf 接收缓冲区，可为 NULL。
- * @param recv_len 期望接收长度。
+ * @param recv_len 期望接收的响应长度。
  * @param timeout_ms 超时时间（毫秒）。
  * @return ESP_OK 成功，其他失败。
  */
@@ -100,8 +102,8 @@ esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
                             size_t recv_len, uint32_t timeout_ms);
 
 /**
- * @brief 仅发送 SPI 数据，不关心返回内容。
- * @param cmd SPI 命令码。
+ * @brief 仅发送 SPI 请求数据，不关心返回内容。
+ * @param cmd SPI 命令码；为 0 时仅发送 payload。
  * @param payload 发送数据指针。
  * @param len 发送数据长度。
  * @return ESP_OK 成功，其他失败。
@@ -109,8 +111,8 @@ esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
 esp_err_t spi_send(uint8_t cmd, const uint8_t *payload, size_t len);
 
 /**
- * @brief 仅接收 SPI 数据，底层会发送哑数据产生时钟。
- * @param cmd SPI 命令码。
+ * @brief 仅接收 SPI 数据，必要时先发送命令字节，再发送哑数据产生时钟。
+ * @param cmd SPI 命令码；为 0 时只发送哑数据。
  * @param recv_buf 接收缓冲区。
  * @param len 接收长度。
  * @param timeout_ms 超时时间（毫秒）。
@@ -138,5 +140,11 @@ esp_err_t spi_ota_transfer(uint8_t type, const uint8_t *payload, size_t payload_
  */
 esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
                                 size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
+
+/**
+ * @brief 通知正在运行的 GD32 DCU_APP 设置 OTA 标志并软复位进入 Bootloader。
+ * @return ESP_OK 表示 APP 已确认；ESP_ERR_TIMEOUT 常表示 GD32 已在 Bootloader 或通信未就绪。
+ */
+esp_err_t gd32_app_request_bootloader(uint32_t timeout_ms);
 
 #endif // SPI_MASTER_H

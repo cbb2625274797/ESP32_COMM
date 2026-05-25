@@ -3,277 +3,265 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ESP32 OTA 中继系统 - 上位机</title>
+<title>ESP32 OTA 中继控制台</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="container">
-  <!-- 顶部标题栏 -->
-  <header class="header">
-    <div class="logo-section">
-      <div class="logo-icon">📡</div>
-      <div class="logo-text">
-        <h1>ESP32 OTA 中继系统</h1>
-        <p>GD32 固件空中升级管理平台</p>
-      </div>
+
+  <!-- ====== HEADER: compact status bar ====== -->
+  <header class="header-bar">
+    <div class="header-brand">
+      <span class="dot-mark"></span>
+      <strong>ESP32 OTA 中继控制台</strong>
     </div>
-    <div class="status-badges">
-      <div class="badge disconnected" id="connectionBadge">
-        <span class="dot"></span>
-        <span id="connectionText">未连接</span>
-      </div>
-      <div class="badge" id="healthBadge">
-        <span class="dot"></span>
-        <span id="healthText">系统正常</span>
-      </div>
-      <div class="badge">
-        <span id="fwVersion">v--</span>
-      </div>
+    <div class="header-status">
+      <span class="pill offline" id="pillConn"><span class="indicator"></span><span id="pillConnTxt">未连接</span></span>
+      <span class="pill idle" id="pillMode"><span class="indicator"></span><span id="pillModeTxt">GD32</span></span>
+      <span class="pill" id="pillVer">v--</span>
+      <span class="pill" id="pillIP">--</span>
+      <span class="pill" id="pillRSSI">--</span>
+      <span class="pill idle" id="pillRelay"><span class="indicator"></span><span id="pillRelayTxt">待机</span></span>
+      <span class="pill" id="pillUptime">运行 --</span>
     </div>
   </header>
 
-  <!-- 主网格布局 -->
-  <div class="main-grid">
-    <!-- 左侧面板 -->
-    <div class="left-panel">
-      <!-- 连接配置 -->
-      <div class="card connection-card">
-        <div class="card-header">
-          <div class="card-title">
-            <div class="icon">🔗</div>
-            连接配置
-          </div>
-        </div>
-        <div class="form-group">
-          <label>ESP32 IP 地址</label>
-          <div class="input-group">
-            <input type="text" id="espIp" value="192.168.31.127" placeholder="输入 IP 地址">
-            <button class="btn btn-secondary" onclick="testConnection()">测试</button>
-          </div>
-        </div>
-        <div class="form-group">
-          <label>目标芯片</label>
-          <select id="targetChip" onchange="onTargetChipChange()" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
-            <option value="gd32">GD32（Flash 中继）</option>
-            <option value="esp32">ESP32（自身升级）</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" style="width:100%; margin-top:8px;" onclick="restartEsp32()">
-          🔄 重启 ESP32
-        </button>
-        <a class="btn btn-secondary" href="ble_ota.html" style="width:100%; margin-top:8px; text-decoration:none; display:flex; align-items:center; justify-content:center;">
-          📶 打开 BLE 刷写页面
-        </a>
-      </div>
+  <!-- ====== MAIN LAYOUT ====== -->
+  <div class="main-layout">
 
-      <!-- 文件上传 -->
+    <!-- ====== LEFT: workflow ====== -->
+    <div>
+
+      <!-- 1. Connection -->
       <div class="card">
-        <div class="card-header">
-          <div class="card-title">
-            <div class="icon">📁</div>
-            固件文件
-          </div>
-        </div>
-
-        <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
-          <div class="upload-icon">📤</div>
-          <h3>点击或拖拽文件到此处</h3>
-          <p>支持 .hex 和 .bin 格式</p>
-        </div>
-        <input type="file" id="fileInput" class="file-input" accept=".hex,.bin" onchange="handleFileSelect(event)">
-
-        <div class="file-info" id="fileInfo">
-          <div class="file-header">
-            <div class="file-name">
-              <span class="icon">📄</span>
-              <span id="fileName">-</span>
+        <div class="card-head"><span class="ico">🔗</span> 设备连接</div>
+        <div class="card-body">
+          <div class="form-row">
+            <label class="form-label" for="espIp">ESP32 IP 地址</label>
+            <div class="input-group">
+              <input class="input" type="text" id="espIp" value="192.168.31.127" placeholder="输入 IP 地址">
+              <button class="btn btn-outline" onclick="testConnection()">测试</button>
             </div>
-            <button class="btn btn-secondary" onclick="clearFile()" style="padding:6px 12px;">✕</button>
           </div>
-          <div class="file-meta">
-            <div class="meta-item"><span>类型:</span> <b id="fileType">-</b></div>
-            <div class="meta-item"><span>大小:</span> <b id="fileSize">-</b></div>
-            <div class="meta-item"><span>数据包:</span> <b id="fileChunks">-</b></div>
-          </div>
-        </div>
-
-        <div class="progress-section" id="progressSection">
-          <div class="progress-bar-container">
-            <div class="progress-bar" id="progressBar"></div>
-          </div>
-          <div class="progress-info">
-            <span id="progressText">准备上传...</span>
-            <span id="progressPercent">0%</span>
-          </div>
-        </div>
-
-        <div class="action-buttons">
-          <button class="btn btn-primary" id="uploadBtn" onclick="startUpload()" disabled>
-            ⬆️ 上传固件
-          </button>
-          <button class="btn btn-success" id="relayBtn" onclick="triggerRelay()">
-            🚀 触发 OTA
-          </button>
-        </div>
-        <div id="esp32Actions" style="display:none; margin-top:12px;">
-        </div>
-      </div>
-
-      <!-- OTA 阶段指示 -->
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">
-            <div class="icon">📊</div>
-            OTA 流程阶段
-          </div>
-        </div>
-        <div class="stage-indicator">
-          <div class="stage" id="stage1">
-            <div class="stage-icon">1️⃣</div>
-            <div class="stage-label">握手认证</div>
-          </div>
-          <div class="stage" id="stage2">
-            <div class="stage-icon">2️⃣</div>
-            <div class="stage-label">传输准备</div>
-          </div>
-          <div class="stage" id="stage3">
-            <div class="stage-icon">3️⃣</div>
-            <div class="stage-label">数据转发</div>
-          </div>
-          <div class="stage" id="stage4">
-            <div class="stage-icon">4️⃣</div>
-            <div class="stage-label">完成跳转</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- 右侧面板 -->
-    <div class="right-panel">
-      <!-- 实时状态 -->
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">
-            <div class="icon">📈</div>
-            实时状态
-            <span style="font-size:12px;color:var(--text-muted);font-weight:normal;margin-left:8px;">运行: <span id="statUptime">--</span></span>
-          </div>
-        </div>
-        <div class="status-grid">
-          <div class="status-item">
-            <div class="value" id="statTemperature">--</div>
-            <div class="label">芯片温度</div>
-          </div>
-          <div class="status-item">
-            <div class="value" id="statWifi">--</div>
-            <div class="label">WiFi 状态</div>
-          </div>
-          <div class="status-item">
-            <div class="value" id="statSignal">--</div>
-            <div class="label">信号强度</div>
-          </div>
-          <div class="status-item">
-            <div class="value" id="statHeap">0</div>
-            <div class="label">空闲堆</div>
-          </div>
-          <div class="status-item">
-            <div class="value" id="statMinHeap">0</div>
-            <div class="label">最低空闲堆</div>
-          </div>
-          <div class="status-item">
-            <div class="value" id="statProgress">0%</div>
-            <div class="label">上传进度</div>
-          </div>
-          <div class="status-item">
-            <div class="value" id="statRelayState">待机</div>
-            <div class="label">中继状态</div>
+          <div class="conn-indicator err" id="connStatus">
+            <span class="light"></span>
+            <span id="connStatusTxt">等待连接</span>
           </div>
         </div>
       </div>
 
-      <!-- CAN 帧发送面板 -->
+      <!-- 2. Target -->
       <div class="card">
-        <div class="card-header">
-          <div class="card-title">
-            <div class="icon">📨</div>
-            CAN 帧发送
-          </div>
-        </div>
-        <div style="display:grid; grid-template-columns:80px 1fr 80px 1fr; gap:12px; margin-bottom:16px;">
-          <div class="form-group" style="margin:0;">
-            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">通道</label>
-            <select id="canChannel" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
-              <option value="0">CH0</option>
-              <option value="1">CH1</option>
-              <option value="2">CH2</option>
+        <div class="card-head"><span class="ico">🎯</span> 升级目标</div>
+        <div class="card-body">
+          <div class="form-row">
+            <select class="input" id="targetChip" onchange="onTargetChipChange()">
+              <option value="gd32">GD32（Flash SPI 中继）</option>
+              <option value="esp32">ESP32（自身 OTA 升级）</option>
             </select>
           </div>
-          <div class="form-group" style="margin:0;">
-            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">扩展帧 ID</label>
-            <input type="text" id="canId" value="0x18DA00F1" placeholder="例如: 0x18DA00F1" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
+          <div class="conn-indicator" id="targetHint" style="font-size:12px;font-weight:400;color:var(--text-dim);">
+            将固件写入 ESP32 Flash，由 ESP32 通过 SPI 中继到 GD32 完成刷写。
           </div>
-          <div class="form-group" style="margin:0;">
-            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">DLC</label>
-            <input type="number" id="canDlc" value="8" min="1" max="64" style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
-          </div>
-          <div class="form-group" style="margin:0;">
-            <label style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;">数据 (HEX)</label>
-            <input type="text" id="canData" value="0102030405060708" placeholder="01020304..." style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-size:13px;">
-          </div>
-        </div>
-        <div style="display:flex;gap:12px;">
-          <button class="btn btn-primary" style="flex:1;" onclick="sendCanFrame()">📤 发送</button>
-          <button class="btn btn-secondary" onclick="clearCanFields()">清空</button>
-        </div>
-        <div id="canResponse" style="margin-top:16px;background:var(--bg-secondary);border-radius:10px;padding:12px 16px;font-family:monospace;font-size:12px;display:none;">
-          <div style="color:var(--text-muted);margin-bottom:6px;">响应:</div>
-          <div id="canRespContent" style="color:var(--accent);"></div>
         </div>
       </div>
 
-      <!-- 调试日志 -->
-      <div class="card log-panel">
-        <div class="card-header">
-          <div class="card-title">
-            <div class="icon">🖥️</div>
-            调试日志
-            <span style="font-size:12px;color:var(--text-muted);font-weight:normal;margin-left:8px;">UDP:6666</span>
-          </div>
-        </div>
+      <!-- 3. Firmware -->
+      <div class="card">
+        <div class="card-head"><span class="ico">📁</span> 固件文件</div>
         <div class="card-body">
-          <div class="log-header">
-            <span style="font-size:13px;color:var(--text-muted);">实时日志输出</span>
-            <div class="log-filters">
-              <button class="filter-btn active" onclick="toggleFilter('all', this)">全部</button>
-              <button class="filter-btn" onclick="toggleFilter('E', this)">错误</button>
-              <button class="filter-btn" onclick="toggleFilter('W', this)">警告</button>
-              <button class="filter-btn" onclick="toggleFilter('I', this)">信息</button>
+          <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+            <div class="upload-ico">📤</div>
+            <h4>点击或拖拽文件到此处</h4>
+            <p>支持 .hex 和 .bin 格式</p>
+          </div>
+          <input type="file" id="fileInput" accept=".hex,.bin" onchange="handleFileSelect(event)" style="display:none;">
+
+          <div class="file-info" id="fileInfo">
+            <div class="file-info-row">
+              <span style="font-weight:600;">📄 <span id="fileName">-</span></span>
+              <button class="btn btn-ghost btn-sm" onclick="clearFile()">清除</button>
+            </div>
+            <div class="file-info-grid">
+              <div class="file-meta-item"><span>类型</span><b id="fileType">-</b></div>
+              <div class="file-meta-item"><span>大小</span><b id="fileSize">-</b></div>
+              <div class="file-meta-item"><span>数据包 (8KB/包)</span><b id="fileChunks">-</b></div>
             </div>
           </div>
-          <div class="log-content" id="logContent">
-            <div class="log-entry">
-              <span class="log-time">[--:--:--]</span>
-              <span class="log-level I">I</span>
-              <span class="log-tag">[系统]</span>
-              <span class="log-msg">等待上位机连接...</span>
+          <div class="helper-note warn" id="fileHint">未选择固件。请选择 <code>.bin</code> 或 <code>.hex</code> 文件后再执行上传。</div>
+
+          <div class="progress-wrap" id="progressWrap">
+            <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+            <div class="progress-text">
+              <span id="progressTxt">准备上传...</span>
+              <span id="progressPct">0%</span>
             </div>
-          </div>
-          <div class="log-footer">
-            <span class="log-stats"><span id="logCount">0</span> 条日志</span>
-            <button class="btn btn-secondary" onclick="clearLogs()" style="padding:6px 12px;font-size:12px;">清除日志</button>
           </div>
         </div>
       </div>
+
+      <!-- 4. Execute -->
+      <div class="card">
+        <div class="card-head"><span class="ico">⚡</span> 执行操作</div>
+        <div class="card-body">
+          <button class="btn btn-primary btn-block" id="uploadBtn" onclick="startUpload()" disabled>
+            上传固件到 ESP32
+          </button>
+          <div class="helper-note" id="actionHint">执行顺序：先测试连接，再确认目标芯片，最后上传固件。GD32 模式上传完成后，再触发中继。</div>
+          <div class="btn-row">
+            <button class="btn btn-success" id="relayBtn" onclick="triggerRelay()">
+              触发 GD32 OTA 中继
+            </button>
+            <button class="btn btn-outline" onclick="restartEsp32()">
+              重启 ESP32
+            </button>
+          </div>
+          <div id="esp32Actions" style="display:none;margin-top:12px;"></div>
+          <a class="btn btn-outline btn-block" href="ble_ota.html?v=20260509-0046" style="margin-top:10px;text-decoration:none;">
+            切换到 BLE 蓝牙刷写
+          </a>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ====== RIGHT: status + tools ====== -->
+    <div>
+
+      <!-- Primary status -->
+      <div class="card">
+        <div class="card-head"><span class="ico">📡</span> 设备状态</div>
+        <div class="card-body">
+          <div class="badge-grid">
+            <div class="badge-stat">
+              <div class="v err" id="bConn">离线</div>
+              <div class="k">连接状态</div>
+            </div>
+            <div class="badge-stat">
+              <div class="v" id="bMode">GD32</div>
+              <div class="k">当前模式</div>
+            </div>
+            <div class="badge-stat">
+              <div class="v warn" id="bOTAProgress">0%</div>
+              <div class="k">OTA 进度</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Secondary metrics -->
+      <div class="card">
+        <div class="card-head"><span class="ico">📊</span> 运行指标</div>
+        <div class="card-body">
+          <div class="metric-grid">
+            <div class="metric"><div class="k">温度</div><div class="v" id="mTemp">--</div></div>
+            <div class="metric"><div class="k">WiFi / IP</div><div class="v" id="mWifi" style="font-size:14px;">--</div></div>
+            <div class="metric"><div class="k">信号强度</div><div class="v" id="mRSSI">--</div></div>
+            <div class="metric"><div class="k">空闲堆</div><div class="v" id="mHeap" style="font-size:16px;">--</div></div>
+            <div class="metric"><div class="k">最低空闲堆</div><div class="v" id="mMinHeap" style="font-size:16px;">--</div></div>
+            <div class="metric"><div class="k">固件版本</div><div class="v" id="mVersion" style="font-size:16px;">--</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- OTA stage flow -->
+      <div class="card">
+        <div class="card-head"><span class="ico">🔀</span> OTA 流程阶段</div>
+        <div class="card-body">
+          <div class="stage-flow">
+            <div class="stage-node" id="s1"><div class="stage-dot">1</div><div class="stage-label">握手认证</div></div>
+            <div class="stage-node" id="s2"><div class="stage-dot">2</div><div class="stage-label">传输准备</div></div>
+            <div class="stage-node" id="s3"><div class="stage-dot">3</div><div class="stage-label">数据转发</div></div>
+            <div class="stage-node" id="s4"><div class="stage-dot">4</div><div class="stage-label">完成跳转</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CAN panel -->
+      <div class="card">
+        <div class="card-head"><span class="ico">📨</span> CAN 帧发送</div>
+        <div class="card-body">
+          <div class="can-grid">
+            <div class="form-row" style="margin:0"><label class="form-label">通道</label>
+              <select class="input" id="canChannel"><option value="0">CH0</option><option value="1">CH1</option><option value="2">CH2</option></select>
+            </div>
+            <div class="form-row" style="margin:0"><label class="form-label">扩展帧 ID</label>
+              <input class="input" type="text" id="canId" value="0x18DA00F1">
+            </div>
+            <div class="form-row" style="margin:0"><label class="form-label">DLC</label>
+              <input class="input" type="number" id="canDlc" value="8" min="1" max="64">
+            </div>
+            <div class="form-row" style="margin:0"><label class="form-label">数据 (HEX)</label>
+              <input class="input" type="text" id="canData" value="0102030405060708" placeholder="01020304...">
+            </div>
+          </div>
+          <div class="helper-note" id="canHint">输入十六进制数据后会自动检查字节数是否与 DLC 一致。</div>
+          <div class="btn-row">
+            <button class="btn btn-primary" onclick="sendCanFrame()">发送</button>
+            <button class="btn btn-outline" onclick="clearCanFields()">清空</button>
+          </div>
+          <div id="canResp" style="display:none;margin-top:12px;padding:12px;background:var(--bg-elevated);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;">
+            <div style="color:var(--text-label);margin-bottom:4px;">响应</div>
+            <div id="canRespText" style="color:var(--accent);"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SPI panel -->
+      <div class="card">
+        <div class="card-head"><span class="ico">⚡</span> SPI 发送</div>
+        <div class="card-body">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <input class="input" type="text" id="spiType" value="01" maxlength="2" placeholder="type" title="帧类型 (hex)" style="width:52px;flex:none;">
+            <input class="input" type="text" id="spiData" value="" placeholder="payload hex..." style="flex:1;min-width:100px;">
+            <input class="input" type="number" id="spiTimeout" value="1000" min="100" max="10000" title="超时 ms" style="width:68px;flex:none;">
+            <span style="font-size:11px;color:var(--text-dim);">ms</span>
+            <button class="btn btn-primary" onclick="sendSpiFrame()" style="padding:4px 14px;">发送</button>
+            <button class="btn btn-outline" onclick="clearSpiFields()" style="padding:4px 10px;">清空</button>
+          </div>
+          <div class="helper-note" id="spiHint">type(hex) + payload → 自动构建 SOF+LEN+CRC 帧</div>
+          <div id="spiResp" style="display:none;margin-top:8px;padding:8px 10px;background:var(--bg-elevated);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;">
+            <span id="spiRespText" style="color:var(--accent);"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Log panel -->
+      <div class="card log-panel">
+        <div class="card-head" style="justify-content:space-between;">
+          <span><span class="ico">🖥️</span> 调试日志</span>
+          <span style="font-size:11px;font-weight:400;color:var(--text-label);text-transform:none;letter-spacing:0;">UDP :6666</span>
+        </div>
+        <div class="card-body">
+          <div class="log-toolbar">
+            <div class="log-filters">
+              <button class="log-filter active" onclick="setLogFilter('all', this)">全部</button>
+              <button class="log-filter" onclick="setLogFilter('E', this)">错误</button>
+              <button class="log-filter" onclick="setLogFilter('W', this)">警告</button>
+              <button class="log-filter" onclick="setLogFilter('I', this)">信息</button>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="toggleAutoScroll()" id="autoScrollBtn" title="切换自动滚动">📌 自动滚动</button>
+          </div>
+          <div class="log-scroll" id="logScroll">
+            <div class="log-line"><span class="lt">[--:--:--]</span><span class="lv I">I</span><span class="lg">[系统]</span><span class="lm">等待上位机连接...</span></div>
+          </div>
+          <div class="log-foot">
+            <span>共 <span id="logCount">0</span> 条</span>
+            <button class="btn btn-ghost btn-sm" onclick="clearLogs()">清除日志</button>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
 
-<!-- Toast 提示 -->
+<!-- Toast -->
 <div class="toast" id="toast">
-  <span class="toast-icon" id="toastIcon">✓</span>
-  <span class="toast-message" id="toastMessage">操作成功</span>
+  <span class="toast-ico" id="toastIco">✓</span>
+  <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js"></script>
+<script src="app.js?v=20260525"></script>
 </body>
 </html>

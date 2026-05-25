@@ -88,7 +88,15 @@ int frame_build(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_fr
     return idx;
 }
 
-// 解析 SPI 帧
+/**
+ * @brief 解析并校验一帧 SPI 协议数据。
+ * @param frame 输入帧缓冲区。
+ * @param frame_len 输入帧长度。
+ * @param out_cmd 输出命令字节，可为 NULL。
+ * @param out_payload 输出负载缓冲区，可为 NULL。
+ * @param out_len 输出负载长度指针，可为 NULL。
+ * @return 0 成功，-1 失败。
+ */
 int frame_parse(const uint8_t *frame, size_t frame_len,
                 uint8_t *out_cmd, uint8_t *out_payload, size_t *out_len)
 {
@@ -141,7 +149,15 @@ int frame_parse(const uint8_t *frame, size_t frame_len,
     return 0;
 }
 
-// AES-128 CBC 加密（使用 ESP32-C3 硬件 AES）
+/**
+ * @brief 使用 AES-128 CBC 对明文进行加密（PKCS#7 填充）。
+ * @param plaintext 明文数据指针。
+ * @param len 明文长度。
+ * @param key 16 字节密钥。
+ * @param iv 16 字节初始向量。
+ * @param ciphertext_out 输出密文缓冲区。
+ * @return >=0 为密文长度，-1 表示失败。
+ */
 int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
                          const uint8_t *key, const uint8_t *iv,
                          uint8_t *ciphertext_out)
@@ -189,7 +205,15 @@ int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
     }
 }
 
-// AES-128 CBC 解密（使用 ESP32-C3 硬件 AES）
+/**
+ * @brief 使用 AES-128 CBC 解密密文并移除 PKCS#7 填充。
+ * @param ciphertext 密文数据指针。
+ * @param len 密文长度（必须是 16 的倍数）。
+ * @param key 16 字节密钥。
+ * @param iv 16 字节初始向量。
+ * @param plaintext_out 输出明文缓冲区。
+ * @return >=0 为明文长度，-1 表示失败。
+ */
 int protocol_aes_decrypt(const uint8_t *ciphertext, size_t len,
                          const uint8_t *key, const uint8_t *iv,
                          uint8_t *plaintext_out)
@@ -242,7 +266,13 @@ int protocol_aes_decrypt(const uint8_t *ciphertext, size_t len,
     return orig_len;
 }
 
-// 搅伴算法 - 生成随机数
+/**
+ * @brief 根据时间戳、地址和随机种子生成 16 字节 nonce。
+ * @param timestamp 时间戳输入。
+ * @param mem_addr 地址输入。
+ * @param rand_seed 随机种子输入。
+ * @param nonce_out 输出 nonce 缓冲区（16 字节）。
+ */
 void scramble_generate(uint32_t timestamp, uint32_t mem_addr,
                       uint32_t rand_seed, uint8_t *nonce_out)
 {

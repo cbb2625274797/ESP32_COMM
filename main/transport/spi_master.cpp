@@ -15,6 +15,106 @@
 #include "spi_master.h"
 #include "monitor/debug_log.h"
 
+namespace {
+constexpr size_t kSpiTransferMaxBytes = 256U;
+
+static esp_err_t spi_transfer_clocked(const uint8_t *tx_buf, size_t tx_len,
+                                      uint8_t *rx_buf, size_t rx_len)
+{
+    if (g_spi_device == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if ((tx_len > 0U && tx_buf == NULL) || (rx_len > 0U && rx_buf == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t total_len = (tx_len > rx_len) ? tx_len : rx_len;
+    if (total_len == 0U) {
+        return ESP_OK;
+    }
+    if (total_len > kSpiTransferMaxBytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t tx_staging[kSpiTransferMaxBytes];
+    uint8_t rx_staging[kSpiTransferMaxBytes];
+    const uint8_t *tx_ptr = tx_buf;
+    uint8_t *rx_ptr = rx_buf;
+
+    if (tx_len < total_len) {
+        memset(tx_staging, 0xFF, total_len);
+        if (tx_buf != NULL && tx_len > 0U) {
+            memcpy(tx_staging, tx_buf, tx_len);
+        }
+        tx_ptr = tx_staging;
+    }
+
+    if (rx_len > 0U && rx_len < total_len) {
+        rx_ptr = rx_staging;
+    }
+
+    spi_transaction_t t = {};
+    t.length = total_len * 8U;
+    t.rxlength = (rx_len > 0U) ? (total_len * 8U) : 0U;
+    t.tx_buffer = tx_ptr;
+    t.rx_buffer = (rx_len > 0U) ? rx_ptr : NULL;
+
+    esp_err_t ret = spi_device_transmit(g_spi_device, &t);
+    if (ret == ESP_OK && rx_len > 0U && rx_ptr != rx_buf) {
+        memcpy(rx_buf, rx_ptr, rx_len);
+    }
+    return ret;
+}
+
+static esp_err_t spi_transfer_request_response(uint8_t cmd,
+                                               const uint8_t *payload, size_t payload_len,
+                                               uint8_t *rx_buf, size_t rx_len)
+{
+    if ((payload_len > 0U && payload == NULL) || (rx_len > 0U && rx_buf == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t cmd_len = (cmd != 0U) ? 1U : 0U;
+    const size_t total_len = cmd_len + payload_len + rx_len;
+    if (total_len == 0U) {
+        return ESP_OK;
+    }
+    if (total_len > kSpiTransferMaxBytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t tx_staging[kSpiTransferMaxBytes];
+    uint8_t rx_staging[kSpiTransferMaxBytes];
+    size_t tx_pos = 0U;
+
+    if (cmd_len > 0U) {
+        tx_staging[tx_pos++] = cmd;
+    }
+    if (payload_len > 0U) {
+        memcpy(&tx_staging[tx_pos], payload, payload_len);
+        tx_pos += payload_len;
+    }
+    if (tx_pos < total_len) {
+        memset(&tx_staging[tx_pos], 0xFF, total_len - tx_pos);
+    }
+
+    esp_err_t ret = spi_transfer_clocked(tx_staging, total_len,
+                                         (rx_len > 0U) ? rx_staging : NULL,
+                                         (rx_len > 0U) ? total_len : 0U);
+    if (ret == ESP_OK && rx_len > 0U) {
+        memcpy(rx_buf, &rx_staging[cmd_len + payload_len], rx_len);
+    }
+    return ret;
+}
+} // namespace
+
+/**
+ * @brief 计算 SPI OTA 帧头和负载的异或 CRC8。
+ * @param data 输入数据指针。
+ * @param len 输入长度。
+ * @return 计算得到的 CRC8 值。
+ */
 static uint8_t spi_ota_crc8(const uint8_t *data, size_t len)
 {
     uint8_t crc = 0x00;
@@ -24,6 +124,15 @@ static uint8_t spi_ota_crc8(const uint8_t *data, size_t len)
     return crc;
 }
 
+/**
+ * @brief 构建 SPI OTA 协议帧（SOF + TYPE + LEN + PAYLOAD + CRC）。
+ * @param type 帧类型。
+ * @param payload 负载数据指针，可为 NULL。
+ * @param payload_len 负载长度。
+ * @param out 输出帧缓冲区。
+ * @param out_len 输出帧长度。
+ * @return 构建成功返回 true，否则返回 false。
+ */
 static bool spi_ota_build_frame(uint8_t type, const uint8_t *payload, size_t payload_len,
                                 uint8_t *out, size_t *out_len)
 {
@@ -42,6 +151,15 @@ static bool spi_ota_build_frame(uint8_t type, const uint8_t *payload, size_t pay
     return true;
 }
 
+/**
+ * @brief 解析并校验一帧 SPI OTA 数据。
+ * @param frame 输入帧指针。
+ * @param frame_len 输入帧缓冲区长度。
+ * @param type 输出帧类型，可为 NULL。
+ * @param payload 输出负载指针，可为 NULL。
+ * @param payload_len 输出负载长度，可为 NULL。
+ * @return 解析并校验成功返回 true，否则返回 false。
+ */
 static bool spi_ota_parse_frame(const uint8_t *frame, size_t frame_len,
                                 uint8_t *type, const uint8_t **payload, size_t *payload_len)
 {
@@ -57,6 +175,16 @@ static bool spi_ota_parse_frame(const uint8_t *frame, size_t frame_len,
     return true;
 }
 
+/**
+ * @brief 在接收缓冲区中扫描并定位第一帧有效 SPI OTA 数据。
+ * @param buf 输入缓冲区。
+ * @param buf_len 缓冲区长度。
+ * @param type 输出帧类型，可为 NULL。
+ * @param payload 输出负载指针，可为 NULL。
+ * @param payload_len 输出负载长度，可为 NULL。
+ * @param frame_offset 输出帧起始偏移，可为 NULL。
+ * @return 找到有效帧返回 true，否则返回 false。
+ */
 static bool spi_ota_find_frame(const uint8_t *buf, size_t buf_len,
                                uint8_t *type, const uint8_t **payload, size_t *payload_len,
                                size_t *frame_offset)
@@ -64,6 +192,15 @@ static bool spi_ota_find_frame(const uint8_t *buf, size_t buf_len,
     if (!buf || buf_len < 5) return false;
     for (size_t i = 0; i + 5 <= buf_len; ++i) {
         if (buf[i] != SPI_OTA_SOF) continue;
+        size_t len_field = (size_t)buf[i+2] | ((size_t)buf[i+3] << 8);
+        size_t needed = 5 + len_field;
+        if (i + needed > buf_len) continue;
+        uint8_t crc = spi_ota_crc8(&buf[i], 4 + len_field);
+        if (crc != buf[i + 4 + len_field]) {
+            DEBUG_DBG("SPI", "帧@%u CRC错误: calc=0x%02X recv=0x%02X type=0x%02X len=%u",
+                      (unsigned)i, crc, buf[i + 4 + len_field], buf[i+1], (unsigned)len_field);
+            continue;
+        }
         if (spi_ota_parse_frame(&buf[i], buf_len - i, type, payload, payload_len)) {
             if (frame_offset) *frame_offset = i;
             return true;
@@ -84,14 +221,14 @@ esp_err_t spi_master_init(void)
     DEBUG_INFO("SPI", "=== 初始化 SPI2 (VSPI) ===");
 
     spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = 8;
+    bus_cfg.mosi_io_num = 5;
     bus_cfg.miso_io_num = 7;
     bus_cfg.sclk_io_num = 6;
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = 256;
 
-    DEBUG_INFO("SPI", "SPI2 引脚: MOSI=GPIO8, MISO=GPIO7, SCLK=GPIO6");
+    DEBUG_INFO("SPI", "SPI2 引脚: MOSI=GPIO5, MISO=GPIO7, SCLK=GPIO6");
     DEBUG_INFO("SPI", "SPI2 配置: CLK=%d MHz, CS=GPIO%d, 最大传输=%d 字节",
                SPI_CLOCK_HZ / 1000000, SPI_MASTER_CS_GPIO, bus_cfg.max_transfer_sz);
 
@@ -124,13 +261,21 @@ esp_err_t spi_master_init(void)
     return ESP_OK;
 }
 
-// 带超时的同步 SPI 传输
-// ESP-IDF 6.0: spi_device_transmit() 不再接受超时参数
-// 使用 spi_device_queue_trans() + spi_device_get_trans_result() 实现超时
+/**
+ * @brief 执行一次同步 SPI 事务，先发送请求，再补时钟读取响应尾部。
+ * @param cmd SPI 命令码；为 0 时不额外插入命令字节，直接发送 payload。
+ * @param payload 发送数据指针。
+ * @param payload_len 发送数据长度。
+ * @param recv_buf 接收缓冲区指针。
+ * @param recv_len 期望接收的响应字节数。
+ * @param timeout_ms 预留超时参数（当前实现未直接使用）。
+ * @return ESP_OK 成功，其他为失败错误码。
+ */
 esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
                             size_t payload_len, uint8_t *recv_buf,
                             size_t recv_len, uint32_t timeout_ms)
 {
+    (void)timeout_ms;
     if (g_spi_device == NULL) {
         DEBUG_ERR("SPI", "SPI 设备未初始化");
         return ESP_ERR_INVALID_STATE;
@@ -139,18 +284,7 @@ esp_err_t spi_sync_transfer(uint8_t cmd, const uint8_t *payload,
     DEBUG_DBG("SPI", "SPI 传输: cmd=0x%02X, 发送=%zu 字节, 接收=%zu 字节",
               cmd, payload_len, recv_len);
 
-    spi_transaction_t t = {};
-    t.cmd = cmd;
-    t.length = payload_len * 8;
-    t.rxlength = recv_len * 8;
-    t.tx_buffer = payload;
-    t.rx_buffer = recv_buf;
-    t.user = (void *)(uintptr_t)cmd;
-
-    /* ESP-IDF 6.0: 使用 spi_device_transmit() 无超时参数
-     * 如需超时控制，使用 spi_device_queue_trans() + spi_device_get_trans_result()
-     */
-    esp_err_t ret = spi_device_transmit(g_spi_device, &t);
+    esp_err_t ret = spi_transfer_request_response(cmd, payload, payload_len, recv_buf, recv_len);
     if (ret != ESP_OK) {
         DEBUG_WARN("SPI", "SPI 发送 cmd=0x%02X 失败: %s", cmd, esp_err_to_name(ret));
     } else {
@@ -184,11 +318,18 @@ esp_err_t spi_send(uint8_t cmd, const uint8_t *payload, size_t len)
  */
 esp_err_t spi_recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_ms)
 {
-    uint8_t dummy[64] = {0};
-    memset(dummy, 0xFF, sizeof(dummy));
-    return spi_sync_transfer(cmd, dummy, len, recv_buf, len, timeout_ms);
+    return spi_sync_transfer(cmd, NULL, 0, recv_buf, len, timeout_ms);
 }
 
+/**
+ * @brief 轮询读取 SPI OTA 响应帧，不重复发送请求帧。
+ * @param resp_type 输出响应类型，可为 NULL。
+ * @param resp_payload 输出响应负载缓冲区，可为 NULL。
+ * @param resp_max 响应缓冲区最大长度。
+ * @param resp_len 输出响应长度，可为 NULL。
+ * @param timeout_ms 轮询超时时间（毫秒）。
+ * @return ESP_OK 成功，ESP_ERR_TIMEOUT 超时，其他为底层错误码。
+ */
 esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
                                 size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
 {
@@ -204,18 +345,13 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
 
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     uint32_t attempt = 0;
-    while (xTaskGetTickCount() <= deadline) {
+    while (xTaskGetTickCount() <= deadline && attempt < 10) {
         ++attempt;
         memset(rx_raw, 0xFF, sizeof(rx_raw));
-        spi_transaction_t rsp = {};
-        rsp.length = SPI_OTA_FRAME_MAX * 8;
-        rsp.rxlength = SPI_OTA_FRAME_MAX * 8;
-        rsp.tx_buffer = dummy;
-        rsp.rx_buffer = rx_raw;
-        esp_err_t ret = spi_device_transmit(g_spi_device, &rsp);
+        esp_err_t ret = spi_transfer_clocked(dummy, sizeof(dummy), rx_raw, sizeof(rx_raw));
         if (ret != ESP_OK) {
             DEBUG_WARN("SPI", "SPI OTA 响应读取失败[%u]: %s", attempt, esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
 
@@ -244,14 +380,30 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
                 break;
             }
         }
-        DEBUG_DBG("SPI", "OTA响应未就绪[%u]: %s", attempt, all_ff ? "all-FF" : "no-valid-SOF");
-        vTaskDelay(pdMS_TO_TICKS(10));
+        DEBUG_DBG("SPI", "OTA响应未就绪[%u]: %s first10=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                   attempt, all_ff ? "all-FF" : "no-valid-SOF",
+                   rx_raw[0], rx_raw[1], rx_raw[2], rx_raw[3],
+                   rx_raw[4], rx_raw[5], rx_raw[6], rx_raw[7],
+                   rx_raw[8], rx_raw[9]);
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     DEBUG_ERR("SPI", "OTA响应超时: timeout=%ums", (unsigned)timeout_ms);
     return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * @brief 执行一次 SPI OTA 请求事务并等待响应帧。
+ * @param type 请求帧类型。
+ * @param payload 请求负载。
+ * @param payload_len 负载长度。
+ * @param resp_type 输出响应类型，可为 NULL。
+ * @param resp_payload 输出响应负载缓冲区，可为 NULL。
+ * @param resp_max 响应负载缓冲区大小。
+ * @param resp_len 输出响应长度，可为 NULL。
+ * @param timeout_ms 响应等待超时时间（毫秒）。
+ * @return ESP_OK 成功，其他为失败错误码。
+ */
 esp_err_t spi_ota_transfer(uint8_t type, const uint8_t *payload, size_t payload_len,
                            uint8_t *resp_type, uint8_t *resp_payload,
                            size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
@@ -270,21 +422,34 @@ esp_err_t spi_ota_transfer(uint8_t type, const uint8_t *payload, size_t payload_
 
     DEBUG_INFO("SPI", "OTA事务: req_type=0x%02X req_len=%u", type, (unsigned)payload_len);
 
-    spi_transaction_t req = {};
-    req.length = tx_len * 8;
-    req.tx_buffer = tx_frame;
-    esp_err_t ret = spi_device_transmit(g_spi_device, &req);
+    esp_err_t ret = spi_transfer_clocked(tx_frame, tx_len, NULL, 0);
     if (ret != ESP_OK) {
         DEBUG_ERR("SPI", "SPI OTA 请求事务失败: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2));
+    /* 给 GD32 从机一点时间在 ISR 中处理请求帧并准备响应帧。
+     * GD32 在 CS 释放的 EXTI ISR 中完成处理（微秒级），
+     * 但 EXTI ISR 到 TBE 中断启用之间有微小延迟。
+     * 500µs 足够覆盖所有中断响应延迟。 */
+    esp_rom_delay_us(500);
+
     return spi_ota_poll_response(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
 }
 
 // CANFD 帧发送
 // 帧格式: [通道(1B)] [扩展帧ID(4B BE)] [数据(1~64B)]
+/**
+ * @brief 发送一帧 CANFD 数据到 GD32，并可选等待响应。
+ * @param channel CAN 通道号。
+ * @param ext_id 扩展帧 ID（29-bit）。
+ * @param data 发送负载指针。
+ * @param dlc 发送数据长度。
+ * @param recv_buf 接收缓冲区，可为 NULL。
+ * @param recv_max 接收缓冲区最大长度。
+ * @param timeout_ms 等待响应超时（毫秒）。
+ * @return >=0 为接收字节数，<0 为错误码。
+ */
 static int can_frame_send(can_channel_t channel, uint32_t ext_id,
                           const uint8_t *data, uint8_t dlc,
                           uint8_t *recv_buf, uint8_t recv_max,
@@ -319,13 +484,8 @@ static int can_frame_send(can_channel_t channel, uint32_t ext_id,
     size_t tx_len = 5 + dlc;
     uint8_t rx_buf[5 + CAN_MAX_DLC] = {0};
 
-    spi_transaction_t t = {};
-    t.tx_buffer = tx_buf;
-    t.rx_buffer = rx_buf;
-    t.length = tx_len * 8;
-    t.rxlength = (recv_max > 0) ? (5 + recv_max) * 8 : 0;
-
-    esp_err_t ret = spi_device_transmit(g_spi_device, &t);
+    const size_t rx_len = (recv_buf != NULL && recv_max > 0U) ? (size_t)(5U + recv_max) : 0U;
+    esp_err_t ret = spi_transfer_clocked(tx_buf, tx_len, rx_buf, rx_len);
     if (ret != ESP_OK) {
         DEBUG_ERR("SPI", "CAN[ch%d] ID=0x%08X 发送失败: %s",
                    channel, ext_id, esp_err_to_name(ret));
@@ -352,26 +512,86 @@ static int can_frame_send(can_channel_t channel, uint32_t ext_id,
     return 0;
 }
 
-// 对外暴露的 GD32 CAN 发送接口，会在必要时修正默认 DLC。
+/**
+ * @brief 对外暴露的 GD32 CAN 发送接口，必要时修正默认 DLC。
+ * @param channel CAN 通道。
+ * @param ext_id 扩展帧 ID。
+ * @param data 发送数据指针。
+ * @param dlc 数据长度。
+ * @param recv_buf 接收缓冲区，可为 NULL。
+ * @param recv_max 接收缓冲区大小。
+ * @param timeout_ms 等待响应超时（毫秒）。
+ * @return >=0 为接收字节数，<0 为错误码。
+ */
 int gd32_can_send(can_channel_t channel, uint32_t ext_id,
                   const uint8_t *data, uint8_t dlc,
                   uint8_t *recv_buf, uint8_t recv_max,
                   uint32_t timeout_ms)
 {
-    if (dlc == 0) {
-        dlc = (data != NULL) ? 64 : 0;  // 避免 dlc=0 的情况
-    }
     return can_frame_send(channel, ext_id, data, dlc, recv_buf, recv_max, timeout_ms);
 }
 
-// 对外暴露的无响应 GD32 CAN 发送接口。
+/**
+ * @brief 发送无需响应的 GD32 CAN 帧。
+ * @param channel CAN 通道。
+ * @param ext_id 扩展帧 ID。
+ * @param data 发送数据指针。
+ * @param dlc 数据长度。
+ * @return 0 表示已发送完成，<0 为错误码。
+ */
 int gd32_can_send_no_reply(can_channel_t channel, uint32_t ext_id,
                             const uint8_t *data, uint8_t dlc)
 {
     return can_frame_send(channel, ext_id, data, dlc, NULL, 0, 0);
 }
 
+/**
+ * @brief 向正在运行的 GD32 DCU_APP 发送进入 Bootloader 的短 SPI 命令。
+ * @param timeout_ms 等待 APP 返回确认的最长时间。
+ * @return ESP_OK 表示 APP 已接收命令；超时则通常表示 GD32 已不在 APP 或 SPI 未就绪。
+ */
+esp_err_t gd32_app_request_bootloader(uint32_t timeout_ms)
+{
+    uint8_t cmd = SPI_APP_ENTER_BOOT_CMD;
+    esp_err_t ret = spi_transfer_clocked(&cmd, 1U, NULL, 0U);
+    if (ret != ESP_OK) {
+        DEBUG_WARN("SPI", "APP进入BOOT命令发送失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint8_t rx[8] = {0};
+    uint8_t dummy[8];
+    memset(dummy, 0xFF, sizeof(dummy));
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() <= deadline) {
+        memset(rx, 0xFF, sizeof(rx));
+        ret = spi_transfer_clocked(dummy, sizeof(dummy), rx, sizeof(rx));
+        if (ret == ESP_OK) {
+            for (size_t i = 0; i + 3U < sizeof(rx); ++i) {
+                if (rx[i] == SPI_APP_ENTER_BOOT_CMD && rx[i + 1U] == SPI_APP_ENTER_BOOT_ACK_OK) {
+                    DEBUG_INFO("SPI", "GD32 APP确认进入Bootloader OTA窗口");
+                    return ESP_OK;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    DEBUG_WARN("SPI", "GD32 APP进入Bootloader确认超时");
+    return ESP_ERR_TIMEOUT;
+}
+
 // 带重试的 SPI 传输
+/**
+ * @brief 执行带重试的 SPI 同步传输。
+ * @param cmd SPI 命令码。
+ * @param payload 发送数据指针。
+ * @param payload_len 发送长度。
+ * @param recv_buf 接收缓冲区。
+ * @param recv_len 接收长度。
+ * @param max_retries 最大重试次数。
+ * @return ESP_OK 成功，重试耗尽返回 ESP_ERR_TIMEOUT。
+ */
 esp_err_t spi_transfer_with_retry(uint8_t cmd, const uint8_t *payload,
                                   size_t payload_len, uint8_t *recv_buf,
                                   size_t recv_len, int max_retries)

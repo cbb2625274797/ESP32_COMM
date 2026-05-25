@@ -79,6 +79,10 @@ static bool s_esp32_reboot_pending = false;
 static uint8_t s_esp32_last_cmd = 0;
 static uint16_t s_esp32_last_seq = 0xFFFFU;
 
+/**
+ * @brief 异步完成 ESP32 OTA 收尾并触发重启。
+ * @param pvParameters 任务参数，当前未使用。
+ */
 static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -179,6 +183,11 @@ static int ble_ota_mbuf_to_buf(struct os_mbuf *om, uint8_t *buf, size_t buf_len)
     return (int)copy_len;
 }
 
+/**
+ * @brief 初始化 ESP32 本机 OTA 写入会话并选择目标分区。
+ * @param total_size 固件总大小（字节）。
+ * @return ESP_OK 成功，其他为失败错误码。
+ */
 static esp_err_t ble_esp32_ota_begin(size_t total_size)
 {
     const esp_partition_t *boot_partition = esp_ota_get_running_partition();
@@ -238,6 +247,12 @@ static esp_err_t ble_esp32_ota_begin(size_t total_size)
     return ESP_OK;
 }
 
+/**
+ * @brief 向 ESP32 OTA 分区写入一段固件数据。
+ * @param data 待写入数据指针。
+ * @param len 写入长度（字节）。
+ * @return ESP_OK 成功，其他为失败错误码。
+ */
 static esp_err_t ble_esp32_ota_write(const uint8_t *data, size_t len)
 {
     if (!s_esp32_ota_active || s_esp32_update_partition == NULL) {
@@ -250,6 +265,12 @@ static esp_err_t ble_esp32_ota_write(const uint8_t *data, size_t len)
     return err;
 }
 
+/**
+ * @brief 发送窗口 ACK 通知，回报已处理的分块序号与累计字节数。
+ * @param cmd 对应的数据命令字节。
+ * @param seq 当前确认的分块序号。
+ * @param completed_bytes 已完成写入的累计字节数。
+ */
 static void ble_ota_send_window_ack(uint8_t cmd, uint16_t seq, uint32_t completed_bytes)
 {
     uint8_t ack[8] = {0};
@@ -272,6 +293,11 @@ static void ble_ota_send_window_ack(uint8_t cmd, uint16_t seq, uint32_t complete
     }
 }
 
+/**
+ * @brief 发送收尾阶段事件通知（开始/完成/失败/重启等）。
+ * @param stage 阶段标识码。
+ * @param value 阶段附带值（错误码或耗时等）。
+ */
 static void ble_ota_send_finish_event(uint8_t stage, uint32_t value)
 {
     uint8_t pkt[6] = {0};
@@ -296,6 +322,14 @@ static void ble_ota_send_finish_event(uint8_t stage, uint32_t value)
 /*
  * CTRL (0x0001) - Write
  * 写入 0xF7 触发 OTA 中继
+ */
+/**
+ * @brief GATT CTRL 特征访问回调，处理控制命令写入。
+ * @param conn_handle BLE 连接句柄。
+ * @param attr_handle GATT 属性句柄。
+ * @param ctxt GATT 访问上下文。
+ * @param arg 回调用户参数。
+ * @return NimBLE ATT 错误码，0 表示成功。
  */
 static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -367,6 +401,14 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
  *   [3-6]    total_size   uint32 LE - 固件总大小 (仅 seq=0 时有效)
  *   [7..n-4] payload      固件数据
  *   [n-4..n] crc          校验 (预留)
+ */
+/**
+ * @brief GATT DATA_IN 特征访问回调，接收并处理 OTA 数据块。
+ * @param conn_handle BLE 连接句柄。
+ * @param attr_handle GATT 属性句柄。
+ * @param ctxt GATT 访问上下文。
+ * @param arg 回调用户参数。
+ * @return NimBLE ATT 错误码，0 表示成功。
  */
 static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                                    struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -479,9 +521,10 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
 
     // --- GD32 OTA：首个分块时创建存储元数据 ---
     if (seq == 0 && total_size > 0) {
-        if (total_size > OTA_MAX_FIRMWARE_SIZE) {
-            DEBUG_ERR(TAG, "固件太大: %" PRIu32 " > %zu",
-                      total_size, OTA_MAX_FIRMWARE_SIZE);
+        uint32_t rounded_size = (uint32_t)(((total_size + (uint32_t)GD32_OTA_PACKET_SIZE - 1U) / (uint32_t)GD32_OTA_PACKET_SIZE) * (uint32_t)GD32_OTA_PACKET_SIZE);
+        if (total_size == 0U || total_size > OTA_MAX_FIRMWARE_SIZE || rounded_size > OTA_MAX_FIRMWARE_SIZE) {
+            DEBUG_ERR(TAG, "GD32 固件大小非法: raw=%" PRIu32 " rounded48=%" PRIu32 " max=%zu",
+                      total_size, rounded_size, OTA_MAX_FIRMWARE_SIZE);
             return BLE_ATT_ERR_UNLIKELY;
         }
 
@@ -558,6 +601,14 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
  * VERSION (0x0004) - Read
  * 返回固件版本字符串
  */
+/**
+ * @brief GATT VERSION 特征访问回调，返回固件版本字符串。
+ * @param conn_handle BLE 连接句柄。
+ * @param attr_handle GATT 属性句柄。
+ * @param ctxt GATT 访问上下文。
+ * @param arg 回调用户参数。
+ * @return NimBLE ATT 错误码，0 表示成功。
+ */
 static int ble_ota_version_access(uint16_t conn_handle, uint16_t attr_handle,
                                    struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -577,6 +628,14 @@ static int ble_ota_version_access(uint16_t conn_handle, uint16_t attr_handle,
 /*
  * DATA_OUT (0x0003) - Notify only
  * 访问回调不做读写处理，通知由 ble_ota_notify_response() 发送
+ */
+/**
+ * @brief GATT DATA_OUT 特征访问回调（Notify-only，占位实现）。
+ * @param conn_handle BLE 连接句柄。
+ * @param attr_handle GATT 属性句柄。
+ * @param ctxt GATT 访问上下文。
+ * @param arg 回调用户参数。
+ * @return 0。
  */
 static int ble_ota_data_out_access(uint16_t conn_handle, uint16_t attr_handle,
                                     struct ble_gatt_access_ctxt *ctxt, void *arg)
