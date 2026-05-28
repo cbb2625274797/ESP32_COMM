@@ -206,6 +206,9 @@ select option { background: var(--bg-panel); color: var(--text); }
 .upload-zone .upload-ico { font-size: 32px; margin-bottom: 10px; }
 .upload-zone h4 { font-size: 14px; margin-bottom: 4px; }
 .upload-zone p { font-size: 12px; color: var(--text-dim); }
+.upload-zone-sm { padding: 16px 12px; }
+.upload-zone-sm .upload-ico { font-size: 24px; margin-bottom: 6px; }
+.upload-zone-sm h4 { font-size: 13px; }
 
 /* === FILE INFO === */
 .file-info {

@@ -30,8 +30,7 @@ static uint8_t g_k_session[16] = {0};
 static uint8_t g_gd32_uid_runtime[12] = {0};
 
 static constexpr size_t GD32_UID_LEN = 12;
-static constexpr size_t GD32_CHALLENGE_CIPHER_LEN = 32;
-static constexpr size_t GD32_CHALLENGE_PAYLOAD_WITH_SESSION = 36;
+static constexpr size_t GD32_CHALLENGE_RESPONSE_LEN = 36;
 
 /** @brief OTA 命令分发队列，从 WiFi/BLE 任务接收指令。 */
 QueueHandle_t g_ota_dispatch_queue = NULL;
@@ -149,54 +148,53 @@ static bool parse_and_verify_challenge_payload(const uint8_t *resp_payload, size
 {
     if (!resp_payload || !out_k_session || !out_uid) return false;
 
-    const uint8_t *cipher_blob = resp_payload;
-    size_t cipher_len = resp_len;
-    if (resp_len == GD32_CHALLENGE_PAYLOAD_WITH_SESSION) {
-        uint32_t session_num = read_u32_le(resp_payload);
-        DEBUG_INFO("OTA", "CHALLENGE session_num=0x%08" PRIX32, session_num);
-        cipher_blob = resp_payload + 4;
-        cipher_len = GD32_CHALLENGE_CIPHER_LEN;
-    }
-
-    if (cipher_len != GD32_CHALLENGE_CIPHER_LEN) {
+    if (resp_len != GD32_CHALLENGE_RESPONSE_LEN) {
         DEBUG_ERR("OTA", "CHALLENGE validate failed: invalid payload length=%u", (unsigned)resp_len);
         return false;
     }
-/*
-    if (cipher_len != GD32_CHALLENGE_CIPHER_LEN) {
-        DEBUG_ERR("OTA", "CHALLENGE payload长度异常: %u", (unsigned)resp_len);
+
+    /*
+     * GD32 响应格式 (36 bytes):
+     *   [0..11]  = UID (12 bytes)
+     *   [12..19] = nonce_server[8:16] (8 bytes, nonce 后半段)
+     *   [20..35] = encrypted_Ksession (16 bytes) = AES(K_master, K_session)
+     *
+     * 其中 K_session = AES(K_master, nonce_server)
+     */
+
+    const uint8_t *uid = resp_payload;
+    const uint8_t *nonce_frag = resp_payload + 12;
+    const uint8_t *encrypted_ksession = resp_payload + 20;
+
+    // 校验 nonce 片段: 应与 nonce_server[8:16] 一致
+    if (memcmp(nonce_frag, g_nonce_server + 8, 8) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: nonce片段不匹配");
         return false;
     }
 
-*/
-    uint8_t expected_nonce_block[16] = {0};
-    if (aes128_ecb_encrypt_block_local(MASTER_KEY, g_nonce_server, expected_nonce_block) != 0) {
-        DEBUG_ERR("OTA", "CHALLENGE validate failed: nonce block encrypt failed");
-        return false;
-    }
-/*
-    if (aes128_ecb_encrypt_block_local(MASTER_KEY, g_nonce_server, expected_nonce_block) != 0) {
-        DEBUG_ERR("OTA", "CHALLENGE校验失败: 计算nonce加密块失败");
+    // 派生 K_session = AES(K_master, nonce_server)
+    uint8_t K_session[16] = {0};
+    if (aes128_ecb_encrypt_block_local(MASTER_KEY, g_nonce_server, K_session) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: 派生K_session失败");
         return false;
     }
 
-*/
-    if (memcmp(cipher_blob, expected_nonce_block, sizeof(expected_nonce_block)) != 0) {
-        DEBUG_ERR("OTA", "CHALLENGE校验失败: nonce加密块不匹配");
+    // 验证 encrypted_Ksession: AES(K_master, K_session) 应匹配
+    uint8_t expected_encrypted[16] = {0};
+    if (aes128_ecb_encrypt_block_local(MASTER_KEY, K_session, expected_encrypted) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: 加密K_session失败");
         return false;
     }
 
-    memcpy(out_k_session, expected_nonce_block, sizeof(expected_nonce_block));
-
-    uint8_t device_info[16] = {0};
-    if (aes128_ecb_decrypt_block_local(out_k_session, &cipher_blob[16], device_info) != 0) {
-        DEBUG_ERR("OTA", "CHALLENGE校验失败: device_info解密失败");
+    if (memcmp(encrypted_ksession, expected_encrypted, 16) != 0) {
+        DEBUG_ERR("OTA", "CHALLENGE校验失败: encrypted_Ksession不匹配");
         return false;
     }
 
-    // device_info[0..11] maps to contiguous GD32 UID bytes from
-    // DEVICE_SERIAL_ADDR_LSB (0x1FFFF7E8) to 0x1FFFF7F3.
-    memcpy(out_uid, device_info, GD32_UID_LEN);
+    // 校验通过，输出 K_session 和 UID
+    memcpy(out_k_session, K_session, 16);
+    memcpy(out_uid, uid, GD32_UID_LEN);
+
     if (bytes_all_value(out_uid, GD32_UID_LEN, 0x00U) ||
         bytes_all_value(out_uid, GD32_UID_LEN, 0xFFU)) {
         DEBUG_ERR("OTA", "CHALLENGE校验失败: UID无效(全00/全FF)");
@@ -372,8 +370,6 @@ esp_err_t meta_load(ota_meta_t *meta)
     if (nvs_get_u32(handle, "chunk_count", &val) == ESP_OK) meta->chunk_count = val;
 
     nvs_close(handle);
-    DEBUG_INFO("OTA", "元数据已加载: total=%u, stored=%u, seq=%u",
-               meta->total_size, meta->stored_size, meta->last_seq);
     return ESP_OK;
 }
 
@@ -402,8 +398,6 @@ esp_err_t meta_save(const ota_meta_t *meta)
 
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "NVS commit 失败: %s", esp_err_to_name(err));
-    } else {
-        DEBUG_INFO("OTA", "元数据已保存到 NVS");
     }
     return err;
 }
@@ -488,8 +482,12 @@ static void request_gd32_app_enter_bootloader(void)
     DEBUG_INFO("OTA", "尝试通知 GD32 APP 进入 Bootloader OTA 窗口");
     esp_err_t err = gd32_app_request_bootloader(500);
     if (err == ESP_OK) {
-        DEBUG_INFO("OTA", "GD32 APP 已确认进入 Bootloader，等待复位完成");
-        vTaskDelay(pdMS_TO_TICKS(3500));
+        /* 收到确认：可能来自 APP（即将跳转 BOOT）或 BOOT 本身（已在 BOOT）。
+         * 如果来自 APP，GD32 需要复位并重新初始化 SPI 外设，需等 ~1-2s；
+         * 如果已在 BOOT，SPI 已经就绪，200ms 足够。
+         * 等待 1000ms 给 GD32 足够时间完成系统复位和 Bootloader 初始化。 */
+        DEBUG_INFO("OTA", "GD32 已确认进入 Bootloader，等待就绪");
+        vTaskDelay(pdMS_TO_TICKS(1000));
     } else {
         DEBUG_WARN("OTA", "GD32 APP 未确认进入 Bootloader，继续尝试直接握手: %s", esp_err_to_name(err));
     }
@@ -513,7 +511,7 @@ static ota_result_t send_handshake_req(void)
                                      &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
     log_resp_payload("HANDSHAKE_REQ", resp_type, resp_payload, resp_len);
     if (err == ESP_OK) {
-        err = wait_until_not_wait("HANDSHAKE_REQ", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 8);
+        err = wait_until_not_wait("HANDSHAKE_REQ", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 15);
     }
     if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 2 ||
         resp_payload[0] != 0x00 || resp_payload[1] != 0xAC) {

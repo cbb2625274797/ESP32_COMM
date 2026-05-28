@@ -17,7 +17,6 @@
     </div>
     <div class="header-status">
       <span class="pill offline" id="pillConn"><span class="indicator"></span><span id="pillConnTxt">未连接</span></span>
-      <span class="pill idle" id="pillMode"><span class="indicator"></span><span id="pillModeTxt">GD32</span></span>
       <span class="pill" id="pillVer">v--</span>
       <span class="pill" id="pillIP">--</span>
       <span class="pill" id="pillRSSI">--</span>
@@ -50,46 +49,65 @@
         </div>
       </div>
 
-      <!-- 2. Target -->
+      <!-- 2. ESP32 OTA -->
       <div class="card">
-        <div class="card-head"><span class="ico">🎯</span> 升级目标</div>
+        <div class="card-head"><span class="ico">📦</span> ESP32 自身升级</div>
         <div class="card-body">
-          <div class="form-row">
-            <select class="input" id="targetChip" onchange="onTargetChipChange()">
-              <option value="gd32">GD32（Flash SPI 中继）</option>
-              <option value="esp32">ESP32（自身 OTA 升级）</option>
-            </select>
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">上传固件并执行 OTA，设备将自动重启</div>
+          <div class="upload-zone upload-zone-sm" id="uploadZoneEsp32" onclick="document.getElementById('fileInputEsp32').click()">
+            <div class="upload-ico">📤</div>
+            <h4>点击或拖拽 ESP32 固件</h4>
           </div>
-          <div class="conn-indicator" id="targetHint" style="font-size:12px;font-weight:400;color:var(--text-dim);">
-            将固件写入 ESP32 Flash，由 ESP32 通过 SPI 中继到 GD32 完成刷写。
+          <input type="file" id="fileInputEsp32" accept=".hex,.bin" onchange="handleFileSelect(event, 'esp32')" style="display:none;">
+          <div class="file-info" id="fileInfoEsp32">
+            <div class="file-info-row">
+              <span style="font-weight:600;">📄 <span id="fileNameEsp32">-</span></span>
+              <button class="btn btn-ghost btn-sm" onclick="clearFile('esp32')">清除</button>
+            </div>
+            <div class="file-info-grid">
+              <div class="file-meta-item"><span>类型</span><b id="fileTypeEsp32">-</b></div>
+              <div class="file-meta-item"><span>大小</span><b id="fileSizeEsp32">-</b></div>
+            </div>
           </div>
+          <button class="btn btn-primary btn-block" id="uploadEsp32Btn" onclick="startUpload('esp32')" disabled style="margin-top:10px;">
+            上传并升级 ESP32
+          </button>
         </div>
       </div>
 
-      <!-- 3. Firmware -->
+      <!-- 3. GD32 OTA -->
       <div class="card">
-        <div class="card-head"><span class="ico">📁</span> 固件文件</div>
+        <div class="card-head"><span class="ico">📦</span> GD32 SPI 中继</div>
         <div class="card-body">
-          <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">上传固件到缓存，再触发 SPI 中继刷写</div>
+          <div class="upload-zone upload-zone-sm" id="uploadZoneGd32" onclick="document.getElementById('fileInputGd32').click()">
             <div class="upload-ico">📤</div>
-            <h4>点击或拖拽文件到此处</h4>
-            <p>支持 .hex 和 .bin 格式</p>
+            <h4>点击或拖拽 GD32 固件</h4>
           </div>
-          <input type="file" id="fileInput" accept=".hex,.bin" onchange="handleFileSelect(event)" style="display:none;">
-
-          <div class="file-info" id="fileInfo">
+          <input type="file" id="fileInputGd32" accept=".hex,.bin" onchange="handleFileSelect(event, 'gd32')" style="display:none;">
+          <div class="file-info" id="fileInfoGd32">
             <div class="file-info-row">
-              <span style="font-weight:600;">📄 <span id="fileName">-</span></span>
-              <button class="btn btn-ghost btn-sm" onclick="clearFile()">清除</button>
+              <span style="font-weight:600;">📄 <span id="fileNameGd32">-</span></span>
+              <button class="btn btn-ghost btn-sm" onclick="clearFile('gd32')">清除</button>
             </div>
             <div class="file-info-grid">
-              <div class="file-meta-item"><span>类型</span><b id="fileType">-</b></div>
-              <div class="file-meta-item"><span>大小</span><b id="fileSize">-</b></div>
-              <div class="file-meta-item"><span>数据包 (8KB/包)</span><b id="fileChunks">-</b></div>
+              <div class="file-meta-item"><span>类型</span><b id="fileTypeGd32">-</b></div>
+              <div class="file-meta-item"><span>大小</span><b id="fileSizeGd32">-</b></div>
             </div>
           </div>
-          <div class="helper-note warn" id="fileHint">未选择固件。请选择 <code>.bin</code> 或 <code>.hex</code> 文件后再执行上传。</div>
+          <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled style="margin-top:10px;margin-bottom:8px;">
+            上传固件到缓存
+          </button>
+          <button class="btn btn-outline btn-block" id="relayBtn" onclick="triggerRelay()">
+            触发 GD32 OTA 中继
+          </button>
+        </div>
+      </div>
 
+      <!-- 4. Common -->
+      <div class="card">
+        <div class="card-head"><span class="ico">⚡</span> 通用操作</div>
+        <div class="card-body">
           <div class="progress-wrap" id="progressWrap">
             <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
             <div class="progress-text">
@@ -97,26 +115,7 @@
               <span id="progressPct">0%</span>
             </div>
           </div>
-        </div>
-      </div>
-
-      <!-- 4. Execute -->
-      <div class="card">
-        <div class="card-head"><span class="ico">⚡</span> 执行操作</div>
-        <div class="card-body">
-          <button class="btn btn-primary btn-block" id="uploadBtn" onclick="startUpload()" disabled>
-            上传固件到 ESP32
-          </button>
-          <div class="helper-note" id="actionHint">执行顺序：先测试连接，再确认目标芯片，最后上传固件。GD32 模式上传完成后，再触发中继。</div>
-          <div class="btn-row">
-            <button class="btn btn-success" id="relayBtn" onclick="triggerRelay()">
-              触发 GD32 OTA 中继
-            </button>
-            <button class="btn btn-outline" onclick="restartEsp32()">
-              重启 ESP32
-            </button>
-          </div>
-          <div id="esp32Actions" style="display:none;margin-top:12px;"></div>
+          <button class="btn btn-outline btn-block" onclick="restartEsp32()">重启 ESP32</button>
           <a class="btn btn-outline btn-block" href="ble_ota.html?v=20260509-0046" style="margin-top:10px;text-decoration:none;">
             切换到 BLE 蓝牙刷写
           </a>
@@ -138,10 +137,6 @@
               <div class="k">连接状态</div>
             </div>
             <div class="badge-stat">
-              <div class="v" id="bMode">GD32</div>
-              <div class="k">当前模式</div>
-            </div>
-            <div class="badge-stat">
               <div class="v warn" id="bOTAProgress">0%</div>
               <div class="k">OTA 进度</div>
             </div>
@@ -160,6 +155,7 @@
             <div class="metric"><div class="k">空闲堆</div><div class="v" id="mHeap" style="font-size:16px;">--</div></div>
             <div class="metric"><div class="k">最低空闲堆</div><div class="v" id="mMinHeap" style="font-size:16px;">--</div></div>
             <div class="metric"><div class="k">固件版本</div><div class="v" id="mVersion" style="font-size:16px;">--</div></div>
+            <div class="metric"><div class="k">OTA 缓存</div><div class="v" id="mOtaCache" style="font-size:13px;">--</div></div>
           </div>
         </div>
       </div>
@@ -262,6 +258,6 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260525"></script>
+<script src="app.js?v=20260528"></script>
 </body>
 </html>

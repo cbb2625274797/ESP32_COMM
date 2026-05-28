@@ -1,5 +1,6 @@
 // ==================== 全局状态 ====================
-let currentFile = null;
+let esp32File = null;
+let gd32File = null;
 let uploadProgress = 0;
 let isUploading = false;
 let logFilter = 'all';
@@ -8,6 +9,8 @@ let lastLogHash = null;
 let autoScroll = true;
 let logSocket = null;
 let latestSystemStatus = null;
+let isEsp32Rebooting = false;
+let rebootStartTime = 0;
 
 // ==================== 工具函数 ====================
 function formatBytes(bytes) {
@@ -120,10 +123,10 @@ function toggleAutoScroll() {
 }
 
 function updateUploadButtonLabel() {
-  var chip = document.getElementById('targetChip').value;
-  var uploadBtn = document.getElementById('uploadBtn');
-  if (!uploadBtn) return;
-  uploadBtn.textContent = chip === 'esp32' ? '上传固件到 ESP32' : '上传固件到中继缓存';
+  var esp32Btn = document.getElementById('uploadEsp32Btn');
+  var gd32Btn = document.getElementById('uploadGd32Btn');
+  if (esp32Btn) esp32Btn.disabled = !esp32File || isUploading;
+  if (gd32Btn) gd32Btn.disabled = !gd32File || isUploading;
 }
 
 function setHelper(id, text, type) {
@@ -131,25 +134,6 @@ function setHelper(id, text, type) {
   if (!el) return;
   el.className = 'helper-note ' + (type || '');
   el.innerHTML = text;
-}
-
-function updateFileHint() {
-  if (!currentFile) {
-    setHelper('fileHint', '未选择固件。请选择 <code>.bin</code> 或 <code>.hex</code> 文件后再执行上传。', 'warn');
-    return;
-  }
-  var chip = document.getElementById('targetChip').value;
-  var targetText = chip === 'esp32' ? 'ESP32 自升级' : 'GD32 中继升级';
-  setHelper('fileHint', '文件已就绪：<code>' + currentFile.name + '</code>，当前目标：<b>' + targetText + '</b>。可以开始上传。', 'ok');
-}
-
-function updateActionHint() {
-  var chip = document.getElementById('targetChip').value;
-  if (chip === 'esp32') {
-    setHelper('actionHint', 'ESP32 模式：上传后设备会执行自身 OTA。上传成功后会自动调用 <code>/ota/update</code> 并重启。', 'warn');
-  } else {
-    setHelper('actionHint', 'GD32 模式：先把固件上传到 ESP32 中继缓存，再点击“触发 GD32 OTA 中继”。阶段流会根据真实 <code>relay_state</code> 更新。', '');
-  }
 }
 
 function updateCanHint() {
@@ -192,6 +176,42 @@ function applyDisconnectedRuntimeState() {
   document.getElementById('bOTAProgress').textContent = '--';
   document.getElementById('bOTAProgress').className = 'v err';
   resetStageFlow();
+}
+
+function applyRebootingRuntimeState() {
+  var pc = document.getElementById('pillConn');
+  var pct = document.getElementById('pillConnTxt');
+  pc.className = 'pill processing';
+  var elapsed = Math.round((Date.now() - rebootStartTime) / 1000);
+  pct.textContent = '重启中 ' + elapsed + 's';
+
+  var cs = document.getElementById('connStatus');
+  var cst = document.getElementById('connStatusTxt');
+  cs.className = 'conn-indicator warn';
+  cst.textContent = 'ESP32 正在重启...';
+
+  var bc = document.getElementById('bConn');
+  bc.textContent = '重启中';
+  bc.className = 'v warn';
+
+  document.getElementById('pillRelayTxt').textContent = '重启中';
+  document.getElementById('pillRelay').className = 'pill processing';
+}
+
+function applyUploadingRuntimeState() {
+  var pc = document.getElementById('pillConn');
+  var pct = document.getElementById('pillConnTxt');
+  pc.className = 'pill processing';
+  pct.textContent = '上传中';
+
+  var cs = document.getElementById('connStatus');
+  var cst = document.getElementById('connStatusTxt');
+  cs.className = 'conn-indicator warn';
+  cst.textContent = '固件上传中，设备忙...';
+
+  var bc = document.getElementById('bConn');
+  bc.textContent = '上传中';
+  bc.className = 'v warn';
 }
 
 // ==================== 连接管理 ====================
@@ -311,6 +331,19 @@ function updateSystemStatusUi(data) {
   document.getElementById('mMinHeap').textContent =
     data.min_free_heap !== undefined ? formatBytes(data.min_free_heap) : '--';
 
+  // ota cache
+  var otaStored = ota.stored_size || 0;
+  var mOtaCache = document.getElementById('mOtaCache');
+  if (mOtaCache) {
+    if (otaStored > 0) {
+      mOtaCache.textContent = formatBytes(otaStored) + ' / 216 KB';
+      mOtaCache.className = 'v ok';
+    } else {
+      mOtaCache.textContent = '0 / 216 KB';
+      mOtaCache.className = 'v';
+    }
+  }
+
   // relay state
   var rs = ota.relay_state;
   var relayText = relayStates[rs] || '待机';
@@ -328,11 +361,6 @@ function updateSystemStatusUi(data) {
   var bp = document.getElementById('bOTAProgress');
   bp.textContent = progress + '%';
   bp.className = 'v ' + (progress === 100 ? 'ok' : progress > 0 ? 'warn' : '');
-
-  // DUT mode pill
-  var currentMode = document.getElementById('targetChip').value === 'esp32' ? 'ESP32' : 'GD32';
-  document.getElementById('pillModeTxt').textContent = currentMode;
-  document.getElementById('bMode').textContent = currentMode;
 
   // stage flow from real state
   updateStagesFromRelayState(rs);
@@ -394,28 +422,6 @@ async function sendCanFrame() {
     addLog('E', 'CAN', '发送失败: ' + e.message);
     showToast('发送失败', 'error');
   }
-}
-
-function onTargetChipChange() {
-  var chip = document.getElementById('targetChip').value;
-  var relayBtn = document.getElementById('relayBtn');
-  var esp32Actions = document.getElementById('esp32Actions');
-  if (chip === 'esp32') {
-    relayBtn.style.display = 'none';
-    esp32Actions.style.display = 'block';
-  } else {
-    relayBtn.style.display = '';
-    esp32Actions.style.display = 'none';
-  }
-  updateUploadButtonLabel();
-  updateActionHint();
-  document.getElementById('pillModeTxt').textContent = chip === 'esp32' ? 'ESP32' : 'GD32';
-  document.getElementById('bMode').textContent = chip === 'esp32' ? 'ESP32' : 'GD32';
-  var th = document.getElementById('targetHint');
-  th.innerHTML = chip === 'esp32'
-    ? '直接将固件写入 ESP32 自身 Flash，写入完成后 OTA 升级并自动重启。'
-    : '将固件写入 ESP32 Flash，由 ESP32 通过 SPI 中继到 GD32 完成刷写。';
-  addLog('I', '目标', '切换到: ' + (chip === 'esp32' ? 'ESP32 自身升级' : 'GD32 Flash 中继'));
 }
 
 function clearCanFields() {
@@ -527,22 +533,28 @@ function clearSpiFields() {
 }
 
 // ==================== 文件处理 ====================
-function handleFileSelect(event) {
+function handleFileSelect(event, chip) {
   var file = event.target.files[0];
-  if (file) processFile(file);
+  if (file) processFile(file, chip);
 }
 
-document.getElementById('uploadZone').addEventListener('dragover', function (e) {
-  e.preventDefault(); e.currentTarget.classList.add('dragover');
-});
-document.getElementById('uploadZone').addEventListener('dragleave', function (e) {
-  e.currentTarget.classList.remove('dragover');
-});
-document.getElementById('uploadZone').addEventListener('drop', function (e) {
-  e.preventDefault(); e.currentTarget.classList.remove('dragover');
-  var file = e.dataTransfer.files[0];
-  if (file) processFile(file);
-});
+function setupDropZone(zoneId, chip) {
+  var zone = document.getElementById(zoneId);
+  if (!zone) return;
+  zone.addEventListener('dragover', function (e) {
+    e.preventDefault(); e.currentTarget.classList.add('dragover');
+  });
+  zone.addEventListener('dragleave', function (e) {
+    e.currentTarget.classList.remove('dragover');
+  });
+  zone.addEventListener('drop', function (e) {
+    e.preventDefault(); e.currentTarget.classList.remove('dragover');
+    var file = e.dataTransfer.files[0];
+    if (file) processFile(file, chip);
+  });
+}
+setupDropZone('uploadZoneEsp32', 'esp32');
+setupDropZone('uploadZoneGd32', 'gd32');
 
 document.getElementById('canData').addEventListener('input', updateCanHint);
 document.getElementById('canDlc').addEventListener('input', updateCanHint);
@@ -550,46 +562,46 @@ document.getElementById('canDlc').addEventListener('input', updateCanHint);
 document.getElementById('spiType').addEventListener('input', updateSpiHint);
 document.getElementById('spiData').addEventListener('input', updateSpiHint);
 
-function processFile(file) {
-  currentFile = file;
-  document.getElementById('fileInfo').classList.add('show');
-  document.getElementById('uploadBtn').disabled = false;
-  document.getElementById('fileName').textContent = file.name;
-  document.getElementById('fileType').textContent =
+function processFile(file, chip) {
+  if (chip === 'esp32') esp32File = file;
+  else gd32File = file;
+  var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
+  document.getElementById('fileInfo' + suffix).classList.add('show');
+  document.getElementById('fileName' + suffix).textContent = file.name;
+  document.getElementById('fileType' + suffix).textContent =
     file.name.toLowerCase().indexOf('.hex') >= 0 ? 'Intel HEX' : 'Binary';
-  document.getElementById('fileSize').textContent = formatBytes(file.size);
-  var chunks = Math.ceil(file.size / 8192);
-  document.getElementById('fileChunks').textContent = chunks + ' 包';
-  updateFileHint();
-  addLog('I', '文件', '已选择: ' + file.name + ' (' + formatBytes(file.size) + ')');
-  showToast('文件已选择', 'success');
+  document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
+  updateUploadButtonLabel();
+  addLog('I', '文件', chip.toUpperCase() + ' 已选择: ' + file.name + ' (' + formatBytes(file.size) + ')');
+  showToast(chip.toUpperCase() + ' 文件已选择', 'success');
 }
 
-function clearFile() {
-  currentFile = null;
-  document.getElementById('fileInput').value = '';
-  document.getElementById('fileInfo').classList.remove('show');
-  document.getElementById('uploadBtn').disabled = true;
-  document.getElementById('progressWrap').classList.remove('show');
-  updateFileHint();
-  addLog('I', '文件', '文件已清除');
+function clearFile(chip) {
+  var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
+  if (chip === 'esp32') esp32File = null;
+  else gd32File = null;
+  document.getElementById('fileInput' + suffix).value = '';
+  document.getElementById('fileInfo' + suffix).classList.remove('show');
+  updateUploadButtonLabel();
+  addLog('I', '文件', chip.toUpperCase() + ' 文件已清除');
 }
 
 // ==================== 上传固件 ====================
-async function startUpload() {
-  if (!currentFile || isUploading) return;
-  var chip = document.getElementById('targetChip').value;
+async function startUpload(chip) {
+  var file = chip === 'esp32' ? esp32File : gd32File;
+  if (!file || isUploading) return;
   isUploading = true;
-  var uploadBtn = document.getElementById('uploadBtn');
+  var uploadBtn = document.getElementById(chip === 'esp32' ? 'uploadEsp32Btn' : 'uploadGd32Btn');
+  var origText = uploadBtn.textContent;
   uploadBtn.disabled = true;
   uploadBtn.textContent = '上传中...';
   document.getElementById('progressWrap').classList.add('show');
-  addLog('I', '上传', '开始上传: ' + currentFile.name + ' \u2192 ' + chip.toUpperCase());
+  addLog('I', '上传', '开始上传: ' + file.name + ' \u2192 ' + chip.toUpperCase());
   showToast('开始上传固件到 ' + chip.toUpperCase(), 'success');
 
   try {
-    var arrayBuffer = await currentFile.arrayBuffer();
-    var fileSize = currentFile.size;
+    var arrayBuffer = await file.arrayBuffer();
+    var fileSize = file.size;
     var body, url = getBaseUrl() + '/ota/upload';
 
     if (chip === 'esp32') {
@@ -621,12 +633,12 @@ async function startUpload() {
     xhr.addEventListener('load', function () {
       isUploading = false;
       uploadBtn.disabled = false;
+      uploadBtn.textContent = origText;
       updateUploadButtonLabel();
       if (xhr.status === 200) {
         addLog('I', '上传', '固件上传完成！');
         showToast('固件上传成功', 'success');
         if (chip === 'esp32') {
-          document.getElementById('esp32Actions').style.display = 'block';
           var countdown = 3;
           addLog('I', 'OTA', countdown + ' 秒后自动调用 POST /ota/update 完成升级并重启...');
           var timer = setInterval(function () {
@@ -646,7 +658,9 @@ async function startUpload() {
     });
 
     xhr.addEventListener('error', function () {
-      isUploading = false; uploadBtn.disabled = false;
+      isUploading = false;
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = origText;
       updateUploadButtonLabel();
       addLog('E', '上传', '上传过程发生错误');
       showToast('上传出错', 'error');
@@ -657,7 +671,9 @@ async function startUpload() {
   } catch (e) {
     addLog('E', '上传', '上传失败: ' + e.message);
     showToast('上传失败', 'error');
-    isUploading = false; uploadBtn.disabled = false;
+    isUploading = false;
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = origText;
     updateUploadButtonLabel();
   }
 }
@@ -674,6 +690,8 @@ async function triggerEsp32Update() {
       var data = await resp.json();
       addLog('I', 'OTA', '升级完成: ' + data.message);
       showToast('ESP32 重启中...', 'success');
+      isEsp32Rebooting = true;
+      rebootStartTime = Date.now();
     }
   } catch (e) {
     addLog('E', 'OTA', '升级失败: ' + e.message);
@@ -693,6 +711,8 @@ async function restartEsp32() {
       var data = await resp.json();
       addLog('I', '系统', '重启已触发: ' + data.message);
       showToast('ESP32 重启中，页面将自动恢复...', 'success');
+      isEsp32Rebooting = true;
+      rebootStartTime = Date.now();
     }
   } catch (e) {
     addLog('E', '系统', '重启请求失败: ' + e.message);
@@ -733,11 +753,31 @@ async function pollStatus() {
     });
     if (resp.ok) {
       var data = await resp.json();
+      if (isEsp32Rebooting) {
+        isEsp32Rebooting = false;
+        addLog('I', '系统', 'ESP32 已恢复在线');
+        showToast('ESP32 已恢复在线', 'success');
+      }
       updateSystemStatusUi(data);
     }
   } catch (e) {
-    updateConnectionUi(false, '未连接');
-    applyDisconnectedRuntimeState();
+    if (isUploading) {
+      applyUploadingRuntimeState();
+    } else if (isEsp32Rebooting) {
+      var elapsed = Math.round((Date.now() - rebootStartTime) / 1000);
+      if (elapsed > 60) {
+        isEsp32Rebooting = false;
+        addLog('E', '系统', 'ESP32 重启超时，设备未恢复');
+        showToast('ESP32 重启超时，请检查设备', 'error');
+        updateConnectionUi(false, '未连接');
+        applyDisconnectedRuntimeState();
+      } else {
+        applyRebootingRuntimeState();
+      }
+    } else {
+      updateConnectionUi(false, '未连接');
+      applyDisconnectedRuntimeState();
+    }
   }
 }
 setInterval(pollStatus, 1000);
@@ -767,10 +807,7 @@ async function pollLogs() {
 setInterval(pollLogs, 1000);
 
 setTimeout(function () {
-  onTargetChipChange();
   updateUploadButtonLabel();
-  updateFileHint();
-  updateActionHint();
   updateCanHint();
   addLog('I', '系统', '控制台初始化完成，等待固件文件...');
   updateSpiHint();

@@ -768,10 +768,13 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    if (s_relay_triggered) {
+    if (s_relay_triggered && g_relay_state != RELAY_IDLE &&
+        g_relay_state != RELAY_DONE && g_relay_state != RELAY_ERROR) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "relay already triggered");
         return ESP_FAIL;
     }
+    /* 上一轮中继已结束/失败/空闲，重置标志允许重新触发 */
+    s_relay_triggered = false;
 
     if (!g_ota_dispatch_queue) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay queue not ready");
@@ -1404,10 +1407,13 @@ void wifi_ota_signal_relay(void)
         return;
     }
 
-    if (s_relay_triggered) {
-        DEBUG_WARN("WIFI", "转发已经触发过");
+    if (s_relay_triggered && g_relay_state != RELAY_IDLE &&
+        g_relay_state != RELAY_DONE && g_relay_state != RELAY_ERROR) {
+        DEBUG_WARN("WIFI", "转发正在执行中，状态: %d", g_relay_state);
         return;
     }
+    /* 上一轮中继已结束/失败/空闲，重置标志 */
+    s_relay_triggered = false;
 
     /** @brief OTA 中继是否已触发标志。 */
     s_relay_triggered = true;

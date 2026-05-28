@@ -246,8 +246,36 @@ esp_err_t spi_master_init(void)
     dev_cfg.command_bits = 0;
     dev_cfg.address_bits = 0;
     dev_cfg.dummy_bits = 0;
-    dev_cfg.cs_ena_posttrans = 0;
-    dev_cfg.cs_ena_pretrans = 0;
+    /* CS↑ 后保持 CS 高的时间（SPI 时钟周期数）。
+     *
+     * 0 = 最小 CS 高时间（仅满足 SPI 时序）。
+     * 设大一点让 GD32 EXTI ISR 有足够时间完成 onCsRelease() 处理：
+     * 切 internal NSS HIGH + 清 RBNE FIFO + 帧解析 + 准备响应帧。
+     *
+     * 10 × 250ns = 2.5µs，加上 SPI 驱动本身的 CS 间隮（~1µs），
+     * GD32 实际有 ~3.5µs 的 CS 高窗口。足够完成关键操作。
+     */
+    dev_cfg.cs_ena_posttrans = 10;
+    /* CS↓ 后等待 20 个 SPI 时钟周期再开始发 SCK。
+     *
+     * 4MHz SPI → 20×250ns = 5µs 延时。
+     *
+     * GD32 SPI 从机在 CS↓ 时需要 EXTI ISR 执行 onCsAssert():
+     *   设置 s_csActive=true → 清空接收缓冲 → 切 internal NSS LOW → 配置 DMA。
+     *
+     * 但 SPI0 RBNE 中断优先级 (1,0) 高于 EXTI (1,1)，
+     * 首字节 RBNE 会打断正在执行的 EXTI ISR →
+     *   s_csActive 还没设为 true → s_rxStreamLen 还没清零 →
+     *   首字节存到旧位置 → EXTI 返回后清零 → 首字节丢失。
+     *
+     * cs_ena_pretrans=20 让 ESP32 在 CS↓ 后多等 5µs，
+     * GD32 EXTI ISR 只需 ~1µs 就能完成关键初始化，
+     * 5µs 足够让 onCsAssert() 执行完 s_csActive=true + s_rxStreamLen=0U。
+     *
+     * 代价：每次 SPI 事务多 5µs 延时。
+     * 一次 OTA 事务 = 1次请求 + ~10次轮询 = ~55µs 额外开销，可接受。
+     */
+    dev_cfg.cs_ena_pretrans = 20;
 
     ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &g_spi_device);
     if (ret != ESP_OK) {
@@ -351,7 +379,7 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
         esp_err_t ret = spi_transfer_clocked(dummy, sizeof(dummy), rx_raw, sizeof(rx_raw));
         if (ret != ESP_OK) {
             DEBUG_WARN("SPI", "SPI OTA 响应读取失败[%u]: %s", attempt, esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
 
@@ -385,7 +413,7 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
                    rx_raw[0], rx_raw[1], rx_raw[2], rx_raw[3],
                    rx_raw[4], rx_raw[5], rx_raw[6], rx_raw[7],
                    rx_raw[8], rx_raw[9]);
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 
     DEBUG_ERR("SPI", "OTA响应超时: timeout=%ums", (unsigned)timeout_ms);
@@ -422,18 +450,43 @@ esp_err_t spi_ota_transfer(uint8_t type, const uint8_t *payload, size_t payload_
 
     DEBUG_INFO("SPI", "OTA事务: req_type=0x%02X req_len=%u", type, (unsigned)payload_len);
 
+    /* ============================================================
+     * 第1次 CS 周期：发送请求帧（只发不收）
+     *
+     * ESP32 发完请求帧后 CS↑，GD32 在 CS↑ 的 onCsRelease 中
+     * 或 RBNE 中断的 tryProcessCompleteFrame 中处理帧，
+     * 将 ACK 写入 s_txBuf 并启动 DMA。
+     *
+     * 注意：不能在同一个 CS 周期内发请求+读响应，因为：
+     * 1. SPI 全双工：ESP32 发请求时 MISO 同时在输出旧数据
+     * 2. GD32 收到请求帧后才能准备 ACK，需重启 DMA
+     * 3. DMA 重启期间 MISO 会输出 0x00/0xFF，导致帧断裂
+     * ============================================================ */
     esp_err_t ret = spi_transfer_clocked(tx_frame, tx_len, NULL, 0);
     if (ret != ESP_OK) {
-        DEBUG_ERR("SPI", "SPI OTA 请求事务失败: %s", esp_err_to_name(ret));
+        DEBUG_ERR("SPI", "SPI OTA 请求发送失败: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    /* 给 GD32 从机一点时间在 ISR 中处理请求帧并准备响应帧。
-     * GD32 在 CS 释放的 EXTI ISR 中完成处理（微秒级），
-     * 但 EXTI ISR 到 TBE 中断启用之间有微小延迟。
-     * 500µs 足够覆盖所有中断响应延迟。 */
+    /* 等 GD32 处理帧 + 准备响应。
+     *
+     * GD32 在 CS↑ 的 onCsRelease() 中处理帧：
+     *   isrProcessFrame() → OTA handler 回调 → queueTxFrame() → DMA 启动
+     * 总耗时约 10-20µs（ISR 内执行，无调度延迟）。
+     *
+     * 但 EXTI ISR 可能被更高优先级的 RBNE 中断短暂抢占，
+     * 实际完成时间可能到 30-50µs。
+     *
+     * 500µs 提供了 10x 以上的安全余量，
+     * 同时对 OTA 事务延迟影响可忽略（一次 OTA 事务 ~1ms 级别）。 */
     esp_rom_delay_us(500);
 
+    /* ============================================================
+     * 第2次 CS 周期：发 0xFF dummy 产生时钟，读 MISO 上的响应帧
+     *
+     * GD32 的 onCsAssert 会重启 DMA，将 s_txBuf（ACK帧）
+     * 推到 MISO，ESP32 在 96 字节中扫描定位响应帧。
+     * ============================================================ */
     return spi_ota_poll_response(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
 }
 
