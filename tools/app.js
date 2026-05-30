@@ -1,6 +1,8 @@
-// ==================== 全局状态 ====================
+﻿// ==================== 全局状态 ====================
 let esp32File = null;
 let gd32File = null;
+let esp32FileHandle = null;  // FileSystemFileHandle for hot reload
+let gd32FileHandle = null;   // FileSystemFileHandle for hot reload
 let uploadProgress = 0;
 let isUploading = false;
 let logFilter = 'all';
@@ -37,6 +39,12 @@ function formatUptime(sec) {
   if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
   if (m > 0) return m + 'm ' + s + 's';
   return s + 's';
+}
+
+function formatHttpErrorDetail(text) {
+  var detail = (text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (detail.length > 180) detail = detail.slice(0, 177) + '...';
+  return detail;
 }
 
 function showToast(message, type) {
@@ -538,6 +546,37 @@ function handleFileSelect(event, chip) {
   if (file) processFile(file, chip);
 }
 
+// 通过 File System Access API 选择文件（支持热重载）
+async function pickFileViaFSAPI(chip) {
+  if (!window.showOpenFilePicker) {
+    addLog('W', '文件', '当前浏览器不支持 File System Access API，请手动重新选择文件');
+    return false;
+  }
+  try {
+    var acceptMap = chip === 'esp32'
+      ? { 'application/octet-stream': ['.bin'] }
+      : { 'application/octet-stream': ['.bin', '.hex'] };
+    var handles = await window.showOpenFilePicker({
+      types: [{ description: '固件文件', accept: acceptMap }],
+      multiple: false
+    });
+    if (handles && handles.length > 0) {
+      var handle = handles[0];
+      var file = await handle.getFile();
+      if (chip === 'esp32') esp32FileHandle = handle;
+      else gd32FileHandle = handle;
+      processFile(file, chip);
+      addLog('I', '文件', '已通过 FSAPI 选择文件（支持热重载）: ' + file.name);
+      return true;
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      addLog('W', '文件', 'FSAPI 选择失败: ' + e.message);
+    }
+  }
+  return false;
+}
+
 function setupDropZone(zoneId, chip) {
   var zone = document.getElementById(zoneId);
   if (!zone) return;
@@ -562,14 +601,157 @@ document.getElementById('canDlc').addEventListener('input', updateCanHint);
 document.getElementById('spiType').addEventListener('input', updateSpiHint);
 document.getElementById('spiData').addEventListener('input', updateSpiHint);
 
+// ==================== Intel HEX → BIN 转换 ====================
+
+/**
+ * 将 Intel HEX 字符串解析为原始 BIN 字节数组。
+ *
+ * 支持记录类型: 00(数据), 01(EOF), 02(扩展段地址), 04(扩展线性地址)。
+ * 地址间隙填充 0xFF（Flash 擦除态）。
+ *
+ * @param {string} hexText  Intel HEX 文件的完整文本内容。
+ * @returns {{ data: Uint8Array, baseAddr: number, endAddr: number }}
+ */
+function parseIntelHex(hexText) {
+  var baseAddr = 0;     // 当前扩展地址
+  var segments = [];     // { offset, data } 列表
+  var minAddr = 0xFFFFFFFF;
+  var maxAddr = 0;
+
+  var lines = hexText.split(/\r?\n/);
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line || line[0] !== ':') continue;
+
+    // 解析行: :LLAAAATT[DD...]CC
+    var byteCount = parseInt(line.substr(1, 2), 16);
+    var addr16   = parseInt(line.substr(3, 4), 16);
+    var recType  = parseInt(line.substr(7, 2), 16);
+
+    // 校验和验证
+    var sum = 0;
+    for (var j = 1; j < line.length; j += 2) {
+      sum += parseInt(line.substr(j, 2), 16);
+    }
+    if ((sum & 0xFF) !== 0) {
+      throw new Error('HEX 行 ' + (i + 1) + ' 校验和错误: ' + line);
+    }
+
+    if (recType === 0x01) {
+      // EOF
+      break;
+    } else if (recType === 0x04) {
+      // 扩展线性地址 (upper 16 bits)
+      baseAddr = parseInt(line.substr(9, 4), 16) << 16;
+    } else if (recType === 0x02) {
+      // 扩展段地址
+      baseAddr = (parseInt(line.substr(9, 4), 16) << 4) & 0xFFFFF;
+    } else if (recType === 0x00) {
+      // 数据记录
+      var absAddr = baseAddr + addr16;
+      var data = new Uint8Array(byteCount);
+      for (var k = 0; k < byteCount; k++) {
+        data[k] = parseInt(line.substr(9 + k * 2, 2), 16);
+      }
+      segments.push({ offset: absAddr, data: data });
+      if (absAddr < minAddr) minAddr = absAddr;
+      var endAddr = absAddr + byteCount;
+      if (endAddr > maxAddr) maxAddr = endAddr;
+    }
+    // 其他记录类型 (03, 05 等) 忽略
+  }
+
+  if (segments.length === 0) {
+    throw new Error('HEX 文件中没有有效数据记录');
+  }
+
+  // 合并为连续 bin，间隙填 0xFF
+  var totalSize = maxAddr - minAddr;
+  var bin = new Uint8Array(totalSize);
+  // 先填充 0xFF
+  for (var m = 0; m < totalSize; m++) bin[m] = 0xFF;
+  for (var s = 0; s < segments.length; s++) {
+    var seg = segments[s];
+    var off = seg.offset - minAddr;
+    bin.set(seg.data, off);
+  }
+
+  return { data: bin, baseAddr: minAddr, endAddr: maxAddr };
+}
+
+/**
+ * 检测文件内容是否为 Intel HEX 格式。
+ * 看前几个非空行是否以 ':' 开头。
+ */
+function isIntelHexText(text) {
+  var lines = text.split(/\r?\n/);
+  for (var i = 0; i < Math.min(lines.length, 5); i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    return line[0] === ':';
+  }
+  return false;
+}
+
+// ==================== 文件处理 ====================
+
 function processFile(file, chip) {
+  var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
+  var isHexByName = file.name.toLowerCase().endsWith('.hex');
+
+  if (chip === 'gd32' && isHexByName) {
+    // GD32 固件: .hex 文件自动转换为 .bin，然后替换文件对象
+    var reader = new FileReader();
+    reader.onload = function (e) {
+      try {
+        var text = e.target.result;
+        // 二次确认: 内容也像 HEX
+        if (!isIntelHexText(text)) {
+          // 文件名 .hex 但内容不像，直接用原始文件
+          addLog('W', '文件', file.name + ' 扩展名为 .hex 但内容不像 HEX 格式，按原始文件处理');
+          gd32File = file;
+          document.getElementById('fileInfo' + suffix).classList.add('show');
+          document.getElementById('fileName' + suffix).textContent = file.name;
+          document.getElementById('fileType' + suffix).textContent = 'Binary(?)';
+          document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
+          updateUploadButtonLabel();
+          return;
+        }
+        var result = parseIntelHex(text);
+        var binName = file.name.replace(/\.hex$/i, '.bin');
+        var binBlob = new Blob([result.data], { type: 'application/octet-stream' });
+        var binFile = new File([binBlob], binName, { type: 'application/octet-stream' });
+        gd32File = binFile;
+
+        var baseHex = '0x' + result.baseAddr.toString(16).toUpperCase().padStart(8, '0');
+        addLog('I', '文件', 'HEX → BIN 转换完成: ' + file.name + ' → ' + binName);
+        addLog('I', '文件', '基地址: ' + baseHex + ', 数据大小: ' + formatBytes(result.data.length));
+        showToast('HEX 已自动转换为 BIN', 'success');
+
+        document.getElementById('fileInfo' + suffix).classList.add('show');
+        document.getElementById('fileName' + suffix).textContent = binName + ' (由 ' + file.name + ' 转换)';
+        document.getElementById('fileType' + suffix).textContent = 'Binary (HEX转换)';
+        document.getElementById('fileSize' + suffix).textContent = formatBytes(result.data.length);
+        updateUploadButtonLabel();
+      } catch (err) {
+        addLog('E', '文件', 'HEX 解析失败: ' + err.message);
+        showToast('HEX 文件解析失败: ' + err.message, 'error');
+        gd32File = null;
+        document.getElementById('fileInfo' + suffix).classList.remove('show');
+        updateUploadButtonLabel();
+      }
+    };
+    reader.readAsText(file);
+    return; // 异步，回调里设置 gd32File
+  }
+
+  // .bin 文件或 ESP32 文件: 直接使用
   if (chip === 'esp32') esp32File = file;
   else gd32File = file;
-  var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
   document.getElementById('fileInfo' + suffix).classList.add('show');
   document.getElementById('fileName' + suffix).textContent = file.name;
   document.getElementById('fileType' + suffix).textContent =
-    file.name.toLowerCase().indexOf('.hex') >= 0 ? 'Intel HEX' : 'Binary';
+    isHexByName ? 'Intel HEX' : 'Binary';
   document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
   updateUploadButtonLabel();
   addLog('I', '文件', chip.toUpperCase() + ' 已选择: ' + file.name + ' (' + formatBytes(file.size) + ')');
@@ -578,8 +760,8 @@ function processFile(file, chip) {
 
 function clearFile(chip) {
   var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
-  if (chip === 'esp32') esp32File = null;
-  else gd32File = null;
+  if (chip === 'esp32') { esp32File = null; esp32FileHandle = null; }
+  else { gd32File = null; gd32FileHandle = null; }
   document.getElementById('fileInput' + suffix).value = '';
   document.getElementById('fileInfo' + suffix).classList.remove('show');
   updateUploadButtonLabel();
@@ -590,6 +772,43 @@ function clearFile(chip) {
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file || isUploading) return;
+
+  // 每次上传前尝试重新从本地读取文件
+  var handle = chip === 'esp32' ? esp32FileHandle : gd32FileHandle;
+  if (handle) {
+    // 有 FileSystemFileHandle，调用 getFile() 获取最新内容
+    try {
+      var freshFile = await handle.getFile();
+      if (chip === 'esp32') {
+        esp32File = freshFile;
+        file = freshFile;
+      } else {
+        if (freshFile.name.toLowerCase().endsWith('.hex')) {
+          processFile(freshFile, 'gd32');
+          await new Promise(function(resolve) { setTimeout(resolve, 200); });
+          file = gd32File;
+        } else {
+          gd32File = freshFile;
+          file = freshFile;
+        }
+      }
+      addLog('I', '文件', '已重新读取本地文件: ' + file.name + ' (' + formatBytes(file.size) + ')');
+    } catch (e) {
+      addLog('W', '文件', '重新读取文件失败: ' + e.message + '，将使用缓存版本');
+    }
+  } else {
+    // 没有 handle，尝试直接读取当前 File 对象
+    try {
+      await file.arrayBuffer();
+    } catch (e) {
+      // File 引用已失效，提示用户重新选择
+      addLog('E', '文件', '本地文件已变更或失效，请重新选择文件');
+      showToast('文件已变更，请重新选择', 'error');
+      clearFile(chip);
+      return;
+    }
+  }
+
   isUploading = true;
   var uploadBtn = document.getElementById(chip === 'esp32' ? 'uploadEsp32Btn' : 'uploadGd32Btn');
   var origText = uploadBtn.textContent;
@@ -652,8 +871,10 @@ async function startUpload(chip) {
           }, 1000);
         }
       } else {
-        addLog('E', '上传', '上传失败: HTTP ' + xhr.status);
-        showToast('上传失败', 'error');
+        var detail = formatHttpErrorDetail(xhr.responseText);
+        var message = '上传失败: HTTP ' + xhr.status + (detail ? ' - ' + detail : '');
+        addLog('E', '上传', message);
+        showToast(detail ? ('上传失败: ' + detail) : '上传失败', 'error');
       }
     });
 

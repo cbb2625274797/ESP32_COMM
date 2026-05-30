@@ -373,13 +373,13 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
 
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     uint32_t attempt = 0;
-    while (xTaskGetTickCount() <= deadline && attempt < 10) {
+    while (xTaskGetTickCount() <= deadline) {
         ++attempt;
         memset(rx_raw, 0xFF, sizeof(rx_raw));
         esp_err_t ret = spi_transfer_clocked(dummy, sizeof(dummy), rx_raw, sizeof(rx_raw));
         if (ret != ESP_OK) {
             DEBUG_WARN("SPI", "SPI OTA 响应读取失败[%u]: %s", attempt, esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(2));
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
 
@@ -388,7 +388,7 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
         size_t parsed_len = 0;
         size_t frame_offset = 0;
         if (spi_ota_find_frame(rx_raw, sizeof(rx_raw), &parsed_type, &parsed_payload, &parsed_len, &frame_offset)) {
-            DEBUG_INFO("SPI", "OTA响应: type=0x%02X len=%u offset=%u attempt=%u",
+            DEBUG_DBG("SPI", "OTA响应: type=0x%02X len=%u offset=%u attempt=%u",
                        parsed_type, (unsigned)parsed_len, (unsigned)frame_offset, (unsigned)attempt);
             if (resp_type) *resp_type = parsed_type;
             if (resp_payload && resp_max > 0) {
@@ -413,10 +413,10 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
                    rx_raw[0], rx_raw[1], rx_raw[2], rx_raw[3],
                    rx_raw[4], rx_raw[5], rx_raw[6], rx_raw[7],
                    rx_raw[8], rx_raw[9]);
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    DEBUG_ERR("SPI", "OTA响应超时: timeout=%ums", (unsigned)timeout_ms);
+    DEBUG_DBG("SPI", "OTA响应超时: timeout=%ums", (unsigned)timeout_ms);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -448,7 +448,7 @@ esp_err_t spi_ota_transfer(uint8_t type, const uint8_t *payload, size_t payload_
         return ESP_ERR_INVALID_ARG;
     }
 
-    DEBUG_INFO("SPI", "OTA事务: req_type=0x%02X req_len=%u", type, (unsigned)payload_len);
+    DEBUG_DBG("SPI", "OTA事务: req_type=0x%02X req_len=%u", type, (unsigned)payload_len);
 
     /* ============================================================
      * 第1次 CS 周期：发送请求帧（只发不收）
@@ -631,6 +631,86 @@ esp_err_t gd32_app_request_bootloader(uint32_t timeout_ms)
     }
 
     DEBUG_WARN("SPI", "GD32 APP进入Bootloader确认超时");
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t gd32_app_ping(uint32_t timeout_ms, uint32_t *uptime_sec)
+{
+    /* APP 侧 SPI 从机当前是中断逐字节收发，不适合像 BOOT 那样一次读 96B 长轮询。
+     * 这里改为：每次都完整重发一帧 PING 请求，然后只读一个短窗口寻找 ACK。
+     * 这样即便某次响应窗口错过，也会在下一次重发时重新生成 APP_ALIVE。 */
+    constexpr uint8_t kAppPingType = 0xA1U;
+    constexpr size_t kAppPingPollBytes = 32U;
+
+    uint8_t tx_frame[8] = {0};
+    size_t tx_len = 0U;
+    if (!spi_ota_build_frame(kAppPingType, NULL, 0U, tx_frame, &tx_len)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    uint32_t attempt = 0U;
+
+    while (xTaskGetTickCount() <= deadline) {
+        ++attempt;
+
+        esp_err_t err = spi_transfer_clocked(tx_frame, tx_len, NULL, 0U);
+        if (err != ESP_OK) {
+            DEBUG_DBG("SPI", "APP PING 请求发送失败[%lu]: %s",
+                      (unsigned long)attempt, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        esp_rom_delay_us(200);
+
+        uint8_t rx_raw[kAppPingPollBytes];
+        uint8_t dummy[kAppPingPollBytes];
+        memset(dummy, 0xFF, sizeof(dummy));
+        memset(rx_raw, 0xFF, sizeof(rx_raw));
+
+        err = spi_transfer_clocked(dummy, sizeof(dummy), rx_raw, sizeof(rx_raw));
+        if (err != ESP_OK) {
+            DEBUG_DBG("SPI", "APP PING 响应读取失败[%lu]: %s",
+                      (unsigned long)attempt, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        uint8_t resp_type = 0U;
+        const uint8_t *resp_payload = nullptr;
+        size_t resp_len = 0U;
+        size_t frame_offset = 0U;
+        if (spi_ota_find_frame(rx_raw, sizeof(rx_raw),
+                               &resp_type, &resp_payload, &resp_len, &frame_offset)) {
+            if (resp_type == SPI_OTA_RSP_ACK && resp_len >= 3U && resp_payload[0] == kAppPingType) {
+                if (uptime_sec) {
+                    *uptime_sec = (uint32_t)resp_payload[1] | ((uint32_t)resp_payload[2] << 8);
+                }
+                DEBUG_INFO("SPI", "APP PING 成功: uptime=%lu sec, attempt=%lu, offset=%u",
+                           uptime_sec ? (unsigned long)*uptime_sec : 0UL,
+                           (unsigned long)attempt,
+                           (unsigned)frame_offset);
+                return ESP_OK;
+            }
+
+            DEBUG_DBG("SPI", "APP PING 收到无效帧[%lu]: type=0x%02X len=%u offset=%u payload0=0x%02X",
+                      (unsigned long)attempt,
+                      resp_type,
+                      (unsigned)resp_len,
+                      (unsigned)frame_offset,
+                      resp_len > 0U ? resp_payload[0] : 0xFFU);
+        } else {
+            DEBUG_DBG("SPI", "APP PING 未找到有效帧[%lu]: first8=%02X%02X%02X%02X%02X%02X%02X%02X",
+                      (unsigned long)attempt,
+                      rx_raw[0], rx_raw[1], rx_raw[2], rx_raw[3],
+                      rx_raw[4], rx_raw[5], rx_raw[6], rx_raw[7]);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    DEBUG_DBG("SPI", "APP PING 超时: timeout=%ums", (unsigned)timeout_ms);
     return ESP_ERR_TIMEOUT;
 }
 

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -54,11 +54,11 @@
         <div class="card-head"><span class="ico">📦</span> ESP32 自身升级</div>
         <div class="card-body">
           <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">上传固件并执行 OTA，设备将自动重启</div>
-          <div class="upload-zone upload-zone-sm" id="uploadZoneEsp32" onclick="document.getElementById('fileInputEsp32').click()">
+          <div class="upload-zone upload-zone-sm" id="uploadZoneEsp32" onclick="if(window.showOpenFilePicker){pickFileViaFSAPI('esp32')}else{document.getElementById('fileInputEsp32').click()}">
             <div class="upload-ico">📤</div>
             <h4>点击或拖拽 ESP32 固件</h4>
           </div>
-          <input type="file" id="fileInputEsp32" accept=".hex,.bin" onchange="handleFileSelect(event, 'esp32')" style="display:none;">
+          <input type="file" id="fileInputEsp32" accept=".bin" onchange="handleFileSelect(event, 'esp32')" style="display:none;">
           <div class="file-info" id="fileInfoEsp32">
             <div class="file-info-row">
               <span style="font-weight:600;">📄 <span id="fileNameEsp32">-</span></span>
@@ -79,8 +79,8 @@
       <div class="card">
         <div class="card-head"><span class="ico">📦</span> GD32 SPI 中继</div>
         <div class="card-body">
-          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">上传固件到缓存，再触发 SPI 中继刷写</div>
-          <div class="upload-zone upload-zone-sm" id="uploadZoneGd32" onclick="document.getElementById('fileInputGd32').click()">
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">上传固件到缓存，再触发 SPI 中继刷写<br><span style="color:var(--accent);">支持 .bin 和 .hex（自动转换）</span></div>
+          <div class="upload-zone upload-zone-sm" id="uploadZoneGd32" onclick="if(window.showOpenFilePicker){pickFileViaFSAPI('gd32')}else{document.getElementById('fileInputGd32').click()}">
             <div class="upload-ico">📤</div>
             <h4>点击或拖拽 GD32 固件</h4>
           </div>
@@ -258,6 +258,6 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260528"></script>
+<script src="app.js?v=20260529"></script>
 </body>
 </html>

@@ -1,0 +1,12 @@
+﻿*** Begin Patch
+*** Update File: G:\Robot_v2\DCU\ESP32_COMM\main\transport\spi_master.h
+@@ #define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 4MHz
+- #define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 4MHz
++ #define SPI_CLOCK_HZ          (10 * 1000 * 1000)  // 10MHz
+@@ #define SPI_QUEUE_SIZE        (1)
+- #define SPI_QUEUE_SIZE        (1)
++ #define SPI_QUEUE_SIZE        (3)
+@@ #define SPI_OTA_FRAME_MAX     (96)
+- #define SPI_OTA_FRAME_MAX     (96)
++ #define SPI_OTA_FRAME_MAX     (128)
+*** End Patch

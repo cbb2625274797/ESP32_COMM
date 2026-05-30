@@ -30,12 +30,16 @@
 
 /** @brief 当前 WiFi 工作模式（AP 或 STA）。 */
 static ota_wifi_mode_t s_wifi_mode = OTA_WIFI_MODE_AP;
+/** @brief 冷启动标志，上电复位或掉电复位时为 true。 */
+static bool s_cold_boot = false;
 /** @brief OTA 中继是否已触发标志。 */
 static bool s_relay_triggered = false;
 /** @brief STA 模式连接状态。 */
 static bool s_sta_connected = false;
 /** @brief STA 连接重试次数。 */
 static int s_sta_retry_count = 0;
+/** @brief STA 重试已耗尽标志，用于加速 wifi_ota_task 中的 AP 切换。 */
+static bool s_sta_retry_exhausted = false;
 /** @brief STA 连接成功信号量。 */
 static SemaphoreHandle_t s_sta_connected_sem = NULL;
 /** @brief STA 获取 IP 信号量。 */
@@ -54,6 +58,13 @@ static bool s_gd32_storage_done = false;
 
 /** @brief HTTP 服务器句柄。 */
 static httpd_handle_t s_http_server = NULL;
+
+static constexpr uint32_t GD32_OTA_FLASH_SECTOR_SIZE = 4096U;
+
+static uint32_t align_up_u32(uint32_t value, uint32_t alignment)
+{
+    return ((value + alignment - 1U) / alignment) * alignment;
+}
 
 /**
  * @brief 预先声明：为 STA 模式配置静态 IP、网关和子网掩码。
@@ -111,6 +122,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             s_sta_connected = true;
             /** @brief STA 连接重试次数。 */
             s_sta_retry_count = 0;
+            s_sta_retry_exhausted = false;  // ★ 连接成功，重置耗尽标志
             if (s_sta_connected_sem) {
                 xSemaphoreGive(s_sta_connected_sem);
             }
@@ -124,10 +136,21 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
             if (s_sta_retry_count < WIFI_STA_MAX_RETRY) {
                 s_sta_retry_count++;
-                DEBUG_INFO("WIFI", "重连第 %d 次...", s_sta_retry_count);
+                // ★ 冷启动首次连接失败时增加退避延迟
+                // 长时间断电后路由器可能还在初始化（ARP/DHCP/信道选择）
+                // reason 201=NO_AP_FOUND, 15=AUTH_FAIL, 2=AUTH_EXPIRE, 204=HANDSHAKE_TIMEOUT
+                if (s_cold_boot && s_sta_retry_count <= 3) {
+                    int delay_ms = 2000 * s_sta_retry_count;  // 2s, 4s, 6s 递增退避
+                    DEBUG_INFO("WIFI", "冷启动退避重连第 %d 次 (reason=%d, 等 %dms)...",
+                               s_sta_retry_count, disconn->reason, delay_ms);
+                    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+                } else {
+                    DEBUG_INFO("WIFI", "重连第 %d 次...", s_sta_retry_count);
+                }
                 esp_wifi_connect();
             } else {
                 DEBUG_ERR("WIFI", "STA 重连失败 %d 次，放弃", s_sta_retry_count);
+                s_sta_retry_exhausted = true;
             }
             break;
         }
@@ -233,6 +256,8 @@ static esp_err_t wifi_init_sta(void)
     s_wifi_mode = OTA_WIFI_MODE_STA;
     /** @brief STA 连接重试次数。 */
     s_sta_retry_count = 0;
+    /** @brief STA 重试已耗尽标志。 */
+    s_sta_retry_exhausted = false;
 
     // ★ 设置国家代码：中国，允许信道 1-13
     // ESP32 默认国家是 US（只允许 1-11），中国路由可能用 12/13
@@ -260,6 +285,15 @@ static esp_err_t wifi_init_sta(void)
 
     wifi_set_static_ip();
 
+    // ★ 冷启动时在 wifi_start 前增加延迟
+    // 长时间断电后首次上电，WiFi PHY 校准需要额外时间
+    // esp_wifi_start() 内部会触发 PHY 初始化和校准
+    // 如果校准未完成就启动射频，可能导致连接失败
+    if (s_cold_boot) {
+        DEBUG_INFO("WIFI", "冷启动: 等待 PHY 就绪...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
@@ -284,19 +318,36 @@ static esp_err_t wifi_wait_sta_connected(char *ip_str, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
+    // ★ 使用轮询等待，检查 s_sta_retry_exhausted 标志加速退出
+    // 不再一次性等完整超时，而是每秒检查一次重试耗尽状态
     TickType_t timeout_ticks = pdMS_TO_TICKS(WIFI_STA_CONNECT_TIMEOUT_MS);
-    if (xSemaphoreTake(wait_sem, timeout_ticks) == pdTRUE) {
-        esp_netif_ip_info_t ip_info;
-        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
-            if (ip_str) {
-                snprintf(ip_str, len, IPSTR, IP2STR(&ip_info.ip));
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t deadline = start_tick + timeout_ticks;
+
+    while (xTaskGetTickCount() < deadline) {
+        // 每次最多等 1 秒
+        TickType_t wait_until = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+        if (wait_until > deadline) wait_until = deadline;
+
+        if (xSemaphoreTake(wait_sem, wait_until - xTaskGetTickCount()) == pdTRUE) {
+            esp_netif_ip_info_t ip_info;
+            esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                if (ip_str) {
+                    snprintf(ip_str, len, IPSTR, IP2STR(&ip_info.ip));
+                }
+                DEBUG_INFO("WIFI", "%s 等待成功, 当前 IP: " IPSTR, wait_name, IP2STR(&ip_info.ip));
             }
-            DEBUG_INFO("WIFI", "%s 等待成功, 当前 IP: " IPSTR, wait_name, IP2STR(&ip_info.ip));
+            /** @brief STA 模式连接状态。 */
+            s_sta_connected = true;
+            return ESP_OK;
         }
-        /** @brief STA 模式连接状态。 */
-        s_sta_connected = true;
-        return ESP_OK;
+
+        // ★ 重试已耗尽，不再等待
+        if (s_sta_retry_exhausted) {
+            DEBUG_ERR("WIFI", "STA 重试已耗尽 (%d 次)，立即切换 AP", s_sta_retry_count);
+            return ESP_ERR_TIMEOUT;
+        }
     }
 
     DEBUG_ERR("WIFI", "等待 %s 超时 (%d ms), 重连次数: %d", wait_name, WIFI_STA_CONNECT_TIMEOUT_MS, s_sta_retry_count);
@@ -659,10 +710,22 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "找不到 gd32_ota 分区");
         return ESP_FAIL;
     }
-    esp_err_t erase_err = esp_partition_erase_range(gd32_partition, 0, gd32_partition->size);
+    const uint32_t gd32_erase_size = align_up_u32(gd32_fw_size, GD32_OTA_FLASH_SECTOR_SIZE);
+    if (gd32_erase_size > gd32_partition->size) {
+        DEBUG_ERR("WIFI", "gd32_ota 分区空间不足: erase=%u partition=%u",
+                  (unsigned)gd32_erase_size, (unsigned)gd32_partition->size);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "gd32_ota partition too small");
+        return ESP_FAIL;
+    }
+
+    DEBUG_INFO("WIFI", "擦除 gd32_ota 分区: %u bytes (fw=%u, partition=%u)",
+               (unsigned)gd32_erase_size, (unsigned)gd32_fw_size, (unsigned)gd32_partition->size);
+    esp_err_t erase_err = esp_partition_erase_range(gd32_partition, 0, gd32_erase_size);
     if (erase_err != ESP_OK) {
         DEBUG_ERR("WIFI", "擦除 gd32_ota 分区失败: %s", esp_err_to_name(erase_err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "擦除分区失败");
+        char err_msg[96];
+        snprintf(err_msg, sizeof(err_msg), "erase gd32_ota failed: %s", esp_err_to_name(erase_err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, err_msg);
         return ESP_FAIL;
     }
     meta_clear();
@@ -775,6 +838,7 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     }
     /* 上一轮中继已结束/失败/空闲，重置标志允许重新触发 */
     s_relay_triggered = false;
+    s_gd32_storage_done = false;
 
     if (!g_ota_dispatch_queue) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay queue not ready");
@@ -810,15 +874,17 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     char resp[256];
     int len = snprintf(resp, sizeof(resp),
         "{\"total_size\": %lu, \"stored_size\": %lu, \"last_seq\": %lu, "
-        "\"storage_done\": %s, \"relay_state\": %d}",
+        "\"storage_done\": %s, \"relay_state\": %d, \"gd32_app_alive\": %s}",
         (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
         (unsigned long)meta.last_seq,
         s_gd32_storage_done ? "true" : "false",
-        g_relay_state);
+        g_relay_state,
+        g_gd32_app_alive ? "true" : "false");
 
-    DEBUG_INFO("WIFI", "OTA 状态: total=%lu, stored=%lu, done=%s",
+    DEBUG_INFO("WIFI", "OTA 状态: total=%lu, stored=%lu, done=%s, app_alive=%s",
                (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
-               s_gd32_storage_done ? "true" : "false");
+               s_gd32_storage_done ? "true" : "false",
+               g_gd32_app_alive ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1169,6 +1235,8 @@ static esp_err_t http_ota_server_start(void)
     config.server_port = HTTP_SERVER_PORT;
     config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
+    config.recv_wait_timeout = 30;  // GD32 上传前会擦除 Flash，5 秒默认值过紧
+    config.send_wait_timeout = 30;
 
     DEBUG_INFO("WIFI", "=== 启动 HTTP OTA 服务器 ===");
     DEBUG_INFO("WIFI", "HTTP 服务器端口: %d", config.server_port);
@@ -1414,6 +1482,7 @@ void wifi_ota_signal_relay(void)
     }
     /* 上一轮中继已结束/失败/空闲，重置标志 */
     s_relay_triggered = false;
+    s_gd32_storage_done = false;
 
     /** @brief OTA 中继是否已触发标志。 */
     s_relay_triggered = true;
@@ -1481,17 +1550,62 @@ bool wifi_early_init(void)
 {
     DEBUG_INFO("WIFI", "=== WiFi 早期初始化 (调度器启动前) ===");
 
+    // ★ 冷启动检测：判断是否为上电复位
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    bool is_cold_boot = (reset_reason == ESP_RST_POWERON || reset_reason == ESP_RST_BROWNOUT);
+    s_cold_boot = is_cold_boot;  // 保存到模块级标志，供事件回调使用
+    DEBUG_INFO("WIFI", "复位原因: %d (%s), 冷启动: %s",
+               reset_reason,
+               (reset_reason == ESP_RST_POWERON) ? "POWER_ON" :
+               (reset_reason == ESP_RST_BROWNOUT) ? "BROWNOUT" :
+               (reset_reason == ESP_RST_SW) ? "SOFTWARE" :
+               (reset_reason == ESP_RST_PANIC) ? "PANIC" :
+               (reset_reason == ESP_RST_INT_WDT) ? "INT_WDT" :
+               (reset_reason == ESP_RST_TASK_WDT) ? "TASK_WDT" :
+               (reset_reason == ESP_RST_DEEPSLEEP) ? "DEEP_SLEEP" :
+               "OTHER",
+               is_cold_boot ? "是" : "否");
+
     esp_err_t err = nvs_flash_init();
+    bool nvs_erased = false;
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         // NVS 分区损坏或版本不匹配，擦除后重试
         DEBUG_WARN("WIFI", "NVS 分区异常 (%s)，擦除后重试", esp_err_to_name(err));
         ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_erased = true;
         err = nvs_flash_init();
     }
     if (err != ESP_OK) {
         DEBUG_ERR("WIFI", "NVS 初始化失败: %s", esp_err_to_name(err));
     } else {
+        if (nvs_erased) {
+            DEBUG_WARN("WIFI", "NVS 已擦除重建，WiFi PHY 校准数据已清除，将重新校准");
+        }
         DEBUG_INFO("WIFI", "NVS 初始化成功");
+    }
+
+    // ★ 冷启动时强制清除 WiFi NVS 缓存，避免残留脏数据
+    // 长时间断电后 NVS 中的 WiFi 配置缓存可能不一致
+    if (is_cold_boot) {
+        nvs_handle_t nvs_handle;
+        err = nvs_open("nvs.net80211", NVS_READWRITE, &nvs_handle);
+        if (err == ESP_OK) {
+            // 清除 WiFi 驱动内部 NVS 缓存键
+            nvs_erase_all(nvs_handle);
+            nvs_commit(nvs_handle);
+            nvs_close(nvs_handle);
+            DEBUG_INFO("WIFI", "冷启动: 已清除 WiFi NVS 缓存 (nvs.net80211)");
+        } else {
+            DEBUG_INFO("WIFI", "冷启动: 无 WiFi NVS 缓存分区，跳过清除");
+        }
+        // 同样清除 PHY 校准数据分区，强制下次全量校准
+        err = nvs_open("phy", NVS_READWRITE, &nvs_handle);
+        if (err == ESP_OK) {
+            nvs_erase_all(nvs_handle);
+            nvs_commit(nvs_handle);
+            nvs_close(nvs_handle);
+            DEBUG_INFO("WIFI", "冷启动: 已清除 PHY 校准缓存，将重新校准");
+        }
     }
 
     /** @brief STA 连接成功信号量。 */
@@ -1563,7 +1677,29 @@ void wifi_ota_task(void *pvParameters)
             DEBUG_INFO("WIFI", "STA 已连接, IP: %s", ip_str);
         } else {
             DEBUG_WARN("WIFI", "STA 连接超时，切换到 AP 模式...");
-            esp_wifi_stop();  // 先停 STA，再切 AP
+            // ★ 完整的 STA→AP 切换流程：
+            // 1. 停止 WiFi
+            // 2. 反初始化 WiFi 驱动（释放内部资源，包括 NVS 缓存）
+            // 3. 重新初始化 WiFi 驱动
+            // 4. 重新注册事件回调
+            // 5. 以 AP 模式启动
+            esp_wifi_stop();
+            esp_err_t deinit_err = esp_wifi_deinit();
+            if (deinit_err != ESP_OK) {
+                DEBUG_WARN("WIFI", "WiFi deinit 失败: %s，仅 stop 后切 AP", esp_err_to_name(deinit_err));
+            } else {
+                DEBUG_INFO("WIFI", "WiFi 驱动已反初始化，重新初始化...");
+                wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+                deinit_err = esp_wifi_init(&wifi_cfg);
+                if (deinit_err != ESP_OK) {
+                    DEBUG_ERR("WIFI", "WiFi 驱动重新初始化失败: %s", esp_err_to_name(deinit_err));
+                } else {
+                    // ★ deinit 后事件回调会丢失，必须重新注册
+                    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+                    esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+                    DEBUG_INFO("WIFI", "WiFi/IP 事件回调已重新注册");
+                }
+            }
             /** @brief 当前 WiFi 工作模式（AP 或 STA）。 */
             s_wifi_mode = OTA_WIFI_MODE_AP;
             wifi_init_ap();

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ota_relay.h - OTA 中继核心状态机
  * T2.3, T3.1 - T3.7
  */
@@ -50,6 +50,7 @@ typedef enum {
     RELAY_TRANSFER_DONE,       // 已收到 0xBA C0 + FF FF FF FF
     RELAY_FINISH_SENT,         // 已发送 0x0A AC，等待 GD32 确认
     RELAY_DONE,                // GD32 回复 0x0A AC，OTA 完成
+    RELAY_APP_VERIFY,          // 等待 GD32 APP 启动并回复存活确认
 
     // 错误状态
     RELAY_ERROR = 0xFF
@@ -145,6 +146,9 @@ esp_err_t meta_update(uint32_t stored_size, uint32_t last_seq);
  * @return ESP_OK 成功，其他失败。
  */
 esp_err_t meta_clear(void);
+
+// GD32 APP 存活标志（OTA 完成后由 APP PING 确认）
+extern volatile bool g_gd32_app_alive;
 
 // 当前中继状态（供健康监控外部访问）
 extern relay_state_t g_relay_state;

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * health_monitor.h - 系统健康监控头文件
  */
 #pragma once
@@ -44,6 +44,15 @@ void health_monitor_task(void *pvParameters);
  * @return 健康检查结果，决定是否允许 OTA。
  */
 health_status_t health_check_before_ota(void);
+
+/**
+ * @brief 在 OTA 中继转发阶段执行健康检查，跳过 WiFi 相关检查。
+ *
+ * SPI 中继阶段固件已存储在 ESP32 Flash 中，不依赖 WiFi 连接，
+ * 因此跳过 WiFi 连接状态和 RSSI 检查，只检查温度等本地状态。
+ * @return 健康检查结果，决定是否允许 OTA。
+ */
+health_status_t health_check_before_ota_relay(void);
 
 /**
  * @brief 记录一条健康相关事件日志，便于故障追踪与状态回溯。

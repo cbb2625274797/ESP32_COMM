@@ -31,7 +31,7 @@
 static const char *TAG = "DEBUG_LOG";
 
 /** @brief 当前调试日志过滤级别，运行时可动态调整。 */
-debug_log_level_t g_debug_log_level = DEBUG_LOG_ALL;
+debug_log_level_t g_debug_log_level = DEBUG_LOG_INFO;
 
 /** @brief UDP 调试日志 socket 句柄，首次发送时延迟创建。 */
 static int s_udp_sock = -1;

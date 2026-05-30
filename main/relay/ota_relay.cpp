@@ -21,6 +21,7 @@
 
 /** @brief 当前 OTA 中继状态机状态。 */
 relay_state_t g_relay_state = RELAY_IDLE;
+volatile bool g_gd32_app_alive = false;
 
 static const esp_partition_t *g_gd32_partition = NULL;
 /** @brief OTA 认证会话上下文，包含会话密钥和 IV。 */
@@ -69,6 +70,11 @@ static ota_result_t relay_packets_from_flash(void);
 static ota_result_t finish_ota(void);
 static int aes128_ecb_encrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out);
 static int aes128_ecb_decrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out);
+static void log_resp_payload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len);
+static esp_err_t wait_until_not_wait(const char *stage, uint8_t *resp_type,
+                                     uint8_t *resp_payload, size_t resp_max,
+                                     size_t *resp_len, uint32_t timeout_ms,
+                                     uint32_t max_wait_rounds);
 
 /**
  * @brief 判断响应负载是否为带序号的结构化 ACK。
@@ -113,6 +119,54 @@ static bool parse_structured_error(const uint8_t *payload, size_t len, uint32_t 
  * @param value 目标字节值。
  * @return 全部匹配返回 true，否则返回 false。
  */
+static bool is_handshake_echo_ack(const uint8_t *payload, size_t len)
+{
+    return payload && len >= 2U && payload[0] == 0x00U && payload[1] == 0xACU;
+}
+
+static bool is_challenge_payload_ack(const uint8_t *payload, size_t len)
+{
+    return payload && len == GD32_CHALLENGE_RESPONSE_LEN;
+}
+
+static bool is_confirm_plain_ack(const uint8_t *payload, size_t len)
+{
+    return payload && len == 2U && payload[0] == 0xBAU && payload[1] == 0xC0U;
+}
+
+static bool is_size_seq0_ack(const uint8_t *payload, size_t len)
+{
+    return is_structured_ack_with_seq(payload, len, 0U);
+}
+
+static bool is_finish_plain_ack(const uint8_t *payload, size_t len)
+{
+    return payload && len >= 2U && payload[0] == 0x0AU && payload[1] == 0xACU;
+}
+
+/**
+ * @brief FINISH 阶段匹配器：接受 0x0A 0xAC 明文 ACK 或结构化错误帧。
+ *
+ * BOOT 在 FINISH 成功时回 2B 明文 ACK {0x0A, 0xAC}；
+ * 失败时回 7B 结构化错误帧 {0xBA,0xC0, seq(4B), err_code}。
+ * 两种都需要识别，否则 ESP32 会把错误帧当成残留 ACK 继续轮询。
+ */
+static bool is_finish_ack_or_error(const uint8_t *payload, size_t len)
+{
+    if (!payload) return false;
+    /* 明文 ACK: 0x0A 0xAC */
+    if (len >= 2U && payload[0] == 0x0AU && payload[1] == 0xACU) return true;
+    /* 结构化错误帧: 0xBA 0xC0 + seq(4B) + err_code */
+    if (len >= 7U && payload[0] == 0xBAU && payload[1] == 0xC0U) return true;
+    return false;
+}
+
+
+/**
+ * @brief 按小端序读取 4 字节无符号整数。
+ * @param p 输入字节指针（至少 4 字节）。
+ * @return 读取出的 uint32_t 数值。
+ */
 static bool bytes_all_value(const uint8_t *buf, size_t len, uint8_t value)
 {
     if (!buf || len == 0) return false;
@@ -123,16 +177,62 @@ static bool bytes_all_value(const uint8_t *buf, size_t len, uint8_t value)
 }
 
 /**
- * @brief 按小端序读取 4 字节无符号整数。
- * @param p 输入字节指针（至少 4 字节）。
- * @return 读取出的 uint32_t 数值。
+ * @brief 继续轮询，直到拿到符合当前阶段预期形状的 ACK，或遇到结构化错误/超时。
  */
-static uint32_t read_u32_le(const uint8_t *p)
+static esp_err_t poll_until_expected_ack_shape(const char *stage,
+                                               uint8_t *resp_type,
+                                               uint8_t *resp_payload,
+                                               size_t resp_max,
+                                               size_t *resp_len,
+                                               uint32_t poll_timeout_ms,
+                                               uint32_t wait_rounds,
+                                               uint32_t maxExtraPolls,
+                                               bool (*matcher)(const uint8_t *, size_t))
 {
-    return (uint32_t)p[0] |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
+    if (!stage || !resp_type || !resp_payload || !resp_len || !matcher) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ESP_OK;
+    if (*resp_type == SPI_OTA_RSP_WAIT) {
+        err = wait_until_not_wait(stage, resp_type, resp_payload, resp_max, resp_len,
+                                  poll_timeout_ms, wait_rounds);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    for (uint32_t extra = 0; extra < maxExtraPolls; ++extra) {
+        if (*resp_type != SPI_OTA_RSP_ACK) {
+            return ESP_OK;
+        }
+        if (matcher(resp_payload, *resp_len)) {
+            return ESP_OK;
+        }
+
+        uint32_t err_seq = 0;
+        uint8_t err_code = 0;
+        if (parse_structured_error(resp_payload, *resp_len, &err_seq, &err_code)) {
+            return ESP_OK;
+        }
+
+        DEBUG_WARN("OTA", "%s 收到上一阶段残留ACK/非目标ACK，继续轮询: len=%u", stage, (unsigned)*resp_len);
+        *resp_len = 0;
+        err = spi_ota_poll_response(resp_type, resp_payload, resp_max, resp_len, poll_timeout_ms);
+        if (err != ESP_OK) {
+            return err;
+        }
+        log_resp_payload(stage, *resp_type, resp_payload, *resp_len);
+        if (*resp_type == SPI_OTA_RSP_WAIT) {
+            err = wait_until_not_wait(stage, resp_type, resp_payload, resp_max, resp_len,
+                                      poll_timeout_ms, wait_rounds);
+            if (err != ESP_OK) {
+                return err;
+            }
+        }
+    }
+
+    return ESP_OK;
 }
 
 /**
@@ -311,7 +411,7 @@ static void log_resp_payload(const char *stage, uint8_t resp_type, const uint8_t
     for (size_t i = 0; i < n; ++i) {
         snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", payload[i]);
     }
-    DEBUG_INFO("OTA", "%s 响应: type=0x%02X len=%u payload[%u]=%s%s",
+    DEBUG_DBG("OTA", "%s 响应: type=0x%02X len=%u payload[%u]=%s%s",
                stage, resp_type, (unsigned)len, (unsigned)n,
                n > 0 ? hex : "<empty>",
                len > n ? "..." : "");
@@ -337,7 +437,22 @@ static esp_err_t wait_until_not_wait(const char *stage, uint8_t *resp_type,
     while (*resp_type == SPI_OTA_RSP_WAIT && round < max_wait_rounds) {
         ++round;
         DEBUG_WARN("OTA", "%s 收到 WAIT，开始第 %u 次只读轮询...", stage, round);
-        esp_err_t err = spi_ota_poll_response(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
+        /* GD32 擦除 Flash 期间 (__disable_irq) 无法响应 SPI，
+         * ESP32 的 poll 会持续拿到 0xFF 或 WAIT 帧残留字节，
+         * 导致 spi_ota_poll_response 超时返回 ESP_ERR_TIMEOUT。
+         *
+         * 这是正常现象——只要还在 WAIT 轮询范围内，超时不代表协议失败，
+         * 只是 GD32 还在忙。继续重试即可。
+         *
+         * 用 100ms 短超时做每次 poll，避免擦除期间长阻塞。
+         * 300 轮 × 100ms = 30s，远超 2-3 秒的 Flash 擦除时间。
+         * 实际上擦除完成后 ACK 会立即返回，不会真的等 30s。 */
+        esp_err_t err = spi_ota_poll_response(resp_type, resp_payload, resp_max, resp_len, 100);
+        if (err == ESP_ERR_TIMEOUT) {
+            /* 擦除期间 SPI 无响应 → 保持 WAIT 状态继续轮询 */
+            *resp_type = SPI_OTA_RSP_WAIT;
+            continue;
+        }
         if (err != ESP_OK) {
             return err;
         }
@@ -499,29 +614,58 @@ static ota_result_t send_handshake_req(void)
     DEBUG_INFO("OTA", "发送 HANDSHAKE_REQ (0x00 0xAC)");
 
     uint8_t payload[] = {0x00, 0xAC};
-    uint8_t resp_type = 0;
-    uint8_t resp_payload[64] = {0};
-    size_t resp_len = 0;
+    uint8_t last_resp_type = 0U;
+    size_t last_resp_len = 0U;
+    esp_err_t last_err = ESP_OK;
+    constexpr uint32_t kHandshakeAttempts = 10U;
+    constexpr uint32_t kHandshakeReqTimeoutMs = 200U;
+    constexpr uint32_t kHandshakePollTimeoutMs = 200U;
+    constexpr uint32_t kHandshakeRetryGapMs = 100U;
 
     /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_HANDSHAKE_SENT;
     DEBUG_INFO("OTA", "状态: RELAY_HANDSHAKE_SENT");
 
-    esp_err_t err = spi_ota_transfer(SPI_OTA_CMD_REQ, payload, sizeof(payload),
-                                     &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
-    log_resp_payload("HANDSHAKE_REQ", resp_type, resp_payload, resp_len);
-    if (err == ESP_OK) {
-        err = wait_until_not_wait("HANDSHAKE_REQ", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 15);
-    }
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 2 ||
-        resp_payload[0] != 0x00 || resp_payload[1] != 0xAC) {
-        DEBUG_ERR("OTA", "HANDSHAKE_REQ 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
-        g_relay_state = RELAY_ERROR;
-        return OTA_RESULT_ERR_TIMEOUT;
+    for (uint32_t attempt = 0U; attempt < kHandshakeAttempts; ++attempt) {
+        uint8_t resp_type = 0U;
+        uint8_t resp_payload[64] = {0};
+        size_t resp_len = 0U;
+
+        esp_err_t err = spi_ota_transfer(SPI_OTA_CMD_REQ, payload, sizeof(payload),
+                                         &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
+                                         kHandshakeReqTimeoutMs);
+        last_err = err;
+        last_resp_type = resp_type;
+        last_resp_len = resp_len;
+
+        if (err == ESP_OK) {
+            log_resp_payload("HANDSHAKE_REQ", resp_type, resp_payload, resp_len);
+            err = poll_until_expected_ack_shape("HANDSHAKE_REQ", &resp_type, resp_payload,
+                                                sizeof(resp_payload), &resp_len,
+                                                kHandshakePollTimeoutMs, 2, 2, is_handshake_echo_ack);
+            last_err = err;
+            last_resp_type = resp_type;
+            last_resp_len = resp_len;
+
+            if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK && is_handshake_echo_ack(resp_payload, resp_len)) {
+                DEBUG_INFO("OTA", "握手请求已确认 (attempt=%lu)", (unsigned long)(attempt + 1U));
+                return OTA_RESULT_OK;
+            }
+        }
+
+        DEBUG_WARN("OTA", "HANDSHAKE_REQ 未就绪，重试 %lu/%lu: err=%d resp_type=0x%02X resp_len=%u",
+                   (unsigned long)(attempt + 1U),
+                   (unsigned long)kHandshakeAttempts,
+                   last_err,
+                   last_resp_type,
+                   (unsigned)last_resp_len);
+        vTaskDelay(pdMS_TO_TICKS(kHandshakeRetryGapMs));
     }
 
-    DEBUG_INFO("OTA", "握手请求已确认");
-    return OTA_RESULT_OK;
+    DEBUG_ERR("OTA", "HANDSHAKE_REQ 失败, err=%d, resp_type=0x%02X, resp_len=%zu",
+              last_err, last_resp_type, last_resp_len);
+    g_relay_state = RELAY_ERROR;
+    return OTA_RESULT_ERR_TIMEOUT;
 }
 
 /**
@@ -548,10 +692,10 @@ static ota_result_t send_nonce_and_authenticate(void)
     esp_err_t err = spi_ota_transfer(SPI_OTA_CMD_REQ, g_nonce_server, 16,
                                      &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 5000);
     log_resp_payload("CHALLENGE", resp_type, resp_payload, resp_len);
-    if (err == ESP_OK) {
-        err = wait_until_not_wait("CHALLENGE", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 12);
-    }
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
+    err = poll_until_expected_ack_shape("CHALLENGE", &resp_type, resp_payload,
+                                        sizeof(resp_payload), &resp_len,
+                                        1000, 12, 8, is_challenge_payload_ack);
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !is_challenge_payload_ack(resp_payload, resp_len)) {
         DEBUG_ERR("OTA", "CHALLENGE 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
@@ -586,14 +730,23 @@ static ota_result_t send_nonce_and_authenticate(void)
     err = spi_ota_transfer(SPI_OTA_CMD_REQ, encrypted_confirm, 16,
                            &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
     log_resp_payload("CONFIRM", resp_type, resp_payload, resp_len);
-    if (err == ESP_OK) {
-        err = wait_until_not_wait("CONFIRM", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 8);
-    }
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 2 ||
-        resp_payload[0] != 0xBA || resp_payload[1] != 0xC0) {
+    err = poll_until_expected_ack_shape("CONFIRM", &resp_type, resp_payload,
+                                        sizeof(resp_payload), &resp_len,
+                                        1000, 8, 8, is_confirm_plain_ack);
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !is_confirm_plain_ack(resp_payload, resp_len)) {
         DEBUG_ERR("OTA", "SESSION_KEY/CONFIRM 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
+    }
+
+    /* 诊断: 打印 confirm 响应完整内容，确认是 2B 还是意外读到了 36B challenge 响应 */
+    {
+        char hex[73] = {0};
+        size_t n = (resp_len > 36U) ? 36U : resp_len;
+        for (size_t i = 0; i < n; ++i) {
+            snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", resp_payload[i]);
+        }
+        DEBUG_INFO("OTA", "CONFIRM 验证通过, resp_len=%zu, payload=%s", resp_len, hex);
     }
 
     g_relay_state = RELAY_AUTH_COMPLETE;
@@ -630,10 +783,11 @@ static ota_result_t send_firmware_size(uint32_t size)
     esp_err_t err = spi_ota_transfer(SPI_OTA_CMD_DATA, size_payload, sizeof(size_payload),
                                      &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
     log_resp_payload("SEND_SIZE", resp_type, resp_payload, resp_len);
-    if (err == ESP_OK) {
-        err = wait_until_not_wait("SEND_SIZE", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1500, 12);
-    }
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !is_structured_ack_with_seq(resp_payload, resp_len, 0U)) {
+    DEBUG_WARN("OTA", "SEND_SIZE poll config: poll_timeout_ms=2000 wait_rounds=300 maxExtraPolls=24");
+    err = poll_until_expected_ack_shape("SEND_SIZE", &resp_type, resp_payload,
+                                        sizeof(resp_payload), &resp_len,
+                                        2000, 300, 24, is_size_seq0_ack);
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !is_size_seq0_ack(resp_payload, resp_len)) {
         DEBUG_ERR("OTA", "SEND_SIZE 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_TIMEOUT;
@@ -675,7 +829,7 @@ static ota_result_t relay_packets_from_flash(void)
     for (uint32_t seq = 0; seq < total_packets; seq++) {
         uint32_t retry_count = 0;
         if ((seq % OTA_PACKET_HEALTH_CHECK_INTERVAL) == 0 || seq == 0 || seq == total_packets - 1) {
-            health_status_t health = health_check_before_ota();
+            health_status_t health = health_check_before_ota_relay();
             if (health == HEALTH_MON_SHUTDOWN || health == HEALTH_MON_CRITICAL) {
                 DEBUG_ERR("OTA", "健康检查危险，中止 OTA");
                 return OTA_RESULT_ERR_HEALTH;
@@ -713,7 +867,7 @@ static ota_result_t relay_packets_from_flash(void)
         tx_buf[59] = (uint8_t)((if_end >> 24) & 0xFFU);
         calculate_crc32_with_key_local(g_k_session, plain48, &tx_buf[60]);
 
-        DEBUG_INFO("OTA", "包 %u: chunk=%u if_end=0x%08X crc32=%02X%02X%02X%02X",
+        DEBUG_DBG("OTA", "包 %u: chunk=%u if_end=0x%08X crc32=%02X%02X%02X%02X",
                    seq, (unsigned)chunk_size, (unsigned)if_end,
                    tx_buf[60], tx_buf[61], tx_buf[62], tx_buf[63]);
 
@@ -734,27 +888,75 @@ static ota_result_t relay_packets_from_flash(void)
             }
 
             uint32_t expected_ack = (seq == total_packets - 1) ? 0xFFFFFFFFU : (seq + 1U);
-            if (is_structured_ack_with_seq(resp_payload, resp_len, expected_ack)) {
-                flash_offset += (uint32_t)chunk_size;
-                g_relay_state = RELAY_PACKET_ACK_OK;
+
+            /* 跳过上一阶段残留的、seq 不匹配的结构化 ACK。
+             *
+             * 典型场景：SIZE 阶段的 ACK(seq=0) 仍挂在 DMA 上，
+             * 包 0 发出后第一次 poll 读到 seq=0 而非期望的 seq=1。
+             * 继续轮询直到拿到正确的 ACK 或超时。 */
+            if (!is_structured_ack_with_seq(resp_payload, resp_len, expected_ack)) {
+                uint32_t err_seq = 0;
+                uint8_t err_code = 0;
+                if (parse_structured_error(resp_payload, resp_len, &err_seq, &err_code)) {
+                    if (err_seq == seq) {
+                        DEBUG_WARN("OTA", "包 %u 收到结构化错误 err=0x%02X，准备重发", seq, err_code);
+                        g_relay_state = RELAY_PACKET_ACK_RETRY;
+                        if (++retry_count >= 3U) {
+                            DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
+                            result = (err_code == 0x04U) ? OTA_RESULT_ERR_CRC : OTA_RESULT_ERR_GD32;
+                            break;
+                        }
+                        continue; /* 重发本包 */
+                    }
+                }
+
+                /* 非期望 ACK，也非错误帧 → 可能是残留 ACK，循环 poll 直到拿到正确的 */
+                bool got_expected = false;
+                for (uint32_t retry = 0; retry < 5; ++retry) {
+                    DEBUG_WARN("OTA", "包 %u 收到非目标ACK(seq不匹配)，继续轮询(%u/5)...", seq, retry + 1);
+                    err = spi_ota_poll_response(&resp_type, resp_payload, sizeof(resp_payload), &resp_len, 2000);
+                    if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
+                        err = wait_until_not_wait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 10);
+                    }
+                    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
+                        break;
+                    }
+                    if (is_structured_ack_with_seq(resp_payload, resp_len, expected_ack)) {
+                        got_expected = true;
+                        break;
+                    }
+                    if (parse_structured_error(resp_payload, resp_len, &err_seq, &err_code) && err_seq == seq) {
+                        break; /* 下面统一处理 */
+                    }
+                }
+
+                if (got_expected) {
+                    /* 匹配成功 */
+                    flash_offset += (uint32_t)chunk_size;
+                    g_relay_state = RELAY_PACKET_ACK_OK;
+                    break;
+                }
+
+                /* 最终检查是否为错误帧 */
+                if (parse_structured_error(resp_payload, resp_len, &err_seq, &err_code) && err_seq == seq) {
+                    DEBUG_WARN("OTA", "包 %u 收到结构化错误 err=0x%02X，准备重发", seq, err_code);
+                    g_relay_state = RELAY_PACKET_ACK_RETRY;
+                    if (++retry_count >= 3U) {
+                        DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
+                        result = (err_code == 0x04U) ? OTA_RESULT_ERR_CRC : OTA_RESULT_ERR_GD32;
+                        break;
+                    }
+                    continue; /* 重发本包 */
+                }
+
+                DEBUG_ERR("OTA", "包 %u ACK/ERROR 不匹配，len=%zu", seq, resp_len);
+                result = OTA_RESULT_ERR_GD32;
                 break;
             }
 
-            uint32_t err_seq = 0;
-            uint8_t err_code = 0;
-            if (parse_structured_error(resp_payload, resp_len, &err_seq, &err_code) && err_seq == seq) {
-                DEBUG_WARN("OTA", "包 %u 收到结构化错误 err=0x%02X，准备重发", seq, err_code);
-                g_relay_state = RELAY_PACKET_ACK_RETRY;
-                if (++retry_count >= 3U) {
-                    DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
-                    result = (err_code == 0x04U) ? OTA_RESULT_ERR_CRC : OTA_RESULT_ERR_GD32;
-                    break;
-                }
-                continue;
-            }
-
-            DEBUG_ERR("OTA", "包 %u ACK/ERROR 不匹配，len=%zu", seq, resp_len);
-            result = OTA_RESULT_ERR_GD32;
+            /* 匹配成功 */
+            flash_offset += (uint32_t)chunk_size;
+            g_relay_state = RELAY_PACKET_ACK_OK;
             break;
         }
 
@@ -769,7 +971,7 @@ static ota_result_t relay_packets_from_flash(void)
     }
 
     g_relay_state = RELAY_RECEIVE_DONE;
-    DEBUG_INFO("OTA", "状态: RELAY_RECEIVE_DONE");
+    DEBUG_DBG("OTA", "状态: RELAY_RECEIVE_DONE");
     return result;
 }
 
@@ -791,12 +993,33 @@ static ota_result_t finish_ota(void)
     esp_err_t err = spi_ota_transfer(SPI_OTA_CMD_DATA, finish_payload, sizeof(finish_payload),
                                      &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
     log_resp_payload("FINISH_OTA", resp_type, resp_payload, resp_len);
-    if (err == ESP_OK) {
-        err = wait_until_not_wait("FINISH_OTA", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 10);
-    }
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 2 ||
-        resp_payload[0] != 0x0A || resp_payload[1] != 0xAC) {
+    err = poll_until_expected_ack_shape("FINISH_OTA", &resp_type, resp_payload,
+                                        sizeof(resp_payload), &resp_len,
+                                        1000, 10, 8, is_finish_ack_or_error);
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK ||
+        !is_finish_ack_or_error(resp_payload, resp_len)) {
         DEBUG_ERR("OTA", "FINISH_OTA 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
+        g_relay_state = RELAY_ERROR;
+        return OTA_RESULT_ERR_GD32;
+    }
+
+    /* 检查是否为结构化错误帧（BOOT validateApplication 失败等） */
+    uint32_t err_seq = 0;
+    uint8_t err_code = 0;
+    if (parse_structured_error(resp_payload, resp_len, &err_seq, &err_code)) {
+        DEBUG_ERR("OTA", "FINISH_OTA BOOT 返回错误: seq=0x%08lX err=0x%02X (%s)",
+                  (unsigned long)err_seq, err_code,
+                  err_code == 0x02U ? "FLASH_ERROR/validateApp失败" :
+                  err_code == 0x04U ? "INVALID_PACKET" :
+                  err_code == 0x03U ? "INVALID_KEY" :
+                  "未知错误");
+        g_relay_state = RELAY_ERROR;
+        return OTA_RESULT_ERR_GD32;
+    }
+
+    /* 正常明文 ACK: 0x0A 0xAC */
+    if (!is_finish_plain_ack(resp_payload, resp_len)) {
+        DEBUG_ERR("OTA", "FINISH_OTA 响应格式异常: len=%zu payload[0]=0x%02X", resp_len, resp_payload[0]);
         g_relay_state = RELAY_ERROR;
         return OTA_RESULT_ERR_GD32;
     }
@@ -809,9 +1032,38 @@ static ota_result_t finish_ota(void)
     memset(g_gd32_uid_runtime, 0, sizeof(g_gd32_uid_runtime));
 
     DEBUG_INFO("OTA", "状态: RELAY_DONE");
-    DEBUG_INFO("OTA", "=== OTA 完成 ===");
+    DEBUG_INFO("OTA", "=== OTA 完成，等待 GD32 APP 启动 ===");
 
     meta_clear();
+
+    /* ============================================================
+     * 阶段5: APP 存活验证
+     *
+     * GD32 BOOT 处理完 FINISH_OTA 后会跳转到 APP。
+     * APP 启动需要初始化外设和 SPI，大约需要 1-2 秒。
+     * 我们以 500ms 间隔反复 ping APP，最多等 15 秒。
+     * 收到 APP_ALIVE 回复才认为 OTA 真正成功。
+     * ============================================================ */
+    g_relay_state = RELAY_APP_VERIFY;
+    g_gd32_app_alive = false;
+
+    for (uint32_t attempt = 0; attempt < 30; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        uint32_t uptime = 0;
+        esp_err_t ping_err = gd32_app_ping(1000, &uptime);
+        if (ping_err == ESP_OK) {
+            g_gd32_app_alive = true;
+            DEBUG_INFO("OTA", "GD32 APP 存活确认: uptime=%lu sec", (unsigned long)uptime);
+            DEBUG_INFO("OTA", "=== OTA 全流程完成 (APP 已启动) ===");
+            break;
+        }
+        DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%u/30)", attempt + 1);
+    }
+
+    if (!g_gd32_app_alive) {
+        DEBUG_WARN("OTA", "GD32 APP 存活确认超时，OTA 传输已完成但 APP 未启动");
+    }
+
     return OTA_RESULT_OK;
 }
 
@@ -895,6 +1147,9 @@ void ota_relay_reset(void)
     /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_IDLE;
     session_key_clear(&g_session_ctx);
+    memset(&g_session_ctx, 0, sizeof(session_ctx_t));
+    memset(g_k_session, 0, sizeof(g_k_session));
+    memset(g_nonce_server, 0, sizeof(g_nonce_server));
     memset(g_gd32_uid_runtime, 0, sizeof(g_gd32_uid_runtime));
 }
 
@@ -932,6 +1187,7 @@ void ota_relay_task(void *pvParameters)
 
         if (result == OTA_RESULT_OK) {
             DEBUG_INFO("OTA", "OTA 转发成功完成");
+            ota_relay_reset();
         } else {
             DEBUG_ERR("OTA", "OTA 转发失败，错误码: %d", result);
             ota_relay_reset();

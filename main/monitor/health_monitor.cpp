@@ -1,4 +1,4 @@
-/*
+﻿/*
  * health_monitor.cpp - 系统健康监控
  * 包含：健康状态管理 + WiFi RSSI 监控 + 温度监控
  */
@@ -234,6 +234,36 @@ health_status_t health_check_before_ota(void)
 
     if (status == HEALTH_MON_OK) {
         DEBUG_DBG("HEALTH", "OTA 前检查: 正常");
+    }
+
+    return status;
+}
+
+health_status_t health_check_before_ota_relay(void)
+{
+    health_status_t status = HEALTH_MON_OK;
+
+    if (g_health_state >= SYS_SAFE_SHUTDOWN) {
+        DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_SAFE_SHUTDOWN，禁止传输");
+        return HEALTH_MON_SHUTDOWN;
+    } else if (g_health_state >= SYS_CRITICAL) {
+        /* SYS_CRITICAL 可能是由 WiFi RSSI 过低导致的，
+         * 但 SPI 中继阶段不依赖 WiFi，只检查温度/硬件等本地状态。
+         * 温度达到 TEMP_CRITICAL(100°C) 时 g_health_state 会被设为
+         * SYS_SAFE_SHUTDOWN，在上面的分支已经拦截。
+         * 所以 SYS_CRITICAL 在中继阶段只可能是 WiFi 导致的，允许继续。 */
+        DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_CRITICAL (WiFi 相关)，SPI 中继允许继续");
+    } else if (g_health_state >= SYS_WARNING) {
+        status = HEALTH_MON_WARNING;
+        DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_WARNING，继续传输");
+    }
+
+    /* 跳过 WiFi 连接状态和 RSSI 检查：
+     * SPI 中继阶段固件已存储在 ESP32 Flash 中，
+     * 不依赖 WiFi 连接，无需检查 WiFi 状态。 */
+
+    if (status == HEALTH_MON_OK) {
+        DEBUG_DBG("HEALTH", "OTA 中继检查: 正常");
     }
 
     return status;

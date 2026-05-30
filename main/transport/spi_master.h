@@ -147,4 +147,12 @@ esp_err_t spi_ota_poll_response(uint8_t *resp_type, uint8_t *resp_payload,
  */
 esp_err_t gd32_app_request_bootloader(uint32_t timeout_ms);
 
+/**
+ * @brief 向 GD32 APP 发送存活探测命令 (TYPE=0xA1)，等待 APP 回复 ALIVE ACK。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @param uptime_sec 输出 APP 运行秒数，可为 NULL。
+ * @return ESP_OK APP 存活并回复；ESP_ERR_TIMEOUT 超时无响应。
+ */
+esp_err_t gd32_app_ping(uint32_t timeout_ms, uint32_t *uptime_sec);
+
 #endif // SPI_MASTER_H

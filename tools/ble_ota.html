@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -514,6 +514,7 @@
     selectedFile: null,
     selectedFileBytes: null,
     selectedFileKey: '',
+    selectedFileHandle: null,  // FileSystemFileHandle for hot reload
     abortRequested: false,
     uploading: false,
     autoFlashing: false,
@@ -895,10 +896,38 @@
     updateFileInfo(file);
   }
 
+  // 通过 File System Access API 选择文件（支持热重载）
+  async function pickFileViaFSAPI() {
+    if (!window.showOpenFilePicker) {
+      log('FILE', '当前浏览器不支持 File System Access API', 'W');
+      return false;
+    }
+    try {
+      const handles = await window.showOpenFilePicker({
+        types: [{ description: '固件文件', accept: { 'application/octet-stream': ['.bin', '.hex'] } }],
+        multiple: false
+      });
+      if (handles && handles.length > 0) {
+        const handle = handles[0];
+        const file = await handle.getFile();
+        state.selectedFileHandle = handle;
+        updateFileInfo(file);
+        log('FILE', '已通过 FSAPI 选择文件（支持热重载）: ' + file.name);
+        return true;
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        log('FILE', 'FSAPI 选择失败: ' + e.message, 'W');
+      }
+    }
+    return false;
+  }
+
   function clearSelectedFile() {
     state.selectedFile = null;
     state.selectedFileBytes = null;
     state.selectedFileKey = '';
+    state.selectedFileHandle = null;
     state.lastUploadStatus = 'idle';
     if (els.firmwareFile) els.firmwareFile.value = '';
     updateFileInfo(null);
@@ -940,6 +969,18 @@
   }
 
   async function uploadFirmware() {
+    // 每次刷写前尝试重新从本地读取文件
+    if (state.selectedFileHandle) {
+      try {
+        const freshFile = await state.selectedFileHandle.getFile();
+        updateFileInfo(freshFile);
+        log('FILE', '已重新读取本地文件: ' + freshFile.name + ' (' + formatBytes(freshFile.size) + ')');
+      } catch (e) {
+        log('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
+      }
+    } else {
+      syncSelectedFileFromInput();
+    }
     if (!state.selectedFile || !state.dataInChar) return false;
 
     const cfg = currentTarget();
@@ -1040,6 +1081,18 @@
   }
 
   async function autoFlash() {
+    // 每次刷写前尝试重新从本地读取文件
+    if (state.selectedFileHandle) {
+      try {
+        const freshFile = await state.selectedFileHandle.getFile();
+        updateFileInfo(freshFile);
+        log('FILE', '已重新读取本地文件: ' + freshFile.name + ' (' + formatBytes(freshFile.size) + ')');
+      } catch (e) {
+        log('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
+      }
+    } else {
+      syncSelectedFileFromInput();
+    }
     if (!state.selectedFile || !state.server) return;
     const cfg = currentTarget();
     state.autoFlashing = true;
@@ -1077,7 +1130,10 @@
   els.autoFlashBtn.addEventListener('click', autoFlash);
   els.abortBtn.addEventListener('click', abortTask);
   els.clearLogBtn.addEventListener('click', clearLogs);
-  els.uploadZone.addEventListener('click', () => els.firmwareFile.click());
+  els.uploadZone.addEventListener('click', () => {
+      if (window.showOpenFilePicker) { pickFileViaFSAPI(); }
+      else { els.firmwareFile.click(); }
+    });
   els.uploadZone.addEventListener('dragover', (e) => {
     e.preventDefault();
     e.currentTarget.classList.add('dragover');
