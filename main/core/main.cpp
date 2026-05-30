@@ -1,6 +1,8 @@
-/*
+﻿/*
  * ESP32-C3FH4 OTA 中继 - 程序入口
- * 三个 FreeRTOS 任务：OTA Relay / WiFi Server / BLE GATT
+ * 四个 FreeRTOS 任务：健康监控 / OTA Relay / WiFi Server / BLE GATT
+ *
+ * 使用各模块的单例类进行初始化和任务创建。
  */
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
@@ -19,7 +21,7 @@
 #include "monitor/debug_log.h"
 
 /**
-  * @brief 程序主入口，初始化系统组件并创建各 FreeRTOS 任务。
+ * @brief 程序主入口，初始化系统组件并创建各 FreeRTOS 任务。
  */
 extern "C" void app_main(void)
 {
@@ -31,13 +33,12 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     // 初始化调试日志（UART0 先就绪，UDP socket 延迟到首次发送时创建）
-    debug_log_init();
+    DebugLog::instance().init();
 
     // ★ WiFi 提前初始化（调度器启动前）
-    // 包括：NVS → netif 创建 → event handler 注册 → WiFi driver init → 配置 → connect
-    bool wifi_sta_ok = wifi_early_init();
+    bool wifi_sta_ok = WifiOta::instance().earlyInit();
 
-    health_monitor_init();
+    HealthMonitor::instance().init();
     DEBUG_INFO("MAIN", "健康监控状态已初始化");
     DEBUG_INFO("MAIN", "========================================");
     DEBUG_INFO("MAIN", "ESP32-C3 OTA Relay v1.0 启动");
@@ -50,7 +51,7 @@ extern "C" void app_main(void)
     // 健康监控任务（温度 + WiFi RSSI）
     BaseType_t xRet;
     xRet = xTaskCreatePinnedToCore(
-        health_monitor_task,
+        HealthMonitor::taskEntry,
         "health_mon",
         4096,
         NULL,
@@ -64,10 +65,10 @@ extern "C" void app_main(void)
         DEBUG_INFO("MAIN", "健康监控任务已创建");
     }
 
-    protocol_init();
+    Protocol::instance().init();
     DEBUG_INFO("MAIN", "协议层初始化完成");
 
-    esp_err_t ret = spi_master_init();
+    esp_err_t ret = SpiMaster::instance().init();
     if (ret != ESP_OK) {
         DEBUG_ERR("MAIN", "SPI 总线初始化失败: %d", ret);
     } else {
@@ -76,7 +77,7 @@ extern "C" void app_main(void)
 
     // OTA 中继任务（中高优先级）
     xRet = xTaskCreatePinnedToCore(
-        ota_relay_task,
+        OtaRelay::taskEntry,
         "ota_relay",
         8192,
         NULL,
@@ -92,7 +93,7 @@ extern "C" void app_main(void)
 
     // WiFi OTA 服务器任务
     xRet = xTaskCreatePinnedToCore(
-        wifi_ota_task,
+        WifiOta::taskEntry,
         "wifi_ota",
         8192,
         NULL,
@@ -108,7 +109,7 @@ extern "C" void app_main(void)
 
     // BLE OTA 任务
     xRet = xTaskCreatePinnedToCore(
-        ble_ota_task,
+        BleOta::taskEntry,
         "ble_ota",
         8192,
         NULL,
@@ -124,8 +125,7 @@ extern "C" void app_main(void)
 
     DEBUG_INFO("MAIN", "========================================");
     DEBUG_INFO("MAIN", "所有任务创建完成，OTA Relay 运行中");
-    DEBUG_INFO("MAIN", "调试日志输出: UDP(%s:%d) + UART0(GPIO21/TX, 115200)", 
+    DEBUG_INFO("MAIN", "调试日志输出: UDP(%s:%d) + UART0(GPIO21/TX, 115200)",
                DEBUG_LOG_IP, DEBUG_LOG_PORT);
     DEBUG_INFO("MAIN", "========================================");
 }
-

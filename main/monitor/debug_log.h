@@ -1,4 +1,4 @@
-/*
+﻿/*
  * debug_log.h - 调试日志输出
  *
  * 当前日志会并行写入：
@@ -17,7 +17,11 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "app_config.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 // 调试日志配置（DEBUG_LOG_IP/PORT/ENABLED 已在 app_config.h 中定义）
 
@@ -36,57 +40,67 @@ typedef enum {
     DEBUG_LOG_ALL   = 5     // 全部
 } debug_log_level_t;
 
-// 当前日志级别（运行时可改）
-extern debug_log_level_t g_debug_log_level;
-
 /**
- * @brief 初始化日志系统，包括 UART 输出、UDP 目标和内部缓冲区。
- * @return ESP_OK 成功，其他失败。
+ * @brief 调试日志类（单例）
+ *
+ * 封装 UART0、UDP 和环形缓冲区三路日志输出通道，
+ * 所有内部状态（socket、缓冲区、互斥锁等）均为私有成员。
  */
-esp_err_t debug_log_init(void);
+class DebugLog {
+public:
+    static DebugLog& instance();
 
-/**
- * @brief 初始化 UART0 调试串口。
- * @return ESP_OK 成功，其他失败。
- */
-esp_err_t uart_debug_init(void);
+    /** @brief 初始化日志系统，包括 UART 输出、UDP 目标和内部缓冲区。 */
+    esp_err_t init();
 
-/**
- * @brief 通过 UART0 直接发送一段原始字节数据。
- * @param data 待发送的数据指针。
- * @param len 数据长度。
- * @return ESP_OK 成功，其他失败。
- */
-esp_err_t uart_debug_send(const uint8_t *data, size_t len);
+    /** @brief 初始化 UART0 调试串口。 */
+    esp_err_t uartInit();
 
-/**
- * @brief 发送原始日志数据到底层输出通道。
- * @param data 日志数据指针。
- * @param len 数据长度。
- * @return ESP_OK 成功，其他失败。
- */
-esp_err_t debug_log_send(const uint8_t *data, size_t len);
+    /** @brief 通过 UART0 直接发送一段原始字节数据。 */
+    esp_err_t uartSend(const uint8_t *data, size_t len);
 
-/**
- * @brief 按日志级别与标签格式化输出一条日志。
- * @param level 日志级别。
- * @param tag 日志标签。
- * @param fmt 格式化字符串。
- */
-void debug_log(debug_log_level_t level, const char *tag, const char *fmt, ...);
+    /** @brief 发送原始日志数据到底层输出通道。 */
+    esp_err_t send(const uint8_t *data, size_t len);
 
-/**
- * @brief 获取当前环形日志缓冲区中的日志条数。
- * @return 当前日志条数。
- */
-int debug_log_ring_count(void);
+    /** @brief 按日志级别与标签格式化输出一条日志。 */
+    void log(debug_log_level_t level, const char *tag, const char *fmt, ...);
 
-// 读取并清空环形日志缓冲区，返回 JSON 数组字符串，需由调用者 free。
-char *debug_log_ring_drain_json(int *out_len);  // 调用者 free
+    /** @brief 获取当前环形日志缓冲区中的日志条数。 */
+    int ringCount();
 
-#define DEBUG_ERR(tag, fmt, ...)   debug_log(DEBUG_LOG_ERR,   tag, fmt, ##__VA_ARGS__)
-#define DEBUG_WARN(tag, fmt, ...)  debug_log(DEBUG_LOG_WARN,  tag, fmt, ##__VA_ARGS__)
-#define DEBUG_INFO(tag, fmt, ...)   debug_log(DEBUG_LOG_INFO,  tag, fmt, ##__VA_ARGS__)
-#define DEBUG_DBG(tag, fmt, ...)   debug_log(DEBUG_LOG_DBG,   tag, fmt, ##__VA_ARGS__)
+    /** @brief 读取并清空环形日志缓冲区，返回 JSON 数组字符串（需调用者 free）。 */
+    char* ringDrainJson(int *out_len);
+
+    /** @brief 当前日志级别（运行时可改）。 */
+    debug_log_level_t logLevel = DEBUG_LOG_INFO;
+
+private:
+    DebugLog() = default;
+    ~DebugLog() = default;
+    DebugLog(const DebugLog&) = delete;
+    DebugLog& operator=(const DebugLog&) = delete;
+
+    int m_udpSock = -1;
+    struct sockaddr_in m_debugAddr;
+    bool m_initialized = false;
+    bool m_uartInitialized = false;
+
+    static constexpr int LOG_RING_SLOTS = 64;
+    static constexpr int LOG_RING_SIZE  = 256;
+    char  m_logRing[LOG_RING_SLOTS][LOG_RING_SIZE];
+    int   m_logRingLens[LOG_RING_SLOTS];
+    int   m_logRingHead  = 0;
+    int   m_logRingCount = 0;
+    SemaphoreHandle_t m_logRingMutex = NULL;
+
+    esp_err_t ensureUdpSocket();
+    void ringPush(const char *data, int len);
+};
+
+// 便捷宏 — 直接调用单例方法
+#define DEBUG_ERR(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_ERR,   tag, fmt, ##__VA_ARGS__)
+#define DEBUG_WARN(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_WARN,  tag, fmt, ##__VA_ARGS__)
+#define DEBUG_INFO(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_INFO,  tag, fmt, ##__VA_ARGS__)
+#define DEBUG_DBG(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_DBG,   tag, fmt, ##__VA_ARGS__)
 
 #endif // DEBUG_LOG_H

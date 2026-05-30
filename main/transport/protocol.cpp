@@ -1,9 +1,11 @@
-/*
- * protocol.c - 协议层实现
+﻿/*
+ * protocol.cpp - 协议层实现
  * T2.1, T2.2, T1.3
  * ESP-IDF 6.0 适配版本 - 使用硬件 AES-128-CBC + 硬件 RNG
  *
  * 加密实现使用 ESP32-C3 硬件 AES 加速器（通过 mbedtls port）
+ *
+ * 所有功能封装为 Protocol 类的静态方法。
  */
 #include <string.h>
 #include <stdio.h>
@@ -13,31 +15,30 @@
 #include "protocol.h"
 #include "monitor/debug_log.h"
 
-/** @brief 协议层初始化标志。 */
-static bool s_protocol_initialized = false;
-
-/**
-  * @brief 初始化协议层，准备 CRC 和 AES 模块。
- */
-void protocol_init(void)
+// ============================================================
+// Protocol 单例
+// ============================================================
+Protocol& Protocol::instance()
 {
-    if (s_protocol_initialized) return;
+    static Protocol inst;
+    return inst;
+}
+
+void Protocol::init()
+{
+    if (m_initialized) return;
 
     DEBUG_INFO("PROT", "=== 初始化协议层 ===");
     DEBUG_INFO("PROT", "协议层功能: CRC16 Modbus + 硬件 AES-128-CBC");
 
-    /** @brief 协议层初始化标志。 */
-    s_protocol_initialized = true;
+    m_initialized = true;
     DEBUG_INFO("PROT", "协议层就绪");
 }
 
 /**
  * @brief CRC16 Modbus（LE，低字节在前）
- * @param data 待校验的数据指针。
- * @param len 数据长度（字节）。
- * @return CRC16 校验值。
  */
-uint16_t crc16_modbus(const uint8_t *data, size_t len)
+uint16_t Protocol::crc16Modbus(const uint8_t *data, size_t len)
 {
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; i++) {
@@ -55,13 +56,8 @@ uint16_t crc16_modbus(const uint8_t *data, size_t len)
 
 /**
  * @brief 构建 SPI 帧: SOF + CMD + LEN(2LE) + PAYLOAD + CRC16(2LE)
- * @param cmd 命令码。
- * @param payload 负载数据指针，可为 NULL。
- * @param len 负载长度（字节）。
- * @param out_frame 输出帧缓冲区。
- * @return 帧总长度，失败返回 -1。
  */
-int frame_build(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_frame)
+int Protocol::buildFrame(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_frame)
 {
     if (len > FRAME_MAX_PAYLOAD) {
         DEBUG_ERR("PROT", "Payload 太大: %zu > %d", len, FRAME_MAX_PAYLOAD);
@@ -79,7 +75,7 @@ int frame_build(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_fr
         idx += len;
     }
 
-    uint16_t crc = crc16_modbus(out_frame, idx);
+    uint16_t crc = crc16Modbus(out_frame, idx);
     out_frame[idx++] = (uint8_t)(crc & 0xFF);
     out_frame[idx++] = (uint8_t)((crc >> 8) & 0xFF);
 
@@ -90,15 +86,9 @@ int frame_build(uint8_t cmd, const uint8_t *payload, size_t len, uint8_t *out_fr
 
 /**
  * @brief 解析并校验一帧 SPI 协议数据。
- * @param frame 输入帧缓冲区。
- * @param frame_len 输入帧长度。
- * @param out_cmd 输出命令字节，可为 NULL。
- * @param out_payload 输出负载缓冲区，可为 NULL。
- * @param out_len 输出负载长度指针，可为 NULL。
- * @return 0 成功，-1 失败。
  */
-int frame_parse(const uint8_t *frame, size_t frame_len,
-                uint8_t *out_cmd, uint8_t *out_payload, size_t *out_len)
+int Protocol::parseFrame(const uint8_t *frame, size_t frame_len,
+                         uint8_t *out_cmd, uint8_t *out_payload, size_t *out_len)
 {
     if (frame_len < 6) {
         DEBUG_WARN("PROT", "帧太短: %zu < 6", frame_len);
@@ -129,7 +119,7 @@ int frame_parse(const uint8_t *frame, size_t frame_len,
     }
 
     uint16_t received_crc = frame[idx + payload_len] | (frame[idx + payload_len + 1] << 8);
-    uint16_t calc_crc = crc16_modbus(frame, idx + payload_len);
+    uint16_t calc_crc = crc16Modbus(frame, idx + payload_len);
 
     if (received_crc != calc_crc) {
         DEBUG_WARN("PROT", "CRC 不匹配: 收到=0x%04X, 计算=0x%04X", received_crc, calc_crc);
@@ -151,14 +141,8 @@ int frame_parse(const uint8_t *frame, size_t frame_len,
 
 /**
  * @brief 使用 AES-128 CBC 对明文进行加密（PKCS#7 填充）。
- * @param plaintext 明文数据指针。
- * @param len 明文长度。
- * @param key 16 字节密钥。
- * @param iv 16 字节初始向量。
- * @param ciphertext_out 输出密文缓冲区。
- * @return >=0 为密文长度，-1 表示失败。
  */
-int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
+int Protocol::aesEncrypt(const uint8_t *plaintext, size_t len,
                          const uint8_t *key, const uint8_t *iv,
                          uint8_t *ciphertext_out)
 {
@@ -168,15 +152,18 @@ int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
     }
 
     // PKCS#7 填充
-    size_t padded_len = ((len + 15) / 16) * 16;
-    uint8_t padded[256];
-    memset(padded, 0, sizeof(padded));
-    memcpy(padded, plaintext, len);
-    uint8_t pad = (uint8_t)(16 - (len % 16));
-    if (pad == 0) pad = 16;
-    memset(&padded[len], pad, pad);
+    size_t padded_len = ((len / 16) + 1) * 16;
+    uint8_t padded[FRAME_MAX_PAYLOAD + 16];
+    if (padded_len > sizeof(padded)) {
+        DEBUG_ERR("PROT", "填充后长度超出缓冲区: %zu", padded_len);
+        return -1;
+    }
 
-    DEBUG_DBG("PROT", "AES 加密: 明文=%zu 字节, 填充后=%zu 字节, 填充值=0x%02X", len, padded_len, pad);
+    memcpy(padded, plaintext, len);
+    uint8_t pad_val = (uint8_t)(padded_len - len);
+    memset(&padded[len], pad_val, pad_val);
+
+    DEBUG_DBG("PROT", "AES 加密: 明文=%zu 字节, 填充后=%zu 字节", len, padded_len);
 
     // 硬件 AES-CBC 加密（使用 ESP32-C3 硬件 AES 加速器）
     esp_aes_context aes_ctx;
@@ -196,25 +183,20 @@ int protocol_aes_encrypt(const uint8_t *plaintext, size_t len,
 
     esp_aes_free(&aes_ctx);
 
-    if (ret == 0) {
-        DEBUG_DBG("PROT", "AES 加密成功: %zu -> %zu 字节", len, padded_len);
-        return padded_len;
-    } else {
+    if (ret != 0) {
         DEBUG_ERR("PROT", "esp_aes_crypt_cbc 加密失败: %d", ret);
         return -1;
     }
+
+    DEBUG_DBG("PROT", "AES 加密成功: %zu -> %zu 字节", len, padded_len);
+
+    return padded_len;
 }
 
 /**
- * @brief 使用 AES-128 CBC 解密密文并移除 PKCS#7 填充。
- * @param ciphertext 密文数据指针。
- * @param len 密文长度（必须是 16 的倍数）。
- * @param key 16 字节密钥。
- * @param iv 16 字节初始向量。
- * @param plaintext_out 输出明文缓冲区。
- * @return >=0 为明文长度，-1 表示失败。
+ * @brief 使用 AES-128 CBC 对密文进行解密（去除 PKCS#7 填充）。
  */
-int protocol_aes_decrypt(const uint8_t *ciphertext, size_t len,
+int Protocol::aesDecrypt(const uint8_t *ciphertext, size_t len,
                          const uint8_t *key, const uint8_t *iv,
                          uint8_t *plaintext_out)
 {
@@ -268,13 +250,9 @@ int protocol_aes_decrypt(const uint8_t *ciphertext, size_t len,
 
 /**
  * @brief 根据时间戳、地址和随机种子生成 16 字节 nonce。
- * @param timestamp 时间戳输入。
- * @param mem_addr 地址输入。
- * @param rand_seed 随机种子输入。
- * @param nonce_out 输出 nonce 缓冲区（16 字节）。
  */
-void scramble_generate(uint32_t timestamp, uint32_t mem_addr,
-                      uint32_t rand_seed, uint8_t *nonce_out)
+void Protocol::scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
+                                uint32_t rand_seed, uint8_t *nonce_out)
 {
     uint8_t state[16];
 
@@ -302,11 +280,8 @@ void scramble_generate(uint32_t timestamp, uint32_t mem_addr,
 
 /**
  * @brief 会话密钥初始化
- * @param sess 待初始化的会话上下文。
- * @param k_session 128 位会话密钥。
- * @return 0 成功，-1 失败。
  */
-int session_key_init(session_ctx_t *sess, const uint8_t *k_session)
+int Protocol::sessionKeyInit(session_ctx_t *sess, const uint8_t *k_session)
 {
     if (!sess || !k_session) return -1;
 
@@ -319,10 +294,9 @@ int session_key_init(session_ctx_t *sess, const uint8_t *k_session)
 }
 
 /**
-  * @brief 清除会话上下文中的密钥和状态。
- * @param sess 待清除的会话上下文。
+ * @brief 清除会话上下文中的密钥和状态。
  */
-void session_key_clear(session_ctx_t *sess)
+void Protocol::sessionKeyClear(session_ctx_t *sess)
 {
     if (sess) {
         memset(sess->key, 0, 16);
@@ -332,21 +306,16 @@ void session_key_clear(session_ctx_t *sess)
 }
 
 /**
-  * @brief 使用会话上下文加密数据。
- * @param sess 会话上下文。
- * @param in 输入明文。
- * @param len 数据长度。
- * @param out 输出密文缓冲区。
- * @return 密文长度，失败返回 -1。
+ * @brief 使用会话上下文加密数据。
  */
-int session_encrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out)
+int Protocol::sessionEncrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out)
 {
     if (!sess || !in || !out) return -1;
 
     uint8_t iv_copy[16];
     memcpy(iv_copy, sess->iv, 16);
 
-    int ret = protocol_aes_encrypt(in, len, sess->key, iv_copy, out);
+    int ret = aesEncrypt(in, len, sess->key, iv_copy, out);
 
     if (ret > 0) {
         memcpy(sess->iv, &out[ret - 16], 16);
@@ -356,21 +325,16 @@ int session_encrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t 
 }
 
 /**
-  * @brief 使用会话上下文解密数据。
- * @param sess 会话上下文。
- * @param in 输入密文。
- * @param len 数据长度。
- * @param out 输出明文缓冲区。
- * @return 明文长度，失败返回 -1。
+ * @brief 使用会话上下文解密数据。
  */
-int session_decrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out)
+int Protocol::sessionDecrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t *out)
 {
     if (!sess || !in || !out) return -1;
 
     uint8_t iv_copy[16];
     memcpy(iv_copy, sess->iv, 16);
 
-    int ret = protocol_aes_decrypt(in, len, sess->key, iv_copy, out);
+    int ret = aesDecrypt(in, len, sess->key, iv_copy, out);
 
     if (ret > 0) {
         memcpy(sess->iv, &in[len - 16], 16);
@@ -381,10 +345,8 @@ int session_decrypt(session_ctx_t *sess, const uint8_t *in, size_t len, uint8_t 
 
 /**
  * @brief 使用 ESP-IDF 硬件 RNG 生成随机数
- * @param nonce 输出缓冲区。
- * @param len 随机数字节数。
  */
-void generate_random_nonce(uint8_t *nonce, size_t len)
+void Protocol::generateRandomNonce(uint8_t *nonce, size_t len)
 {
     esp_fill_random(nonce, len);
 }

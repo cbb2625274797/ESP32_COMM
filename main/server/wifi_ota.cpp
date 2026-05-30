@@ -1,5 +1,6 @@
 ﻿/*
- * wifi_ota.c - WiFi OTA 服务器实现
+ * wifi_ota.cpp - WiFi OTA 服务器实现
+ * WifiOta 类封装 WiFi 初始化、HTTP OTA 服务器和网络状态查询。
  * T4.1 - T4.5
  */
 #include <string.h>
@@ -28,36 +29,13 @@
 #include "spi_master.h"
 #include "cJSON.h"
 
-/** @brief 当前 WiFi 工作模式（AP 或 STA）。 */
-static ota_wifi_mode_t s_wifi_mode = OTA_WIFI_MODE_AP;
-/** @brief 冷启动标志，上电复位或掉电复位时为 true。 */
-static bool s_cold_boot = false;
-/** @brief OTA 中继是否已触发标志。 */
-static bool s_relay_triggered = false;
-/** @brief STA 模式连接状态。 */
-static bool s_sta_connected = false;
-/** @brief STA 连接重试次数。 */
-static int s_sta_retry_count = 0;
-/** @brief STA 重试已耗尽标志，用于加速 wifi_ota_task 中的 AP 切换。 */
-static bool s_sta_retry_exhausted = false;
-/** @brief STA 连接成功信号量。 */
-static SemaphoreHandle_t s_sta_connected_sem = NULL;
-/** @brief STA 获取 IP 信号量。 */
-static SemaphoreHandle_t s_sta_got_ip_sem = NULL;
 
-// ESP32 OTA 状态
-static bool s_esp32_ota_active = false;
-/** @brief ESP32 OTA 写入句柄。 */
-static esp_ota_handle_t s_esp32_ota_handle = 0;
-static const esp_partition_t *s_esp32_update_partition = NULL;
-/** @brief ESP32 OTA 已接收字节数。 */
-static size_t s_esp32_received = 0;
-
-// GD32 OTA 存储状态
-static bool s_gd32_storage_done = false;
-
-/** @brief HTTP 服务器句柄。 */
-static httpd_handle_t s_http_server = NULL;
+// ============================================================
+WifiOta& WifiOta::instance()
+{
+    static WifiOta inst;
+    return inst;
+}
 
 static constexpr uint32_t GD32_OTA_FLASH_SECTOR_SIZE = 4096U;
 
@@ -69,7 +47,6 @@ static uint32_t align_up_u32(uint32_t value, uint32_t alignment)
 /**
  * @brief 预先声明：为 STA 模式配置静态 IP、网关和子网掩码。
  */
-static void wifi_set_static_ip(void);
 
 /**
   * @brief 为 HTTP 响应添加跨域访问控制头。
@@ -106,7 +83,7 @@ static esp_err_t http_options_handler(httpd_req_t *req)
  * @param event_id 具体事件 ID。
  * @param event_data 事件附带数据。
  */
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+void WifiOta::wifiEventHandler(void* arg, esp_event_base_t event_base,
                                       int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT) {
@@ -118,39 +95,36 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
         case WIFI_EVENT_STA_CONNECTED:
             DEBUG_INFO("WIFI", "STA 已关联到 AP");
-            /** @brief STA 模式连接状态。 */
-            s_sta_connected = true;
-            /** @brief STA 连接重试次数。 */
-            s_sta_retry_count = 0;
-            s_sta_retry_exhausted = false;  // ★ 连接成功，重置耗尽标志
-            if (s_sta_connected_sem) {
-                xSemaphoreGive(s_sta_connected_sem);
+            WifiOta::instance().m_staConnected = true;
+            WifiOta::instance().m_staRetryCount = 0;
+            WifiOta::instance().m_staRetryExhausted = false;  // ★ 连接成功，重置耗尽标志
+            if (WifiOta::instance().m_staConnectedSem) {
+                xSemaphoreGive(WifiOta::instance().m_staConnectedSem);
             }
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {
             wifi_event_sta_disconnected_t* disconn = (wifi_event_sta_disconnected_t*)event_data;
-            DEBUG_WARN("WIFI", "STA 断开, reason=%d, retry=%d", disconn->reason, s_sta_retry_count);
-            /** @brief STA 模式连接状态。 */
-            s_sta_connected = false;
+            DEBUG_WARN("WIFI", "STA 断开, reason=%d, retry=%d", disconn->reason, WifiOta::instance().m_staRetryCount);
+            WifiOta::instance().m_staConnected = false;
 
-            if (s_sta_retry_count < WIFI_STA_MAX_RETRY) {
-                s_sta_retry_count++;
+            if (WifiOta::instance().m_staRetryCount < WIFI_STA_MAX_RETRY) {
+                WifiOta::instance().m_staRetryCount++;
                 // ★ 冷启动首次连接失败时增加退避延迟
                 // 长时间断电后路由器可能还在初始化（ARP/DHCP/信道选择）
                 // reason 201=NO_AP_FOUND, 15=AUTH_FAIL, 2=AUTH_EXPIRE, 204=HANDSHAKE_TIMEOUT
-                if (s_cold_boot && s_sta_retry_count <= 3) {
-                    int delay_ms = 2000 * s_sta_retry_count;  // 2s, 4s, 6s 递增退避
+                if (WifiOta::instance().m_coldBoot && WifiOta::instance().m_staRetryCount <= 3) {
+                    int delay_ms = 2000 * WifiOta::instance().m_staRetryCount;  // 2s, 4s, 6s 递增退避
                     DEBUG_INFO("WIFI", "冷启动退避重连第 %d 次 (reason=%d, 等 %dms)...",
-                               s_sta_retry_count, disconn->reason, delay_ms);
+                               WifiOta::instance().m_staRetryCount, disconn->reason, delay_ms);
                     vTaskDelay(pdMS_TO_TICKS(delay_ms));
                 } else {
-                    DEBUG_INFO("WIFI", "重连第 %d 次...", s_sta_retry_count);
+                    DEBUG_INFO("WIFI", "重连第 %d 次...", WifiOta::instance().m_staRetryCount);
                 }
                 esp_wifi_connect();
             } else {
-                DEBUG_ERR("WIFI", "STA 重连失败 %d 次，放弃", s_sta_retry_count);
-                s_sta_retry_exhausted = true;
+                DEBUG_ERR("WIFI", "STA 重连失败 %d 次，放弃", WifiOta::instance().m_staRetryCount);
+                WifiOta::instance().m_staRetryExhausted = true;
             }
             break;
         }
@@ -176,8 +150,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         case IP_EVENT_STA_GOT_IP: {
             ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
             DEBUG_INFO("WIFI", "STA 获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
-            if (s_sta_got_ip_sem) {
-                xSemaphoreGive(s_sta_got_ip_sem);
+            if (WifiOta::instance().m_staGotIpSem) {
+                xSemaphoreGive(WifiOta::instance().m_staGotIpSem);
             }
             break;
         }
@@ -194,12 +168,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
   * @brief 初始化 SoftAP 模式，供局域网 OTA 使用。
  * @return ESP_OK 成功，其他失败。
  */
-static esp_err_t wifi_init_ap(void)
+void WifiOta::initAp()
 {
     DEBUG_INFO("WIFI", "=== 初始化 WiFi AP 模式 ===");
 
-    /** @brief 当前 WiFi 工作模式（AP 或 STA）。 */
-    s_wifi_mode = OTA_WIFI_MODE_AP;
+    WifiOta::instance().m_wifiMode = OTA_WIFI_MODE_AP;
 
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (ap_netif == NULL) {
@@ -238,8 +211,6 @@ static esp_err_t wifi_init_ap(void)
     DEBUG_INFO("WIFI", "AP IP 地址: 192.168.31.1");
     DEBUG_INFO("WIFI", "AP 网关地址: 192.168.31.1");
     DEBUG_INFO("WIFI", "最大连接数: %d", WIFI_AP_MAX_CONNECT);
-
-    return ESP_OK;
 }
 
 // ----------------------------------------
@@ -248,16 +219,13 @@ static esp_err_t wifi_init_ap(void)
   * @brief 初始化 STA 模式并连接预配置的路由器。
  * @return ESP_OK 成功，其他失败。
  */
-static esp_err_t wifi_init_sta(void)
+esp_err_t WifiOta::initSta()
 {
     DEBUG_INFO("WIFI", "=== 初始化 WiFi STA 模式 ===");
 
-    /** @brief 当前 WiFi 工作模式（AP 或 STA）。 */
-    s_wifi_mode = OTA_WIFI_MODE_STA;
-    /** @brief STA 连接重试次数。 */
-    s_sta_retry_count = 0;
-    /** @brief STA 重试已耗尽标志。 */
-    s_sta_retry_exhausted = false;
+    WifiOta::instance().m_wifiMode = OTA_WIFI_MODE_STA;
+    WifiOta::instance().m_staRetryCount = 0;
+    WifiOta::instance().m_staRetryExhausted = false;
 
     // ★ 设置国家代码：中国，允许信道 1-13
     // ESP32 默认国家是 US（只允许 1-11），中国路由可能用 12/13
@@ -283,13 +251,13 @@ static esp_err_t wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-    wifi_set_static_ip();
+    setStaticIp();
 
     // ★ 冷启动时在 wifi_start 前增加延迟
     // 长时间断电后首次上电，WiFi PHY 校准需要额外时间
     // esp_wifi_start() 内部会触发 PHY 初始化和校准
     // 如果校准未完成就启动射频，可能导致连接失败
-    if (s_cold_boot) {
+    if (WifiOta::instance().m_coldBoot) {
         DEBUG_INFO("WIFI", "冷启动: 等待 PHY 就绪...");
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -308,9 +276,9 @@ static esp_err_t wifi_init_sta(void)
  * @param len 缓冲区长度。
  * @return ESP_OK 连接成功，其他失败。
  */
-static esp_err_t wifi_wait_sta_connected(char *ip_str, size_t len)
+esp_err_t WifiOta::waitStaConnected(char *ip_str, size_t ip_len)
 {
-    SemaphoreHandle_t wait_sem = WIFI_STA_USE_STATIC_IP ? s_sta_connected_sem : s_sta_got_ip_sem;
+    SemaphoreHandle_t wait_sem = WIFI_STA_USE_STATIC_IP ? WifiOta::instance().m_staConnectedSem : WifiOta::instance().m_staGotIpSem;
     const char *wait_name = WIFI_STA_USE_STATIC_IP ? "STA_CONNECTED" : "STA_GOT_IP";
 
     if (wait_sem == NULL) {
@@ -318,7 +286,7 @@ static esp_err_t wifi_wait_sta_connected(char *ip_str, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // ★ 使用轮询等待，检查 s_sta_retry_exhausted 标志加速退出
+    // ★ 使用轮询等待，检查 WifiOta::instance().m_staRetryExhausted 标志加速退出
     // 不再一次性等完整超时，而是每秒检查一次重试耗尽状态
     TickType_t timeout_ticks = pdMS_TO_TICKS(WIFI_STA_CONNECT_TIMEOUT_MS);
     TickType_t start_tick = xTaskGetTickCount();
@@ -334,30 +302,29 @@ static esp_err_t wifi_wait_sta_connected(char *ip_str, size_t len)
             esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
             if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
                 if (ip_str) {
-                    snprintf(ip_str, len, IPSTR, IP2STR(&ip_info.ip));
+                    snprintf(ip_str, ip_len, IPSTR, IP2STR(&ip_info.ip));
                 }
                 DEBUG_INFO("WIFI", "%s 等待成功, 当前 IP: " IPSTR, wait_name, IP2STR(&ip_info.ip));
             }
-            /** @brief STA 模式连接状态。 */
-            s_sta_connected = true;
+            WifiOta::instance().m_staConnected = true;
             return ESP_OK;
         }
 
         // ★ 重试已耗尽，不再等待
-        if (s_sta_retry_exhausted) {
-            DEBUG_ERR("WIFI", "STA 重试已耗尽 (%d 次)，立即切换 AP", s_sta_retry_count);
+        if (WifiOta::instance().m_staRetryExhausted) {
+            DEBUG_ERR("WIFI", "STA 重试已耗尽 (%d 次)，立即切换 AP", WifiOta::instance().m_staRetryCount);
             return ESP_ERR_TIMEOUT;
         }
     }
 
-    DEBUG_ERR("WIFI", "等待 %s 超时 (%d ms), 重连次数: %d", wait_name, WIFI_STA_CONNECT_TIMEOUT_MS, s_sta_retry_count);
+    DEBUG_ERR("WIFI", "等待 %s 超时 (%d ms), 重连次数: %d", wait_name, WIFI_STA_CONNECT_TIMEOUT_MS, WifiOta::instance().m_staRetryCount);
     return ESP_ERR_TIMEOUT;
 }
 
 /**
  * @brief 设置 STA 静态 IP
  */
-static void wifi_set_static_ip(void)
+void WifiOta::setStaticIp()
 {
     if (WIFI_STA_USE_STATIC_IP) {
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -398,43 +365,39 @@ static esp_err_t esp32_ota_begin(size_t total_size)
     DEBUG_INFO("OTA", "当前启动分区: %s, size=%u, address=0x%lx",
                boot_partition->label, boot_partition->size, boot_partition->address);
 
-    s_esp32_update_partition = esp_partition_find_first(
+    WifiOta::instance().m_esp32UpdatePartition = esp_partition_find_first(
         ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-    if (s_esp32_update_partition == NULL ||
-        s_esp32_update_partition->address == boot_partition->address) {
-        s_esp32_update_partition = esp_partition_find_first(
+    if (WifiOta::instance().m_esp32UpdatePartition == NULL ||
+        WifiOta::instance().m_esp32UpdatePartition->address == boot_partition->address) {
+        WifiOta::instance().m_esp32UpdatePartition = esp_partition_find_first(
             ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
     }
 
-    if (s_esp32_update_partition == NULL) {
+    if (WifiOta::instance().m_esp32UpdatePartition == NULL) {
         DEBUG_ERR("OTA", "找不到可用的 OTA 分区");
         return ESP_FAIL;
     }
 
     DEBUG_INFO("OTA", "OTA 目标分区: %s, size=%u, address=0x%lx",
-               s_esp32_update_partition->label,
-               s_esp32_update_partition->size,
-               s_esp32_update_partition->address);
+               WifiOta::instance().m_esp32UpdatePartition->label,
+               WifiOta::instance().m_esp32UpdatePartition->size,
+               WifiOta::instance().m_esp32UpdatePartition->address);
 
-    if (total_size > s_esp32_update_partition->size) {
+    if (total_size > WifiOta::instance().m_esp32UpdatePartition->size) {
         DEBUG_ERR("OTA", "固件太大: %u > 分区大小: %u",
-                  total_size, s_esp32_update_partition->size);
+                  total_size, WifiOta::instance().m_esp32UpdatePartition->size);
         return ESP_FAIL;
     }
 
-    esp_err_t err = esp_ota_begin(s_esp32_update_partition, total_size, &s_esp32_ota_handle);
+    esp_err_t err = esp_ota_begin(WifiOta::instance().m_esp32UpdatePartition, total_size, &WifiOta::instance().m_esp32OtaHandle);
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "esp_ota_begin 失败: %s", esp_err_to_name(err));
-        /** @brief ESP32 OTA 目标分区。 */
-        s_esp32_update_partition = NULL;
+        WifiOta::instance().m_esp32UpdatePartition = NULL;
         return err;
     }
-
-    /** @brief ESP32 OTA 已接收字节数。 */
-    s_esp32_received = 0;
-    /** @brief ESP32 自身 OTA 写入进行中标志。 */
-    s_esp32_ota_active = true;
-    DEBUG_INFO("OTA", "ESP32 OTA 开始，目标分区: %s", s_esp32_update_partition->label);
+    WifiOta::instance().m_esp32Received = 0;
+    WifiOta::instance().m_esp32OtaActive = true;
+    DEBUG_INFO("OTA", "ESP32 OTA 开始，目标分区: %s", WifiOta::instance().m_esp32UpdatePartition->label);
     return ESP_OK;
 }
 
@@ -446,12 +409,12 @@ static esp_err_t esp32_ota_begin(size_t total_size)
  */
 static esp_err_t esp32_ota_write(const uint8_t *data, size_t len)
 {
-    if (!s_esp32_ota_active || s_esp32_update_partition == NULL) {
+    if (!WifiOta::instance().m_esp32OtaActive || WifiOta::instance().m_esp32UpdatePartition == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t err = esp_ota_write(s_esp32_ota_handle, data, len);
+    esp_err_t err = esp_ota_write(WifiOta::instance().m_esp32OtaHandle, data, len);
     if (err == ESP_OK) {
-        s_esp32_received += len;
+        WifiOta::instance().m_esp32Received += len;
     }
     return err;
 }
@@ -465,33 +428,29 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
 {
     (void)req;
     http_set_cors_headers(req);
-    if (!s_esp32_ota_active) {
+    if (!WifiOta::instance().m_esp32OtaActive) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "OTA not started");
         return ESP_FAIL;
     }
 
-    DEBUG_INFO("OTA", "ESP32 OTA 完成, 共 %u 字节, 设置启动分区...", s_esp32_received);
+    DEBUG_INFO("OTA", "ESP32 OTA 完成, 共 %u 字节, 设置启动分区...", WifiOta::instance().m_esp32Received);
 
-    esp_err_t err = esp_ota_end(s_esp32_ota_handle);
+    esp_err_t err = esp_ota_end(WifiOta::instance().m_esp32OtaHandle);
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "esp_ota_end 失败: %s", esp_err_to_name(err));
-        /** @brief ESP32 自身 OTA 写入进行中标志。 */
-        s_esp32_ota_active = false;
+        WifiOta::instance().m_esp32OtaActive = false;
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
         return ESP_FAIL;
     }
 
-    err = esp_ota_set_boot_partition(s_esp32_update_partition);
+    err = esp_ota_set_boot_partition(WifiOta::instance().m_esp32UpdatePartition);
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
-        /** @brief ESP32 自身 OTA 写入进行中标志。 */
-        s_esp32_ota_active = false;
+        WifiOta::instance().m_esp32OtaActive = false;
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
         return ESP_FAIL;
     }
-
-    /** @brief ESP32 自身 OTA 写入进行中标志。 */
-    s_esp32_ota_active = false;
+    WifiOta::instance().m_esp32OtaActive = false;
     DEBUG_INFO("OTA", "ESP32 OTA 完成，重启中...");
 
     const char resp[] = "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\"}";
@@ -533,11 +492,11 @@ static esp_err_t esp32_ota_status_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
     char resp[128];
-    if (s_esp32_ota_active) {
+    if (WifiOta::instance().m_esp32OtaActive) {
         snprintf(resp, sizeof(resp),
             "{\"active\": true, \"received\": %u, \"partition\": \"%s\"}",
-            (unsigned int)s_esp32_received,
-            s_esp32_update_partition ? s_esp32_update_partition->label : "null");
+            (unsigned int)WifiOta::instance().m_esp32Received,
+            WifiOta::instance().m_esp32UpdatePartition ? WifiOta::instance().m_esp32UpdatePartition->label : "null");
     } else {
         snprintf(resp, sizeof(resp), "{\"active\": false}");
     }
@@ -679,7 +638,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         }
 
         free(fw_buf);
-        DEBUG_INFO("WIFI", "ESP32 OTA 存储完成: %u 字节 (跳过 JSON 头 %d 字节)", (unsigned int)s_esp32_received, json_header_len);
+        DEBUG_INFO("WIFI", "ESP32 OTA 存储完成: %u 字节 (跳过 JSON 头 %d 字节)", (unsigned int)WifiOta::instance().m_esp32Received, json_header_len);
         const char resp[] = "{\"status\": \"ok\", \"message\": \"stored, call POST /ota/update to finish\", \"target\": \"esp32\"}";
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, strlen(resp));
@@ -696,12 +655,12 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    if (g_relay_state != RELAY_IDLE) {
-        DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", g_relay_state);
-        ota_relay_reset();
+    if (OtaRelay::relayState != RELAY_IDLE) {
+        DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", OtaRelay::relayState);
+        OtaRelay::instance().reset();
     }
-    s_gd32_storage_done = false;
-    s_relay_triggered = false;
+    WifiOta::instance().m_gd32StorageDone = false;
+    WifiOta::instance().m_relayTriggered = false;
 
     const esp_partition_t *gd32_partition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "gd32_ota");
@@ -728,7 +687,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, err_msg);
         return ESP_FAIL;
     }
-    meta_clear();
+    OtaRelay::metaClear();
 
     uint8_t *buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
     if (!buf) {
@@ -747,13 +706,13 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         .chunk_count = (expected_fw_size_raw + OTA_BLOCK_SIZE - 1U) / OTA_BLOCK_SIZE,
         .checksum = {0}
     };
-    meta_save(&meta_raw);
+    OtaRelay::metaSave(&meta_raw);
     DEBUG_INFO("WIFI", "GD32 raw upload start: %u bytes", expected_fw_size_raw);
 
     int first_chunk_len = pre_read_len;
     if (first_chunk_len > req->content_len) first_chunk_len = req->content_len;
     if (first_chunk_len > 0) {
-        esp_err_t err = flash_write_chunk(0, pre_read_buf, first_chunk_len);
+        esp_err_t err = OtaRelay::flashWriteChunk(0, pre_read_buf, first_chunk_len);
         if (err != ESP_OK) {
             DEBUG_ERR("WIFI", "GD32 first chunk write failed: len=%d err=%s",
                       first_chunk_len, esp_err_to_name(err));
@@ -762,7 +721,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         received = first_chunk_len;
-        meta_update((uint32_t)received, (uint32_t)(received / OTA_BLOCK_SIZE));
+        OtaRelay::metaUpdate((uint32_t)received, (uint32_t)(received / OTA_BLOCK_SIZE));
     }
 
     while (received < req->content_len) {
@@ -779,7 +738,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         }
 
         uint32_t flash_offset = (uint32_t)received;
-        esp_err_t err = flash_write_chunk(flash_offset, buf, ret);
+        esp_err_t err = OtaRelay::flashWriteChunk(flash_offset, buf, ret);
         if (err != ESP_OK) {
             DEBUG_ERR("WIFI", "GD32 flash write failed: offset=%u len=%d err=%s",
                       flash_offset, ret, esp_err_to_name(err));
@@ -789,21 +748,21 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         }
 
         received += ret;
-        meta_update((uint32_t)received, (uint32_t)(received / OTA_BLOCK_SIZE));
+        OtaRelay::metaUpdate((uint32_t)received, (uint32_t)(received / OTA_BLOCK_SIZE));
     }
 
     free(buf);
     DEBUG_INFO("WIFI", "GD32 raw upload done: %d / %u bytes", received, expected_fw_size_raw);
 
     ota_meta_t final_meta;
-    meta_load(&final_meta);
+    OtaRelay::metaLoad(&final_meta);
     if (final_meta.total_size > 0 && final_meta.stored_size >= final_meta.total_size) {
-        s_gd32_storage_done = true;
+        WifiOta::instance().m_gd32StorageDone = true;
         DEBUG_INFO("WIFI", "GD32 firmware fully stored, auto-triggering relay");
         // 自动触发中继
-        if (g_ota_dispatch_queue) {
+        if (OtaRelay::dispatchQueue) {
             uint32_t cmd = 1;  // 1 = start relay
-            xQueueSend(g_ota_dispatch_queue, &cmd, 0);
+            xQueueSend(OtaRelay::dispatchQueue, &cmd, 0);
         }
     }
 
@@ -826,27 +785,27 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
 
     ota_meta_t meta;
     memset(&meta, 0, sizeof(meta));
-    if (meta_load(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
+    if (OtaRelay::metaLoad(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "firmware not fully stored");
         return ESP_FAIL;
     }
 
-    if (s_relay_triggered && g_relay_state != RELAY_IDLE &&
-        g_relay_state != RELAY_DONE && g_relay_state != RELAY_ERROR) {
+    if (WifiOta::instance().m_relayTriggered && OtaRelay::relayState != RELAY_IDLE &&
+        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_ERROR) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "relay already triggered");
         return ESP_FAIL;
     }
     /* 上一轮中继已结束/失败/空闲，重置标志允许重新触发 */
-    s_relay_triggered = false;
-    s_gd32_storage_done = false;
+    WifiOta::instance().m_relayTriggered = false;
+    WifiOta::instance().m_gd32StorageDone = false;
 
-    if (!g_ota_dispatch_queue) {
+    if (!OtaRelay::dispatchQueue) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay queue not ready");
         return ESP_FAIL;
     }
 
-    wifi_ota_signal_relay();
-    if (!s_relay_triggered) {
+    WifiOta::instance().signalRelay();
+    if (!WifiOta::instance().m_relayTriggered) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay trigger failed");
         return ESP_FAIL;
     }
@@ -869,7 +828,7 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     DEBUG_INFO("WIFI", "=== HTTP: GET /ota/status ===");
     
     ota_meta_t meta;
-    meta_load(&meta);
+    OtaRelay::metaLoad(&meta);
 
     char resp[256];
     int len = snprintf(resp, sizeof(resp),
@@ -877,14 +836,14 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "\"storage_done\": %s, \"relay_state\": %d, \"gd32_app_alive\": %s}",
         (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
         (unsigned long)meta.last_seq,
-        s_gd32_storage_done ? "true" : "false",
-        g_relay_state,
-        g_gd32_app_alive ? "true" : "false");
+        WifiOta::instance().m_gd32StorageDone ? "true" : "false",
+        OtaRelay::relayState,
+        OtaRelay::gd32AppAlive ? "true" : "false");
 
     DEBUG_INFO("WIFI", "OTA 状态: total=%lu, stored=%lu, done=%s, app_alive=%s",
                (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
-               s_gd32_storage_done ? "true" : "false",
-               g_gd32_app_alive ? "true" : "false");
+               WifiOta::instance().m_gd32StorageDone ? "true" : "false",
+               OtaRelay::gd32AppAlive ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -902,7 +861,7 @@ static esp_err_t health_handler(httpd_req_t *req)
     http_set_cors_headers(req);
     DEBUG_INFO("WIFI", "=== HTTP: GET /health ===");
     
-    health_state_t state = health_get_current();
+    health_state_t state = HealthMonitor::instance().getCurrent();
     uint32_t free_heap = esp_get_free_heap_size();
 
     char resp[128];
@@ -928,7 +887,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
     http_set_cors_headers(req);
 
     int json_len = 0;
-    char *json = debug_log_ring_drain_json(&json_len);
+    char *json = DebugLog::instance().ringDrainJson(&json_len);
 
     if (json && json_len > 0) {
         httpd_resp_set_type(req, "application/json");
@@ -1002,7 +961,7 @@ static esp_err_t can_send_handler(httpd_req_t *req)
 
     // 发送 CAN 帧到 GD32
     uint8_t resp_data[CAN_MAX_DLC] = {0};
-    int resp_len = gd32_can_send(ch, ext_id, tx_data, tx_dlc,
+    int resp_len = SpiMaster::instance().canSend(ch, ext_id, tx_data, tx_dlc,
                                    resp_data, sizeof(resp_data), 1000);
 
     char resp[512];
@@ -1091,7 +1050,7 @@ static esp_err_t spi_send_handler(httpd_req_t *req)
     uint8_t resp_type = 0;
     uint8_t resp_payload[SPI_OTA_FRAME_MAX] = {0};
     size_t resp_len = 0;
-    esp_err_t spi_err = spi_ota_transfer(frame_type, payload_data, payload_len,
+    esp_err_t spi_err = SpiMaster::instance().otaTransfer(frame_type, payload_data, payload_len,
                                          &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
                                          timeout_ms);
 
@@ -1129,7 +1088,7 @@ static esp_err_t can_status_handler(httpd_req_t *req)
     snprintf(resp, sizeof(resp),
         "{\"channels\": 3, \"max_dlc\": %d, \"spi_init\": %s}",
         CAN_MAX_DLC,
-        g_spi_device != NULL ? "true" : "false");
+        SpiMaster::instance().deviceHandle() != NULL ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
@@ -1147,7 +1106,7 @@ static esp_err_t wifi_status_handler(httpd_req_t *req)
     char ip_str[16] = "0.0.0.0";
     int8_t rssi = -127;
 
-    if (s_wifi_mode == OTA_WIFI_MODE_STA && s_sta_connected) {
+    if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().m_staConnected) {
         esp_netif_ip_info_t ip_info;
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
@@ -1161,9 +1120,9 @@ static esp_err_t wifi_status_handler(httpd_req_t *req)
 
     int len = snprintf(resp, sizeof(resp),
         "{\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}",
-        s_wifi_mode == OTA_WIFI_MODE_AP ? "AP" : "STA",
+        WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_AP ? "AP" : "STA",
         ip_str, rssi,
-        (s_wifi_mode == OTA_WIFI_MODE_STA) ? (s_sta_connected ? "true" : "false") : "N/A");
+        (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA) ? (WifiOta::instance().m_staConnected ? "true" : "false") : "N/A");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1184,7 +1143,7 @@ static esp_err_t system_status_handler(httpd_req_t *req)
     int8_t rssi = -127;
     bool connected = false;
 
-    if (s_wifi_mode == OTA_WIFI_MODE_STA && s_sta_connected) {
+    if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().m_staConnected) {
         esp_netif_ip_info_t ip_info;
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
@@ -1199,26 +1158,26 @@ static esp_err_t system_status_handler(httpd_req_t *req)
 
     ota_meta_t meta;
     memset(&meta, 0, sizeof(meta));
-    meta_load(&meta);
+    OtaRelay::metaLoad(&meta);
 
     char resp[800];
     int len = snprintf(resp, sizeof(resp),
         "{\"version\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu}}",
-        FW_VERSION,health_get_current(),
+        FW_VERSION,HealthMonitor::instance().getCurrent(),
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
-        (double)health_get_last_temperature(),
+        (double)HealthMonitor::instance().getLastTemperature(),
         (unsigned long)(esp_timer_get_time() / 1000000),
-        s_wifi_mode == OTA_WIFI_MODE_AP ? "AP" : "STA",
+        WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_AP ? "AP" : "STA",
         ip_str,
         rssi,
         connected ? "true" : "false",
         (unsigned long)meta.total_size,
         (unsigned long)meta.stored_size,
-        s_gd32_storage_done ? "true" : "false",
-        g_relay_state,
-        (unsigned long)g_relay_seq,
-        (unsigned long)g_relay_total_packets);
+        WifiOta::instance().m_gd32StorageDone ? "true" : "false",
+        OtaRelay::relayState,
+        (unsigned long)OtaRelay::relaySeq,
+        (unsigned long)OtaRelay::relayTotalPackets);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1231,7 +1190,7 @@ static esp_err_t system_status_handler(httpd_req_t *req)
    * @brief 启动 HTTP OTA 服务器，注册各接口路由。
  * @return ESP_OK 成功，其他失败。
  */
-static esp_err_t http_ota_server_start(void)
+esp_err_t WifiOta::httpServerStart()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_SERVER_PORT;
@@ -1243,7 +1202,7 @@ static esp_err_t http_ota_server_start(void)
     DEBUG_INFO("WIFI", "=== 启动 HTTP OTA 服务器 ===");
     DEBUG_INFO("WIFI", "HTTP 服务器端口: %d", config.server_port);
 
-    esp_err_t err = httpd_start(&s_http_server, &config);
+    esp_err_t err = httpd_start(&WifiOta::instance().m_httpServer, &config);
     if (err != ESP_OK) {
         DEBUG_ERR("WIFI", "HTTP 服务器启动失败: %s", esp_err_to_name(err));
         return err;
@@ -1252,9 +1211,9 @@ static esp_err_t http_ota_server_start(void)
     // 从 NVS 恢复固件存储状态（重启后保留）
     {
         ota_meta_t boot_meta;
-        if (meta_load(&boot_meta) == ESP_OK &&
+        if (OtaRelay::metaLoad(&boot_meta) == ESP_OK &&
             boot_meta.total_size > 0 && boot_meta.stored_size >= boot_meta.total_size) {
-            s_gd32_storage_done = true;
+            WifiOta::instance().m_gd32StorageDone = true;
             DEBUG_INFO("WIFI", "从 NVS 恢复: 固件已就绪 (%u bytes)", boot_meta.total_size);
         }
     }
@@ -1265,14 +1224,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = ota_upload_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &upload_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &upload_uri);
     httpd_uri_t upload_options_uri = {
         .uri = "/ota/upload",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &upload_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &upload_options_uri);
 
     httpd_uri_t relay_uri = {
         .uri = "/ota/relay",
@@ -1280,14 +1239,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = ota_relay_trigger_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &relay_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &relay_uri);
     httpd_uri_t relay_options_uri = {
         .uri = "/ota/relay",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &relay_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &relay_options_uri);
 
     httpd_uri_t status_uri = {
         .uri = "/ota/status",
@@ -1295,14 +1254,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = ota_status_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &status_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_uri);
     httpd_uri_t status_options_uri = {
         .uri = "/ota/status",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &status_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_options_uri);
 
     httpd_uri_t esp32_update_uri = {
         .uri = "/ota/update",
@@ -1310,14 +1269,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = esp32_ota_update_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &esp32_update_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_update_uri);
     httpd_uri_t esp32_update_options_uri = {
         .uri = "/ota/update",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &esp32_update_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_update_options_uri);
 
     httpd_uri_t restart_uri = {
         .uri = "/restart",
@@ -1325,14 +1284,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = restart_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &restart_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &restart_uri);
     httpd_uri_t restart_options_uri = {
         .uri = "/restart",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &restart_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &restart_options_uri);
 
     httpd_uri_t esp32_status_uri = {
         .uri = "/ota/esp32_status",
@@ -1340,14 +1299,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = esp32_ota_status_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &esp32_status_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_status_uri);
     httpd_uri_t esp32_status_options_uri = {
         .uri = "/ota/esp32_status",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &esp32_status_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_status_options_uri);
 
     httpd_uri_t health_uri = {
         .uri = "/health",
@@ -1355,14 +1314,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = health_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &health_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &health_uri);
     httpd_uri_t health_options_uri = {
         .uri = "/health",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &health_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &health_options_uri);
 
     httpd_uri_t logs_uri = {
         .uri = "/logs",
@@ -1370,14 +1329,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = logs_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &logs_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &logs_uri);
     httpd_uri_t logs_options_uri = {
         .uri = "/logs",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &logs_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &logs_options_uri);
 
     httpd_uri_t wifi_status_uri = {
         .uri = "/wifi/status",
@@ -1385,14 +1344,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = wifi_status_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &wifi_status_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &wifi_status_uri);
     httpd_uri_t wifi_status_options_uri = {
         .uri = "/wifi/status",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &wifi_status_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &wifi_status_options_uri);
 
     httpd_uri_t system_status_uri = {
         .uri = "/system/status",
@@ -1400,14 +1359,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = system_status_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &system_status_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_status_uri);
     httpd_uri_t system_status_options_uri = {
         .uri = "/system/status",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &system_status_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_status_options_uri);
 
     // CAN 帧转发
     httpd_uri_t can_send_uri = {
@@ -1416,14 +1375,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = can_send_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &can_send_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_send_uri);
     httpd_uri_t can_send_options_uri = {
         .uri = "/can/send",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &can_send_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_send_options_uri);
 
     httpd_uri_t can_status_uri = {
         .uri = "/can/status",
@@ -1431,14 +1390,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = can_status_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &can_status_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_status_uri);
     httpd_uri_t can_status_options_uri = {
         .uri = "/can/status",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &can_status_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_status_options_uri);
 
     DEBUG_INFO("WIFI", "HTTP 服务器已启动");
     // SPI 直接发送
@@ -1448,14 +1407,14 @@ static esp_err_t http_ota_server_start(void)
         .handler = spi_send_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &spi_send_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &spi_send_uri);
     httpd_uri_t spi_send_options_uri = {
         .uri = "/spi/send",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(s_http_server, &spi_send_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &spi_send_options_uri);
 
     DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /ota/status, /ota/esp32_status, /health, /wifi/status, /system/status, /can/send, /can/status, /spi/send");
 
@@ -1467,40 +1426,38 @@ static esp_err_t http_ota_server_start(void)
 /**
   * @brief 通知 OTA 中继开始向 GD32 转发固件。
  */
-void wifi_ota_signal_relay(void)
+void WifiOta::signalRelay()
 {
     ota_meta_t meta;
     memset(&meta, 0, sizeof(meta));
-    if (meta_load(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
+    if (OtaRelay::metaLoad(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
         DEBUG_WARN("WIFI", "GD32 固件未完整存储，拒绝触发转发: stored=%lu total=%lu",
                    (unsigned long)meta.stored_size, (unsigned long)meta.total_size);
         return;
     }
 
-    if (s_relay_triggered && g_relay_state != RELAY_IDLE &&
-        g_relay_state != RELAY_DONE && g_relay_state != RELAY_ERROR) {
-        DEBUG_WARN("WIFI", "转发正在执行中，状态: %d", g_relay_state);
+    if (WifiOta::instance().m_relayTriggered && OtaRelay::relayState != RELAY_IDLE &&
+        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_ERROR) {
+        DEBUG_WARN("WIFI", "转发正在执行中，状态: %d", OtaRelay::relayState);
         return;
     }
     /* 上一轮中继已结束/失败/空闲，重置标志 */
-    s_relay_triggered = false;
-    s_gd32_storage_done = false;
+    WifiOta::instance().m_relayTriggered = false;
+    WifiOta::instance().m_gd32StorageDone = false;
+    WifiOta::instance().m_relayTriggered = true;
 
-    /** @brief OTA 中继是否已触发标志。 */
-    s_relay_triggered = true;
-
-    if (g_ota_dispatch_queue) {
+    if (OtaRelay::dispatchQueue) {
         uint32_t msg = 1;
-        BaseType_t ret = xQueueSend(g_ota_dispatch_queue, &msg, pdMS_TO_TICKS(100));
+        BaseType_t ret = xQueueSend(OtaRelay::dispatchQueue, &msg, pdMS_TO_TICKS(100));
         if (ret == pdTRUE) {
             DEBUG_INFO("WIFI", "OTA 调度信号已发送到中继任务");
         } else {
             DEBUG_ERR("WIFI", "OTA 调度信号发送失败");
-            s_relay_triggered = false;
+            WifiOta::instance().m_relayTriggered = false;
         }
     } else {
         DEBUG_ERR("WIFI", "OTA 中继队列尚未就绪");
-        s_relay_triggered = false;
+        WifiOta::instance().m_relayTriggered = false;
     }
 }
 
@@ -1508,19 +1465,18 @@ void wifi_ota_signal_relay(void)
   * @brief 获取当前 WiFi 工作模式（AP 或 STA）。
  * @return 当前 WiFi 模式枚举值。
  */
-ota_wifi_mode_t wifi_get_mode(void)
+ota_wifi_mode_t WifiOta::getMode()
 {
-    /** @brief 当前 WiFi 工作模式（AP 或 STA）。 */
-    return s_wifi_mode;
+    return WifiOta::instance().m_wifiMode;
 }
 
 /**
   * @brief 获取当前 WiFi 信号强度。
  * @return 信号强度（dBm），未连接时返回无效值。
  */
-int8_t wifi_get_rssi(void)
+int8_t WifiOta::getRssi()
 {
-    if (s_wifi_mode != OTA_WIFI_MODE_STA || !s_sta_connected) {
+    if (WifiOta::instance().m_wifiMode != OTA_WIFI_MODE_STA || !WifiOta::instance().m_staConnected) {
         return -127;
     }
     wifi_ap_record_t ap_info;
@@ -1534,10 +1490,9 @@ int8_t wifi_get_rssi(void)
   * @brief 判断 STA 是否已连接到上级 WiFi。
  * @return true 已连接，false 未连接。
  */
-bool wifi_is_connected(void)
+bool WifiOta::isConnected()
 {
-    /** @brief STA 模式连接状态。 */
-    return s_sta_connected;
+    return WifiOta::instance().m_staConnected;
 }
 
 // ----------------------------------------
@@ -1548,14 +1503,14 @@ bool wifi_is_connected(void)
   * @brief 在调度器启动前初始化 WiFi 并尝试 STA 连接。
  * @return true STA 初始化中，false 需回退 AP。
  */
-bool wifi_early_init(void)
+bool WifiOta::earlyInit()
 {
     DEBUG_INFO("WIFI", "=== WiFi 早期初始化 (调度器启动前) ===");
 
     // ★ 冷启动检测：判断是否为上电复位
     esp_reset_reason_t reset_reason = esp_reset_reason();
-    bool is_cold_boot = (reset_reason == ESP_RST_POWERON || reset_reason == ESP_RST_BROWNOUT);
-    s_cold_boot = is_cold_boot;  // 保存到模块级标志，供事件回调使用
+    WifiOta::instance().m_coldBoot = (reset_reason == ESP_RST_POWERON || reset_reason == ESP_RST_BROWNOUT);
+    
     DEBUG_INFO("WIFI", "复位原因: %d (%s), 冷启动: %s",
                reset_reason,
                (reset_reason == ESP_RST_POWERON) ? "POWER_ON" :
@@ -1566,7 +1521,7 @@ bool wifi_early_init(void)
                (reset_reason == ESP_RST_TASK_WDT) ? "TASK_WDT" :
                (reset_reason == ESP_RST_DEEPSLEEP) ? "DEEP_SLEEP" :
                "OTHER",
-               is_cold_boot ? "是" : "否");
+               WifiOta::instance().m_coldBoot ? "是" : "否");
 
     esp_err_t err = nvs_flash_init();
     bool nvs_erased = false;
@@ -1588,7 +1543,7 @@ bool wifi_early_init(void)
 
     // ★ 冷启动时强制清除 WiFi NVS 缓存，避免残留脏数据
     // 长时间断电后 NVS 中的 WiFi 配置缓存可能不一致
-    if (is_cold_boot) {
+    if (WifiOta::instance().m_coldBoot) {
         nvs_handle_t nvs_handle;
         err = nvs_open("nvs.net80211", NVS_READWRITE, &nvs_handle);
         if (err == ESP_OK) {
@@ -1610,17 +1565,15 @@ bool wifi_early_init(void)
         }
     }
 
-    /** @brief STA 连接成功信号量。 */
-    s_sta_connected_sem = xSemaphoreCreateBinary();
-    /** @brief STA 获取 IP 信号量。 */
-    s_sta_got_ip_sem = xSemaphoreCreateBinary();
-    if (!s_sta_connected_sem || !s_sta_got_ip_sem) {
+    WifiOta::instance().m_staConnectedSem = xSemaphoreCreateBinary();
+    WifiOta::instance().m_staGotIpSem = xSemaphoreCreateBinary();
+    if (!WifiOta::instance().m_staConnectedSem || !WifiOta::instance().m_staGotIpSem) {
         DEBUG_ERR("WIFI", "创建信号量失败");
     }
 
     // 注册 WiFi/IP 事件回调（必须在 esp_wifi_init 之前）
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiOta::wifiEventHandler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &WifiOta::wifiEventHandler, NULL));
     DEBUG_INFO("WIFI", "WiFi/IP 事件回调已注册");
 
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -1642,39 +1595,39 @@ bool wifi_early_init(void)
     // STA 优先，失败时返回 false 让 task 切 AP
     if (CONFIG_WIFI_MODE == 1) {
         DEBUG_INFO("WIFI", "工作模式: STA (优先)");
-        err = wifi_init_sta();
+        err = initSta();
         if (err == ESP_OK) {
             // 连接已触发（STA_START 事件驱动），返回 true
-            // 实际连接状态由 wifi_ota_task 等待确认
+            // 实际连接状态由 WifiOta::taskEntry 等待确认
             return true;
         }
         DEBUG_WARN("WIFI", "STA 初始化失败，将切换 AP");
         return false;
     } else {
         DEBUG_INFO("WIFI", "工作模式: AP");
-        wifi_init_ap();
+        initAp();
         return false;  // AP 模式，不需要等待连接
     }
 }
 
 // ----------------------------------------
 // WiFi OTA FreeRTOS 任务
-// WiFi 初始化已在 app_main 中通过 wifi_early_init() 完成
+// WiFi 初始化已在 app_main 中通过 WifiOta::instance().earlyInit() 完成
 // 此任务负责：等待连接结果 → 启动 HTTP 服务器 → 状态监控
 /**
   * @brief WiFi OTA FreeRTOS 任务，提供 HTTP 上传和中继触发。
  * @param pvParameters FreeRTOS 任务参数，未使用。
  */
-void wifi_ota_task(void *pvParameters)
+void WifiOta::taskEntry(void *pvParameters)
 {
     (void)pvParameters;
 
     DEBUG_INFO("WIFI", "=== WiFi OTA 任务启动 ===");
 
     // 等待 STA 连接结果（wifi_early_init 已触发连接）
-    if (wifi_get_mode() == OTA_WIFI_MODE_STA) {
+    if (WifiOta::getMode() == OTA_WIFI_MODE_STA) {
         char ip_str[16] = {0};
-        esp_err_t err = wifi_wait_sta_connected(ip_str, sizeof(ip_str));
+        esp_err_t err = instance().waitStaConnected(ip_str, sizeof(ip_str));
         if (err == ESP_OK) {
             DEBUG_INFO("WIFI", "STA 已连接, IP: %s", ip_str);
         } else {
@@ -1697,19 +1650,18 @@ void wifi_ota_task(void *pvParameters)
                     DEBUG_ERR("WIFI", "WiFi 驱动重新初始化失败: %s", esp_err_to_name(deinit_err));
                 } else {
                     // ★ deinit 后事件回调会丢失，必须重新注册
-                    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-                    esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+                    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiOta::wifiEventHandler, NULL);
+                    esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &WifiOta::wifiEventHandler, NULL);
                     DEBUG_INFO("WIFI", "WiFi/IP 事件回调已重新注册");
                 }
             }
-            /** @brief 当前 WiFi 工作模式（AP 或 STA）。 */
-            s_wifi_mode = OTA_WIFI_MODE_AP;
-            wifi_init_ap();
+            WifiOta::instance().m_wifiMode = OTA_WIFI_MODE_AP;
+            instance().initAp();
         }
     }
     // AP 模式：wifi_early_init 已完成，无需额外操作
 
-    esp_err_t err = http_ota_server_start();
+    esp_err_t err = instance().httpServerStart();
     if (err != ESP_OK) {
         DEBUG_ERR("WIFI", "HTTP 服务器启动失败");
     }
@@ -1726,7 +1678,7 @@ void wifi_ota_task(void *pvParameters)
         DEBUG_INFO("WIFI", "[启动摘要] ESP32-C3 OTA Relay v%s", FW_VERSION);
         DEBUG_INFO("WIFI", "[启动摘要] Chip: %s, Rev %d", CONFIG_IDF_TARGET, chip.revision);
         DEBUG_INFO("WIFI", "[启动摘要] Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
-        DEBUG_INFO("WIFI", "[启动摘要] WiFi: %s", wifi_get_mode() == OTA_WIFI_MODE_STA ? "STA" : "AP");
+        DEBUG_INFO("WIFI", "[启动摘要] WiFi: %s", WifiOta::getMode() == OTA_WIFI_MODE_STA ? "STA" : "AP");
         DEBUG_INFO("WIFI", "[启动摘要] NVS + WiFi driver + netif + event handler 初始化完成");
         DEBUG_INFO("WIFI", "[启动摘要] HTTP 服务器端口: %d", HTTP_SERVER_PORT);
         DEBUG_INFO("WIFI", "========================================");
@@ -1742,9 +1694,9 @@ void wifi_ota_task(void *pvParameters)
 
         // 每 10 秒检查一次 RSSI
         if (tick % 10 == 0) {
-            int8_t rssi = wifi_get_rssi();
+            int8_t rssi = WifiOta::getRssi();
             if (rssi != -127) {
-                health_update_from_wifi_rssi(rssi);
+                HealthMonitor::instance().updateFromWifiRssi(rssi);
 
                 if (rssi < WIFI_RSSI_CRITICAL) {
                     DEBUG_WARN("WIFI", "WiFi RSSI 危险: %d dBm (阈值: %d)", rssi, WIFI_RSSI_CRITICAL);

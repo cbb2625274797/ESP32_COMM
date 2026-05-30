@@ -1,52 +1,58 @@
-/*
+﻿/*
  * wifi_ota.h - WiFi OTA 服务器
  * T4.1 - T4.5
+ *
+ * WifiOta 类封装 WiFi 初始化、HTTP OTA 服务器和网络状态查询。
  */
 #ifndef WIFI_OTA_H
 #define WIFI_OTA_H
 
 #include "ota_relay.h"
+#include "esp_ota_ops.h"
+#include "esp_http_server.h"
+#include "esp_event.h"
 
-// WiFi 模式: AP 或 STA
 typedef enum {
-    OTA_WIFI_MODE_AP,    // AP 模式（ESP32 作为热点）
-    OTA_WIFI_MODE_STA    // STA 模式（连接路由器）
+    OTA_WIFI_MODE_AP,
+    OTA_WIFI_MODE_STA
 } ota_wifi_mode_t;
 
-/**
- * @brief WiFi OTA 任务入口，负责 HTTP 服务、上传处理和 OTA 触发流程。
- * @param pvParameters FreeRTOS 任务参数，未使用。
- */
-void wifi_ota_task(void *pvParameters);
+class WifiOta {
+public:
+    static WifiOta& instance();
 
-// 在 app_main 早期执行 WiFi 初始化并尝试以 STA 模式联网。
-/**
- * @brief 返回 true 表示 STA 初始化已开始，false 表示后续应回退到 AP 模式。
- * @return true STA 初始化中，false 需回退 AP。
- */
-bool wifi_early_init(void);
+    bool earlyInit();
+    static void taskEntry(void *pvParameters);
+    void signalRelay();
 
-/**
- * @brief 在固件存储完成后通知 OTA 中继开始向 GD32 转发。
- */
-void wifi_ota_signal_relay(void);
+    static ota_wifi_mode_t getMode();
+    static int8_t getRssi();
+    static bool isConnected();
 
-/**
- * @brief 获取当前 WiFi 工作模式（AP 或 STA）。
- * @return 当前 WiFi 模式枚举值。
- */
-ota_wifi_mode_t wifi_get_mode(void);
+    // 以下状态为 public，供 C 回调函数访问
+    ota_wifi_mode_t m_wifiMode = OTA_WIFI_MODE_AP;
+    bool m_coldBoot = false;
+    bool m_relayTriggered = false;
+    bool m_staConnected = false;
+    int m_staRetryCount = 0;
+    bool m_staRetryExhausted = false;
+    SemaphoreHandle_t m_staConnectedSem = NULL;
+    SemaphoreHandle_t m_staGotIpSem = NULL;
 
-/**
- * @brief 获取当前 WiFi RSSI，未连接时通常返回无效/默认值。
- * @return 信号强度（dBm），未连接时返回无效值。
- */
-int8_t wifi_get_rssi(void);
+    bool m_esp32OtaActive = false;
+    esp_ota_handle_t m_esp32OtaHandle = 0;
+    const esp_partition_t *m_esp32UpdatePartition = NULL;
+    size_t m_esp32Received = 0;
+    bool m_gd32StorageDone = false;
+    httpd_handle_t m_httpServer = NULL;
 
-/**
- * @brief 判断当前 STA 模式下是否已经连接到上级 WiFi。
- * @return true 已连接，false 未连接。
- */
-bool wifi_is_connected(void);
+    void initAp();
+    esp_err_t initSta();
+    void setStaticIp();
+    static void wifiEventHandler(void *arg, esp_event_base_t event_base,
+                                 int32_t event_id, void *event_data);
+    esp_err_t httpServerStart();
+    esp_err_t waitStaConnected(char *ip_str, size_t ip_len);
+};
 
 #endif // WIFI_OTA_H
