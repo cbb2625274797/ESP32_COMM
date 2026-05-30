@@ -1201,9 +1201,9 @@ static esp_err_t system_status_handler(httpd_req_t *req)
     memset(&meta, 0, sizeof(meta));
     meta_load(&meta);
 
-    char resp[700];
+    char resp[800];
     int len = snprintf(resp, sizeof(resp),
-        "{\"version\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d}}",
+        "{\"version\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu}}",
         FW_VERSION,health_get_current(),
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
@@ -1216,7 +1216,9 @@ static esp_err_t system_status_handler(httpd_req_t *req)
         (unsigned long)meta.total_size,
         (unsigned long)meta.stored_size,
         s_gd32_storage_done ? "true" : "false",
-        g_relay_state);
+        g_relay_state,
+        (unsigned long)g_relay_seq,
+        (unsigned long)g_relay_total_packets);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);

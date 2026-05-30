@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ota_relay.c - OTA 中继核心状态机实现
  * T2.3, T2.4, T3.1 - T3.7
  */
@@ -21,6 +21,8 @@
 
 /** @brief 当前 OTA 中继状态机状态。 */
 relay_state_t g_relay_state = RELAY_IDLE;
+uint32_t g_relay_seq = 0;
+uint32_t g_relay_total_packets = 0;
 volatile bool g_gd32_app_alive = false;
 
 static const esp_partition_t *g_gd32_partition = NULL;
@@ -69,7 +71,6 @@ static ota_result_t relay_packets_from_flash(void);
  */
 static ota_result_t finish_ota(void);
 static int aes128_ecb_encrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out);
-static int aes128_ecb_decrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out);
 static void log_resp_payload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len);
 static esp_err_t wait_until_not_wait(const char *stage, uint8_t *resp_type,
                                      uint8_t *resp_payload, size_t resp_max,
@@ -333,24 +334,6 @@ static int aes128_ecb_encrypt_block_local(const uint8_t *key, const uint8_t *in,
     return ret;
 }
 
-/**
- * @brief 使用 AES-128 ECB 解密单个 16 字节分组。
- * @param key 16 字节密钥。
- * @param in 输入密文分组（16 字节）。
- * @param out 输出明文分组（16 字节）。
- * @return 0 表示成功，非 0 表示失败。
- */
-static int aes128_ecb_decrypt_block_local(const uint8_t *key, const uint8_t *in, uint8_t *out)
-{
-    esp_aes_context aes;
-    esp_aes_init(&aes);
-    int ret = esp_aes_setkey(&aes, key, 128);
-    if (ret == 0) {
-        ret = esp_aes_crypt_ecb(&aes, ESP_AES_DECRYPT, in, out);
-    }
-    esp_aes_free(&aes);
-    return ret;
-}
 
 /**
  * @brief 按 3 个分组对 48 字节数据执行 AES-128 ECB 加密。
@@ -825,6 +808,8 @@ static ota_result_t relay_packets_from_flash(void)
     DEBUG_INFO("OTA", "总包数: %u, 每包 %u 字节", total_packets, (unsigned)GD32_OTA_PACKET_SIZE);
     DEBUG_INFO("OTA", "状态: RELAY_RELAY_ACTIVE");
     g_relay_state = RELAY_RELAY_ACTIVE;
+    g_relay_total_packets = total_packets;
+    g_relay_seq = 0;
 
     for (uint32_t seq = 0; seq < total_packets; seq++) {
         uint32_t retry_count = 0;
@@ -873,6 +858,7 @@ static ota_result_t relay_packets_from_flash(void)
 
         g_relay_state = RELAY_PACKET_SENT;
 
+        resend_packet:
         while (1) {
             resp_len = 0;
             err = spi_ota_transfer(SPI_OTA_CMD_DATA, tx_buf, sizeof(tx_buf),
@@ -910,16 +896,27 @@ static ota_result_t relay_packets_from_flash(void)
                     }
                 }
 
-                /* 非期望 ACK，也非错误帧 → 可能是残留 ACK，循环 poll 直到拿到正确的 */
+                /* 非期望 ACK，也非错误帧 -> 可能是残留 ACK，循环 poll 直到拿到正确的。
+                 * 超时/非ACK 退出时需要重发当前包（GD32 Flash 缓冲满时会发 WAIT 后排空，
+                 * ESP32 必须重发才能让 GD32 重新处理）。 */
                 bool got_expected = false;
                 for (uint32_t retry = 0; retry < 5; ++retry) {
                     DEBUG_WARN("OTA", "包 %u 收到非目标ACK(seq不匹配)，继续轮询(%u/5)...", seq, retry + 1);
                     err = spi_ota_poll_response(&resp_type, resp_payload, sizeof(resp_payload), &resp_len, 2000);
                     if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
-                        err = wait_until_not_wait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1000, 10);
+                        err = wait_until_not_wait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 100, 5);
                     }
                     if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
-                        break;
+                        /* poll 超时或收到非 ACK（WAIT/ERROR）-> GD32 Flash 缓冲可能已满，
+                         * 正在排空。重发当前包让 GD32 重新入队处理。 */
+                        DEBUG_WARN("OTA", "包 %u poll 超时/非ACK，重发 (retry=%u/3)", seq, retry_count + 1);
+                        g_relay_state = RELAY_PACKET_ACK_RETRY;
+                        if (++retry_count >= 3U) {
+                            DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
+                            result = OTA_RESULT_ERR_GD32;
+                            break;
+                        }
+                        goto resend_packet;
                     }
                     if (is_structured_ack_with_seq(resp_payload, resp_len, expected_ack)) {
                         got_expected = true;
@@ -949,9 +946,15 @@ static ota_result_t relay_packets_from_flash(void)
                     continue; /* 重发本包 */
                 }
 
-                DEBUG_ERR("OTA", "包 %u ACK/ERROR 不匹配，len=%zu", seq, resp_len);
-                result = OTA_RESULT_ERR_GD32;
-                break;
+                /* 轮询耗尽仍未拿到期望 ACK -> 重发当前包 */
+                DEBUG_WARN("OTA", "包 %u 轮询耗尽未匹配，重发 (retry=%u/3)", seq, retry_count + 1);
+                g_relay_state = RELAY_PACKET_ACK_RETRY;
+                if (++retry_count >= 3U) {
+                    DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
+                    result = OTA_RESULT_ERR_GD32;
+                    break;
+                }
+                goto resend_packet;
             }
 
             /* 匹配成功 */
@@ -964,12 +967,12 @@ static ota_result_t relay_packets_from_flash(void)
             break;
         }
 
+        g_relay_seq = seq + 1;
         if (seq % (total_packets / 10 + 1) == 0) {
-            uint32_t progress = (seq * 100U) / total_packets;
-            DEBUG_INFO("OTA", "转发进度: %u/%u 包 (%u%%)", seq, total_packets, progress);
+            uint32_t progress = (g_relay_seq * 100U) / total_packets;
+            DEBUG_INFO("OTA", "转发进度: %u/%u 包 (%u%%)", g_relay_seq, total_packets, progress);
         }
     }
-
     g_relay_state = RELAY_RECEIVE_DONE;
     DEBUG_DBG("OTA", "状态: RELAY_RECEIVE_DONE");
     return result;
@@ -1146,6 +1149,8 @@ void ota_relay_reset(void)
 {
     /** @brief 当前 OTA 中继状态机状态。 */
     g_relay_state = RELAY_IDLE;
+    g_relay_seq = 0;
+    g_relay_total_packets = 0;
     session_key_clear(&g_session_ctx);
     memset(&g_session_ctx, 0, sizeof(session_ctx_t));
     memset(g_k_session, 0, sizeof(g_k_session));

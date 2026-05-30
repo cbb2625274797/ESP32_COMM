@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 OTA 中继控制台</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=20260530b">
 </head>
 <body>
 <div class="container">
@@ -104,21 +104,30 @@
         </div>
       </div>
 
-      <!-- 4. Common -->
+      <!-- 4. Flash Progress -->
       <div class="card">
-        <div class="card-head"><span class="ico">⚡</span> 通用操作</div>
+        <div class="card-head"><span class="ico">⚡</span> 刷写进度</div>
         <div class="card-body">
-          <div class="progress-wrap" id="progressWrap">
+          <!-- Phase step indicators -->
+          <div class="progress-phase-row">
+            <div class="pp-step active" id="ppEsp32"><span class="pp-ico">📦</span><span class="pp-txt">ESP32 OTA</span></div>
+            <div class="pp-step" id="ppGd32Up"><span class="pp-ico">📤</span><span class="pp-txt">GD32 上传</span></div>
+            <div class="pp-step" id="ppGd32Relay"><span class="pp-ico">🔀</span><span class="pp-txt">GD32 转发</span></div>
+          </div>
+          <!-- Unified progress bar -->
+          <div class="progress-wrap show" id="progressWrap">
             <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
             <div class="progress-text">
-              <span id="progressTxt">准备上传...</span>
+              <span id="progressTxt">等待操作...</span>
               <span id="progressPct">0%</span>
             </div>
           </div>
-          <button class="btn btn-outline btn-block" onclick="restartEsp32()">重启 ESP32</button>
-          <a class="btn btn-outline btn-block" href="ble_ota.html?v=20260509-0046" style="margin-top:10px;text-decoration:none;">
-            切换到 BLE 蓝牙刷写
-          </a>
+          <div style="margin-top:12px;">
+            <button class="btn btn-outline btn-block" onclick="restartEsp32()">重启 ESP32</button>
+            <a class="btn btn-outline btn-block" href="ble_ota.html?v=20260509-0046" style="margin-top:10px;text-decoration:none;">
+              切换到 BLE 蓝牙刷写
+            </a>
+          </div>
         </div>
       </div>
 
@@ -258,6 +267,6 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260529"></script>
+<script src="app.js?v=20260530f"></script>
 </body>
 </html>

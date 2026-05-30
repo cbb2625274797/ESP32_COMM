@@ -1,4 +1,4 @@
-/* ===== ESP32 OTA 控制台 — 工业调试台风格 ===== */
+﻿/* ===== ESP32 OTA 控制台 — 工业调试台风格 ===== */
 
 :root {
   --bg-root: #090e15;
@@ -229,25 +229,72 @@ select option { background: var(--bg-panel); color: var(--text); }
 .file-meta-item b { font-weight: 600; }
 
 /* === PROGRESS === */
-.progress-wrap { margin-top: 14px; display: none; }
+.progress-phase-row {
+  display: flex; align-items: center; gap: 0; margin-bottom: 14px;
+  flex-wrap: nowrap;
+  background: var(--bg-input);
+  border-radius: 20px;
+  padding: 4px;
+  border: 1px solid var(--border);
+}
+.pp-step {
+  flex: 1;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  padding: 7px 10px; border-radius: 16px;
+  font-size: 12px; font-weight: 600; color: var(--text-dim);
+  background: transparent;
+  transition: all .25s ease; white-space: nowrap;
+  cursor: default;
+}
+.pp-ico { font-size: 13px; opacity: .45; transition: all .25s ease; }
+.pp-txt { transition: color .25s ease; }
+.pp-sep { display: none; }
+
+/* Active step — highlighted capsule */
+.pp-step.active {
+  color: #07121c;
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent-dim);
+}
+.pp-step.active .pp-ico { opacity: 1; }
+.pp-step.active .pp-txt { color: #07121c; }
+
+/* Done step — green outlined capsule */
+.pp-step.done {
+  color: var(--green);
+  background: rgba(34,197,94,.12);
+}
+.pp-step.done .pp-ico { opacity: 1; }
+.pp-step.done .pp-txt::after {
+  content: ' ✓'; font-size: 10px;
+}
+
+.progress-wrap { margin-top: 0; display: none; }
 .progress-wrap.show { display: block; }
 .progress-track {
-  width: 100%; height: 8px; border-radius: 20px;
+  width: 100%; height: 10px; border-radius: 20px;
   background: var(--bg-input); overflow: hidden;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,.3);
 }
 .progress-fill {
-  height: 100%; border-radius: 20px; background: var(--accent);
-  width: 0%; transition: width .25s ease;
+  height: 100%; border-radius: 20px;
+  background: linear-gradient(90deg, #22d3ee, #06b6d4);
+  width: 0%; transition: width .3s ease;
   position: relative;
+  box-shadow: 0 0 8px rgba(34,211,238,.3);
 }
 .progress-fill::after {
   content: ""; position: absolute; inset: 0;
-  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.25) 50%, transparent 100%);
-  animation: sweep 1.8s linear infinite;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.3) 50%, transparent 100%);
+  animation: sweep 1.6s linear infinite;
+}
+.progress-fill.done {
+  background: linear-gradient(90deg, #22c55e, #16a34a);
+  box-shadow: 0 0 8px rgba(34,197,94,.3);
 }
 @keyframes sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
 .progress-text {
-  display: flex; justify-content: space-between; margin-top: 6px;
+  display: flex; justify-content: space-between; margin-top: 7px;
   font-size: 12px; color: var(--text-dim);
 }
 
@@ -413,3 +460,4 @@ select option { background: var(--bg-panel); color: var(--text); }
   .can-grid { grid-template-columns: 1fr 1fr; }
   .btn-row { flex-direction: column; }
 }
+

@@ -152,5 +152,7 @@ extern volatile bool g_gd32_app_alive;
 
 // 当前中继状态（供健康监控外部访问）
 extern relay_state_t g_relay_state;
+extern uint32_t g_relay_seq;
+extern uint32_t g_relay_total_packets;
 
 #endif // OTA_RELAY_H

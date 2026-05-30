@@ -13,6 +13,53 @@ let logSocket = null;
 let latestSystemStatus = null;
 let isEsp32Rebooting = false;
 let rebootStartTime = 0;
+// ==================== 刷写进度 ====================
+var activePhase = null;  // 'esp32Ota' | 'gd32Upload' | 'gd32Relay' | null
+
+function setActivePhase(phase) {
+  activePhase = phase;
+  var stepMap = { esp32Ota: 'ppEsp32', gd32Upload: 'ppGd32Up', gd32Relay: 'ppGd32Relay' };
+  Object.keys(stepMap).forEach(function(p) {
+    var el = document.getElementById(stepMap[p]);
+    if (!el) return;
+    el.classList.remove('active', 'done');
+    if (p === phase) el.classList.add('active');
+  });
+  // Reset progress fill color
+  var fill = document.getElementById('progressFill');
+  if (fill) fill.classList.remove('done');
+}
+
+function markPhaseDone(phase) {
+  var stepMap = { esp32Ota: 'ppEsp32', gd32Upload: 'ppGd32Up', gd32Relay: 'ppGd32Relay' };
+  var el = document.getElementById(stepMap[phase]);
+  if (el) { el.classList.remove('active'); el.classList.add('done'); }
+  // All done? turn progress bar green
+  if (phase === 'gd32Relay') {
+    var fill = document.getElementById('progressFill');
+    if (fill) fill.classList.add('done');
+  }
+}
+
+function setProgress(pct, text) {
+  var fillEl = document.getElementById('progressFill');
+  var txtEl = document.getElementById('progressTxt');
+  var pctEl = document.getElementById('progressPct');
+  if (fillEl) fillEl.style.width = pct + '%';
+  if (txtEl) txtEl.textContent = text;
+  if (pctEl) pctEl.textContent = pct + '%';
+}
+
+function resetProgress() {
+  setProgress(0, '等待操作...');
+  activePhase = null;
+  ['ppEsp32', 'ppGd32Up', 'ppGd32Relay'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.classList.remove('active', 'done');
+  });
+  var fill = document.getElementById('progressFill');
+  if (fill) fill.classList.remove('done');
+}
 
 // ==================== 工具函数 ====================
 function formatBytes(bytes) {
@@ -183,6 +230,7 @@ function applyDisconnectedRuntimeState() {
   document.getElementById('mRSSI').textContent = '--';
   document.getElementById('bOTAProgress').textContent = '--';
   document.getElementById('bOTAProgress').className = 'v err';
+  resetProgress();
   resetStageFlow();
 }
 
@@ -362,13 +410,32 @@ function updateSystemStatusUi(data) {
   else if (rs === 17) pr.className = 'pill online';
   else pr.className = 'pill idle';
 
-  // OTA progress
+  // OTA cache progress (GD32 upload to ESP32 flash)
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
-  var progress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
+  var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
   var bp = document.getElementById('bOTAProgress');
-  bp.textContent = progress + '%';
-  bp.className = 'v ' + (progress === 100 ? 'ok' : progress > 0 ? 'warn' : '');
+  bp.textContent = storageProgress + '%';
+  bp.className = 'v ' + (storageProgress === 100 ? 'ok' : storageProgress > 0 ? 'warn' : '');
+
+  // GD32 relay forwarding progress
+  var relaySeq = ota.relay_seq || 0;
+  var relayTotal = ota.relay_total_packets || 0;
+  var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
+
+  if (rs > 0 && rs < 17) {
+    // Relay is active — show relay progress
+    setActivePhase('gd32Relay');
+    setProgress(relayProgress, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
+  } else if (total > 0 && stored < total && !isUploading) {
+    // GD32 upload to cache in progress (handled by upload progress if uploading)
+    setActivePhase('gd32Upload');
+    setProgress(storageProgress, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
+  } else if (rs === 17) {
+    // Relay done
+    markPhaseDone('gd32Relay');
+    setProgress(100, 'GD32 刷写完成');
+  }
 
   // stage flow from real state
   updateStagesFromRelayState(rs);
@@ -814,7 +881,7 @@ async function startUpload(chip) {
   var origText = uploadBtn.textContent;
   uploadBtn.disabled = true;
   uploadBtn.textContent = '上传中...';
-  document.getElementById('progressWrap').classList.add('show');
+  setActivePhase(chip === 'esp32' ? 'esp32Ota' : 'gd32Upload');
   addLog('I', '上传', '开始上传: ' + file.name + ' \u2192 ' + chip.toUpperCase());
   showToast('开始上传固件到 ' + chip.toUpperCase(), 'success');
 
@@ -841,10 +908,7 @@ async function startUpload(chip) {
       if (e.lengthComputable) {
         var pct = Math.round((e.loaded / e.total) * 100);
         uploadProgress = pct;
-        document.getElementById('progressFill').style.width = pct + '%';
-        document.getElementById('progressTxt').textContent =
-          '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total);
-        document.getElementById('progressPct').textContent = pct + '%';
+        setProgress(pct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
         document.getElementById('bOTAProgress').textContent = pct + '%';
       }
     });
@@ -857,7 +921,9 @@ async function startUpload(chip) {
       if (xhr.status === 200) {
         addLog('I', '上传', '固件上传完成！');
         showToast('固件上传成功', 'success');
+        setProgress(100, '上传完成');
         if (chip === 'esp32') {
+          markPhaseDone('esp32Ota');
           var countdown = 3;
           addLog('I', 'OTA', countdown + ' 秒后自动调用 POST /ota/update 完成升级并重启...');
           var timer = setInterval(function () {
@@ -869,6 +935,10 @@ async function startUpload(chip) {
               triggerEsp32Update();
             }
           }, 1000);
+        } else {
+          markPhaseDone('gd32Upload');
+          setActivePhase('gd32Relay');
+          setProgress(0, '等待触发转发...');
         }
       } else {
         var detail = formatHttpErrorDetail(xhr.responseText);
