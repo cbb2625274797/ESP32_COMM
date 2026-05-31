@@ -343,7 +343,7 @@ esp_err_t OtaRelay::flashReadChunk(uint32_t offset, uint8_t *data, size_t len)
  * @brief 阶段1 - 发起与 GD32 的握手
  * @return 操作结果码。
  */
-void OtaRelay::requestGd32AppEnterBootloader()
+esp_err_t OtaRelay::requestGd32AppEnterBootloader()
 {
     DEBUG_INFO("OTA", "尝试通知 GD32 APP 进入 Bootloader OTA 窗口");
     esp_err_t err = SpiMaster::instance().appRequestBootloader(500);
@@ -354,9 +354,10 @@ void OtaRelay::requestGd32AppEnterBootloader()
          * 等待 1000ms 给 GD32 足够时间完成系统复位和 Bootloader 初始化。 */
         DEBUG_INFO("OTA", "GD32 已确认进入 Bootloader，等待就绪");
         vTaskDelay(pdMS_TO_TICKS(1000));
-    } else {
-        DEBUG_WARN("OTA", "GD32 APP 未确认进入 Bootloader，继续尝试直接握手: %s", esp_err_to_name(err));
+        return ESP_OK;
     }
+    DEBUG_WARN("OTA", "GD32 APP 未确认进入 Bootloader: %s", esp_err_to_name(err));
+    return err;
 }
 
 ota_result_t OtaRelay::sendHandshakeReq()

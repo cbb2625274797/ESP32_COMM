@@ -69,6 +69,9 @@
               <div class="file-meta-item"><span>大小</span><b id="fileSizeEsp32">-</b></div>
             </div>
           </div>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-top:8px;cursor:pointer;">
+            <input type="checkbox" id="compressEsp32"> zlib 压缩（弱网加速，CPU 开销大）
+          </label>
           <button class="btn btn-primary btn-block" id="uploadEsp32Btn" onclick="startUpload('esp32')" disabled style="margin-top:10px;">
             上传并升级 ESP32
           </button>
@@ -95,6 +98,9 @@
               <div class="file-meta-item"><span>大小</span><b id="fileSizeGd32">-</b></div>
             </div>
           </div>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-bottom:4px;cursor:pointer;">
+            <input type="checkbox" id="compressGd32"> zlib 压缩（弱网加速，CPU 开销大）
+          </label>
           <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled style="margin-top:10px;margin-bottom:8px;">
             上传固件到缓存
           </button>

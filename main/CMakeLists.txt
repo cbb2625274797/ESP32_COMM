@@ -1,4 +1,4 @@
-idf_component_register(
+﻿idf_component_register(
     SRCS
         "core/main.cpp"
         "relay/ota_relay.cpp"
@@ -6,6 +6,7 @@ idf_component_register(
         "transport/protocol.cpp"
         "server/wifi_ota.cpp"
         "server/ble_ota.cpp"
+        "utils/ota_compressor.cpp"
         "monitor/health_monitor.cpp"
         "monitor/debug_log.cpp"
     INCLUDE_DIRS

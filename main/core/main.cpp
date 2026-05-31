@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ESP32-C3FH4 OTA 中继 - 程序入口
  * 四个 FreeRTOS 任务：健康监控 / OTA Relay / WiFi Server / BLE GATT
  *
@@ -79,7 +79,7 @@ extern "C" void app_main(void)
     xRet = xTaskCreatePinnedToCore(
         OtaRelay::taskEntry,
         "ota_relay",
-        8192,
+        12288,
         NULL,
         configMAX_PRIORITIES - 2,
         NULL,

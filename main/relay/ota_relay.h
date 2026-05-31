@@ -93,6 +93,8 @@ public:
     static constexpr size_t GD32_UID_LEN = 12;
     static constexpr size_t GD32_CHALLENGE_RESPONSE_LEN = 36;
 
+    esp_err_t requestGd32AppEnterBootloader();
+    ota_result_t probeBootHandshake();
     ota_result_t sendHandshakeReq();
     ota_result_t sendNonceAndAuthenticate();
     ota_result_t sendFirmwareSize(uint32_t size);
@@ -129,8 +131,6 @@ public:
                                                uint8_t *out_k_session, uint8_t *out_uid);
     static bool aes128EcbEncrypt48Bytes(const uint8_t *key, const uint8_t *in, uint8_t *out);
     static void calculateCrc32WithKey(const uint8_t *key, const uint8_t *data48, uint8_t *output);
-
-    void requestGd32AppEnterBootloader();
 
 private:
     OtaRelay() = default;

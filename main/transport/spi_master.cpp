@@ -39,6 +39,8 @@ esp_err_t SpiMaster::transferClocked(const uint8_t *tx_buf, size_t tx_len,
     }
 
     if ((tx_len > 0U && tx_buf == NULL) || (rx_len > 0U && rx_buf == NULL)) {
+        DEBUG_WARN("SPI", "transferClocked INVALID_ARG: tx_len=%u tx_buf=%p rx_len=%u rx_buf=%p dev=%p",
+                   (unsigned)tx_len, tx_buf, (unsigned)rx_len, rx_buf, m_spiDevice);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -74,6 +76,10 @@ esp_err_t SpiMaster::transferClocked(const uint8_t *tx_buf, size_t tx_len,
     t.rx_buffer = (rx_len > 0U) ? rx_ptr : NULL;
 
     esp_err_t ret = spi_device_transmit(m_spiDevice, &t);
+    if (ret != ESP_OK) {
+        DEBUG_WARN("SPI", "spi_device_transmit fail: %s len=%u tx=%p rx=%p",
+                   esp_err_to_name(ret), (unsigned)(total_len * 8U), t.tx_buffer, t.rx_buffer);
+    }
 
     if (ret == ESP_OK && rx_len > 0U && rx_ptr != rx_buf) {
         memcpy(rx_buf, rx_ptr, rx_len);
@@ -202,8 +208,8 @@ esp_err_t SpiMaster::init()
     DEBUG_INFO("SPI", "=== 初始化 SPI2 总线 ===");
 
     spi_bus_config_t bus_cfg = {};
-    bus_cfg.miso_io_num = 2;
-    bus_cfg.mosi_io_num = 7;
+    bus_cfg.miso_io_num = 7;
+    bus_cfg.mosi_io_num = 5;
     bus_cfg.sclk_io_num = 6;
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
@@ -220,7 +226,11 @@ esp_err_t SpiMaster::init()
     dev_cfg.mode = SPI_MODE;
     dev_cfg.spics_io_num = SPI_MASTER_CS_GPIO;
     dev_cfg.queue_size = SPI_QUEUE_SIZE;
-    dev_cfg.flags = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_NO_DUMMY;
+    dev_cfg.command_bits = 0;
+    dev_cfg.address_bits = 0;
+    dev_cfg.dummy_bits = 0;
+    dev_cfg.cs_ena_posttrans = 10;
+    dev_cfg.cs_ena_pretrans = 20;
 
     ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &m_spiDevice);
     if (ret != ESP_OK) {
@@ -228,7 +238,7 @@ esp_err_t SpiMaster::init()
         return ret;
     }
 
-    DEBUG_INFO("SPI", "SPI2 总线初始化完成: CS=GPIO%d, CLK=%d Hz",
+    DEBUG_INFO("SPI", "SPI2 总线初始化完成: MOSI=GPIO5, MISO=GPIO7, SCLK=GPIO6, CS=GPIO%d, CLK=%d Hz",
                SPI_MASTER_CS_GPIO, SPI_CLOCK_HZ);
 
     return ESP_OK;
@@ -269,6 +279,8 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
         return ESP_ERR_INVALID_ARG;
     }
 
+    DEBUG_DBG("SPI", "OTA TX: type=0x%02X len=%u first4=%02X%02X%02X%02X",
+              type, (unsigned)tx_len, tx_frame[0], tx_frame[1], tx_frame[2], tx_frame[3]);
     esp_err_t ret = transferClocked(tx_frame, tx_len, NULL, 0);
     if (ret != ESP_OK) {
         DEBUG_WARN("SPI", "OTA 请求发送失败: %s", esp_err_to_name(ret));
@@ -302,6 +314,15 @@ esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
         size_t frame_offset = 0;
 
         if (otaFindFrame(rx_raw, sizeof(rx_raw), &found_type, &found_payload, &found_len, &frame_offset)) {
+            /* 有效性检查：ACK/ERROR 帧必须有 payload，空 payload 的 ACK 是帧截断/错位，
+             * 继续轮询而非当作有效响应返回。 */
+            if ((found_type == SPI_OTA_RSP_ACK || found_type == SPI_OTA_RSP_ERROR) && found_len == 0) {
+                DEBUG_DBG("SPI", "OTA 响应帧截断: type=0x%02X len=0 offset=%u, 继续轮询",
+                          found_type, (unsigned)frame_offset);
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+
             if (resp_type) *resp_type = found_type;
             if (resp_payload && resp_max > 0) {
                 size_t copy_len = (found_len < resp_max) ? found_len : resp_max;

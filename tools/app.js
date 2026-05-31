@@ -836,6 +836,29 @@ function clearFile(chip) {
 }
 
 // ==================== 上传固件 ====================
+// ==================== zlib compression ====================
+async function compressZlib(arrayBuffer) {
+  var cs = new CompressionStream("deflate");
+  var writer = cs.writable.getWriter();
+  writer.write(new Uint8Array(arrayBuffer));
+  writer.close();
+  var chunks = [];
+  var reader = cs.readable.getReader();
+  for (;;) {
+    var r = await reader.read();
+    if (r.done) break;
+    chunks.push(r.value);
+  }
+  var total = chunks.reduce(function(n, c) { return n + c.length; }, 0);
+  var out = new Uint8Array(total);
+  var off = 0;
+  for (var j = 0; j < chunks.length; j++) {
+    out.set(chunks[j], off);
+    off += chunks[j].length;
+  }
+  return out.buffer;
+}
+
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file || isUploading) return;
@@ -890,19 +913,45 @@ async function startUpload(chip) {
     var fileSize = file.size;
     var body, url = getBaseUrl() + '/ota/upload';
 
+    var useCompress = chip === 'esp32'
+      ? document.getElementById('compressEsp32').checked
+      : document.getElementById('compressGd32').checked;
+
     if (chip === 'esp32') {
-      var headerJson = JSON.stringify({ type: 'esp32', total_size: fileSize });
+      var headerObj = { type: 'esp32', total_size: fileSize };
+      var payload = arrayBuffer;
+      if (useCompress) {
+        payload = await compressZlib(arrayBuffer);
+        headerObj.compress = 'zlib';
+        addLog('I', '压缩', 'zlib: ' + formatBytes(fileSize) + ' -> ' + formatBytes(payload.byteLength) + ' (' + Math.round(payload.byteLength * 100 / fileSize) + '%)');
+      } else {
+        addLog('I', '上传', '直传（无压缩）: ' + formatBytes(fileSize));
+      }
+      var headerJson = JSON.stringify(headerObj);
       var encoder = new TextEncoder();
       var headerBytes = encoder.encode(headerJson);
-      var fileBytes = new Uint8Array(arrayBuffer);
-      var combined = new Uint8Array(headerBytes.length + fileSize);
+      var combined = new Uint8Array(headerBytes.length + payload.byteLength);
       combined.set(headerBytes, 0);
-      combined.set(fileBytes, headerBytes.length);
+      combined.set(new Uint8Array(payload), headerBytes.length);
       body = combined.buffer;
     } else {
-      body = arrayBuffer;
+      var headerObj = { total_size: fileSize };
+      var payload = arrayBuffer;
+      if (useCompress) {
+        payload = await compressZlib(arrayBuffer);
+        headerObj.compress = 'zlib';
+        addLog('I', '压缩', 'zlib: ' + formatBytes(fileSize) + ' -> ' + formatBytes(payload.byteLength) + ' (' + Math.round(payload.byteLength * 100 / fileSize) + '%)');
+      } else {
+        addLog('I', '上传', '直传（无压缩）: ' + formatBytes(fileSize));
+      }
+      var gd32Header = JSON.stringify(headerObj);
+      var encoder = new TextEncoder();
+      var headerBytes = encoder.encode(gd32Header);
+      var combined = new Uint8Array(headerBytes.length + payload.byteLength);
+      combined.set(headerBytes, 0);
+      combined.set(new Uint8Array(payload), headerBytes.length);
+      body = combined.buffer;
     }
-
     var xhr = new XMLHttpRequest();
     xhr.upload.addEventListener('progress', function (e) {
       if (e.lengthComputable) {

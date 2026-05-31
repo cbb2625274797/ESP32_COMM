@@ -10,7 +10,7 @@
 // ============================================================
 // 固件版本
 // ============================================================
-inline constexpr const char *FW_VERSION = "0.3.0";
+inline constexpr const char *FW_VERSION = "0.3.1";
 
 // ============================================================
 // WiFi 工作模式选择
@@ -54,8 +54,12 @@ inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;
 // OTA 配置
 // ============================================================
 inline constexpr size_t  OTA_BLOCK_SIZE         = 8192;
+inline constexpr size_t  OTA_DECOMP_OUT_BUF_SIZE = 2048;  // 流式解压提示值，实际受堆限制自适应   // adaptive: init caps to available heap
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB，对齐 GD32 APP_MAX_SIZE (0x36000)
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
+inline constexpr uint32_t OTA_POLL_RETRIES      = 40;          // 每包 ACK 轮询次数
+inline constexpr uint32_t OTA_RESEND_RETRIES    = 10;           // 每包重发次数上限
+inline constexpr uint32_t OTA_PACKET_DELAY_MS   = 5;            // 每包发送后延时(ms)，给 GD32 处理时间           // 每包重发次数上限
 
 // ============================================================
 // 健康监控阈值
