@@ -94,7 +94,7 @@ public:
                               size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
 
     /** @brief 通知 GD32 DCU_APP 设置 OTA 标志并软复位进入 Bootloader。 */
-    esp_err_t appRequestBootloader(uint32_t timeout_ms);
+    esp_err_t appRequestBootloader();
 
     /** @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。 */
     esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec);

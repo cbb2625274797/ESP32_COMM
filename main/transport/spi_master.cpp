@@ -349,31 +349,41 @@ esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
     return ESP_ERR_TIMEOUT;
 }
 
-esp_err_t SpiMaster::appRequestBootloader(uint32_t timeout_ms)
+esp_err_t SpiMaster::appRequestBootloader()
 {
     DEBUG_INFO("SPI", "请求 GD32 APP 进入 Bootloader...");
 
-    uint8_t cmd = SPI_APP_ENTER_BOOT_CMD;
-    esp_err_t ret = transferClocked(&cmd, 1, NULL, 0);
-    if (ret != ESP_OK) {
-        DEBUG_WARN("SPI", "发送 Bootloader 请求失败: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    constexpr uint32_t kMaxRetries = 3U;
+    constexpr uint32_t kPerRetryAckMs = 200U;
+    constexpr uint32_t kRetryGapMs = 50U;
 
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-
-    while (xTaskGetTickCount() <= deadline) {
-        uint8_t rx = 0;
-        uint8_t dummy = 0xFF;
-        ret = transferClocked(&dummy, 1, &rx, 1);
-        if (ret == ESP_OK && rx == SPI_APP_ENTER_BOOT_ACK_OK) {
-            DEBUG_INFO("SPI", "GD32 APP 已确认进入 Bootloader");
-            return ESP_OK;
+    for (uint32_t retry = 0U; retry < kMaxRetries; ++retry) {
+        if (retry > 0U) {
+            DEBUG_WARN("SPI", "Bootloader 请求重发 (%lu/%lu)", (unsigned long)retry, (unsigned long)kMaxRetries);
+            vTaskDelay(pdMS_TO_TICKS(kRetryGapMs));
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        uint8_t cmd = SPI_APP_ENTER_BOOT_CMD;
+        esp_err_t ret = transferClocked(&cmd, 1, NULL, 0);
+        if (ret != ESP_OK) {
+            DEBUG_WARN("SPI", "发送 Bootloader 请求失败: %s", esp_err_to_name(ret));
+            continue;
+        }
+
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(kPerRetryAckMs);
+        while (xTaskGetTickCount() <= deadline) {
+            uint8_t rx = 0;
+            uint8_t dummy = 0xFF;
+            ret = transferClocked(&dummy, 1, &rx, 1);
+            if (ret == ESP_OK && rx == SPI_APP_ENTER_BOOT_ACK_OK) {
+                DEBUG_INFO("SPI", "GD32 APP 已确认进入 Bootloader (retry=%lu)", (unsigned long)retry);
+                return ESP_OK;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 
-    DEBUG_WARN("SPI", "GD32 APP 进入 Bootloader 确认超时");
+    DEBUG_WARN("SPI", "GD32 APP 进入 Bootloader 确认超时 (retries exhausted)");
     return ESP_ERR_TIMEOUT;
 }
 

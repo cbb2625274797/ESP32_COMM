@@ -123,8 +123,8 @@ bool OtaRelay::isSizeSeq0Ack(const uint8_t *payload, size_t len)
 bool OtaRelay::isFinishPlainAck(const uint8_t *payload, size_t len)
 {
     if (!payload) return false;
-    if (len >= 2U && payload[0] == 0x0AU && payload[1] == 0xACU) return true;
-    if (len >= 7U && payload[0] == 0xBAU && payload[1] == 0xC0U) return true;
+    if (len == 2U && payload[0] == 0x0AU && payload[1] == 0xACU) return true;
+    /* structured ACK 0xBAC0 no longer accepted as FINISH success */
     return false;
 }
 
@@ -346,7 +346,7 @@ esp_err_t OtaRelay::flashReadChunk(uint32_t offset, uint8_t *data, size_t len)
 esp_err_t OtaRelay::requestGd32AppEnterBootloader()
 {
     DEBUG_INFO("OTA", "尝试通知 GD32 APP 进入 Bootloader OTA 窗口");
-    esp_err_t err = SpiMaster::instance().appRequestBootloader(500);
+    esp_err_t err = SpiMaster::instance().appRequestBootloader();
     if (err == ESP_OK) {
         /* 收到确认：可能来自 APP（即将跳转 BOOT）或 BOOT 本身（已在 BOOT）。
          * 如果来自 APP，GD32 需要复位并重新初始化 SPI 外设，需等 ~1-2s；
@@ -358,6 +358,28 @@ esp_err_t OtaRelay::requestGd32AppEnterBootloader()
     }
     DEBUG_WARN("OTA", "GD32 APP 未确认进入 Bootloader: %s", esp_err_to_name(err));
     return err;
+}
+
+
+ota_result_t OtaRelay::probeBootHandshake()
+{
+    /* 0xB0 timeout: probe if GD32 is already in BOOT.
+     * Send one lightweight HANDSHAKE_REQ, accept only echo ACK 0x00 0xAC
+     * as "already in BOOT" signal; otherwise fail immediately. */
+    DEBUG_INFO("OTA", "0xB0 timeout, probing if GD32 already in BOOT...");
+    uint8_t payload[] = {0x00, 0xAC};
+    uint8_t resp_type = 0U;
+    uint8_t resp_payload[64] = {0};
+    size_t resp_len = 0U;
+
+    esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_REQ, payload, sizeof(payload),
+                                     &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 500);
+    if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK && isHandshakeEchoAck(resp_payload, resp_len)) {
+        DEBUG_INFO("OTA", "BOOT probe success: GD32 already in BOOT, continue OTA");
+        return OTA_RESULT_OK;
+    }
+    DEBUG_ERR("OTA", "BOOT probe failed: GD32 not in BOOT, abort (err=%d resp_type=0x%02X)", err, resp_type);
+    return OTA_RESULT_ERR_TIMEOUT;
 }
 
 ota_result_t OtaRelay::sendHandshakeReq()
@@ -642,7 +664,7 @@ ota_result_t OtaRelay::relayPacketsFromFlash()
                 break;
             }
 
-            uint32_t expected_ack = (seq == total_packets - 1) ? 0xFFFFFFFFU : (seq + 1U);
+            uint32_t expected_ack = (seq == total_packets - 1) ? 0xF0F0F0F0U : (seq + 1U);
 
             /* 跳过上一阶段残留的、seq 不匹配的结构化 ACK。
              *
@@ -669,8 +691,8 @@ ota_result_t OtaRelay::relayPacketsFromFlash()
                  * 超时/非ACK 退出时需要重发当前包（GD32 Flash 缓冲满时会发 WAIT 后排空，
                  * ESP32 必须重发才能让 GD32 重新处理）。 */
                 bool got_expected = false;
-                for (uint32_t retry = 0; retry < 5; ++retry) {
-                    DEBUG_WARN("OTA", "包 %u 收到非目标ACK(seq不匹配)，继续轮询(%u/5)...", seq, retry + 1);
+                for (uint32_t retry = 0; retry < 10; ++retry) {
+                    DEBUG_DBG("OTA", "包 %u 收到非目标ACK(seq不匹配)，继续轮询(%u/5)...", seq, retry + 1);
                     err = SpiMaster::instance().otaPollResponse(&resp_type, resp_payload, sizeof(resp_payload), &resp_len, 2000);
                     if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
                         err = waitUntilNotWait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 100, 5);
@@ -707,7 +729,7 @@ ota_result_t OtaRelay::relayPacketsFromFlash()
                 if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code) && err_seq == seq) {
                     DEBUG_WARN("OTA", "包 %u 收到结构化错误 err=0x%02X，准备重发", seq, err_code);
                     relayState = RELAY_PACKET_ACK_RETRY;
-                    if (++retry_count >= 3U) {
+                    if (++retry_count >=10U) {
                         DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
                         result = (err_code == 0x04U) ? OTA_RESULT_ERR_CRC : OTA_RESULT_ERR_GD32;
                         break;
@@ -718,7 +740,7 @@ ota_result_t OtaRelay::relayPacketsFromFlash()
                 /* 轮询耗尽仍未拿到期望 ACK -> 重发当前包 */
                 DEBUG_WARN("OTA", "包 %u 轮询耗尽未匹配，重发 (retry=%u/3)", seq, retry_count + 1);
                 relayState = RELAY_PACKET_ACK_RETRY;
-                if (++retry_count >= 3U) {
+                if (++retry_count >= 10U) {
                     DEBUG_ERR("OTA", "包 %u 重发次数超限", seq);
                     result = OTA_RESULT_ERR_GD32;
                     break;
@@ -756,45 +778,71 @@ ota_result_t OtaRelay::finishOta()
     DEBUG_INFO("OTA", "=== 阶段4: 结束 OTA ===");
     DEBUG_INFO("OTA", "发送 FINISH_OTA (0x0A 0xAC)，等待 GD32 确认即将跳转 APP");
 
+    uint8_t finish_payload[2] = {0x0A, 0xAC};
     uint8_t resp_type = 0;
     uint8_t resp_payload[32] = {0};
     size_t resp_len = 0;
-    uint8_t finish_payload[2] = {0x0A, 0xAC};
 
-    relayState = RELAY_FINISH_SENT;
-    esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_DATA, finish_payload, sizeof(finish_payload),
-                                     &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
-    logRespPayload("FINISH_OTA", resp_type, resp_payload, resp_len);
-    err = pollUntilExpectedAckShape("FINISH_OTA", &resp_type, resp_payload,
-                                        sizeof(resp_payload), &resp_len,
-                                        1000, 10, 8, OtaRelay::isFinishPlainAck);
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK ||
-        !isFinishPlainAck(resp_payload, resp_len)) {
-        DEBUG_ERR("OTA", "FINISH_OTA 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
+    /* FINISH_OTA 重试机制：GD32 Flash 缓冲未排空时会回 WAIT，
+     * 需要重试直到收到正确的 ACK(0x0A 0xAC) 或超时。 */
+    for (uint32_t retry = 0; retry < 10; ++retry) {
+        resp_type = 0;
+        resp_len = 0;
+        memset(resp_payload, 0, sizeof(resp_payload));
+
+        relayState = RELAY_FINISH_SENT;
+        esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_DATA, finish_payload, sizeof(finish_payload),
+                                         &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
+        logRespPayload("FINISH_OTA", resp_type, resp_payload, resp_len);
+        if (err != ESP_OK) {
+            DEBUG_WARN("OTA", "FINISH_OTA 传输失败, err=%d, retry=%u/10", err, retry + 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        err = pollUntilExpectedAckShape("FINISH_OTA", &resp_type, resp_payload,
+                                            sizeof(resp_payload), &resp_len,
+                                            1000, 10, 8, OtaRelay::isFinishPlainAck);
+        if (err != ESP_OK) {
+            DEBUG_WARN("OTA", "FINISH_OTA poll 失败, err=%d, retry=%u/10", err, retry + 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (resp_type == SPI_OTA_RSP_ACK && isFinishPlainAck(resp_payload, resp_len)) {
+            /* 成功收到 FINISH_OTA ACK */
+            break;
+        }
+
+        /* 检查是否为 WAIT 帧（GD32 Flash 缓冲未排空） */
+        if (resp_type == SPI_OTA_RSP_WAIT) {
+            DEBUG_INFO("OTA", "FINISH_OTA 收到 WAIT, GD32 正在排空 Flash 缓冲, retry=%u/10", retry + 1);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        /* 检查是否为错误帧 */
+        uint32_t err_seq = 0;
+        uint8_t err_code = 0;
+        if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code)) {
+            DEBUG_ERR("OTA", "FINISH_OTA 收到错误帧 err=0x%02X, retry=%u/10", err_code, retry + 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        DEBUG_WARN("OTA", "FINISH_OTA 响应异常, resp_type=0x%02X, resp_len=%zu, retry=%u/10",
+                   resp_type, resp_len, retry + 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (resp_type != SPI_OTA_RSP_ACK || !isFinishPlainAck(resp_payload, resp_len)) {
+        DEBUG_ERR("OTA", "FINISH_OTA 失败, err=0, resp_type=0x%02X, resp_len=%zu", resp_type, resp_len);
         relayState = RELAY_ERROR;
         return OTA_RESULT_ERR_GD32;
     }
 
-    /* 检查是否为结构化错误帧（BOOT validateApplication 失败等） */
-    uint32_t err_seq = 0;
-    uint8_t err_code = 0;
-    if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code)) {
-        DEBUG_ERR("OTA", "FINISH_OTA BOOT 返回错误: seq=0x%08lX err=0x%02X (%s)",
-                  (unsigned long)err_seq, err_code,
-                  err_code == 0x02U ? "FLASH_ERROR/validateApp失败" :
-                  err_code == 0x04U ? "INVALID_PACKET" :
-                  err_code == 0x03U ? "INVALID_KEY" :
-                  "未知错误");
-        relayState = RELAY_ERROR;
-        return OTA_RESULT_ERR_GD32;
-    }
-
-    /* 正常明文 ACK: 0x0A 0xAC */
-    if (!isFinishPlainAck(resp_payload, resp_len)) {
-        DEBUG_ERR("OTA", "FINISH_OTA 响应格式异常: len=%zu payload[0]=0x%02X", resp_len, resp_payload[0]);
-        relayState = RELAY_ERROR;
-        return OTA_RESULT_ERR_GD32;
-    }
+    /* isFinishPlainAck already verified: only 0x0A 0xAC (len==2) passes.
+     * Structured error frames (0xBA 0xC0 ...) are rejected above. */
 
     relayState = RELAY_DONE;
     Protocol::sessionKeyClear(&m_sessionCtx);
@@ -833,7 +881,9 @@ ota_result_t OtaRelay::finishOta()
     }
 
     if (!gd32AppAlive) {
-        DEBUG_WARN("OTA", "GD32 APP 存活确认超时，OTA 传输已完成但 APP 未启动");
+        DEBUG_ERR("OTA", "GD32 APP alive confirm timeout, OTA failed");
+        reset();
+        return OTA_RESULT_ERR_GD32;
     }
 
     return OTA_RESULT_OK;
@@ -847,21 +897,28 @@ ota_result_t OtaRelay::startHandshake()
 {
     ota_result_t res;
 
-    requestGd32AppEnterBootloader();
+    esp_err_t boot_err = requestGd32AppEnterBootloader();
+    if (boot_err != ESP_OK) {
+        res = probeBootHandshake();
+        if (res != OTA_RESULT_OK) {
+            reset();
+            return res;
+        }
+    }
 
     res = sendHandshakeReq();
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     res = sendNonceAndAuthenticate();
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     ota_meta_t meta;
     OtaRelay::metaLoad(&meta);
     res = sendFirmwareSize(meta.total_size);
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     res = relayPacketsFromFlash();
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     res = finishOta();
 
@@ -885,16 +942,16 @@ ota_result_t OtaRelay::forwardFirmware()
     requestGd32AppEnterBootloader();
 
     ota_result_t res = sendHandshakeReq();
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     res = sendNonceAndAuthenticate();
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     res = sendFirmwareSize(meta.total_size);
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     res = relayPacketsFromFlash();
-    if (res != OTA_RESULT_OK) return res;
+    if (res != OTA_RESULT_OK) { reset(); return res; }
 
     res = finishOta();
 
@@ -968,3 +1025,4 @@ void OtaRelay::taskEntry(void *pvParameters)
         }
     }
 }
+
