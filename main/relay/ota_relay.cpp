@@ -28,6 +28,7 @@ relay_state_t OtaRelay::relayState = RELAY_IDLE;
 uint32_t OtaRelay::relaySeq = 0;
 uint32_t OtaRelay::relayTotalPackets = 0;
 volatile bool OtaRelay::gd32AppAlive = false;
+gd32_version_t OtaRelay::gd32Version = {};
 QueueHandle_t OtaRelay::dispatchQueue = NULL;
 QueueHandle_t OtaRelay::resultQueue = NULL;
 
@@ -870,10 +871,15 @@ ota_result_t OtaRelay::finishOta()
     for (uint32_t attempt = 0; attempt < 30; ++attempt) {
         vTaskDelay(pdMS_TO_TICKS(500));
         uint32_t uptime = 0;
-        esp_err_t ping_err = SpiMaster::instance().appPing(1000, &uptime);
+        gd32_version_t ping_ver = {};
+        esp_err_t ping_err = SpiMaster::instance().appPing(1000, &uptime, &ping_ver);
         if (ping_err == ESP_OK) {
             gd32AppAlive = true;
-            DEBUG_INFO("OTA", "GD32 APP 存活确认: uptime=%lu sec", (unsigned long)uptime);
+            gd32Version = ping_ver;
+            DEBUG_INFO("OTA", "GD32 APP 存活确认: uptime=%lu sec, APP=v%d.%d.%d.%d, BOOT=v%d.%d.%d.%d",
+                       (unsigned long)uptime,
+                       ping_ver.app_major, ping_ver.app_minor, ping_ver.app_patch, ping_ver.app_build,
+                       ping_ver.boot_major, ping_ver.boot_minor, ping_ver.boot_patch, ping_ver.boot_build);
             DEBUG_INFO("OTA", "=== OTA 全流程完成 (APP 已启动) ===");
             break;
         }
@@ -1018,11 +1024,13 @@ void OtaRelay::taskEntry(void *pvParameters)
 
         if (result == OTA_RESULT_OK) {
             DEBUG_INFO("OTA", "OTA 转发成功完成");
-            instance().reset();
+            /* 保持 RELAY_DONE 状态 3 秒，让网页轮询有机会看到完成状态 */
+            vTaskDelay(pdMS_TO_TICKS(3000));
         } else {
             DEBUG_ERR("OTA", "OTA 转发失败，错误码: %d", result);
-            instance().reset();
         }
+        instance().reset();
     }
 }
+
 

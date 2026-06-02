@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "transport/protocol.h"
+#include "transport/spi_master.h"
 #include "esp_partition.h"
 
 #define OTA_META_NVS_NAMESPACE "ota_meta"
@@ -80,6 +81,7 @@ public:
     static uint32_t relaySeq;
     static uint32_t relayTotalPackets;
     static volatile bool gd32AppAlive;
+    static gd32_version_t gd32Version;
     static QueueHandle_t dispatchQueue;
     static QueueHandle_t resultQueue;
 
@@ -140,3 +142,5 @@ private:
 };
 
 #endif // OTA_RELAY_H
+
+

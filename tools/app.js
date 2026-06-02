@@ -327,7 +327,7 @@ function updateStagesFromRelayState(rs) {
   if (rs >= 1 && rs <= 6) activeStage = 1;
   else if (rs >= 7 && rs <= 8) activeStage = 2;
   else if (rs >= 9 && rs <= 15) activeStage = 3;
-  else if (rs >= 16 && rs <= 17) activeStage = 4;
+  else if (rs >= 16 && rs <= 18) activeStage = 4;
 
   for (var i = 0; i < activeStage - 1; i++) {
     all[i].className = 'stage-node done';
@@ -350,8 +350,7 @@ function updateSystemStatusUi(data) {
     4: '收到握手响应', 5: '会话密钥已发', 6: '认证完成',
     7: '大小已发', 8: '大小确认', 9: '接收中', 10: '转发中',
     11: '数据包已发', 12: 'ACK正常', 13: '等待重发',
-    14: '接收完成', 15: '传输完成', 16: '结束已发', 17: 'OTA完成',
-    255: '错误'
+    14: '接收完成', 15: '传输完成', 16: '结束已发', 17: 'OTA完成', 18: 'APP验证', 255: '错误'
   };
 
   var connected = !!wifi.connected;
@@ -363,7 +362,30 @@ function updateSystemStatusUi(data) {
   // version
   if (data.version) {
     document.getElementById('pillVer').textContent = 'v' + data.version;
-    document.getElementById('mVersion').textContent = 'v' + data.version;
+    document.getElementById('pillVer').title = data.build_time ? ('编译: ' + data.build_time) : '';
+    document.getElementById('mVersion').textContent = 'v' + data.version + (data.build_time ? '  (' + data.build_time + ')' : '');
+
+    // GD32 版本
+    var mGd32App = document.getElementById('mGd32App');
+    var mGd32Boot = document.getElementById('mGd32Boot');
+    if (mGd32App) {
+      if (ota.gd32_app && ota.gd32_app !== 'v0.0.0.0') {
+        mGd32App.textContent = ota.gd32_app;
+        mGd32App.className = 'v ok';
+      } else {
+        mGd32App.textContent = ota.gd32_app_alive ? '未知' : '离线';
+        mGd32App.className = 'v';
+      }
+    }
+    if (mGd32Boot) {
+      if (ota.gd32_boot && ota.gd32_boot !== 'v0.0.0.0') {
+        mGd32Boot.textContent = ota.gd32_boot;
+        mGd32Boot.className = 'v ok';
+      } else {
+        mGd32Boot.textContent = ota.gd32_app_alive ? '未知' : '离线';
+        mGd32Boot.className = 'v';
+      }
+    }
   }
 
   // temperature
@@ -407,7 +429,7 @@ function updateSystemStatusUi(data) {
   var pr = document.getElementById('pillRelay');
   if (rs === 255) pr.className = 'pill offline';
   else if (rs > 0 && rs < 17) pr.className = 'pill processing';
-  else if (rs === 17) pr.className = 'pill online';
+  else if (rs === 17 || rs === 18) pr.className = 'pill online';
   else pr.className = 'pill idle';
 
   // OTA cache progress (GD32 upload to ESP32 flash)
@@ -423,16 +445,30 @@ function updateSystemStatusUi(data) {
   var relayTotal = ota.relay_total_packets || 0;
   var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
 
+  var gd32AppAlive = ota.gd32_app_alive;
   if (rs > 0 && rs < 17) {
     // Relay is active — show relay progress
     setActivePhase('gd32Relay');
     setProgress(relayProgress, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
+  } else if (rs === 17) {
+    // Relay done, waiting for APP verify
+    setActivePhase('gd32Relay');
+    setProgress(100, '转发完成，等待 APP 启动...');
+  } else if (rs === 18) {
+    // APP verify phase
+    setActivePhase('gd32Relay');
+    if (gd32AppAlive) {
+      markPhaseDone('gd32Relay');
+      setProgress(100, 'GD32 刷写完成');
+    } else {
+      setProgress(100, '转发完成，验证 APP 存活...');
+    }
   } else if (total > 0 && stored < total && !isUploading) {
     // GD32 upload to cache in progress (handled by upload progress if uploading)
     setActivePhase('gd32Upload');
     setProgress(storageProgress, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
-  } else if (rs === 17) {
-    // Relay done
+  } else if (gd32AppAlive && rs === 0 && total > 0 && stored >= total) {
+    // Relay finished and reset, but APP is alive → truly done
     markPhaseDone('gd32Relay');
     setProgress(100, 'GD32 刷写完成');
   }
@@ -836,29 +872,6 @@ function clearFile(chip) {
 }
 
 // ==================== 上传固件 ====================
-// ==================== zlib compression ====================
-async function compressZlib(arrayBuffer) {
-  var cs = new CompressionStream("deflate");
-  var writer = cs.writable.getWriter();
-  writer.write(new Uint8Array(arrayBuffer));
-  writer.close();
-  var chunks = [];
-  var reader = cs.readable.getReader();
-  for (;;) {
-    var r = await reader.read();
-    if (r.done) break;
-    chunks.push(r.value);
-  }
-  var total = chunks.reduce(function(n, c) { return n + c.length; }, 0);
-  var out = new Uint8Array(total);
-  var off = 0;
-  for (var j = 0; j < chunks.length; j++) {
-    out.set(chunks[j], off);
-    off += chunks[j].length;
-  }
-  return out.buffer;
-}
-
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file || isUploading) return;
@@ -913,20 +926,10 @@ async function startUpload(chip) {
     var fileSize = file.size;
     var body, url = getBaseUrl() + '/ota/upload';
 
-    var useCompress = chip === 'esp32'
-      ? document.getElementById('compressEsp32').checked
-      : document.getElementById('compressGd32').checked;
-
     if (chip === 'esp32') {
       var headerObj = { type: 'esp32', total_size: fileSize };
       var payload = arrayBuffer;
-      if (useCompress) {
-        payload = await compressZlib(arrayBuffer);
-        headerObj.compress = 'zlib';
-        addLog('I', '压缩', 'zlib: ' + formatBytes(fileSize) + ' -> ' + formatBytes(payload.byteLength) + ' (' + Math.round(payload.byteLength * 100 / fileSize) + '%)');
-      } else {
-        addLog('I', '上传', '直传（无压缩）: ' + formatBytes(fileSize));
-      }
+      addLog('I', '上传', '直传: ' + formatBytes(fileSize));
       var headerJson = JSON.stringify(headerObj);
       var encoder = new TextEncoder();
       var headerBytes = encoder.encode(headerJson);
@@ -937,13 +940,7 @@ async function startUpload(chip) {
     } else {
       var headerObj = { total_size: fileSize };
       var payload = arrayBuffer;
-      if (useCompress) {
-        payload = await compressZlib(arrayBuffer);
-        headerObj.compress = 'zlib';
-        addLog('I', '压缩', 'zlib: ' + formatBytes(fileSize) + ' -> ' + formatBytes(payload.byteLength) + ' (' + Math.round(payload.byteLength * 100 / fileSize) + '%)');
-      } else {
-        addLog('I', '上传', '直传（无压缩）: ' + formatBytes(fileSize));
-      }
+      addLog('I', '上传', '直传: ' + formatBytes(fileSize));
       var gd32Header = JSON.stringify(headerObj);
       var encoder = new TextEncoder();
       var headerBytes = encoder.encode(gd32Header);
@@ -1152,3 +1149,5 @@ setTimeout(function () {
   addLog('I', '系统', '控制台初始化完成，等待固件文件...');
   updateSpiHint();
 }, 500);
+
+

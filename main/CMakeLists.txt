@@ -6,7 +6,6 @@
         "transport/protocol.cpp"
         "server/wifi_ota.cpp"
         "server/ble_ota.cpp"
-        "utils/ota_compressor.cpp"
         "monitor/health_monitor.cpp"
         "monitor/debug_log.cpp"
     INCLUDE_DIRS
@@ -34,4 +33,14 @@
         freertos
         mbedtls
         bt
+)
+
+# 每次构建时自动刷新 version.h（BUILD_TIME / GIT_HASH）
+add_custom_target(version_header ALL
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -DOUTPUT_FILE=${CMAKE_CURRENT_SOURCE_DIR}/include/version.h
+        -P ${CMAKE_SOURCE_DIR}/cmake/gen_version_script.cmake
+    COMMENT "Refreshing version.h"
+    VERBATIM
 )

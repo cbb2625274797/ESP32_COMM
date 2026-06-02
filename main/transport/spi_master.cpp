@@ -189,7 +189,11 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
         if (i + total > buf_len) continue;
 
         uint8_t expected_crc = otaCrc8(&buf[i], 4 + plen);
-        if (buf[i + 4 + plen] != expected_crc) continue;
+        if (buf[i + 4 + plen] != expected_crc) {
+            DEBUG_WARN("SPI", "CRC mismatch at offset %u: plen=%u expected=0x%02X actual=0x%02X",
+                       (unsigned)i, (unsigned)plen, expected_crc, buf[i + 4 + plen]);
+            continue;
+        }
 
         if (type) *type = buf[i + 1];
         if (payload) *payload = (plen > 0) ? &buf[i + 4] : nullptr;
@@ -387,7 +391,7 @@ esp_err_t SpiMaster::appRequestBootloader()
     return ESP_ERR_TIMEOUT;
 }
 
-esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec)
+esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version)
 {
     constexpr uint8_t kAppPingType = 0xA1U;
     constexpr size_t kAppPingPollBytes = 32U;
@@ -412,7 +416,8 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec)
             continue;
         }
 
-        esp_rom_delay_us(200);
+        /* 给 GD32 充足时间处理 CS 释放中断并准备响应帧 */
+        vTaskDelay(pdMS_TO_TICKS(3));
 
         uint8_t rx_raw[kAppPingPollBytes];
         uint8_t dummy[kAppPingPollBytes];
@@ -427,35 +432,73 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec)
             continue;
         }
 
-        uint8_t resp_type = 0U;
-        const uint8_t *resp_payload = nullptr;
-        size_t resp_len = 0U;
-        size_t frame_offset = 0U;
-        if (otaFindFrame(rx_raw, sizeof(rx_raw),
-                         &resp_type, &resp_payload, &resp_len, &frame_offset)) {
-            if (resp_type == SPI_OTA_RSP_ACK && resp_len >= 3U && resp_payload[0] == kAppPingType) {
-                if (uptime_sec) {
-                    *uptime_sec = (uint32_t)resp_payload[1] | ((uint32_t)resp_payload[2] << 8);
-                }
-                DEBUG_INFO("SPI", "APP PING 成功: uptime=%lu sec, attempt=%lu, offset=%u",
-                           uptime_sec ? (unsigned long)*uptime_sec : 0UL,
-                           (unsigned long)attempt,
-                           (unsigned)frame_offset);
-                return ESP_OK;
-            }
+        bool found = false;
 
-            DEBUG_DBG("SPI", "APP PING 收到无效帧[%lu]: type=0x%02X len=%u offset=%u payload0=0x%02X",
-                      (unsigned long)attempt,
-                      resp_type,
-                      (unsigned)resp_len,
-                      (unsigned)frame_offset,
-                      resp_len > 0U ? resp_payload[0] : 0xFFU);
-        } else {
-            DEBUG_DBG("SPI", "APP PING 未找到有效帧[%lu]: first8=%02X%02X%02X%02X%02X%02X%02X%02X",
-                      (unsigned long)attempt,
-                      rx_raw[0], rx_raw[1], rx_raw[2], rx_raw[3],
-                      rx_raw[4], rx_raw[5], rx_raw[6], rx_raw[7]);
+        /* GD32 SPI 从机字节偏移不可预测，直接在 raw buffer 中
+         * 搜索完整的标签化 PING 响应模式：
+         *   0xA1 [0x55...] app_vers [0xAA...] boot_vers
+         * 找到 0xA1 后跳过重复字节，验证 0x55 和 0xAA 标签。
+         */
+        for (size_t i = 0; i + 14 < sizeof(rx_raw); ++i) {
+            if (rx_raw[i] != kAppPingType) continue;  /* 找 0xA1 */
+            size_t p = i + 1;
+            /* 跳过最多 1 个重复的 A1 字节（SPI 偏移最多产生 1 个重复） */
+            if (p < sizeof(rx_raw) && rx_raw[p] == kAppPingType) ++p;
+            if (p >= sizeof(rx_raw) || rx_raw[p] != 0x55U) continue;
+            /* 跳过最多 1 个重复的 0x55 */
+            if (p + 1 < sizeof(rx_raw) && rx_raw[p + 1] == 0x55U) ++p;
+            size_t app_start = p + 1;  /* APP 版本起始 */
+            if (app_start + 4 > sizeof(rx_raw)) continue;
+            size_t bp = app_start + 4;
+            /* 跳过最多 1 个重复字节 */
+            if (bp < sizeof(rx_raw) && bp > 0 && rx_raw[bp] == rx_raw[bp - 1]) ++bp;
+            if (bp >= sizeof(rx_raw) || rx_raw[bp] != 0xAAU) continue;
+            /* 跳过最多 1 个重复的 0xAA */
+            if (bp + 1 < sizeof(rx_raw) && rx_raw[bp + 1] == 0xAAU) ++bp;
+            size_t boot_start = bp + 1;
+            if (boot_start + 4 > sizeof(rx_raw)) continue;
+
+            /* 模式匹配成功！提取版本数据 */
+            found = true;
+
+            if (version) {
+                memset(version, 0, sizeof(gd32_version_t));
+                version->app_major = rx_raw[app_start];
+                version->app_minor = rx_raw[app_start + 1];
+                version->app_patch = rx_raw[app_start + 2];
+                version->app_build = rx_raw[app_start + 3];
+                version->boot_major = rx_raw[boot_start];
+                version->boot_minor = rx_raw[boot_start + 1];
+                version->boot_patch = rx_raw[boot_start + 2];
+                version->boot_build = rx_raw[boot_start + 3];
+            }
+            if (uptime_sec) {
+                size_t ut = boot_start + 4;
+                if (ut + 3 < sizeof(rx_raw)) {
+                    *uptime_sec = (uint32_t)rx_raw[ut]
+                                | ((uint32_t)rx_raw[ut + 1] << 8)
+                                | ((uint32_t)rx_raw[ut + 2] << 16)
+                                | ((uint32_t)rx_raw[ut + 3] << 24);
+                } else {
+                    *uptime_sec = 0;
+                }
+            }
+            DEBUG_WARN("SPI", "APP PING 标签匹配: A1@%u APP@%u BOOT@%u",
+                       (unsigned)i, (unsigned)app_start, (unsigned)boot_start);
+            break;
         }
+
+        if (found) {
+            DEBUG_INFO("SPI", "APP PING 成功: uptime=%lu sec, attempt=%lu",
+                       uptime_sec ? (unsigned long)*uptime_sec : 0UL,
+                       (unsigned long)attempt);
+            return ESP_OK;
+        }
+
+        DEBUG_WARN("SPI", "APP PING 无匹配[%lu]: first8=%02X%02X%02X%02X%02X%02X%02X%02X",
+                  (unsigned long)attempt,
+                  rx_raw[0], rx_raw[1], rx_raw[2], rx_raw[3],
+                  rx_raw[4], rx_raw[5], rx_raw[6], rx_raw[7]);
 
         vTaskDelay(pdMS_TO_TICKS(5));
     }
@@ -549,3 +592,5 @@ int SpiMaster::canSendNoReply(can_channel_t channel, uint32_t ext_id,
 
     return 0;
 }
+
+

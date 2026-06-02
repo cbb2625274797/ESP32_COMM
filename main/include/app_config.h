@@ -3,14 +3,18 @@
  * ESP32-C3 OTA 中继项目
  *
  * 使用 constexpr 代替 #define，提供类型安全
+ * 版本号和编译时间由 version.h 自动生成
  */
 #pragma once
 #include <cstdint>
+#include "version.h"
 
 // ============================================================
-// 固件版本
+// 固件版本（由 version.h 自动生成，此处提供 C++ constexpr 访问）
 // ============================================================
-inline constexpr const char *FW_VERSION = "0.3.1";
+inline constexpr const char *FW_VERSION = FW_VERSION_STRING;
+inline constexpr const char *FW_BUILD_TIME = BUILD_TIME;
+inline constexpr const char *FW_GIT_HASH = GIT_HASH;
 
 // ============================================================
 // WiFi 工作模式选择
@@ -54,21 +58,20 @@ inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;
 // OTA 配置
 // ============================================================
 inline constexpr size_t  OTA_BLOCK_SIZE         = 8192;
-inline constexpr size_t  OTA_DECOMP_OUT_BUF_SIZE = 2048;  // 流式解压提示值，实际受堆限制自适应   // adaptive: init caps to available heap
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB，对齐 GD32 APP_MAX_SIZE (0x36000)
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
 inline constexpr uint32_t OTA_POLL_RETRIES      = 40;          // 每包 ACK 轮询次数
 inline constexpr uint32_t OTA_RESEND_RETRIES    = 10;           // 每包重发次数上限
-inline constexpr uint32_t OTA_PACKET_DELAY_MS   = 5;            // 每包发送后延时(ms)，给 GD32 处理时间           // 每包重发次数上限
+inline constexpr uint32_t OTA_PACKET_DELAY_MS   = 5;            // 每包发送后延时(ms)，给 GD32 处理时间
 
 // ============================================================
 // 健康监控阈值
 // ============================================================
 inline constexpr int32_t WIFI_RSSI_CRITICAL = -85;
 inline constexpr int32_t WIFI_RSSI_WARNING  = -75;
-inline constexpr int32_t OTA_WIFI_RSSI_CRITICAL = -88;   // OTA 期间更宽松，避免瞬时波动误判
-inline constexpr uint32_t OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS = 15000;  // OTA 最多接受 15 秒内的 RSSI 样本
-inline constexpr uint32_t OTA_PACKET_HEALTH_CHECK_INTERVAL = 32;     // 每 32 个 48B 包做一次 OTA 健康检查
+inline constexpr int32_t OTA_WIFI_RSSI_CRITICAL = -88;
+inline constexpr uint32_t OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS = 15000;
+inline constexpr uint32_t OTA_PACKET_HEALTH_CHECK_INTERVAL = 32;
 inline constexpr int32_t TEMP_WARNING       = 80;
 inline constexpr int32_t TEMP_CRITICAL      = 100;
 inline constexpr size_t  HEAP_WARNING_MIN   = 10240;
@@ -76,8 +79,8 @@ inline constexpr size_t  HEAP_WARNING_MIN   = 10240;
 // ============================================================
 // 调试配置（UDP 日志）
 // ============================================================
-inline constexpr uint8_t  DEBUG_LOG_ENABLED = 1;       // 设为 0 禁用调试日志
-inline constexpr const char* DEBUG_LOG_IP   = "192.168.31.3";  // 上位机 IP
+inline constexpr uint8_t  DEBUG_LOG_ENABLED = 1;
+inline constexpr const char* DEBUG_LOG_IP   = "192.168.31.3";
 inline constexpr uint16_t DEBUG_LOG_PORT   = 6666;
 
 // ============================================================
@@ -94,8 +97,8 @@ inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_GD32  = 0xF7;
 inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_ESP32 = 0xF8;
 inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;
 inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;
-inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;   // 默认目标 payload；ATT Write Command 可写值≈(MTU-3)，当前 512 MTU 下协议 payload 建议 ≤ 498B
-inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;  // cmd(1)+seq(2)+size(4)+crc(4)
+inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;
+inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;
 
 // ============================================================
 // 安全常量（需与 GD32 固件团队确认）
@@ -120,3 +123,4 @@ inline constexpr uint8_t GD32_CHIP_UID[] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
     0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B
 };
+

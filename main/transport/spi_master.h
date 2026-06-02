@@ -53,6 +53,18 @@ typedef struct {
     uint8_t       dlc;         // 数据长度 (1~64)
 } can_frame_t;
 
+// GD32 版本信息（从 APP PING 响应解析）
+typedef struct {
+    uint16_t app_major;
+    uint16_t app_minor;
+    uint16_t app_patch;
+    uint16_t app_build;
+    uint16_t boot_major;
+    uint16_t boot_minor;
+    uint16_t boot_patch;
+    uint16_t boot_build;
+} gd32_version_t;
+
 /**
  * @brief SPI Master 驱动类（单例）
  *
@@ -97,7 +109,7 @@ public:
     esp_err_t appRequestBootloader();
 
     /** @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。 */
-    esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec);
+    esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version = nullptr);
 
     /** @brief 执行带重试的 SPI 同步传输。 */
     esp_err_t transferWithRetry(uint8_t cmd, const uint8_t *payload,
@@ -147,3 +159,5 @@ private:
 };
 
 #endif // SPI_MASTER_H
+
+

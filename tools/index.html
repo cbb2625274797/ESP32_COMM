@@ -69,8 +69,6 @@
               <div class="file-meta-item"><span>大小</span><b id="fileSizeEsp32">-</b></div>
             </div>
           </div>
-                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-top:8px;cursor:pointer;">
-            <input type="checkbox" id="compressEsp32"> zlib 压缩（弱网加速，CPU 开销大）
           </label>
           <button class="btn btn-primary btn-block" id="uploadEsp32Btn" onclick="startUpload('esp32')" disabled style="margin-top:10px;">
             上传并升级 ESP32
@@ -98,8 +96,6 @@
               <div class="file-meta-item"><span>大小</span><b id="fileSizeGd32">-</b></div>
             </div>
           </div>
-                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-bottom:4px;cursor:pointer;">
-            <input type="checkbox" id="compressGd32"> zlib 压缩（弱网加速，CPU 开销大）
           </label>
           <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled style="margin-top:10px;margin-bottom:8px;">
             上传固件到缓存
@@ -169,7 +165,9 @@
             <div class="metric"><div class="k">信号强度</div><div class="v" id="mRSSI">--</div></div>
             <div class="metric"><div class="k">空闲堆</div><div class="v" id="mHeap" style="font-size:16px;">--</div></div>
             <div class="metric"><div class="k">最低空闲堆</div><div class="v" id="mMinHeap" style="font-size:16px;">--</div></div>
-            <div class="metric"><div class="k">固件版本</div><div class="v" id="mVersion" style="font-size:16px;">--</div></div>
+            <div class="metric"><div class="k">ESP32 版本</div><div class="v" id="mVersion" style="font-size:16px;">--</div></div>
+            <div class="metric"><div class="k">GD32 APP</div><div class="v" id="mGd32App" style="font-size:14px;">--</div></div>
+            <div class="metric"><div class="k">GD32 BOOT</div><div class="v" id="mGd32Boot" style="font-size:14px;">--</div></div>
             <div class="metric"><div class="k">OTA 缓存</div><div class="v" id="mOtaCache" style="font-size:13px;">--</div></div>
           </div>
         </div>
@@ -273,6 +271,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260530f"></script>
+<script src="app.js?v=20260603b"></script>
 </body>
 </html>
+

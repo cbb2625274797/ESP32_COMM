@@ -1,4 +1,4 @@
-/*
+﻿/*
  * wifi_ota.cpp - WiFi OTA 服务器实现
  * WifiOta 类封装 WiFi 初始化、HTTP OTA 服务器和网络状态查询。
  * T4.1 - T4.5
@@ -28,7 +28,7 @@
 #include "monitor/debug_log.h"
 #include "spi_master.h"
 #include "cJSON.h"
-#include "utils/ota_compressor.h"
+
 
 
 // ============================================================
@@ -403,24 +403,6 @@ static esp_err_t esp32_ota_begin(size_t total_size)
 }
 
 /**
-  * @brief 将接收到的数据块写入 ESP32 OTA 分区。
- * @param data
- * @param len
- * @return ESP_OK 成功，其他失败。
- */
-static esp_err_t esp32_ota_write(const uint8_t *data, size_t len)
-{
-    if (!WifiOta::instance().m_esp32OtaActive || WifiOta::instance().m_esp32UpdatePartition == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t err = esp_ota_write(WifiOta::instance().m_esp32OtaHandle, data, len);
-    if (err == ESP_OK) {
-        WifiOta::instance().m_esp32Received += len;
-    }
-    return err;
-}
-
-/**
  * @brief HTTP POST /ota/update - 完成 ESP32 OTA 并重启
  * @param req
  * @return
@@ -539,23 +521,6 @@ static int recv_json_header(httpd_req_t *req, char *buf, int buf_size)
  * @param req
  * @return ESP_OK 成功，其他失败。
  */
-// --- OTA decompress write callbacks ---
-struct Esp32DecompArg { size_t written; };
-static esp_err_t esp32_decomp_write_cb(const uint8_t *data, size_t len, void *arg) {
-    auto *a = (Esp32DecompArg *)arg;
-    esp_err_t err = esp32_ota_write(data, len);
-    if (err == ESP_OK) a->written += len;
-    return err;
-}
-
-struct Gd32DecompArg { uint32_t offset; };
-static esp_err_t gd32_decomp_write_cb(const uint8_t *data, size_t len, void *arg) {
-    auto *a = (Gd32DecompArg *)arg;
-    esp_err_t err = OtaRelay::flashWriteChunk(a->offset, data, len);
-    if (err == ESP_OK) a->offset += (uint32_t)len;
-    return err;
-}
-
 static esp_err_t ota_upload_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
@@ -571,7 +536,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     }
 
     bool is_esp32_ota = false;
-    OtaCompress compress_type = OtaCompress::NONE;
     uint32_t total_size = 0;
     int json_header_len = 0;
     uint8_t pre_read_buf[256] = {0};
@@ -602,14 +566,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
                 if (size_item) {
                     total_size = (uint32_t)cJSON_GetNumberValue(size_item);
                 }
-                cJSON *compress_item = cJSON_GetObjectItem(root, "compress");
-                if (compress_item && cJSON_IsString(compress_item)) {
-                    const char *cstr = cJSON_GetStringValue(compress_item);
-                    if (strcmp(cstr, "zlib") == 0) {
-                        compress_type = OtaCompress::ZLIB;
-                        DEBUG_INFO("WIFI", "detected zlib compressed upload");
-                    }
-                }
                 cJSON_Delete(root);
             }
         }
@@ -628,13 +584,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        // init decompressor (NONE = passthrough, no extra RAM)
-        OtaDecompCtx decomp_ctx;
-        err = ota_decomp_init(&decomp_ctx, compress_type, OTA_DECOMP_OUT_BUF_SIZE);
-        if (err != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "decompress init failed");
-            return ESP_FAIL;
-        }
 
         // 堆分配缓冲区，避免栈溢出（HTTP server 栈仅 8KB）
         uint8_t *fw_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
@@ -654,15 +603,12 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             int ret = httpd_req_recv(req, (char *)fw_buf, to_read);
             if (ret <= 0) break;
 
-            size_t decomp_out = 0;
-            Esp32DecompArg ea = { .written = 0 };
-            err = ota_decomp_process(&decomp_ctx, fw_buf, (size_t)ret,
-                                      esp32_decomp_write_cb, &ea, &decomp_out);
+            err = esp_ota_write(WifiOta::instance().m_esp32OtaHandle, fw_buf, (size_t)ret);
             if (err != ESP_OK) {
-                DEBUG_ERR("WIFI", "OTA decompress/write failed");
+                DEBUG_ERR("WIFI", "OTA write failed");
                 break;
             }
-            total_firmware_written += ea.written;
+            total_firmware_written += ret;
             total_received += ret;
 
             if (total_size > 0) {
@@ -676,13 +622,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         }
 
         free(fw_buf);
-        esp_err_t finish_err = ota_decomp_finish(&decomp_ctx);
-        ota_decomp_free(&decomp_ctx);
-        if (finish_err != ESP_OK) {
-            DEBUG_ERR("WIFI", "ESP32 OTA decompress verify failed");
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "decompress verify failed");
-            return ESP_FAIL;
-        }
         DEBUG_INFO("WIFI", "ESP32 OTA 存储完成: %u 字节 (跳过 JSON 头 %d 字节)", (unsigned int)WifiOta::instance().m_esp32Received, json_header_len);
         const char resp[] = "{\"status\": \"ok\", \"message\": \"stored, call POST /ota/update to finish\", \"target\": \"esp32\"}";
         httpd_resp_set_type(req, "application/json");
@@ -692,11 +631,16 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     // --- GD32 OTA（原逻辑）---
     const uint32_t gd32_fw_size = (uint32_t)req->content_len;
-    uint32_t gd32_decomp_size = (total_size > 0) ? total_size : gd32_fw_size;
-    const uint32_t gd32_valid_size = gd32_decomp_size;
+    // 网页上传协议：JSON 头 + raw binary。raw binary 大小优先取 JSON 中的 total_size，否则按 content_len - json_header_len 计算。
+    uint32_t gd32_valid_size;
+    if (json_header_len > 0 && (uint32_t)json_header_len < gd32_fw_size) {
+        gd32_valid_size = (total_size > 0 && total_size < gd32_fw_size) ? total_size : (gd32_fw_size - (uint32_t)json_header_len);
+    } else {
+        gd32_valid_size = gd32_fw_size;
+    }
     const uint32_t gd32_rounded_size = (uint32_t)(((gd32_valid_size + (uint32_t)GD32_OTA_PACKET_SIZE - 1U) / (uint32_t)GD32_OTA_PACKET_SIZE) * (uint32_t)GD32_OTA_PACKET_SIZE);
     if (gd32_valid_size == 0U || gd32_valid_size > OTA_MAX_FIRMWARE_SIZE || gd32_rounded_size > OTA_MAX_FIRMWARE_SIZE) {
-        DEBUG_ERR("WIFI", "firmware size invalid: decomp=%u rounded48=%u max=%u",
+        DEBUG_ERR("WIFI", "firmware size invalid: valid=%u rounded48=%u max=%u",
                   (unsigned)gd32_valid_size, (unsigned)gd32_rounded_size, (unsigned)OTA_MAX_FIRMWARE_SIZE);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "firmware too large or alignment overflow");
         return ESP_FAIL;
@@ -753,15 +697,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         .checksum = {0}
     };
     OtaRelay::metaSave(&meta_raw);
-    // init GD32 decompressor
-    OtaDecompCtx gd32_decomp;
-    esp_err_t decomp_init_err = ota_decomp_init(&gd32_decomp, compress_type, OTA_DECOMP_OUT_BUF_SIZE);
-    if (decomp_init_err != ESP_OK) {
-        free(buf);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "GD32 decompress init failed");
-        return ESP_FAIL;
-    }
-    Gd32DecompArg gd32_da = { .offset = 0 };
+    uint32_t gd32_offset = 0;
 
     DEBUG_INFO("WIFI", "GD32 raw upload start: %u bytes", expected_fw_size_raw);
 
@@ -771,19 +707,18 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         int first_chunk_len = pre_read_len;
         if (first_chunk_len > req->content_len) first_chunk_len = req->content_len;
         if (first_chunk_len > 0) {
-            size_t first_out = 0;
-            gd32_da.offset = 0;
-            esp_err_t err = ota_decomp_process(&gd32_decomp, pre_read_buf, (size_t)first_chunk_len,
-                                              gd32_decomp_write_cb, &gd32_da, &first_out);
+            gd32_offset = 0;
+            esp_err_t err = OtaRelay::flashWriteChunk(gd32_offset, pre_read_buf, (size_t)first_chunk_len);
             if (err != ESP_OK) {
-                DEBUG_ERR("WIFI", "GD32 first chunk decompress/write failed: len=%d err=%s",
+                DEBUG_ERR("WIFI", "GD32 first chunk write failed: len=%d err=%s",
                           first_chunk_len, esp_err_to_name(err));
                 free(buf);
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
                 return ESP_FAIL;
             }
             received = first_chunk_len;
-            OtaRelay::metaUpdate(gd32_da.offset, (uint32_t)(gd32_da.offset / OTA_BLOCK_SIZE));
+            gd32_offset += (uint32_t)first_chunk_len;
+            OtaRelay::metaUpdate(gd32_offset, (uint32_t)(gd32_offset / OTA_BLOCK_SIZE));
         }
     } else {
         received = pre_read_len;  // 跳过已消费的 JSON 头字节
@@ -802,35 +737,26 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        size_t chunk_out = 0;
-        esp_err_t err = ota_decomp_process(&gd32_decomp, buf, (size_t)ret,
-                                gd32_decomp_write_cb, &gd32_da, &chunk_out);
+        esp_err_t err = OtaRelay::flashWriteChunk(gd32_offset, buf, (size_t)ret);
         if (err != ESP_OK) {
-            DEBUG_ERR("WIFI", "GD32 decompress/write failed: offset=%u len=%d err=%s",
-                      (unsigned)gd32_da.offset, ret, esp_err_to_name(err));
+            DEBUG_ERR("WIFI", "GD32 write failed: offset=%u len=%d err=%s",
+                      (unsigned)gd32_offset, ret, esp_err_to_name(err));
             free(buf);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
             return ESP_FAIL;
         }
 
         received += ret;
+        gd32_offset += (uint32_t)ret;
     }
 
     free(buf);
-    // finish GD32 decompression
-    esp_err_t gd32_finish_err = ota_decomp_finish(&gd32_decomp);
-    ota_decomp_free(&gd32_decomp);
-    if (gd32_finish_err != ESP_OK) {
-        DEBUG_ERR("WIFI", "GD32 decompress verify failed");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "GD32 decompress verify failed");
-        return ESP_FAIL;
-    }
 
-    // update meta with actual decompressed size
-    OtaRelay::metaUpdate(gd32_da.offset, (uint32_t)(gd32_da.offset / OTA_BLOCK_SIZE));
+    // update meta with written size
+    OtaRelay::metaUpdate(gd32_offset, (uint32_t)(gd32_offset / OTA_BLOCK_SIZE));
 
 
-    DEBUG_INFO("WIFI", "GD32 upload done: %u / %u bytes (decompressed)", (unsigned)gd32_da.offset, expected_fw_size_raw);
+    DEBUG_INFO("WIFI", "GD32 upload done: %u / %u bytes", (unsigned)gd32_offset, expected_fw_size_raw);
 
     ota_meta_t final_meta;
     OtaRelay::metaLoad(&final_meta);
@@ -869,7 +795,7 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     }
 
     if (WifiOta::instance().m_relayTriggered && OtaRelay::relayState != RELAY_IDLE &&
-        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_ERROR) {
+        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_APP_VERIFY && OtaRelay::relayState != RELAY_ERROR) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "relay already triggered");
         return ESP_FAIL;
     }
@@ -921,7 +847,11 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     DEBUG_INFO("WIFI", "OTA 状态: total=%lu, stored=%lu, done=%s, app_alive=%s",
                (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
                WifiOta::instance().m_gd32StorageDone ? "true" : "false",
-               OtaRelay::gd32AppAlive ? "true" : "false");
+               OtaRelay::gd32AppAlive ? "true" : "false",
+        OtaRelay::gd32Version.app_major, OtaRelay::gd32Version.app_minor,
+        OtaRelay::gd32Version.app_patch, OtaRelay::gd32Version.app_build,
+        OtaRelay::gd32Version.boot_major, OtaRelay::gd32Version.boot_minor,
+        OtaRelay::gd32Version.boot_patch, OtaRelay::gd32Version.boot_build);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1209,6 +1139,25 @@ static esp_err_t wifi_status_handler(httpd_req_t *req)
 }
 
 /**
+ * @brief HTTP GET /api/version 处理器 - 返回固件版本、编译时间、Git hash
+ */
+static esp_err_t version_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+    gd32_version_t gv = OtaRelay::gd32Version;
+    char resp[512];
+    int len = snprintf(resp, sizeof(resp),
+        "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", "
+        "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\", \"gd32_alive\": %s}",
+        FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH,
+        gv.app_major, gv.app_minor, gv.app_patch, gv.app_build,
+        gv.boot_major, gv.boot_minor, gv.boot_patch, gv.boot_build,
+        OtaRelay::gd32AppAlive ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, len);
+    return ESP_OK;
+}
+/**
  * @brief HTTP GET /system/status 处理器
  * @param req
  * @return
@@ -1234,14 +1183,33 @@ static esp_err_t system_status_handler(httpd_req_t *req)
         connected = true;
     }
 
+    /* 若尚无 GD32 版本信息且 OTA 中继空闲，尝试一次 SPI PING 获取 */
+    if (OtaRelay::gd32Version.app_major == 0 &&
+        OtaRelay::gd32Version.boot_major == 0 &&
+        OtaRelay::relayState == RELAY_IDLE) {
+        static uint32_t last_ping_ms = 0;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - last_ping_ms > 5000) {  /* 5 秒节流 */
+            last_ping_ms = now_ms;
+            uint32_t uptime = 0;
+            gd32_version_t ver = {};
+            if (SpiMaster::instance().appPing(500, &uptime, &ver) == ESP_OK) {
+                OtaRelay::gd32AppAlive = true;
+                OtaRelay::gd32Version = ver;
+            } else {
+                OtaRelay::gd32AppAlive = false;
+            }
+        }
+    }
+
     ota_meta_t meta;
     memset(&meta, 0, sizeof(meta));
     OtaRelay::metaLoad(&meta);
 
-    char resp[800];
+    char resp[1024];
     int len = snprintf(resp, sizeof(resp),
-        "{\"version\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu}}",
-        FW_VERSION,HealthMonitor::instance().getCurrent(),
+        "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, \"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}}",
+        FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
         (double)HealthMonitor::instance().getLastTemperature(),
@@ -1255,7 +1223,12 @@ static esp_err_t system_status_handler(httpd_req_t *req)
         WifiOta::instance().m_gd32StorageDone ? "true" : "false",
         OtaRelay::relayState,
         (unsigned long)OtaRelay::relaySeq,
-        (unsigned long)OtaRelay::relayTotalPackets);
+        (unsigned long)OtaRelay::relayTotalPackets,
+        OtaRelay::gd32AppAlive ? "true" : "false",
+        OtaRelay::gd32Version.app_major, OtaRelay::gd32Version.app_minor,
+        OtaRelay::gd32Version.app_patch, OtaRelay::gd32Version.app_build,
+        OtaRelay::gd32Version.boot_major, OtaRelay::gd32Version.boot_minor,
+        OtaRelay::gd32Version.boot_patch, OtaRelay::gd32Version.boot_build);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1493,8 +1466,23 @@ esp_err_t WifiOta::httpServerStart()
         .user_ctx = NULL
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &spi_send_options_uri);
+    // 版本信息端点
+    httpd_uri_t version_uri = {
+        .uri = "/api/version",
+        .method = HTTP_GET,
+        .handler = version_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &version_uri);
+    httpd_uri_t version_options_uri = {
+        .uri = "/api/version",
+        .method = HTTP_OPTIONS,
+        .handler = http_options_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &version_options_uri);
 
-    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /ota/status, /ota/esp32_status, /health, /wifi/status, /system/status, /can/send, /can/status, /spi/send");
+    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /ota/status, /ota/esp32_status, /health, /wifi/status, /system/status, /can/send, /can/status, /spi/send, /api/version");
 
     return ESP_OK;
 }
@@ -1515,7 +1503,7 @@ void WifiOta::signalRelay()
     }
 
     if (WifiOta::instance().m_relayTriggered && OtaRelay::relayState != RELAY_IDLE &&
-        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_ERROR) {
+        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_APP_VERIFY && OtaRelay::relayState != RELAY_ERROR) {
         DEBUG_WARN("WIFI", "转发正在执行中，状态: %d", OtaRelay::relayState);
         return;
     }
@@ -1787,3 +1775,6 @@ void WifiOta::taskEntry(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
+
+
