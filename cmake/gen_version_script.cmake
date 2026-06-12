@@ -8,7 +8,7 @@
 # 版本号（可手动修改）
 set(FW_VERSION_MAJOR 0)
 set(FW_VERSION_MINOR 3)
-set(FW_VERSION_PATCH 11)
+set(FW_VERSION_PATCH 12)
 
 # 获取编译时间
 string(TIMESTAMP BUILD_TIME "%Y-%m-%d %H:%M:%S")

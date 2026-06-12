@@ -356,7 +356,7 @@
           </div>
           <div class="sub-actions">
             <button id="versionBtn" class="btn btn-secondary" disabled>读取版本</button>
-            <a class="btn btn-secondary" href="index.html">回 WiFi 页面</a>
+            <a class="btn btn-secondary" href="index.html" target="_blank">回 WiFi 页面 ↗</a>
           </div>
         </div>
       </div>
@@ -481,7 +481,7 @@
   const UI_BUILD = '2026-05-08-ble-console-v1';
   const BLE_OTA_NOTIFY_ACK = 0xA1;
   const BLE_OTA_NOTIFY_FINISH = 0xB1;
-  const BLE_OTA_ACK_WINDOW = 8;
+  const BLE_OTA_ACK_WINDOW = 32;
 
   const TARGETS = {
     gd32: {
@@ -512,8 +512,6 @@
     versionChar: null,
     notificationsEnabled: false,
     selectedFile: null,
-    selectedFileBytes: null,
-    selectedFileKey: '',
     selectedFileHandle: null,  // FileSystemFileHandle for hot reload
     abortRequested: false,
     uploading: false,
@@ -869,8 +867,6 @@
     els.packetCount.textContent = String(packets);
     els.sentCount.textContent = '0';
 
-    state.selectedFileBytes = null;
-    state.selectedFileKey = file ? `${file.name}|${file.size}|${file.lastModified || 0}` : '';
     state.selectedFile = file || null;
     state.lastUploadStatus = 'idle';
 
@@ -883,15 +879,14 @@
     if (file) {
       setProgress(0, `已选择 ${file.name}`);
       log('FILE', `已选择: ${file.name} (${formatBytes(file.size)}), 目标=${currentTarget().label}`);
-      preloadSelectedFileBytes().catch((err) => {
-        log('FILE', `预读文件失败: ${err.message}`, 'W');
-      });
     } else {
       setProgress(0, '等待选择文件');
     }
   }
 
   function syncSelectedFileFromInput() {
+    // FSAPI 选择的文件以 selectedFileHandle 为准，不从 input 元素同步，避免切标签页回来误清空
+    if (state.selectedFileHandle) return;
     const file = (els.firmwareFile && els.firmwareFile.files && els.firmwareFile.files[0]) || null;
     updateFileInfo(file);
   }
@@ -925,26 +920,11 @@
 
   function clearSelectedFile() {
     state.selectedFile = null;
-    state.selectedFileBytes = null;
-    state.selectedFileKey = '';
     state.selectedFileHandle = null;
     state.lastUploadStatus = 'idle';
     if (els.firmwareFile) els.firmwareFile.value = '';
     updateFileInfo(null);
     log('FILE', '文件已清除');
-  }
-
-  async function preloadSelectedFileBytes() {
-    if (!state.selectedFile) {
-      throw new Error('未选择固件文件');
-    }
-    if (state.selectedFileBytes && state.selectedFileBytes.length === state.selectedFile.size) {
-      return state.selectedFileBytes;
-    }
-    const bytes = new Uint8Array(await state.selectedFile.arrayBuffer());
-    state.selectedFileBytes = bytes;
-    log('FILE', `固件已缓存到内存: ${bytes.length} bytes`);
-    return bytes;
   }
 
   function buildPacket(seq, totalSize, payload, cmd) {
@@ -964,9 +944,6 @@
     return new Promise(r => setTimeout(r, ms));
   }
 
-  async function drainGattQueue() {
-    await sleep(120);
-  }
 
   async function uploadFirmware() {
     // 每次刷写前尝试重新从本地读取文件
@@ -986,8 +963,6 @@
     const cfg = currentTarget();
     const payloadSize = Math.max(32, Math.min(498, Number(els.payloadSize.value) || 480));
     const file = state.selectedFile;
-    const totalSize = file.size;
-    const packetTotal = Math.ceil(totalSize / payloadSize);
 
     state.abortRequested = false;
     state.uploading = true;
@@ -1013,14 +988,16 @@
         throw new Error('DATA_OUT 通知未开启，无法使用 ACK 模式');
       }
 
-      log('OTA', `开始准备固件: target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, cmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, ackWindow=${BLE_OTA_ACK_WINDOW}`);
-      let fileBytes = state.selectedFileBytes;
-      if (!fileBytes || fileBytes.length !== totalSize) {
-        setProgress(0, `[${cfg.label}] 正在读取固件文件到内存...`);
-        fileBytes = await preloadSelectedFileBytes();
-      } else {
-        setProgress(0, `[${cfg.label}] 使用已缓存的固件数据...`);
-        log('OTA', `使用缓存固件: ${fileBytes.length} bytes`);
+      log('OTA', `开始准备固件: target=${cfg.label}, file=${file.name}, payload=${payloadSize}, cmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, ackWindow=${BLE_OTA_ACK_WINDOW}`);
+      setProgress(0, `[${cfg.label}] 正在读取固件文件...`);
+      // 直接读取同一个 File 对象的 arrayBuffer，不经过 state 中间变量
+      // 保证 totalSize、包头 total_size、发送字节数三者完全一致
+      const fileBytes = new Uint8Array(await file.arrayBuffer());
+      const totalSize = fileBytes.length;
+      const packetTotal = Math.ceil(totalSize / payloadSize);
+      log('OTA', `固件已读取: totalSize=${totalSize}, packetTotal=${packetTotal}, file.size=${file.size}`);
+      if (totalSize !== file.size) {
+        log('OTA', `⚠️ file.size(${file.size}) ≠ arrayBuffer(${totalSize})，以 arrayBuffer 为准，请确认页面已 Ctrl+F5 刷新`, 'W');
       }
       log('OTA', `开始写入 DATA_IN: target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`);
 
@@ -1038,14 +1015,17 @@
 
           const percent = ((seq + 1) / packetTotal) * 100;
           els.sentCount.textContent = String(seq + 1);
-          setProgress(percent, `[${cfg.label}] 已写 ${seq + 1}/${packetTotal} 包，等待窗口 ACK`);
+          setProgress(percent, `[${cfg.label}] 已写 ${seq + 1}/${packetTotal} 包`);
         }
 
-        const ack = await waitForAck(cfg.packetCmd, endSeq, 10000);
-        if (ack.seq + 1 === packetTotal || ((ack.seq + 1) % (BLE_OTA_ACK_WINDOW * 5)) === 0) {
-          log('OTA', `${cfg.label} 窗口 ACK 已确认: seq=${ack.seq}, bytes=${ack.bytes}`);
+        await waitForAck(cfg.packetCmd, endSeq, 10000);
+
+        // ACK 字节数校验: 设备报告的累计字节必须匹配预期
+        const expectedBytes = Math.min((endSeq + 1) * payloadSize, totalSize);
+        if (state.lastAckBytes < expectedBytes) {
+          const missing = expectedBytes - state.lastAckBytes;
+          throw new Error(`BLE 丢包检测: seq=${endSeq} 期望${expectedBytes}字节 实际${state.lastAckBytes}字节 丢失${missing}字节(${(missing / payloadSize).toFixed(1)}包)`);
         }
-        await sleep(0);
       }
 
       setProgress(100, `[${cfg.label}] 固件数据已全部写入 DATA_IN`);
@@ -1053,7 +1033,7 @@
       if (cfg.label === 'ESP32') {
         return true;
       }
-      await drainGattQueue();
+      await sleep(30);
       const cmdHex = els.ctrlHex.value || cfg.ctrlHex;
       const cmd = hexToBytes(cmdHex);
       try {

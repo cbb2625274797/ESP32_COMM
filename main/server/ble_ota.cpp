@@ -52,19 +52,14 @@
 #define BLE_OTA_FINISH_REBOOT_NOW 0x07
 #define BLE_OTA_FINISH_ERR_OTA_END 0x81
 #define BLE_OTA_FINISH_ERR_SET_BOOT 0x82
-#define BLE_OTA_ACK_WINDOW 8
+#define BLE_OTA_ACK_WINDOW 32
 
 // ============================================================
-// 前向声明（GAP event handler 在广播函数之前定义，需要声明）
+// 前向声明
 // ============================================================
 static void ble_ota_start_advertising(void);
 static void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes);
 static void sendFinishEvent(uint8_t stage, uint32_t value);
-
-// ============================================================
-// 静态状态
-// ============================================================
-
 
 // ============================================================
 BleOta& BleOta::instance()
@@ -229,7 +224,11 @@ static esp_err_t ble_esp32_ota_begin(size_t total_size)
         return ESP_FAIL;
     }
 
-    esp_err_t err = esp_ota_begin(BleOta::instance().m_esp32UpdatePartition, total_size, &BleOta::instance().m_esp32OtaHandle);
+    // 用分区大小初始化 OTA，而非包头声明的 total_size
+    // esp_ota_end 会从固件镜像头读取实际大小来校验，不依赖此处传入的 size
+    esp_err_t err = esp_ota_begin(BleOta::instance().m_esp32UpdatePartition,
+                                  BleOta::instance().m_esp32UpdatePartition->size,
+                                  &BleOta::instance().m_esp32OtaHandle);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(err));
         BleOta::instance().m_esp32UpdatePartition = NULL;
@@ -486,14 +485,23 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
         DEBUG_DBG(TAG, "ESP32 OTA 写入成功: seq=%u received=%u",
                   seq, (unsigned int)BleOta::instance().m_esp32Received);
 
+        // 尾包检测: data_len < 标准负载说明是最后一包（不满一个完整 payload）
+        bool isLastPacket = (data_len < BLE_OTA_CHUNK_PAYLOAD);
+
         if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
-            (total_size > 0 && BleOta::instance().m_esp32Received >= total_size)) {
+            (total_size > 0 && BleOta::instance().m_esp32Received >= total_size) ||
+            isLastPacket) {
+            if (isLastPacket) {
+                DEBUG_INFO(TAG, "ESP32 尾包检测: seq=%u data_len=%zu received=%u total=%" PRIu32,
+                           seq, data_len, (unsigned int)BleOta::instance().m_esp32Received, total_size);
+            }
             sendWindowAck(cmd, seq, (uint32_t)BleOta::instance().m_esp32Received);
         }
 
-        if (total_size > 0 && BleOta::instance().m_esp32Received >= total_size) {
-            DEBUG_INFO(TAG, "★ ESP32 固件接收完毕: %u / %" PRIu32 " 字节 (共 %u 块)",
-                       (unsigned int)BleOta::instance().m_esp32Received, total_size, seq + 1);
+        if ((total_size > 0 && BleOta::instance().m_esp32Received >= total_size) || isLastPacket) {
+            DEBUG_INFO(TAG, "★ ESP32 固件接收完毕: %u / %" PRIu32 " 字节 (共 %u 块)%s",
+                       (unsigned int)BleOta::instance().m_esp32Received, total_size, seq + 1,
+                       isLastPacket ? " [尾包]" : "");
             BleOta::instance().m_esp32LastCmd = cmd;
             BleOta::instance().m_esp32LastSeq = seq;
 
@@ -578,7 +586,8 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
-        (meta.total_size > 0 && stored_size >= meta.total_size)) {
+        (meta.total_size > 0 && stored_size >= meta.total_size) ||
+        (data_len < BLE_OTA_CHUNK_PAYLOAD)) {
         sendWindowAck(cmd, seq, stored_size);
     }
 
@@ -733,17 +742,17 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
             // 向对端请求更快的连接参数，提升 OTA 吞吐
             struct ble_gap_upd_params up = {};
             up.itvl_min        = 6;      // 7.5 ms 最小连接间隔
-            up.itvl_max        = 12;     // 15 ms 最大连接间隔
+            up.itvl_max        = 6;      // 7.5 ms 固定间隔（避免对端选大值）
             up.latency         = 0;      // 无延迟
             up.supervision_timeout = 2000; // 2 秒监控超时
-            up.min_ce_len      = 0;      // 控制器自行决定
-            up.max_ce_len      = 0;
+            up.min_ce_len      = 12;     // 最小连接事件长度 12×0.625=7.5ms，尽量多传包
+            up.max_ce_len      = 12;
             int rc = ble_gap_update_params(BleOta::instance().m_connHandle, &up);
             if (rc != 0) {
                 DEBUG_WARN(TAG, "请求更新连接参数失败: rc=%d（对端不一定接受，继续运行）", rc);
             } else {
-                DEBUG_INFO(TAG, "已请求更快的连接参数: itvl=%.1f-%.1fms latency=0",
-                           up.itvl_min * 1.25f, up.itvl_max * 1.25f);
+                DEBUG_INFO(TAG, "已请求更快的连接参数: itvl=%.1fms ce_len=%.1fms latency=0",
+                           up.itvl_min * 1.25f, up.min_ce_len * 0.625f);
             }
         } else {
             DEBUG_WARN(TAG, "BLE 连接失败: status=%d", event->connect.status);
@@ -883,6 +892,11 @@ static void ble_ota_on_sync(void)
     // GATT 服务已在 serverStart() 中注册，不再重复注册
     // 重复调用 ble_gatts_count_cfg / ble_gatts_add_svcs 会导致 BLE_HS_EBUSY
 
+    DEBUG_INFO(TAG, "DATA_OUT 值句柄: %u", s_data_out_val_handle);
+    if (s_data_out_val_handle == 0) {
+        DEBUG_WARN(TAG, "DATA_OUT 值句柄为 0，通知功能不可用");
+    }
+
     BleOta::instance().m_bleReady = true;
     ble_ota_start_advertising();
 }
@@ -973,8 +987,7 @@ esp_err_t BleOta::serverStart()
 
     nimble_port_freertos_init(ble_ota_nimble_host_task);
 
-    // Sync val_handle to class member
-    BleOta::instance().mDataOutValHandle = s_data_out_val_handle;
+    // s_data_out_val_handle 由 on_sync 回调填充，此处不复制
     DEBUG_INFO(TAG, "BLE OTA 服务器初始化完成");
     return ESP_OK;
 }
@@ -990,7 +1003,7 @@ esp_err_t BleOta::notifyResponse(const uint8_t *data, size_t len)
     if (!BleOta::instance().m_bleConnected) {
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (BleOta::instance().mDataOutValHandle == 0) {
+    if (s_data_out_val_handle == 0) {
         DEBUG_WARN(TAG, "DATA_OUT 值句柄未设置");
         return ESP_ERR_INVALID_STATE;
     }
@@ -1003,7 +1016,7 @@ esp_err_t BleOta::notifyResponse(const uint8_t *data, size_t len)
         return ESP_ERR_NO_MEM;
     }
 
-    int rc = ble_gattc_notify_custom(BleOta::instance().m_connHandle, BleOta::instance().mDataOutValHandle, om);
+    int rc = ble_gattc_notify_custom(BleOta::instance().m_connHandle, s_data_out_val_handle, om);
     if (rc != 0) {
         DEBUG_WARN(TAG, "通知发送失败: rc=%d", rc);
         return ESP_FAIL;

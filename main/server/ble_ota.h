@@ -23,7 +23,6 @@ public:
     bool m_bleReady = false;
     bool m_bleConnected = false;
     uint16_t m_connHandle = 0xFFFF;
-    uint16_t mDataOutValHandle = 0;
 
     bool m_esp32OtaActive = false;
     esp_ota_handle_t m_esp32OtaHandle = 0;
