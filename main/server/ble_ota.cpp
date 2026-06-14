@@ -71,6 +71,10 @@ static void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes);
 static void sendFinishEvent(uint8_t stage, uint32_t value);
 
 // ============================================================
+/**
+  * @brief 获取 BleOta 单例实例。
+ * @return BleOta 类引用。
+ */
 BleOta& BleOta::instance()
 {
     static BleOta inst;
@@ -103,6 +107,10 @@ static void ble_esp32_restart_task(void *pvParameters)
     // 不会返回
 }
 
+/**
+  * @brief 异步完成 ESP32 OTA 收尾并触发重启。
+ * @param pvParameters 前端 SHA-256 十六进制字符串（堆分配，任务负责释放）。
+ */
 static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 {
     // pvParameters: heap-allocated char[65] frontend SHA hex string (or nullptr)

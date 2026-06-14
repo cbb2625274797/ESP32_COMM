@@ -23,12 +23,19 @@
 
 #define TAG "OTA_CORE"
 
+/**
+  * @brief 获取 Esp32OtaCore 单例实例。
+ * @return Esp32OtaCore 引用。
+ */
 Esp32OtaCore& Esp32OtaCore::instance()
 {
     static Esp32OtaCore inst;
     return inst;
 }
 
+/**
+  * @brief 复位所有状态变量。
+ */
 void Esp32OtaCore::resetState()
 {
     m_active = false;
@@ -40,6 +47,11 @@ void Esp32OtaCore::resetState()
     m_ended = false;
 }
 
+/**
+  * @brief 开启 OTA 会话。
+ * @param total_size 固件总大小（字节）。
+ * @return ESP_OK 成功，ESP_ERR_INVALID_STATE 被占用，ESP_FAIL 其他错误。
+ */
 esp_err_t Esp32OtaCore::begin(size_t total_size)
 {
     // 若本核心已有未完成会话，先中止并释放全局互斥
@@ -109,6 +121,12 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     return ESP_OK;
 }
 
+/**
+  * @brief 写入固件数据块。
+ * @param data 数据缓冲区。
+ * @param len 数据长度。
+ * @return ESP_OK 成功，否则错误码。
+ */
 esp_err_t Esp32OtaCore::write(const uint8_t *data, size_t len)
 {
     if (!m_active || m_partition == nullptr) {
@@ -124,6 +142,10 @@ esp_err_t Esp32OtaCore::write(const uint8_t *data, size_t len)
     return err;
 }
 
+/**
+  * @brief 从 OTA 分区读回数据并计算 SHA-256。
+ * @return ESP_OK 成功，否则错误码。
+ */
 esp_err_t Esp32OtaCore::computeShaFromPartition()
 {
     if (m_partition == NULL || m_received == 0) {
@@ -172,6 +194,11 @@ esp_err_t Esp32OtaCore::computeShaFromPartition()
     return ESP_OK;
 }
 
+/**
+  * @brief 计算设备端 SHA-256 并输出 hex 字符串。
+ * @param out_device_sha_hex 输出缓冲区，至少 65 字节。
+ * @return ESP_OK 成功，否则错误码。
+ */
 esp_err_t Esp32OtaCore::computeDeviceSha(char *out_device_sha_hex)
 {
     if (!m_active || m_partition == NULL) {
@@ -191,6 +218,13 @@ esp_err_t Esp32OtaCore::computeDeviceSha(char *out_device_sha_hex)
     return ESP_OK;
 }
 
+/**
+  * @brief 收尾 OTA 会话：end、校验 SHA、set_boot、可选重启。
+ * @param frontend_sha_hex 前端提供的 64 字符 hex SHA-256。
+ * @param reboot 成功后是否重启。
+ * @param out_device_sha_hex 输出设备端 SHA hex 缓冲区。
+ * @return ESP_OK 成功，ESP_ERR_INVALID_VERSION SHA 不匹配，否则错误码。
+ */
 esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
                                  char *out_device_sha_hex)
 {
@@ -287,6 +321,9 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
     return ESP_OK;
 }
 
+/**
+  * @brief 中止 OTA 会话并清理资源。
+ */
 void Esp32OtaCore::abort()
 {
     if (!m_active) {

@@ -20,12 +20,19 @@
 // ============================================================
 // Protocol 单例
 // ============================================================
+/**
+  * @brief 获取 Protocol 单例实例。
+ * @return Protocol 单例引用。
+ */
 Protocol& Protocol::instance()
 {
     static Protocol inst;
     return inst;
 }
 
+/**
+  * @brief 初始化协议层，打印初始化信息并设置初始化标志。
+ */
 void Protocol::init()
 {
     if (m_initialized) return;

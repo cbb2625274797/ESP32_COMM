@@ -37,6 +37,10 @@ typedef enum {
  */
 class HealthMonitor {
 public:
+    /**
+      * @brief 获取 HealthMonitor 单例实例。
+     * @return HealthMonitor 引用。
+     */
     static HealthMonitor& instance();
 
     /** @brief 初始化健康监控模块，创建内部互斥锁与基础状态。 */

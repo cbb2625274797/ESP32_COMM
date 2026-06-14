@@ -23,6 +23,10 @@
 // ============================================================
 // 单例
 // ============================================================
+/**
+  * @brief 获取 HealthMonitor 单例实例。
+ * @return HealthMonitor 引用。
+ */
 HealthMonitor& HealthMonitor::instance()
 {
     static HealthMonitor inst;
@@ -32,6 +36,9 @@ HealthMonitor& HealthMonitor::instance()
 // ============================================================
 // 初始化
 // ============================================================
+/**
+  * @brief 初始化健康监控模块，创建内部互斥锁与基础状态。
+ */
 void HealthMonitor::init()
 {
     m_mutex = xSemaphoreCreateMutex();
@@ -43,6 +50,10 @@ void HealthMonitor::init()
 // ============================================================
 // 线程安全的健康状态读写
 // ============================================================
+/**
+  * @brief 加锁读取当前健康状态。
+ * @return 当前健康状态。
+ */
 health_state_t HealthMonitor::getState()
 {
     if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
@@ -51,6 +62,10 @@ health_state_t HealthMonitor::getState()
     return s;
 }
 
+/**
+  * @brief 加锁设置健康状态。
+ * @param newState 新的健康状态。
+ */
 void HealthMonitor::setState(health_state_t newState)
 {
     if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
@@ -61,11 +76,19 @@ void HealthMonitor::setState(health_state_t newState)
 // ============================================================
 // 获取当前健康状态（public 接口）
 // ============================================================
+/**
+  * @brief 获取当前系统健康状态（线程安全）。
+ * @return 当前健康状态。
+ */
 health_state_t HealthMonitor::getCurrent()
 {
     return getState();
 }
 
+/**
+  * @brief 获取最近一次芯片温度。
+ * @return 温度值（摄氏度）。
+ */
 float HealthMonitor::getLastTemperature()
 {
     if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
@@ -74,6 +97,12 @@ float HealthMonitor::getLastTemperature()
     return t;
 }
 
+/**
+  * @brief 获取最近一次 WiFi RSSI 及其年龄。
+ * @param out_rssi 输出参数，返回 RSSI 值。
+ * @param out_age_ms 输出参数，返回样本年龄（毫秒）。
+ * @return 是否有有效数据。
+ */
 bool HealthMonitor::getLastWifiRssi(int8_t *out_rssi, uint32_t *out_age_ms)
 {
     if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
@@ -96,6 +125,10 @@ bool HealthMonitor::getLastWifiRssi(int8_t *out_rssi, uint32_t *out_age_ms)
 // ============================================================
 // 温度监控（定时器回调）
 // ============================================================
+/**
+  * @brief 温度监控定时器回调函数。
+ * @param arg 用户参数（未使用）。
+ */
 void HealthMonitor::tempMonitorCallback(void *arg)
 {
     auto& self = instance();
@@ -127,6 +160,10 @@ void HealthMonitor::tempMonitorCallback(void *arg)
 // ============================================================
 // FreeRTOS 任务入口
 // ============================================================
+/**
+  * @brief 健康监控 FreeRTOS 任务入口。
+ * @param pvParameters 任务参数。
+ */
 void HealthMonitor::taskEntry(void *pvParameters)
 {
     auto& self = instance();
@@ -173,6 +210,11 @@ void HealthMonitor::taskEntry(void *pvParameters)
 // ============================================================
 // 健康事件日志
 // ============================================================
+/**
+  * @brief 记录一条健康事件日志。
+ * @param event 事件名称。
+ * @param value 事件值。
+ */
 void HealthMonitor::logEvent(const char *event, int value)
 {
     DEBUG_INFO("HEALTH", "[健康事件] %s: %d", event, value);
@@ -181,6 +223,10 @@ void HealthMonitor::logEvent(const char *event, int value)
 // ============================================================
 // OTA 健康检查
 // ============================================================
+/**
+  * @brief OTA 传输前执行健康检查。
+ * @return 健康检查状态。
+ */
 health_status_t HealthMonitor::checkBeforeOta()
 {
     health_status_t status = HEALTH_MON_OK;
@@ -227,6 +273,10 @@ health_status_t HealthMonitor::checkBeforeOta()
     return status;
 }
 
+/**
+  * @brief OTA 中继转发阶段执行健康检查（跳过 WiFi 检查）。
+ * @return 健康检查状态。
+ */
 health_status_t HealthMonitor::checkBeforeOtaRelay()
 {
     health_status_t status = HEALTH_MON_OK;
@@ -261,6 +311,11 @@ health_status_t HealthMonitor::checkBeforeOtaRelay()
 // ============================================================
 // WiFi RSSI 更新
 // ============================================================
+/**
+  * @brief 根据 WiFi RSSI 更新健康状态。
+ * @param rssi WiFi RSSI 值。
+ * @return 健康检查状态。
+ */
 health_status_t HealthMonitor::updateFromWifiRssi(int8_t rssi)
 {
     if (rssi < WIFI_RSSI_CRITICAL) {

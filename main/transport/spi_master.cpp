@@ -23,6 +23,10 @@ static constexpr size_t kSpiTransferMaxBytes = 256U;
 // ============================================================
 // 单例
 // ============================================================
+/**
+ * @brief 获取 SpiMaster 单例实例（单例模式）。
+ * @return SpiMaster 单例引用。
+ */
 SpiMaster& SpiMaster::instance()
 {
     static SpiMaster inst;
@@ -32,6 +36,15 @@ SpiMaster& SpiMaster::instance()
 // ============================================================
 // 内部 SPI 传输
 // ============================================================
+/**
+ * @brief 执行底层 SPI 时钟同步传输。
+ * @param tx_buf 发送数据缓冲区，可为 NULL。
+ * @param tx_len 发送数据长度。
+ * @param rx_buf 接收数据缓冲区，可为 NULL。
+ * @param rx_len 接收数据长度。
+ * @param timeout_ms 超时时间（毫秒），0 表示无限等待。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::transferClocked(const uint8_t *tx_buf, size_t tx_len,
                                      uint8_t *rx_buf, size_t rx_len,
                                      uint32_t timeout_ms)
@@ -100,6 +113,16 @@ esp_err_t SpiMaster::transferClocked(const uint8_t *tx_buf, size_t tx_len,
     return ESP_OK;
 }
 
+/**
+ * @brief 执行 SPI 请求-响应组合传输。
+ * @param cmd 命令字节（0 表示无命令）。
+ * @param payload 负载数据缓冲区。
+ * @param payload_len 负载数据长度。
+ * @param rx_buf 接收数据缓冲区。
+ * @param rx_len 期望接收的数据长度。
+ * @param timeout_ms 超时时间（毫秒），0 表示无限等待。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::transferRequestResponse(uint8_t cmd,
                                              const uint8_t *payload, size_t payload_len,
                                              uint8_t *rx_buf, size_t rx_len,
@@ -146,6 +169,12 @@ esp_err_t SpiMaster::transferRequestResponse(uint8_t cmd,
 // ============================================================
 // OTA 帧工具
 // ============================================================
+/**
+ * @brief 计算 OTA 帧的 8 位 CRC 校验和。
+ * @param data 数据缓冲区。
+ * @param len 数据长度。
+ * @return 计算得到的 CRC 值。
+ */
 uint8_t SpiMaster::otaCrc8(const uint8_t *data, size_t len)
 {
     uint8_t crc = 0x00;
@@ -155,6 +184,15 @@ uint8_t SpiMaster::otaCrc8(const uint8_t *data, size_t len)
     return crc;
 }
 
+/**
+ * @brief 构建 OTA 协议帧。
+ * @param type 帧类型。
+ * @param payload 负载数据缓冲区。
+ * @param payload_len 负载数据长度。
+ * @param out 输出帧缓冲区。
+ * @param out_len 输出实际帧长度。
+ * @return true 表示构建成功，false 表示失败。
+ */
 bool SpiMaster::otaBuildFrame(uint8_t type, const uint8_t *payload, size_t payload_len,
                               uint8_t *out, size_t *out_len)
 {
@@ -173,6 +211,15 @@ bool SpiMaster::otaBuildFrame(uint8_t type, const uint8_t *payload, size_t paylo
     return true;
 }
 
+/**
+ * @brief 解析 OTA 协议帧。
+ * @param frame 帧数据缓冲区。
+ * @param frame_len 帧数据长度。
+ * @param type 输出解析得到的帧类型。
+ * @param payload 输出指向负载数据的指针。
+ * @param payload_len 输出负载数据长度。
+ * @return true 表示解析成功，false 表示失败。
+ */
 bool SpiMaster::otaParseFrame(const uint8_t *frame, size_t frame_len,
                               uint8_t *type, const uint8_t **payload, size_t *payload_len)
 {
@@ -192,6 +239,16 @@ bool SpiMaster::otaParseFrame(const uint8_t *frame, size_t frame_len,
     return true;
 }
 
+/**
+ * @brief 在数据缓冲区中搜索并解析 OTA 帧。
+ * @param buf 数据缓冲区。
+ * @param buf_len 数据缓冲区长度。
+ * @param type 输出帧类型。
+ * @param payload 输出指向负载数据的指针。
+ * @param payload_len 输出负载数据长度。
+ * @param frame_offset 输出帧在缓冲区中的偏移位置。
+ * @return true 表示找到并成功解析，false 表示未找到。
+ */
 bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
                              uint8_t *type, const uint8_t **payload, size_t *payload_len,
                              size_t *frame_offset)
@@ -222,6 +279,10 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
 // ============================================================
 // 初始化
 // ============================================================
+/**
+ * @brief 初始化 SPI2 总线与目标从设备。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::init()
 {
     LockGuard lock(m_mutex);
@@ -274,6 +335,16 @@ esp_err_t SpiMaster::init()
 // ============================================================
 // 公开 SPI 传输接口
 // ============================================================
+/**
+ * @brief 执行一次同步 SPI 事务，先发送请求，再读取响应字节。
+ * @param cmd 命令字节。
+ * @param payload 负载数据缓冲区。
+ * @param payload_len 负载数据长度。
+ * @param recv_buf 接收数据缓冲区。
+ * @param recv_len 接收数据长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::syncTransfer(uint8_t cmd, const uint8_t *payload,
                                   size_t payload_len, uint8_t *recv_buf,
                                   size_t recv_len, uint32_t timeout_ms)
@@ -282,12 +353,27 @@ esp_err_t SpiMaster::syncTransfer(uint8_t cmd, const uint8_t *payload,
     return transferRequestResponse(cmd, payload, payload_len, recv_buf, recv_len, timeout_ms);
 }
 
+/**
+ * @brief 仅发送 SPI 请求数据，不关心返回内容。
+ * @param cmd 命令字节。
+ * @param payload 负载数据缓冲区。
+ * @param len 负载数据长度。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::send(uint8_t cmd, const uint8_t *payload, size_t len)
 {
     LockGuard lock(m_mutex);
     return transferRequestResponse(cmd, payload, len, NULL, 0, 0U);
 }
 
+/**
+ * @brief 仅接收 SPI 数据，必要时先发送命令字节。
+ * @param cmd 命令字节。
+ * @param recv_buf 接收数据缓冲区。
+ * @param len 接收数据长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_ms)
 {
     LockGuard lock(m_mutex);
@@ -297,6 +383,18 @@ esp_err_t SpiMaster::recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t t
 // ============================================================
 // SPI OTA 协议
 // ============================================================
+/**
+ * @brief 按 GD32 SPI OTA 最小协议执行一次请求加响应读取。
+ * @param type 请求帧类型。
+ * @param payload 负载数据缓冲区。
+ * @param payload_len 负载数据长度。
+ * @param resp_type 输出响应类型。
+ * @param resp_payload 输出响应负载缓冲区。
+ * @param resp_max 响应负载缓冲区最大长度。
+ * @param resp_len 输出实际响应长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t payload_len,
                                  uint8_t *resp_type, uint8_t *resp_payload,
                                  size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
@@ -319,6 +417,15 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
     return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
 }
 
+/**
+ * @brief 仅执行 SPI OTA 响应读取事务，不重复发送请求帧。
+ * @param resp_type 输出响应类型。
+ * @param resp_payload 输出响应负载缓冲区。
+ * @param resp_max 响应负载缓冲区最大长度。
+ * @param resp_len 输出实际响应长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
                                      size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
 {
@@ -326,6 +433,15 @@ esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
     return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
 }
 
+/**
+ * @brief 无锁版本的 OTA 响应轮询实现。
+ * @param resp_type 输出响应类型。
+ * @param resp_payload 输出响应负载缓冲区。
+ * @param resp_max 响应负载缓冲区最大长度。
+ * @param resp_len 输出实际响应长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_payload,
                                              size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
 {
@@ -390,6 +506,10 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
     return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * @brief 通知 GD32 DCU_APP 设置 OTA 标志并软复位进入 Bootloader。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::appRequestBootloader()
 {
     LockGuard lock(m_mutex);
@@ -429,6 +549,13 @@ esp_err_t SpiMaster::appRequestBootloader()
     return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @param uptime_sec 输出设备运行时间（秒）。
+ * @param version 输出 GD32 版本信息（可选）。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version)
 {
     LockGuard lock(m_mutex);
@@ -546,6 +673,16 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
     return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * @brief 执行带重试的 SPI 同步传输。
+ * @param cmd 命令字节。
+ * @param payload 负载数据缓冲区。
+ * @param payload_len 负载数据长度。
+ * @param recv_buf 接收数据缓冲区。
+ * @param recv_len 接收数据长度。
+ * @param max_retries 最大重试次数。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::transferWithRetry(uint8_t cmd, const uint8_t *payload,
                                        size_t payload_len, uint8_t *recv_buf,
                                        size_t recv_len, int max_retries)
@@ -579,6 +716,17 @@ esp_err_t SpiMaster::transferWithRetry(uint8_t cmd, const uint8_t *payload,
 // ============================================================
 // CANFD 接口
 // ============================================================
+/**
+ * @brief 发送一帧 CANFD 数据，可选等待并读取响应内容。
+ * @param channel CAN 通道编号（0~2）。
+ * @param ext_id 扩展帧 ID（29 位）。
+ * @param data CAN 数据负载。
+ * @param dlc 数据长度。
+ * @param recv_buf 接收数据缓冲区。
+ * @param recv_max 接收缓冲区最大长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return 成功时返回接收数据长度，失败返回 -1。
+ */
 int SpiMaster::canSend(can_channel_t channel, uint32_t ext_id,
                        const uint8_t *data, uint8_t dlc,
                        uint8_t *recv_buf, uint8_t recv_max,
@@ -608,6 +756,14 @@ int SpiMaster::canSend(can_channel_t channel, uint32_t ext_id,
     return (int)recv_max;
 }
 
+/**
+ * @brief 发送一帧无需响应的 CANFD 数据。
+ * @param channel CAN 通道编号（0~2）。
+ * @param ext_id 扩展帧 ID（29 位）。
+ * @param data CAN 数据负载。
+ * @param dlc 数据长度。
+ * @return 成功返回 0，失败返回 -1。
+ */
 int SpiMaster::canSendNoReply(can_channel_t channel, uint32_t ext_id,
                               const uint8_t *data, uint8_t dlc)
 {
@@ -638,6 +794,16 @@ int SpiMaster::canSendNoReply(can_channel_t channel, uint32_t ext_id,
 // ============================================================
 // 无锁内部版本实现
 // ============================================================
+/**
+ * @brief 无锁版本的同步 SPI 传输实现。
+ * @param cmd 命令字节。
+ * @param payload 负载数据缓冲区。
+ * @param payload_len 负载数据长度。
+ * @param recv_buf 接收数据缓冲区。
+ * @param recv_len 接收数据长度。
+ * @param timeout_ms 超时时间（毫秒）。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::syncTransferUnlocked(uint8_t cmd, const uint8_t *payload,
                                           size_t payload_len, uint8_t *recv_buf,
                                           size_t recv_len, uint32_t timeout_ms)
@@ -645,6 +811,13 @@ esp_err_t SpiMaster::syncTransferUnlocked(uint8_t cmd, const uint8_t *payload,
     return transferRequestResponse(cmd, payload, payload_len, recv_buf, recv_len, timeout_ms);
 }
 
+/**
+ * @brief 无锁版本的 SPI 发送实现。
+ * @param cmd 命令字节。
+ * @param payload 负载数据缓冲区。
+ * @param len 负载数据长度。
+ * @return ESP_OK 表示成功，否则返回错误码。
+ */
 esp_err_t SpiMaster::sendUnlocked(uint8_t cmd, const uint8_t *payload, size_t len)
 {
     return transferRequestResponse(cmd, payload, len, NULL, 0, 0U);

@@ -33,6 +33,10 @@ static const char *TAG = "DEBUG_LOG";
 // ============================================================
 // 单例
 // ============================================================
+/**
+  * @brief 获取 DebugLog 单例实例。
+ * @return DebugLog 引用。
+ */
 DebugLog& DebugLog::instance()
 {
     static DebugLog inst;
@@ -42,6 +46,10 @@ DebugLog& DebugLog::instance()
 // ============================================================
 // 日志环形缓冲区（供 HTTP /logs 拉取）
 // ============================================================
+/**
+  * @brief 获取当前环形日志缓冲区中的日志条数。
+ * @return 日志条数。
+ */
 int DebugLog::ringCount()
 {
     if (!m_logRingMutex) return 0;
@@ -51,6 +59,11 @@ int DebugLog::ringCount()
     return count;
 }
 
+/**
+  * @brief 读取并清空环形日志缓冲区，返回 JSON 数组字符串。
+ * @param out_len 输出参数，返回 JSON 字符串长度。
+ * @return 指向 JSON 字符串的指针，需调用者 free。
+ */
 char *DebugLog::ringDrainJson(int *out_len)
 {
     if (!m_logRingMutex) {
@@ -117,6 +130,11 @@ char *DebugLog::ringDrainJson(int *out_len)
     return json;
 }
 
+/**
+  * @brief 向环形日志缓冲区中推送一条日志数据。
+ * @param data 日志数据指针。
+ * @param len 数据长度。
+ */
 void DebugLog::ringPush(const char *data, int len)
 {
     if (!m_logRingMutex || len <= 0) return;
@@ -139,6 +157,10 @@ void DebugLog::ringPush(const char *data, int len)
 // ============================================================
 // UART 调试日志
 // ============================================================
+/**
+  * @brief 初始化 UART0 调试串口。
+ * @return esp_err_t 错误码。
+ */
 esp_err_t DebugLog::uartInit()
 {
     if (m_uartInitialized) {
@@ -180,6 +202,12 @@ esp_err_t DebugLog::uartInit()
     return ESP_OK;
 }
 
+/**
+  * @brief 通过 UART0 直接发送原始字节数据。
+ * @param data 待发送数据指针。
+ * @param len 数据长度。
+ * @return esp_err_t 错误码。
+ */
 esp_err_t DebugLog::uartSend(const uint8_t *data, size_t len)
 {
     if (!m_uartInitialized) {
@@ -197,6 +225,10 @@ esp_err_t DebugLog::uartSend(const uint8_t *data, size_t len)
 // ============================================================
 // 初始化（UART 立即可用，UDP socket 延迟到首次发送时创建）
 // ============================================================
+/**
+  * @brief 初始化日志系统，包括 UART 输出、UDP 目标和内部缓冲区。
+ * @return esp_err_t 错误码。
+ */
 esp_err_t DebugLog::init()
 {
     if (m_initialized) {
@@ -219,6 +251,10 @@ esp_err_t DebugLog::init()
     return ESP_OK;
 }
 
+/**
+  * @brief 确保 UDP socket 已创建（延迟创建）。
+ * @return esp_err_t 错误码。
+ */
 esp_err_t DebugLog::ensureUdpSocket()
 {
     if (m_udpSock >= 0) {
@@ -235,6 +271,12 @@ esp_err_t DebugLog::ensureUdpSocket()
     return ESP_OK;
 }
 
+/**
+  * @brief 发送原始日志数据到底层输出通道。
+ * @param data 待发送数据指针。
+ * @param len 数据长度。
+ * @return esp_err_t 错误码。
+ */
 esp_err_t DebugLog::send(const uint8_t *data, size_t len)
 {
     esp_err_t udp_ret = ESP_FAIL;
@@ -270,6 +312,13 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
     return ESP_FAIL;
 }
 
+/**
+  * @brief 按日志级别与标签格式化输出一条日志。
+ * @param level 日志级别。
+ * @param tag 日志标签。
+ * @param fmt 格式化字符串。
+ * @param ... 可变参数。
+ */
 void DebugLog::log(debug_log_level_t level, const char *tag, const char *fmt, ...)
 {
     if (!m_initialized) {

@@ -14,12 +14,37 @@
 
 class BleOta {
 public:
+    /**
+  * @brief 获取 BleOta 单例实例。
+ * @return BleOta 类引用。
+ */
     static BleOta& instance();
 
+    /**
+  * @brief BLE OTA FreeRTOS 任务入口。
+ * @param pvParameters 任务参数，未使用。
+ */
     static void taskEntry(void *pvParameters);
+    /**
+  * @brief 启动 BLE GATT 服务器并注册 OTA 服务。
+ * @return ESP_OK 成功，其他失败。
+ */
     esp_err_t serverStart();
+    /**
+  * @brief 通过 BLE Notify 推送响应数据。
+ * @param data 待推送的数据指针。
+ * @param len 数据长度。
+ * @return ESP_OK 成功，其他失败。
+ */
     esp_err_t notifyResponse(const uint8_t *data, size_t len);
+    /**
+  * @brief 检查 BLE 客户端连接状态。
+ * @return 已连接返回 true，未连接返回 false。
+ */
     bool isConnected();
+    /**
+  * @brief 触发中继模块向 GD32 转发固件。
+ */
     void signalRelay();
 
     // 以下状态为 public，供 C 回调函数访问

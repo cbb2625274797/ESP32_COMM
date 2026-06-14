@@ -34,6 +34,10 @@
 
 
 // ============================================================
+/**
+  * @brief 获取 WifiOta 单例实例（静态局部变量实现）。
+ * @return WifiOta 单例引用。
+ */
 WifiOta& WifiOta::instance()
 {
     static WifiOta inst;
@@ -42,6 +46,12 @@ WifiOta& WifiOta::instance()
 
 static constexpr uint32_t GD32_OTA_FLASH_SECTOR_SIZE = 4096U;
 
+/**
+  * @brief 按指定对齐值向上取整。
+ * @param value 待对齐的值。
+ * @param alignment 对齐字节数。
+ * @return 对齐后的值。
+ */
 static uint32_t align_up_u32(uint32_t value, uint32_t alignment)
 {
     return ((value + alignment - 1U) / alignment) * alignment;

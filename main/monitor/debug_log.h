@@ -48,6 +48,10 @@ typedef enum {
  */
 class DebugLog {
 public:
+    /**
+      * @brief 获取 DebugLog 单例实例。
+     * @return DebugLog 引用。
+     */
     static DebugLog& instance();
 
     /** @brief 初始化日志系统，包括 UART 输出、UDP 目标和内部缓冲区。 */

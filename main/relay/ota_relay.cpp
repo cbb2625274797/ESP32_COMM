@@ -36,11 +36,18 @@ QueueHandle_t OtaRelay::dispatchQueue = NULL;
 QueueHandle_t OtaRelay::resultQueue = NULL;
 SemaphoreHandle_t OtaRelay::s_stateMutex = NULL;
 
+/**
+  * @brief 获取OtaRelay单例引用.
+ * @return OtaRelay单例引用.
+ */
 OtaRelay& OtaRelay::instance()
 {
     static OtaRelay inst;
     return inst;
 }
+/**
+  * @brief 初始化状态互斥锁.
+ */
 void OtaRelay::initMutex()
 {
     if (!s_stateMutex) {
@@ -48,30 +55,50 @@ void OtaRelay::initMutex()
     }
 }
 
+/**
+  * @brief 获取当前中继状态.
+ * @return 当前中继状态.
+ */
 relay_state_t OtaRelay::getState()
 {
     StateLockGuard lock;
     return relayState;
 }
 
+/**
+  * @brief 获取中继当前序号.
+ * @return 当前序号值.
+ */
 uint32_t OtaRelay::getRelaySeq()
 {
     StateLockGuard lock;
     return relaySeq;
 }
 
+/**
+  * @brief 获取中继总包数.
+ * @return 总包数.
+ */
 uint32_t OtaRelay::getRelayTotalPackets()
 {
     StateLockGuard lock;
     return relayTotalPackets;
 }
 
+/**
+  * @brief 获取GD32 APP存活标志位.
+ * @return true 存活，false 未存活.
+ */
 bool OtaRelay::getGd32AppAlive()
 {
     StateLockGuard lock;
     return gd32AppAlive;
 }
 
+/**
+  * @brief 获取GD32固件版本.
+ * @param out 输出参数，版本结构体指针.
+ */
 void OtaRelay::getGd32Version(gd32_version_t *out)
 {
     if (!out) return;
@@ -79,30 +106,50 @@ void OtaRelay::getGd32Version(gd32_version_t *out)
     *out = gd32Version;
 }
 
+/**
+  * @brief 设置中继状态.
+ * @param s 目标状态值.
+ */
 void OtaRelay::setState(relay_state_t s)
 {
     StateLockGuard lock;
     relayState = s;
 }
 
+/**
+  * @brief 设置中继当前序号.
+ * @param seq 序号值.
+ */
 void OtaRelay::setRelaySeq(uint32_t seq)
 {
     StateLockGuard lock;
     relaySeq = seq;
 }
 
+/**
+  * @brief 设置中继总包数.
+ * @param total 总包数.
+ */
 void OtaRelay::setRelayTotalPackets(uint32_t total)
 {
     StateLockGuard lock;
     relayTotalPackets = total;
 }
 
+/**
+  * @brief 设置GD32 APP存活标志位.
+ * @param alive 存活状态.
+ */
 void OtaRelay::setGd32AppAlive(bool alive)
 {
     StateLockGuard lock;
     gd32AppAlive = alive;
 }
 
+/**
+  * @brief 设置GD32固件版本.
+ * @param ver 版本结构体引用.
+ */
 void OtaRelay::setGd32Version(const gd32_version_t &ver)
 {
     StateLockGuard lock;
@@ -115,6 +162,13 @@ void OtaRelay::setGd32Version(const gd32_version_t &ver)
 // 内部工具函数
 // ============================================================
 
+/**
+  * @brief 检查缓冲区是否全部为指定值.
+ * @param buf 缓冲区指针.
+ * @param len 缓冲区长度.
+ * @param value 待检查的值.
+ * @return true 全部为指定值，false 不是.
+ */
 static bool bytesAllValue(const uint8_t *buf, size_t len, uint8_t value)
 {
     if (!buf || len == 0) return false;
@@ -124,6 +178,13 @@ static bool bytesAllValue(const uint8_t *buf, size_t len, uint8_t value)
     return true;
 }
 
+/**
+  * @brief 使用AES-128-ECB加密单个16字节块.
+ * @param key 16字节密钥.
+ * @param in 16字节输入数据.
+ * @param out 16字节输出数据.
+ * @return 0 成功，-1 失败.
+ */
 int OtaRelay::aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
     esp_aes_context ctx;
@@ -134,6 +195,13 @@ int OtaRelay::aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, 
     return ret;
 }
 
+/**
+  * @brief 记录响应载荷日志.
+ * @param stage 阶段名称字符串.
+ * @param resp_type 响应类型.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ */
 void OtaRelay::logRespPayload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len)
 {
     char hex[193] = {0};
@@ -145,6 +213,17 @@ void OtaRelay::logRespPayload(const char *stage, uint8_t resp_type, const uint8_
               n > 0 ? hex : "<empty>", len > n ? "..." : "");
 }
 
+/**
+  * @brief 循环等待直到响应不再是WAIT状态.
+ * @param stage 阶段名称字符串.
+ * @param resp_type 响应类型输出.
+ * @param resp_payload 响应载荷缓冲区.
+ * @param resp_max 缓冲区最大长度.
+ * @param resp_len 实际响应长度输出.
+ * @param timeout_ms 单次轮询超时毫秒.
+ * @param max_wait_rounds 最大WAIT轮次.
+ * @return ESP_OK 成功，其他失败.
+ */
 esp_err_t OtaRelay::waitUntilNotWait(const char *stage, uint8_t *resp_type,
                                      uint8_t *resp_payload, size_t resp_max,
                                      size_t *resp_len, uint32_t timeout_ms, uint32_t max_wait_rounds)
@@ -162,6 +241,13 @@ esp_err_t OtaRelay::waitUntilNotWait(const char *stage, uint8_t *resp_type,
     return ESP_OK;
 }
 
+/**
+  * @brief 判断是否为带序号的结构化ACK.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ * @param expected_seq 期望的序号.
+ * @return true 匹配成功，false 不匹配.
+ */
 bool OtaRelay::isStructuredAckWithSeq(const uint8_t *payload, size_t len, uint32_t expected_seq)
 {
     if (!payload || len < 6) return false;
@@ -171,6 +257,14 @@ bool OtaRelay::isStructuredAckWithSeq(const uint8_t *payload, size_t len, uint32
     return seq == expected_seq;
 }
 
+/**
+  * @brief 解析结构化错误帧.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ * @param seq_out 输出错误序号.
+ * @param err_out 输出错误码.
+ * @return true 解析成功，false 解析失败.
+ */
 bool OtaRelay::parseStructuredError(const uint8_t *payload, size_t len, uint32_t *seq_out, uint8_t *err_out)
 {
     if (!payload || len < 7) return false;
@@ -181,18 +275,48 @@ bool OtaRelay::parseStructuredError(const uint8_t *payload, size_t len, uint32_t
     return true;
 }
 
+/**
+  * @brief 判断是否为握手回显ACK.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ * @return true 是握手回显ACK，false 不是.
+ */
 bool OtaRelay::isHandshakeEchoAck(const uint8_t *payload, size_t len)
 { return payload && len >= 2U && payload[0] == 0x00U && payload[1] == 0xACU; }
 
+/**
+  * @brief 判断是否为挑战应答ACK.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ * @return true 是挑战应答ACK，false 不是.
+ */
 bool OtaRelay::isChallengePayloadAck(const uint8_t *payload, size_t len)
 { return payload && len == GD32_CHALLENGE_RESPONSE_LEN; }
 
+/**
+  * @brief 判断是否为普通确认ACK.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ * @return true 是确认ACK，false 不是.
+ */
 bool OtaRelay::isConfirmPlainAck(const uint8_t *payload, size_t len)
 { return payload && len == 2U && payload[0] == 0xBAU && payload[1] == 0xC0U; }
 
+/**
+  * @brief 判断是否为大小序号0的ACK.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ * @return true 是大小序号0ACK，false 不是.
+ */
 bool OtaRelay::isSizeSeq0Ack(const uint8_t *payload, size_t len)
 { return isStructuredAckWithSeq(payload, len, 0U); }
 
+/**
+  * @brief 判断是否为普通的结束ACK.
+ * @param payload 载荷指针.
+ * @param len 载荷长度.
+ * @return true 是结束ACK，false 不是.
+ */
 bool OtaRelay::isFinishPlainAck(const uint8_t *payload, size_t len)
 {
     if (!payload) return false;
@@ -201,6 +325,19 @@ bool OtaRelay::isFinishPlainAck(const uint8_t *payload, size_t len)
     return false;
 }
 
+/**
+  * @brief 轮询直到收到预期的ACK形状.
+ * @param stage 阶段名称字符串.
+ * @param resp_type 响应类型输出.
+ * @param resp_payload 响应载荷缓冲区.
+ * @param resp_max 缓冲区最大长度.
+ * @param resp_len 实际响应长度输出.
+ * @param poll_timeout_ms 轮询超时毫秒.
+ * @param wait_rounds WAIT状态最大轮询次数.
+ * @param maxExtraPolls 额外轮询次数.
+ * @param matcher 匹配回调函数.
+ * @return ESP_OK 成功，其他失败.
+ */
 esp_err_t OtaRelay::pollUntilExpectedAckShape(const char *stage,
                                                uint8_t *resp_type, uint8_t *resp_payload,
                                                size_t resp_max, size_t *resp_len,
@@ -233,6 +370,14 @@ esp_err_t OtaRelay::pollUntilExpectedAckShape(const char *stage,
     return ESP_OK;
 }
 
+/**
+  * @brief 解析并验证挑战应答载荷.
+ * @param resp_payload 响应载荷指针.
+ * @param resp_len 响应长度.
+ * @param out_k_session 输出会话密钥.
+ * @param out_uid 输出GD32 UID.
+ * @return true 验证通过，false 验证失败.
+ */
 bool OtaRelay::parseAndVerifyChallengePayload(const uint8_t *resp_payload, size_t resp_len,
                                                uint8_t *out_k_session, uint8_t *out_uid)
 {
@@ -265,6 +410,13 @@ bool OtaRelay::parseAndVerifyChallengePayload(const uint8_t *resp_payload, size_
     return true;
 }
 
+/**
+  * @brief 使用AES-128-ECB加密48字节数据.
+ * @param key 16字节密钥.
+ * @param in 48字节输入数据.
+ * @param out 48字节输出数据.
+ * @return true 加密成功，false 加密失败.
+ */
 bool OtaRelay::aes128EcbEncrypt48Bytes(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
     for (int i = 0; i < 3; ++i)
@@ -272,6 +424,12 @@ bool OtaRelay::aes128EcbEncrypt48Bytes(const uint8_t *key, const uint8_t *in, ui
     return true;
 }
 
+/**
+  * @brief 使用密钥计算48字节数据的CRC32.
+ * @param key 16字节密钥.
+ * @param data48 48字节输入数据.
+ * @param output 输出4字节CRC32结果.
+ */
 void OtaRelay::calculateCrc32WithKey(const uint8_t *key, const uint8_t *data48, uint8_t *output)
 {
     uint32_t crc = 0xFFFFFFFFU;
@@ -613,6 +771,10 @@ esp_err_t OtaRelay::requestGd32AppEnterBootloader()
 }
 
 
+/**
+  * @brief 阶段1 - 发送握手请求并等待确认.
+ * @return 操作结果码.
+ */
 ota_result_t OtaRelay::sendHandshakeReq()
 {
     DEBUG_INFO("OTA", "=== 阶段1: 握手开始 ===");

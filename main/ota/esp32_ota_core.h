@@ -22,15 +22,30 @@
 
 class Esp32OtaCore {
 public:
+    /**
+      * @brief 获取 Esp32OtaCore 单例实例。
+     * @return Esp32OtaCore 引用。
+     */
     static Esp32OtaCore& instance();
 
     // ── 阶段 1：开启 OTA 会话 ──
     //   total_size: 固件总大小（字节），用于分区大小校验和传给 esp_ota_begin
     //   返回 ESP_OK / ESP_ERR_INVALID_STATE（被其它通道占用）/ ESP_FAIL
+    /**
+      * @brief 开启 OTA 会话。
+     * @param total_size 固件总大小（字节）。
+     * @return ESP_OK 成功，ESP_ERR_INVALID_STATE 被占用，ESP_FAIL 其他错误。
+     */
     esp_err_t begin(size_t total_size);
 
     // ── 阶段 2：写入固件数据（可在 begin 后多次调用）──
     //   纯 esp_ota_write，不做增量 SHA（SHA 在 finalize 时统一从分区读回计算）
+    /**
+      * @brief 写入固件数据块。
+     * @param data 数据缓冲区。
+     * @param len 数据长度。
+     * @return ESP_OK 成功，否则错误码。
+     */
     esp_err_t write(const uint8_t *data, size_t len);
 
     // ── 阶段 3：收尾（end → 校验 SHA → set_boot → 可选重启）──
@@ -41,6 +56,13 @@ public:
     //     ESP_OK                   成功（若 reboot=true，本调用不会返回）
     //     ESP_ERR_INVALID_VERSION  SHA 不匹配（已 abort 并清理）
     //     其他                     end/set_boot 失败（已清理）
+    /**
+      * @brief 收尾 OTA 会话：end、校验 SHA、set_boot、可选重启。
+     * @param frontend_sha_hex 前端提供的 64 字符 hex SHA-256。
+     * @param reboot 成功后是否重启。
+     * @param out_device_sha_hex 输出设备端 SHA hex 缓冲区。
+     * @return ESP_OK 成功，ESP_ERR_INVALID_VERSION SHA 不匹配。
+     */
     esp_err_t finalize(const char *frontend_sha_hex, bool reboot,
                        char *out_device_sha_hex);
 
@@ -48,25 +70,44 @@ public:
     //   供前端只读校验场景（如 WiFi verify_only 模式）
     //   out_device_sha_hex: 输出缓冲区，至少 65 字节
     //   返回 ESP_OK / 失败
+    /**
+      * @brief 仅计算设备端 SHA（不 end、不 set_boot、不重启）。
+     * @param out_device_sha_hex 输出缓冲区，至少 65 字节。
+     * @return ESP_OK 成功，否则错误码。
+     */
     esp_err_t computeDeviceSha(char *out_device_sha_hex);
 
     // ── 中止并清理（abort + 释放 mutex + 状态复位）──
     //   若 esp_ota_end 已成功（m_ended=true），则跳过 esp_ota_abort 仅复位状态
+    /**
+      * @brief 中止并清理 OTA 会话。
+     */
     void abort();
 
     // ── 状态查询 ──
+    /** @brief 查询 OTA 是否激活。 */
     bool   isActive() const  { return m_active; }
+    /** @brief 获取已接收的字节数。 */
     size_t getReceived() const { return m_received; }
+    /** @brief 查询是否等待重启。 */
     bool   isRebootPending() const { return m_rebootPending; }
+    /** @brief 设置重启待处理标志。 */
     void   setRebootPending(bool v) { m_rebootPending = v; }
 
 private:
     Esp32OtaCore() = default;
 
     // 从 OTA 分区读回计算 SHA-256（WiFi 风格），结果写入 m_sha256，置 m_shaComputed=true
+    /**
+      * @brief 从 OTA 分区读回计算 SHA-256。
+     * @return ESP_OK 成功，否则错误码。
+     */
     esp_err_t computeShaFromPartition();
 
     // 状态全复位（不调 esp_ota_abort，由调用方根据 m_ended 决定）
+    /**
+      * @brief 复位所有状态（不调 esp_ota_abort）。
+     */
     void resetState();
 
     bool                 m_active = false;

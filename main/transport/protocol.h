@@ -37,13 +37,37 @@ typedef struct {
  */
 class Protocol {
 public:
+    /**
+      * @brief 获取 Protocol 单例实例。
+     * @return Protocol 单例引用。
+     */
     static Protocol& instance();
 
+    /**
+      * @brief 初始化协议层。
+     */
     void init();
 
+    /**
+      * @brief 生成基于时间戳、地址和随机种子的扰码 nonce。
+     * @param timestamp 时间戳。
+     * @param mem_addr 内存地址。
+     * @param rand_seed 随机种子。
+     * @param nonce_out 输出的 16 字节 nonce 缓冲区。
+     */
     static void scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
                                  uint32_t rand_seed, uint8_t *nonce_out);
+    /**
+      * @brief 会话密钥初始化，将密钥拷贝到会话上下文。
+     * @param sess 会话上下文指针。
+     * @param k_session 会话密钥数据。
+     * @return 成功返回 0，参数无效返回 -1。
+     */
     static int sessionKeyInit(session_ctx_t *sess, const uint8_t *k_session);
+    /**
+      * @brief 清除会话上下文的密钥和 IV 数据。
+     * @param sess 会话上下文指针。
+     */
     static void sessionKeyClear(session_ctx_t *sess);
 
 private:

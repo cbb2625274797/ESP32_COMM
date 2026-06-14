@@ -14,6 +14,7 @@ extern volatile bool g_esp32OtaOccupied;
 
 // 获取全局 OTA 占用标志（带超时），成功返回 true
 // 内部: Take Mutex → 检查标志 → 若空闲则置 true → Give Mutex
+/** @brief 获取全局 OTA 占用标志（带超时），成功返回 true。 */
 static inline bool esp32_ota_mutex_acquire(uint32_t timeout_ms) {
     if (!g_esp32OtaMutex) return false;
     if (xSemaphoreTake(g_esp32OtaMutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
@@ -28,6 +29,7 @@ static inline bool esp32_ota_mutex_acquire(uint32_t timeout_ms) {
 
 // 释放全局 OTA 占用标志
 // 内部: Take Mutex → 清除标志 → Give Mutex
+/** @brief 释放全局 OTA 占用标志。 */
 static inline void esp32_ota_mutex_release(void) {
     if (!g_esp32OtaMutex) return;
     xSemaphoreTake(g_esp32OtaMutex, portMAX_DELAY);
