@@ -8,7 +8,7 @@
 #define FW_VERSION_STRING "0.3.12"
 
 // 编译时间
-#define BUILD_TIME "2026-06-14 22:46:58"
+#define BUILD_TIME "2026-06-14 23:55:14"
 
 // Git 信息
-#define GIT_HASH "2caf10b"
+#define GIT_HASH "unknown"

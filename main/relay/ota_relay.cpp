@@ -201,9 +201,6 @@ bool OtaRelay::isFinishPlainAck(const uint8_t *payload, size_t len)
     return false;
 }
 
-bool OtaRelay::isStructuredAckWithPayload(const uint8_t *payload, size_t len)
-{ return payload && len >= 6U && payload[0] == 0xBAU && payload[1] == 0xC0U; }
-
 esp_err_t OtaRelay::pollUntilExpectedAckShape(const char *stage,
                                                uint8_t *resp_type, uint8_t *resp_payload,
                                                size_t resp_max, size_t *resp_len,
@@ -306,7 +303,6 @@ esp_err_t OtaRelay::metaLoad(ota_meta_t *meta)
     if (nvs_get_u32(handle, "total_size", &val) == ESP_OK) meta->total_size = val;
     if (nvs_get_u32(handle, "stored_size", &val) == ESP_OK) meta->stored_size = val;
     if (nvs_get_u32(handle, "last_seq", &val) == ESP_OK) meta->last_seq = val;
-    if (nvs_get_u32(handle, "chunk_count", &val) == ESP_OK) meta->chunk_count = val;
 
     size_t sha_len = sizeof(meta->checksum);
     if (nvs_get_blob(handle, "checksum", meta->checksum, &sha_len) == ESP_OK && sha_len == sizeof(meta->checksum)) {
@@ -338,7 +334,6 @@ esp_err_t OtaRelay::metaSave(const ota_meta_t *meta)
     nvs_set_u32(handle, "total_size", meta->total_size);
     nvs_set_u32(handle, "stored_size", meta->stored_size);
     nvs_set_u32(handle, "last_seq", meta->last_seq);
-    nvs_set_u32(handle, "chunk_count", meta->chunk_count);
     nvs_set_blob(handle, "checksum", meta->checksum, sizeof(meta->checksum));
     err = nvs_commit(handle);
     nvs_close(handle);
@@ -617,27 +612,6 @@ esp_err_t OtaRelay::requestGd32AppEnterBootloader()
     return err;
 }
 
-
-ota_result_t OtaRelay::probeBootHandshake()
-{
-    /* 0xB0 timeout: probe if GD32 is already in BOOT.
-     * Send one lightweight HANDSHAKE_REQ, accept only echo ACK 0x00 0xAC
-     * as "already in BOOT" signal; otherwise fail immediately. */
-    DEBUG_INFO("OTA", "0xB0 timeout, probing if GD32 already in BOOT...");
-    uint8_t payload[] = {0x00, 0xAC};
-    uint8_t resp_type = 0U;
-    uint8_t resp_payload[64] = {0};
-    size_t resp_len = 0U;
-
-    esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_REQ, payload, sizeof(payload),
-                                     &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 500);
-    if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK && isHandshakeEchoAck(resp_payload, resp_len)) {
-        DEBUG_INFO("OTA", "BOOT probe success: GD32 already in BOOT, continue OTA");
-        return OTA_RESULT_OK;
-    }
-    DEBUG_ERR("OTA", "BOOT probe failed: GD32 not in BOOT, abort (err=%d resp_type=0x%02X)", err, resp_type);
-    return OTA_RESULT_ERR_TIMEOUT;
-}
 
 ota_result_t OtaRelay::sendHandshakeReq()
 {
@@ -1158,51 +1132,6 @@ ota_result_t OtaRelay::finishOta()
 }
 
 /**
- * @brief 启动完整 OTA 流程的主入口
- * @return 操作结果码。
- */
-ota_result_t OtaRelay::startHandshake()
-{
-    ota_result_t res;
-
-    esp_err_t boot_err = requestGd32AppEnterBootloader();
-    if (boot_err != ESP_OK) {
-        res = probeBootHandshake();
-        if (res != OTA_RESULT_OK) {
-            reset();
-            return res;
-        }
-    }
-
-    res = sendHandshakeReq();
-    if (res != OTA_RESULT_OK) { reset(); return res; }
-
-    res = sendNonceAndAuthenticate();
-    if (res != OTA_RESULT_OK) { reset(); return res; }
-
-    ota_meta_t meta;
-    OtaRelay::metaLoad(&meta);
-
-    // 固件完整性校验
-    esp_err_t verify_err = metaVerifyChecksum();
-    if (verify_err != ESP_OK) {
-        DEBUG_ERR("OTA", "固件完整性校验失败，中止转发");
-        reset();
-        return OTA_RESULT_ERR_CRC;
-    }
-
-    res = sendFirmwareSize(meta.total_size);
-    if (res != OTA_RESULT_OK) { reset(); return res; }
-
-    res = relayPacketsFromFlash(0);
-    if (res != OTA_RESULT_OK) { reset(); return res; }
-
-    res = finishOta();
-
-    return res;
-}
-
-/**
  * @brief 从 Flash 向 GD32 转发固件
  * @return 操作结果码。
  */
@@ -1213,8 +1142,8 @@ ota_result_t OtaRelay::forwardFirmware()
         return OTA_RESULT_ERR_STORAGE;
     }
 
-    DEBUG_INFO("OTA", "开始固件转发: %u 字节, %u 块",
-               meta.total_size, meta.chunk_count);
+    DEBUG_INFO("OTA", "开始固件转发: %u 字节",
+               meta.total_size);
 
     // 固件完整性校验
     {

@@ -133,14 +133,18 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
     // 通知前端：开始 finalize
     sendFinishEvent(BLE_OTA_FINISH_BEGIN_OTA_END, 0);
 
+    // 关键：reboot=false，让 finalize 真正返回、拿到 device_sha_hex，
+    // 再依次推送 SHA 通知 + FINISH_DONE_OTA_END + FINISH_REBOOT_NOW，
+    // 最后延迟重启。若 reboot=true，core 内部直接 esp_restart()，
+    // 下面所有 notifyResponse / sendFinishEvent 都不会执行，
+    // 前端也就拿不到设备端 SHA 与"收尾完成/即将重启"事件。
     char device_sha_hex[65] = {0};
     esp_err_t err = core.finalize(frontend_sha_hex,
-                                  /*reboot=*/true,
+                                  /*reboot=*/false,
                                   device_sha_hex);
-    // reboot=true 时 finalize 正常不会返回（core 内部 esp_restart）
 
     if (err == ESP_OK) {
-        // 极端情况：reboot 未执行（理论上不会发生），仍上报并标记
+        // 1) 把设备端 SHA 通过 SHA256 通知推给前端
         if (device_sha_hex[0] != '\0') {
             uint8_t sha_pkt[33] = {0};
             sha_pkt[0] = BLE_OTA_NOTIFY_SHA256;
@@ -151,8 +155,18 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
             }
             BleOta::instance().notifyResponse(sha_pkt, sizeof(sha_pkt));
         }
+        // 2) 等待 SHA 通知从 NimBLE host 队列送出
+        vTaskDelay(pdMS_TO_TICKS(150));
+
+        // 3) 推送"OTA 收尾完成"与"即将重启"事件
         sendFinishEvent(BLE_OTA_FINISH_DONE_OTA_END, 0);
         sendFinishEvent(BLE_OTA_FINISH_REBOOT_NOW, 0);
+
+        // 4) 通知全部发出后延迟 500ms 重启
+        DEBUG_INFO(TAG, "[FINISH] 通知已发送，500ms 后重启...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+        // 不会返回
     } else if (err == ESP_ERR_INVALID_VERSION) {
         DEBUG_ERR(TAG, "[FINISH] SHA-256 不匹配，OTA 已中止");
         sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH, 0);
@@ -536,7 +550,6 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                 meta.total_size  = total_size;
                 meta.stored_size = 0;
                 meta.last_seq    = 0;
-                meta.chunk_count = (total_size + expected_payload - 1U) / expected_payload;
 
                 esp_err_t err = OtaRelay::metaSave(&meta);
                 if (err != ESP_OK) {
@@ -544,8 +557,8 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                     return BLE_ATT_ERR_UNLIKELY;
                 }
 
-                DEBUG_INFO(TAG, "GD32 固件存储开始: total=%" PRIu32 " chunk_count=%" PRIu32 ", payload=%zu",
-                           meta.total_size, meta.chunk_count, data_len);
+                DEBUG_INFO(TAG, "GD32 固件存储开始: total=%" PRIu32 ", payload=%zu",
+                           meta.total_size, data_len);
             }
 
             ota_meta_t meta = {};

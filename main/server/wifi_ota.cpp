@@ -21,10 +21,6 @@
 #include "esp_event.h"
 #include "esp_mac.h"
 
-// SHA-256 哈希计算
-#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
-#include "mbedtls/private/sha256.h"
-
 #include "app_config.h"
 #include "ota_mutex.h"
 #include "wifi_ota.h"
@@ -501,19 +497,31 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    // ── 完整模式：finalize（end → 校验 → set_boot）后由 core 内部重启 ──
+    // ── 完整模式：finalize 不重启，先把含设备端 SHA 的结果返回给前端 ──
+    //   关键：reboot=false，让 core.finalize 真正返回，才能拿到 device_sha_hex
+    //   并把响应发回前端；待响应发完后再延迟重启。
+    //   若 reboot=true，core 内部直接 esp_restart()，HTTP 响应永远发不出去，
+    //   前端会得到 "Failed to fetch" 而错过核对结果。
     DEBUG_INFO("OTA", "ESP32 OTA finalize, %u bytes...", (unsigned)core.getReceived());
     esp_err_t err = core.finalize(has_frontend_sha ? frontend_sha_hex : nullptr,
-                                  /*reboot=*/true,
+                                  /*reboot=*/false,
                                   device_sha_hex);
 
     if (err == ESP_OK) {
-        // 正常不会走到这里（reboot=true 时 core 会 esp_restart）
-        char resp[256] = {0};
+        // 1) 把包含设备端 SHA 的响应发回前端
+        char resp[320] = {0};
         snprintf(resp, sizeof(resp),
-                 "{\"status\": \"ok\", \"message\": \"OTA finished\"}");
+                 "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\", "
+                 "\"sha256\": \"%s\"}",
+                 device_sha_hex);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, strlen(resp));
+
+        // 2) 响应发完后延迟 500ms 重启，给 TCP 缓冲区时间 flush 到客户端
+        DEBUG_INFO("OTA", "响应已发送，500ms 后重启...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+        // 不会返回
         return ESP_OK;
     }
 
@@ -552,27 +560,7 @@ static esp_err_t restart_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/**
- * @brief HTTP GET /ota/update - 查询 ESP32 OTA 状态
- * @param req
- * @return
- */
-static esp_err_t esp32_ota_status_handler(httpd_req_t *req)
-{
-    http_set_cors_headers(req);
-    char resp[128];
-    if (Esp32OtaCore::instance().isActive()) {
-        snprintf(resp, sizeof(resp),
-            "{\"active\": true, \"received\": %u}",
-            (unsigned int)Esp32OtaCore::instance().getReceived());
-    } else {
-        snprintf(resp, sizeof(resp), "{\"active\": false}");
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, strlen(resp));
-    return ESP_OK;
-}
-
+// ----------------------------------------
 // 从 HTTP 流中读取完整的 JSON 头（以 } 结尾）
 /**
  * @brief 返回 JSON 字符串长度，失败返回 0
@@ -795,7 +783,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         .total_size = expected_fw_size_raw,
         .stored_size = 0,
         .last_seq = 0,
-        .chunk_count = (expected_fw_size_raw + OTA_BLOCK_SIZE - 1U) / OTA_BLOCK_SIZE,
         .checksum = {0}
     };
     OtaRelay::metaSave(&meta_raw);
@@ -931,72 +918,6 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     const char resp[] = "{\"status\": \"ok\", \"message\": \"OTA relay triggered\"}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
-
-    return ESP_OK;
-}
-
-/**
- * @brief HTTP GET /ota/status 处理器
- * @param req
- * @return
- */
-static esp_err_t ota_status_handler(httpd_req_t *req)
-{
-    http_set_cors_headers(req);
-    DEBUG_INFO("WIFI", "=== HTTP: GET /ota/status ===");
-    
-    ota_meta_t meta;
-    OtaRelay::metaLoad(&meta);
-
-    char resp[256];
-    int len = snprintf(resp, sizeof(resp),
-        "{\"total_size\": %lu, \"stored_size\": %lu, \"last_seq\": %lu, "
-        "\"storage_done\": %s, \"relay_state\": %d, \"gd32_app_alive\": %s}",
-        (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
-        (unsigned long)meta.last_seq,
-        WifiOta::instance().getGd32StorageDone() ? "true" : "false",
-        OtaRelay::getState(),
-        OtaRelay::getGd32AppAlive() ? "true" : "false");
-
-    gd32_version_t snapVer = {};
-    OtaRelay::getGd32Version(&snapVer);
-    DEBUG_INFO("WIFI", "OTA 状态: total=%lu, stored=%lu, done=%s, app_alive=%s",
-               (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
-               WifiOta::instance().getGd32StorageDone() ? "true" : "false",
-               OtaRelay::getGd32AppAlive() ? "true" : "false",
-        snapVer.app_major, snapVer.app_minor,
-        snapVer.app_patch, snapVer.app_build,
-        snapVer.boot_major, snapVer.boot_minor,
-        snapVer.boot_patch, snapVer.boot_build);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, len);
-
-    return ESP_OK;
-}
-
-/**
- * @brief HTTP GET /health 处理器
- * @param req
- * @return
- */
-static esp_err_t health_handler(httpd_req_t *req)
-{
-    http_set_cors_headers(req);
-    DEBUG_INFO("WIFI", "=== HTTP: GET /health ===");
-    
-    health_state_t state = HealthMonitor::instance().getCurrent();
-    uint32_t free_heap = esp_get_free_heap_size();
-
-    char resp[128];
-    int len = snprintf(resp, sizeof(resp),
-        "{\"health\": %d, \"free_heap\": %lu}",
-        state, (unsigned long)free_heap);
-
-    DEBUG_INFO("WIFI", "健康状态: %d, 空闲堆: %lu", state, (unsigned long)free_heap);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, len);
 
     return ESP_OK;
 }
@@ -1199,79 +1120,6 @@ static esp_err_t spi_send_handler(httpd_req_t *req)
 }
 
 /**
- * @brief HTTP GET /can/status 处理器
- * @param req
- * @return
- */
-static esp_err_t can_status_handler(httpd_req_t *req)
-{
-    http_set_cors_headers(req);
-    char resp[128];
-    snprintf(resp, sizeof(resp),
-        "{\"channels\": 3, \"max_dlc\": %d, \"spi_init\": %s}",
-        CAN_MAX_DLC,
-        SpiMaster::instance().deviceHandle() != NULL ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, strlen(resp));
-    return ESP_OK;
-}
-
-/**
- * @brief HTTP GET /wifi/status 处理器
- * @param req
- * @return
- */
-static esp_err_t wifi_status_handler(httpd_req_t *req)
-{
-    http_set_cors_headers(req);
-    char resp[256];
-    char ip_str[16] = "0.0.0.0";
-    int8_t rssi = -127;
-
-    if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().getStaConnected()) {
-        esp_netif_ip_info_t ip_info;
-        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
-            snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
-        }
-        wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-            rssi = ap_info.rssi;
-        }
-    }
-
-    int len = snprintf(resp, sizeof(resp),
-        "{\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}",
-        WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_AP ? "AP" : "STA",
-        ip_str, rssi,
-        (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA) ? (WifiOta::instance().getStaConnected() ? "true" : "false") : "N/A");
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, len);
-
-    return ESP_OK;
-}
-
-/**
- * @brief HTTP GET /api/version 处理器 - 返回固件版本、编译时间、Git hash
- */
-static esp_err_t version_handler(httpd_req_t *req)
-{
-    http_set_cors_headers(req);
-    gd32_version_t gv = {}; OtaRelay::getGd32Version(&gv);
-    char resp[512];
-    int len = snprintf(resp, sizeof(resp),
-        "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", "
-        "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\", \"gd32_alive\": %s}",
-        FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH,
-        gv.app_major, gv.app_minor, gv.app_patch, gv.app_build,
-        gv.boot_major, gv.boot_minor, gv.boot_patch, gv.boot_build,
-        OtaRelay::getGd32AppAlive() ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, len);
-    return ESP_OK;
-}
-/**
  * @brief HTTP GET /system/status 处理器
  * @param req
  * @return
@@ -1419,21 +1267,6 @@ esp_err_t WifiOta::httpServerStart()
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &relay_options_uri);
 
-    httpd_uri_t status_uri = {
-        .uri = "/ota/status",
-        .method = HTTP_GET,
-        .handler = ota_status_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_uri);
-    httpd_uri_t status_options_uri = {
-        .uri = "/ota/status",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_options_uri);
-
     httpd_uri_t esp32_update_uri = {
         .uri = "/ota/update",
         .method = HTTP_POST,
@@ -1464,36 +1297,6 @@ esp_err_t WifiOta::httpServerStart()
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &restart_options_uri);
 
-    httpd_uri_t esp32_status_uri = {
-        .uri = "/ota/esp32_status",
-        .method = HTTP_GET,
-        .handler = esp32_ota_status_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_status_uri);
-    httpd_uri_t esp32_status_options_uri = {
-        .uri = "/ota/esp32_status",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_status_options_uri);
-
-    httpd_uri_t health_uri = {
-        .uri = "/health",
-        .method = HTTP_GET,
-        .handler = health_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &health_uri);
-    httpd_uri_t health_options_uri = {
-        .uri = "/health",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &health_options_uri);
-
     httpd_uri_t logs_uri = {
         .uri = "/logs",
         .method = HTTP_GET,
@@ -1508,21 +1311,6 @@ esp_err_t WifiOta::httpServerStart()
         .user_ctx = NULL
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &logs_options_uri);
-
-    httpd_uri_t wifi_status_uri = {
-        .uri = "/wifi/status",
-        .method = HTTP_GET,
-        .handler = wifi_status_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &wifi_status_uri);
-    httpd_uri_t wifi_status_options_uri = {
-        .uri = "/wifi/status",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &wifi_status_options_uri);
 
     httpd_uri_t system_status_uri = {
         .uri = "/system/status",
@@ -1555,22 +1343,6 @@ esp_err_t WifiOta::httpServerStart()
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_send_options_uri);
 
-    httpd_uri_t can_status_uri = {
-        .uri = "/can/status",
-        .method = HTTP_GET,
-        .handler = can_status_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_status_uri);
-    httpd_uri_t can_status_options_uri = {
-        .uri = "/can/status",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_status_options_uri);
-
-    DEBUG_INFO("WIFI", "HTTP 服务器已启动");
     // SPI 直接发送
     httpd_uri_t spi_send_uri = {
         .uri = "/spi/send",
@@ -1586,23 +1358,8 @@ esp_err_t WifiOta::httpServerStart()
         .user_ctx = NULL
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &spi_send_options_uri);
-    // 版本信息端点
-    httpd_uri_t version_uri = {
-        .uri = "/api/version",
-        .method = HTTP_GET,
-        .handler = version_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &version_uri);
-    httpd_uri_t version_options_uri = {
-        .uri = "/api/version",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &version_options_uri);
 
-    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /ota/status, /ota/esp32_status, /health, /wifi/status, /system/status, /can/send, /can/status, /spi/send, /api/version");
+    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /restart, /logs, /system/status, /can/send, /spi/send");
 
     return ESP_OK;
 }

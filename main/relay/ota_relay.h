@@ -16,19 +16,16 @@
 #include "esp_partition.h"
 
 #define OTA_META_NVS_NAMESPACE "ota_meta"
-#define OTA_META_NVS_KEY "meta"
 
 typedef struct {
     uint32_t total_size;
     uint32_t stored_size;
     uint32_t last_seq;
-    uint32_t chunk_count;
     uint8_t  checksum[32];
 } ota_meta_t;
 
 typedef enum {
     RELAY_IDLE = 0,
-    RELAY_HANDSHAKE_IDLE,
     RELAY_HANDSHAKE_SENT,
     RELAY_CHALLENGE_SENT,
     RELAY_CHALLENGE_RESPOND,
@@ -36,13 +33,11 @@ typedef enum {
     RELAY_AUTH_COMPLETE,
     RELAY_SIZE_SENT,
     RELAY_SIZE_ACK,
-    RELAY_RECEIVING,
     RELAY_RELAY_ACTIVE,
     RELAY_PACKET_SENT,
     RELAY_PACKET_ACK_OK,
     RELAY_PACKET_ACK_RETRY,
     RELAY_RECEIVE_DONE,
-    RELAY_TRANSFER_DONE,
     RELAY_FINISH_SENT,
     RELAY_DONE,
     RELAY_APP_VERIFY,
@@ -65,7 +60,6 @@ public:
     static OtaRelay& instance();
 
     static void taskEntry(void *pvParameters);
-    ota_result_t startHandshake();
     ota_result_t forwardFirmware();
 
     /* ---- 线程安全的状态访问接口 ----
@@ -136,7 +130,6 @@ public:
     static constexpr size_t GD32_CHALLENGE_RESPONSE_LEN = 36;
 
     esp_err_t requestGd32AppEnterBootloader();
-    ota_result_t probeBootHandshake();
     ota_result_t sendHandshakeReq();
     ota_result_t sendNonceAndAuthenticate();
     ota_result_t sendFirmwareSize(uint32_t size);
@@ -157,8 +150,6 @@ public:
     static bool isConfirmPlainAck(const uint8_t *payload, size_t len);
     static bool isSizeSeq0Ack(const uint8_t *payload, size_t len);
     static bool isFinishPlainAck(const uint8_t *payload, size_t len);
-    static bool isTransferDoneAck(const uint8_t *payload, size_t len);
-    static bool isStructuredAckWithPayload(const uint8_t *payload, size_t len);
 
     static esp_err_t pollUntilExpectedAckShape(const char *stage,
                                                uint8_t *resp_type,

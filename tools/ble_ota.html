@@ -1114,22 +1114,19 @@
         log('OTA', `⚠️ file.size(${file.size}) ≠ arrayBuffer(${totalSize})，以 arrayBuffer 为准，请确认页面已 Ctrl+F5 刷新`, 'W');
       }
 
-      // 计算文件的 SHA-256 哈希值用于完整性验证
-      setBleStage(4, '计算SHA-256...', null);
-      setBleStageText('正在计算文件哈希...');
+      // SHA-256 已在文件选择时（updateFileInfo）计算并存入 state.fileSha256。
+      // 此处不再重复打日志（避免与 [FILE] SHA-256 重复），仅保证 fileSha256 变量有值。
       var fileSha256;
       if (state.fileSha256) {
-        // 复用已计算的 SHA-256
         fileSha256 = state.fileSha256.toLowerCase();
-        log('OTA', `复用已计算的 SHA-256: ${fileSha256.toUpperCase()}`);
       } else {
+        // 极端兜底：state.fileSha256 未初始化（理论上 updateFileInfo 总会先设置）
         log('OTA', '正在计算文件 SHA-256 哈希...');
         const hashBuffer = await crypto.subtle.digest('SHA-256', fileBytes.buffer);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         fileSha256 = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
         state.fileSha256 = fileSha256.toUpperCase();
       }
-      log('OTA', `文件 SHA-256: ${fileSha256.toUpperCase()}`);
       // Update SHA display in file info
       var shaElem = document.getElementById('fileSha256');
       if (shaElem) shaElem.textContent = fileSha256.toUpperCase();
@@ -1296,12 +1293,22 @@
   }
 
   async function autoFlash() {
-    // 每次刷写前尝试重新从本地读取文件
+    // 每次刷写前尝试重新从本地读取文件（支持热重载：用户重新编译后无需重新选择）
     if (state.selectedFileHandle) {
       try {
         const freshFile = await state.selectedFileHandle.getFile();
-        updateFileInfo(freshFile);
-        log('FILE', '已重新读取本地文件: ' + freshFile.name + ' (' + formatBytes(freshFile.size) + ')');
+        // 仅在文件变化时才刷新元数据并重算 SHA-256
+        // （name/size/lastModified 任一不同即视为变化）
+        // 避免对同一文件重复触发 updateFileInfo → 产生重复的 [FILE] SHA-256 日志
+        const cached = state.selectedFile;
+        const changed = !cached ||
+                        cached.name !== freshFile.name ||
+                        cached.size !== freshFile.size ||
+                        cached.lastModified !== freshFile.lastModified;
+        if (changed) {
+          updateFileInfo(freshFile);
+          log('FILE', '已重新读取本地文件（已变更）: ' + freshFile.name + ' (' + formatBytes(freshFile.size) + ')');
+        }
       } catch (e) {
         log('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
       }
