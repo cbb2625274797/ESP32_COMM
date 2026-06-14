@@ -28,6 +28,7 @@
 #include "app_config.h"
 #include "ota_mutex.h"
 #include "wifi_ota.h"
+#include "esp32_ota_core.h"
 #include "ota_relay.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
@@ -427,89 +428,25 @@ void WifiOta::setStaticIp()
 
 // ----------------------------------------
 // ESP32 OTA 内部函数
+// 注：begin/write/finalize/abort 已抽离到 Esp32OtaCore（main/ota/esp32_ota_core.{h,cpp}）
+//     WiFi 与 BLE 通道共用同一核心，本文件仅负责 HTTP 传输层。
 
-/**
- * @brief 清理 WiFi OTA 的 SHA-256 上下文和哈希状态
- */
-static void wifi_esp32_ota_cleanup_sha()
-{
-    WifiOta::instance().m_esp32HashComputed = false;
-    memset(WifiOta::instance().m_esp32Sha256, 0, sizeof(WifiOta::instance().m_esp32Sha256));
-    WifiOta::instance().m_hasFrontendSha256 = false;
-    memset(WifiOta::instance().m_frontendSha256, 0, sizeof(WifiOta::instance().m_frontendSha256));
-}
 
-/**
-   * @brief 初始化 ESP32 自身的 OTA 写入流程。
- * @param total_size
- * @return ESP_OK 成功，其他失败。
- */
-static esp_err_t esp32_ota_begin(size_t total_size)
-{
-    // ★ 全局互斥：检查 ESP32 OTA 是否已被其他通道占用
-    if (!esp32_ota_mutex_acquire(1000)) {
-        DEBUG_ERR("OTA", "ESP32 OTA 被其他通道占用，拒绝 WiFi OTA begin");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const esp_partition_t *boot_partition = esp_ota_get_running_partition();
-    DEBUG_INFO("OTA", "当前启动分区: %s, size=%u, address=0x%lx",
-               boot_partition->label, boot_partition->size, boot_partition->address);
-
-    WifiOta::instance().m_esp32UpdatePartition = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-    if (WifiOta::instance().m_esp32UpdatePartition == NULL ||
-        WifiOta::instance().m_esp32UpdatePartition->address == boot_partition->address) {
-        WifiOta::instance().m_esp32UpdatePartition = esp_partition_find_first(
-            ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
-    }
-
-    if (WifiOta::instance().m_esp32UpdatePartition == NULL) {
-        DEBUG_ERR("OTA", "找不到可用的 OTA 分区");
-        esp32_ota_mutex_release();
-        return ESP_FAIL;
-    }
-
-    DEBUG_INFO("OTA", "OTA 目标分区: %s, size=%u, address=0x%lx",
-               WifiOta::instance().m_esp32UpdatePartition->label,
-               WifiOta::instance().m_esp32UpdatePartition->size,
-               WifiOta::instance().m_esp32UpdatePartition->address);
-
-    if (total_size > WifiOta::instance().m_esp32UpdatePartition->size) {
-        DEBUG_ERR("OTA", "固件太大: %u > 分区大小: %u",
-                  total_size, WifiOta::instance().m_esp32UpdatePartition->size);
-        esp32_ota_mutex_release();
-        return ESP_FAIL;
-    }
-
-    esp_err_t err = esp_ota_begin(WifiOta::instance().m_esp32UpdatePartition, total_size, &WifiOta::instance().m_esp32OtaHandle);
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "esp_ota_begin 失败: %s", esp_err_to_name(err));
-        WifiOta::instance().m_esp32UpdatePartition = NULL;
-        esp32_ota_mutex_release();
-        return err;
-    }
-    WifiOta::instance().m_esp32Received = 0;
-    WifiOta::instance().m_esp32OtaActive = true;
-
-    // 清理旧状态（SHA-256 将在重启前从分区读回计算，上传期间不再计算）
-    wifi_esp32_ota_cleanup_sha();
-
-    DEBUG_INFO("OTA", "ESP32 OTA 开始，目标分区: %s", WifiOta::instance().m_esp32UpdatePartition->label);
-    return ESP_OK;
-}
 
 /**
  * @brief HTTP POST /ota/update - 完成 ESP32 OTA 并重启
  *   verify_only=true: 仅校验 SHA-256，不设置启动分区，不重启
  *   verify_only=false或缺省: 完整流程（校验 + 设置启动分区 + 重启）
+ *
+ * 实际的 end/verify/set_boot/restart 逻辑全部委托给 Esp32OtaCore。
  * @param req
  * @return
  */
 static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
-    if (!WifiOta::instance().m_esp32OtaActive) {
+    Esp32OtaCore &core = Esp32OtaCore::instance();
+    if (!core.isActive()) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "OTA not started");
         return ESP_FAIL;
     }
@@ -532,9 +469,6 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
                         strncpy(frontend_sha_hex, sha_str, 64);
                         frontend_sha_hex[64] = '\0';
                         has_frontend_sha = true;
-                        strncpy(WifiOta::instance().m_frontendSha256, sha_str, 64);
-                        WifiOta::instance().m_frontendSha256[64] = '\0';
-                        WifiOta::instance().m_hasFrontendSha256 = true;
                         DEBUG_INFO("OTA", "Frontend SHA-256: %s", frontend_sha_hex);
                     }
                 }
@@ -547,144 +481,54 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         }
     }
 
-    if (verify_only) {
-        DEBUG_INFO("OTA", "ESP32 OTA verify-only mode, %u bytes", (unsigned)WifiOta::instance().m_esp32Received);
-    } else {
-        DEBUG_INFO("OTA", "ESP32 OTA complete, %u bytes, setting boot partition...", (unsigned)WifiOta::instance().m_esp32Received);
+    char device_sha_hex[65] = {0};
 
-        esp_err_t err = esp_ota_end(WifiOta::instance().m_esp32OtaHandle);
-        if (err != ESP_OK) {
-            DEBUG_ERR("OTA", "esp_ota_end failed: %s", esp_err_to_name(err));
-            esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
-            esp32_ota_mutex_release();
-            WifiOta::instance().m_esp32OtaActive = false;
-            WifiOta::instance().m_esp32OtaHandle = 0;
-            wifi_esp32_ota_cleanup_sha();
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+    // ── verify_only 模式：只计算并返回设备端 SHA，不 end/set_boot/reboot ──
+    if (verify_only) {
+        DEBUG_INFO("OTA", "ESP32 OTA verify-only mode, %u bytes", (unsigned)core.getReceived());
+        esp_err_t sha_err = core.computeDeviceSha(device_sha_hex);
+        if (sha_err != ESP_OK) {
+            DEBUG_ERR("OTA", "verify-only: SHA 计算失败: %s", esp_err_to_name(sha_err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(sha_err));
             return ESP_FAIL;
         }
-    }
-
-    // ── SHA-256 验证：从 OTA 分区读回并计算哈希 ──
-    if (has_frontend_sha && WifiOta::instance().m_esp32UpdatePartition != NULL) {
-        DEBUG_INFO("OTA", "Verifying: reading OTA partition for SHA-256...");
-        const esp_partition_t *part = WifiOta::instance().m_esp32UpdatePartition;
-        mbedtls_sha256_context verify_ctx;
-        mbedtls_sha256_init(&verify_ctx);
-        mbedtls_sha256_starts(&verify_ctx, 0);
-
-        uint8_t *read_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
-        if (!read_buf) {
-            DEBUG_ERR("OTA", "SHA-256 verify: malloc failed");
-            mbedtls_sha256_free(&verify_ctx);
-        } else {
-            size_t offset = 0;
-            while (offset < WifiOta::instance().m_esp32Received) {
-                size_t to_read = WifiOta::instance().m_esp32Received - offset;
-                if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
-                esp_err_t rd_err = esp_partition_read(part, offset, read_buf, to_read);
-                if (rd_err != ESP_OK) {
-                    DEBUG_ERR("OTA", "SHA-256 verify: partition read failed at offset %u", (unsigned int)offset);
-                    break;
-                }
-                mbedtls_sha256_update(&verify_ctx, read_buf, to_read);
-                offset += to_read;
-            }
-            free(read_buf);
-            mbedtls_sha256_finish(&verify_ctx, WifiOta::instance().m_esp32Sha256);
-            mbedtls_sha256_free(&verify_ctx);
-            WifiOta::instance().m_esp32HashComputed = true;
-
-            char device_sha_hex[65] = {0};
-            for (int i = 0; i < 32; ++i) {
-                snprintf(&device_sha_hex[i * 2], sizeof(device_sha_hex) - i * 2, "%02x", WifiOta::instance().m_esp32Sha256[i]);
-            }
-            DEBUG_INFO("OTA", "Device SHA-256: %s", device_sha_hex);
-
-            bool match = true;
-            for (int i = 0; i < 64; i++) {
-                if (tolower((unsigned char)frontend_sha_hex[i]) != tolower((unsigned char)device_sha_hex[i])) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                DEBUG_INFO("OTA", "SHA-256 verified OK");
-                if (verify_only) {
-                    char ok_resp[256] = {0};
-                    snprintf(ok_resp, sizeof(ok_resp),
-                             "{\"status\": \"ok\", \"message\": \"SHA-256 verified\", \"sha256\": \"%s\"}",
-                             device_sha_hex);
-                    httpd_resp_set_type(req, "application/json");
-                    httpd_resp_send(req, ok_resp, strlen(ok_resp));
-                    return ESP_OK;
-                }
-            } else {
-                DEBUG_ERR("OTA", "SHA-256 mismatch! frontend=%s device=%s, abort", frontend_sha_hex, device_sha_hex);
-                if (!verify_only) {
-                    esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
-                }
-                wifi_esp32_ota_cleanup_sha();
-                esp32_ota_mutex_release();
-                WifiOta::instance().m_esp32OtaActive = false;
-                WifiOta::instance().m_esp32OtaHandle = 0;
-                WifiOta::instance().m_esp32UpdatePartition = NULL;
-                WifiOta::instance().m_esp32Received = 0;
-                char err_resp[256] = {0};
-                snprintf(err_resp, sizeof(err_resp),
-                         "{\"status\": \"error\", \"message\": \"SHA-256 mismatch\", \"frontend\": \"%s\", \"device\": \"%s\"}",
-                         frontend_sha_hex, device_sha_hex);
-                httpd_resp_set_type(req, "application/json");
-                httpd_resp_send(req, err_resp, strlen(err_resp));
-                return ESP_FAIL;
-            }
-        }
-    }
-
-    // ── 非verify_only模式：设置启动分区并重启 ──
-    if (verify_only) {
-        // 没有前端SHA或验证被跳过，在verify_only下也返回ok
-        char ok_resp[128] = {0};
+        char ok_resp[256] = {0};
         snprintf(ok_resp, sizeof(ok_resp),
-                 "{\"status\": \"ok\", \"message\": \"verify skipped, no SHA-256 provided\"}");
+                 "{\"status\": \"ok\", \"message\": \"SHA-256 computed\", \"sha256\": \"%s\"}",
+                 device_sha_hex);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, ok_resp, strlen(ok_resp));
         return ESP_OK;
     }
 
-    esp_err_t err = esp_ota_set_boot_partition(WifiOta::instance().m_esp32UpdatePartition);
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-        esp32_ota_mutex_release();
-        WifiOta::instance().m_esp32OtaActive = false;
-        wifi_esp32_ota_cleanup_sha();
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
-        return ESP_FAIL;
-    }
-    esp32_ota_mutex_release();
-    WifiOta::instance().m_esp32OtaActive = false;
-    DEBUG_INFO("OTA", "ESP32 OTA finished, rebooting...");
+    // ── 完整模式：finalize（end → 校验 → set_boot）后由 core 内部重启 ──
+    DEBUG_INFO("OTA", "ESP32 OTA finalize, %u bytes...", (unsigned)core.getReceived());
+    esp_err_t err = core.finalize(has_frontend_sha ? frontend_sha_hex : nullptr,
+                                  /*reboot=*/true,
+                                  device_sha_hex);
 
-    char resp[256] = {0};
-    if (WifiOta::instance().m_esp32HashComputed) {
-        char device_sha_hex[65] = {0};
-        for (int i = 0; i < 32; ++i) {
-            snprintf(&device_sha_hex[i * 2], sizeof(device_sha_hex) - i * 2, "%02x", WifiOta::instance().m_esp32Sha256[i]);
-        }
+    if (err == ESP_OK) {
+        // 正常不会走到这里（reboot=true 时 core 会 esp_restart）
+        char resp[256] = {0};
         snprintf(resp, sizeof(resp),
-                 "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\", \"sha256\": \"%s\"}",
-                 device_sha_hex);
+                 "{\"status\": \"ok\", \"message\": \"OTA finished\"}");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, strlen(resp));
+        return ESP_OK;
+    }
+
+    // 失败：core 已内部清理（abort + mutex release）
+    if (err == ESP_ERR_INVALID_VERSION) {
+        char err_resp[256] = {0};
+        snprintf(err_resp, sizeof(err_resp),
+                 "{\"status\": \"error\", \"message\": \"SHA-256 mismatch\", \"frontend\": \"%s\", \"device\": \"%s\"}",
+                 frontend_sha_hex, device_sha_hex);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, err_resp, strlen(err_resp));
     } else {
-        snprintf(resp, sizeof(resp),
-                 "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\"}");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
     }
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, strlen(resp));
-
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
-    return ESP_OK;
+    return ESP_FAIL;
 }
 
 /**
@@ -717,11 +561,10 @@ static esp_err_t esp32_ota_status_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
     char resp[128];
-    if (WifiOta::instance().m_esp32OtaActive) {
+    if (Esp32OtaCore::instance().isActive()) {
         snprintf(resp, sizeof(resp),
-            "{\"active\": true, \"received\": %u, \"partition\": \"%s\"}",
-            (unsigned int)WifiOta::instance().m_esp32Received,
-            WifiOta::instance().m_esp32UpdatePartition ? WifiOta::instance().m_esp32UpdatePartition->label : "null");
+            "{\"active\": true, \"received\": %u}",
+            (unsigned int)Esp32OtaCore::instance().getReceived());
     } else {
         snprintf(resp, sizeof(resp), "{\"active\": false}");
     }
@@ -820,7 +663,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        esp_err_t err = esp32_ota_begin(total_size);
+        Esp32OtaCore &core = Esp32OtaCore::instance();
+        esp_err_t err = core.begin(total_size);
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
                 httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "ESP32 OTA occupied by another channel");
@@ -833,11 +677,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         // 堆分配缓冲区，避免栈溢出（HTTP server 栈仅 8KB）
         uint8_t *fw_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
         if (!fw_buf) {
-            esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
-            esp32_ota_mutex_release();
-            WifiOta::instance().m_esp32OtaActive = false;
-            WifiOta::instance().m_esp32OtaHandle = 0;
-            wifi_esp32_ota_cleanup_sha();
+            core.abort();
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存分配失败");
             return ESP_FAIL;
         }
@@ -854,31 +694,22 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             if (ret <= 0) {
                 DEBUG_ERR("WIFI", "HTTP recv failed (ret=%d), aborting OTA", ret);
                 free(fw_buf);
-                esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
-                esp32_ota_mutex_release();
-                WifiOta::instance().m_esp32OtaActive = false;
-                WifiOta::instance().m_esp32OtaHandle = 0;
-                wifi_esp32_ota_cleanup_sha();
+                core.abort();
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTP recv failed");
                 return ESP_FAIL;
             }
 
-            err = esp_ota_write(WifiOta::instance().m_esp32OtaHandle, fw_buf, (size_t)ret);
+            err = core.write(fw_buf, (size_t)ret);
             if (err != ESP_OK) {
-                DEBUG_ERR("WIFI", "OTA write failed");
+                DEBUG_ERR("WIFI", "OTA write failed: %s", esp_err_to_name(err));
                 free(fw_buf);
-                esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
-                esp32_ota_mutex_release();
-                WifiOta::instance().m_esp32OtaActive = false;
-                WifiOta::instance().m_esp32OtaHandle = 0;
-                wifi_esp32_ota_cleanup_sha();
+                core.abort();
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
                 return ESP_FAIL;
             }
 
             total_firmware_written += ret;
             total_received += ret;
-            WifiOta::instance().m_esp32Received += ret;
 
             if (total_size > 0) {
                 int percent = (int)((total_firmware_written * 100) / total_size);
@@ -891,7 +722,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         }
 
         free(fw_buf);
-        DEBUG_INFO("WIFI", "ESP32 OTA 存储完成: %u 字节 (跳过 JSON 头 %d 字节)", (unsigned int)WifiOta::instance().m_esp32Received, json_header_len);
+        DEBUG_INFO("WIFI", "ESP32 OTA 存储完成: %u 字节 (跳过 JSON 头 %d 字节)", (unsigned int)core.getReceived(), json_header_len);
         const char resp[] = "{\"status\": \"ok\", \"message\": \"stored, call POST /ota/update to finish\", \"target\": \"esp32\"}";
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, strlen(resp));

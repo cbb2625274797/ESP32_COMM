@@ -1,6 +1,7 @@
 ﻿idf_component_register(
     SRCS
         "core/main.cpp"
+        "ota/esp32_ota_core.cpp"
         "relay/ota_relay.cpp"
         "transport/spi_master.cpp"
         "transport/protocol.cpp"
@@ -11,6 +12,7 @@
     INCLUDE_DIRS
         "."
         "core"
+        "ota"
         "relay"
         "transport"
         "server"

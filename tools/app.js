@@ -1390,17 +1390,13 @@ async function pollStatus() {
         updateEsp32StagesFromPhase(6);  // 启动完成
         addLog('I', '系统', 'ESP32 已恢复在线');
         showToast('ESP32 已恢复在线', 'success');
-      } else if (currentOtaTarget === 'esp32' && esp32OtaPhase >= 3 && esp32OtaPhase < 6) {
-        updateEsp32StagesFromPhase(6);
-        addLog('I', '系统', 'ESP32 已恢复在线');
-        showToast('ESP32 已恢复在线', 'success');
       }
       updateSystemStatusUi(data);
     }
   } catch (e) {
     consecutivePollFailures++;
     // 传输中屏蔽网关无响应的检测功能（上传期间设备忙，无法响应轮询是正常的）
-    if (consecutivePollFailures === 5 && !pollSlowMode && !isUploading) {
+    if (consecutivePollFailures === 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting) {
       addLog('W', '诊断', '设备连续 5 次无响应，正在诊断网络...');
       var diag = await diagnoseNetwork();
       addLog('W', '诊断', diag);

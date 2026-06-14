@@ -3,11 +3,11 @@
  * T4.1 - T4.5
  *
  * WifiOta 类封装 WiFi 初始化、HTTP OTA 服务器和网络状态查询。
+ * ESP32 本机 OTA 的写入/收尾逻辑已抽离到 Esp32OtaCore（WiFi/BLE 共用）。
  */
 #ifndef WIFI_OTA_H
 #define WIFI_OTA_H
 
-#include "ota_relay.h"
 #include "esp_ota_ops.h"
 #include "esp_http_server.h"
 #include "esp_event.h"
@@ -31,7 +31,7 @@ public:
     static int8_t getRssi();
     static bool isConnected();
 
-    // ── WiFi 连接状态（WiFi 事件回调 / HTTP / reconnect 任务共享，需 mutex 保护）──
+    // ── WiFi 连接状态（WiFi 事件回调 / HTTP / reconnect task 共享，需 mutex 保护）──
     bool getStaConnected() const          { return m_staConnected.load(); }
     void setStaConnected(bool v)          { m_staConnected.store(v); }
     int  getStaRetryCount() const         { return m_staRetryCount.load(); }
@@ -55,17 +55,7 @@ public:
     SemaphoreHandle_t m_staGotIpSem = NULL;
     TaskHandle_t m_reconnectTask = nullptr;
 
-    bool m_esp32OtaActive = false;
-    esp_ota_handle_t m_esp32OtaHandle = 0;
-    const esp_partition_t *m_esp32UpdatePartition = NULL;
-    size_t m_esp32Received = 0;
     httpd_handle_t m_httpServer = NULL;
-
-    // ── SHA-256 哈希校验 ──
-    uint8_t m_esp32Sha256[32] = {0};                // 重启前验证计算的SHA-256哈希值
-    bool m_esp32HashComputed = false;               // 是否已计算哈希
-    char m_frontendSha256[65] = {0};                // 前端提供的SHA-256（上传时存储）
-    bool m_hasFrontendSha256 = false;               // 前端是否提供了SHA-256
 
 private:
     // ── 跨任务共享状态（atomic + m_stateMutex 保护）──

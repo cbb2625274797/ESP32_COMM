@@ -35,6 +35,7 @@
           </div>
           <div class="sub-actions">
             <button id="versionBtn" class="btn btn-outline" disabled>读取版本</button>
+            <button id="restartBtn" class="btn btn-outline" disabled title="确认后会重启 ESP32，重连后页面会自动恢复">🔄 重启设备</button>
             <a class="btn btn-outline" href="index.html" target="_blank">回 WiFi 页面 ↗</a>
           </div>
         </div>
@@ -47,7 +48,7 @@
             <label class="form-label" for="targetChip">目标芯片</label>
             <select id="targetChip">
               <option value="gd32">GD32（写入后自动触发中继）</option>
-              <option value="esp32">ESP32（写入后重启升级）</option>
+              <option value="esp32" selected>ESP32（写入后重启升级）</option>
             </select>
           </div>
           <div class="row-2">
@@ -149,8 +150,8 @@
             <div class="stage-node" id="bs2"><div class="stage-dot">2</div><div class="stage-label">GATT 准备</div><div class="stage-detail" id="bsd2"></div></div>
             <div class="stage-node" id="bs3"><div class="stage-dot">3</div><div class="stage-label">文件准备</div><div class="stage-detail" id="bsd3"></div></div>
             <div class="stage-node" id="bs4"><div class="stage-dot">4</div><div class="stage-label">数据写入</div><div class="stage-detail" id="bsd4"></div></div>
-            <div class="stage-node" id="bs5"><div class="stage-dot">5</div><div class="stage-label">完成触发</div><div class="stage-detail" id="bsd5"></div></div>
-            <div class="stage-node" id="bs6"><div class="stage-dot">6</div><div class="stage-label">校验比对</div><div class="stage-detail" id="bsd6"></div></div>
+            <div class="stage-node" id="bs5"><div class="stage-dot">5</div><div class="stage-label" id="bsl5">校验比对</div><div class="stage-detail" id="bsd5"></div></div>
+            <div class="stage-node" id="bs6"><div class="stage-dot">6</div><div class="stage-label" id="bsl6">完成触发</div><div class="stage-detail" id="bsd6"></div></div>
           </div>
           <div class="stage-status-bar" id="bleStageBar">
             <span class="ssb-dot"></span>
@@ -197,7 +198,11 @@
       ctrlHex: 'F7',
       recommendedPayload: 480,
       finishText: '自动触发中继',
-      hint: '当前目标：<b>GD32</b>。页面会使用 <b>cmd=0x00</b> 发送数据，写入完成后自动触发 SPI OTA 中继。'
+      hint: '当前目标：<b>GD32</b>。页面会使用 <b>cmd=0x00</b> 发送数据，写入完成后自动触发 SPI OTA 中继。',
+      verifyStage: 6,
+      finalizeStage: 5,
+      stage5Label: '完成触发',
+      stage6Label: '校验比对'
     },
     esp32: {
       label: 'ESP32',
@@ -205,7 +210,11 @@
       ctrlHex: 'F8',
       recommendedPayload: 480,
       finishText: '自动完成 OTA',
-      hint: '当前目标：<b>ESP32</b>。页面会使用 <b>cmd=0x01</b> 发送数据，最后一包到齐后由设备端自动完成 OTA 并重启。'
+      hint: '当前目标：ESP32。页面会使用 <b>cmd=0x01</b> 发送数据，写入完成后发 <b>0xF8</b> + 32 字节 SHA-256 触发设备端收尾：设备端读 OTA 分区算 SHA 并比对，一致则 end+set_boot+reboot；不一致上报 0x85，不重启。',
+      verifyStage: 5,
+      finalizeStage: 6,
+      stage5Label: '校验比对',
+      stage6Label: '完成触发'
     }
   };
 
@@ -231,6 +240,10 @@
     ackWaiter: null,
     fileSha256: null,
     deviceSha256: null,
+    expectedReboot: false,        // 发送 0xFA 后置 true，重连后清
+    reconnecting: false,          // 自动重连中
+    reconnectAttempts: 0,         // 重连尝试次数
+    uploadTargetKey: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -258,6 +271,7 @@
     otaState: $('otaState'),
     fileInfo: $('fileInfo'),
     clearFileBtn: $('clearFileBtn'),
+    restartBtn: $('restartBtn'),
     progressFill: $('progressFill'),
     progressText: $('progressText'),
     progressPercent: $('progressPercent'),
@@ -271,6 +285,10 @@
 
   function currentTarget() {
     return TARGETS[els.targetChip.value] || TARGETS.gd32;
+  }
+
+  function flowTarget() {
+    return TARGETS[state.uploadTargetKey] || currentTarget();
   }
 
   const MAX_LOG_LINES = 1000;
@@ -298,6 +316,14 @@
   // ====== BLE OTA Stage Flow Management ======
   var bleStageIds = ['bs1','bs2','bs3','bs4','bs5','bs6'];
   var bleStageDetailIds = ['bsd1','bsd2','bsd3','bsd4','bsd5','bsd6'];
+  var bleStageLabelIds = ['bsl5', 'bsl6'];
+
+  function updateBleStageLabels(cfg) {
+    var stage5 = document.getElementById(bleStageLabelIds[0]);
+    var stage6 = document.getElementById(bleStageLabelIds[1]);
+    if (stage5) stage5.textContent = cfg.stage5Label || '完成触发';
+    if (stage6) stage6.textContent = cfg.stage6Label || '校验比对';
+  }
 
   function resetBleStages() {
     bleStageIds.forEach(function(id) {
@@ -442,6 +468,10 @@
     }
     els.disconnectBtn.disabled = !connected;
     els.versionBtn.disabled = !connected;
+    els.targetChip.disabled = state.uploading;
+    els.payloadSize.disabled = state.uploading;
+    els.ctrlHex.disabled = state.uploading;
+    if (els.restartBtn) els.restartBtn.disabled = !connected || state.reconnecting || state.expectedReboot || state.uploading;
     els.uploadBtn.disabled = !idle;
     els.autoFlashBtn.disabled = !idle;
     els.abortBtn.disabled = !state.uploading;
@@ -502,9 +532,10 @@
 
   function refreshTargetUi() {
     const cfg = currentTarget();
+    updateBleStageLabels(cfg);
     els.ctrlHex.value = cfg.ctrlHex;
     els.payloadSize.value = String(cfg.recommendedPayload);
-    els.protocolHint.innerHTML = `${cfg.hint} 推荐 payload：<b>${cfg.recommendedPayload}B</b>。协议格式：<b>cmd(1) + seq(2) + total_size(4) + payload</b>。<br><b>传输机制：</b>每 <b>${BLE_OTA_ACK_WINDOW}</b> 包等待一次 DATA_OUT ACK。${cfg.label === 'ESP32' ? ' <br><b>ESP32 模式：</b>最后一包到齐后由设备端自动完成 OTA 并重启。': '<br><b>GD32 模式：</b>数据写入后自动触发 SPI OTA 中继。'}`;
+    els.protocolHint.innerHTML = `${cfg.hint} 推荐 payload：<b>${cfg.recommendedPayload}B</b>。协议格式：<b>cmd(1) + seq(2) + total_size(4) + payload</b>。<br><b>传输机制：</b>每 <b>${BLE_OTA_ACK_WINDOW}</b> 包等待一次 DATA_OUT ACK。${cfg.label === 'ESP32' ? ' <br><b>ESP32 模式：</b>数据写入完成后发送 <mark>0xF8 + 32B 文件 SHA-256</mark> 触发设备端收尾；设备端自行读回 OTA 分区、完成 SHA-256 比对，并决定是否 end + set_boot + reboot。': '<br><b>GD32 模式：</b>数据写入后自动触发 SPI OTA 中继。'}`;
     if (state.selectedFile) updateFileInfo(state.selectedFile);
     setConnectionState(!!state.server);
     log('CFG', `目标切换为 ${cfg.label}: packetCmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, payload=${cfg.recommendedPayload}`);
@@ -528,7 +559,7 @@
       });
 
       state.device = device;
-      state.device.addEventListener('gattserverdisconnected', onDisconnected);
+      state.device.addEventListener('gattserverdisconnected', onDisconnected, { once: true });
       els.deviceName.textContent = device.name || '未知设备';
       els.deviceId.textContent = device.id || '-';
 
@@ -567,10 +598,20 @@
 
   function onDisconnected() {
     log('BLE', '设备已断开', 'W');
+    var wasExpected = state.expectedReboot;
     resetUiAfterDisconnect();
+    if (wasExpected && state.device) {
+      // 是主动重启引起的断开，启动自动重连
+      state.reconnecting = true;
+      state.reconnectAttempts = 0;
+      tryReconnect();
+    }
   }
 
   async function disconnectBle() {
+    // 用户主动断开：取消任何进行中的重连 / expectedReboot
+    state.expectedReboot = false;
+    state.reconnecting = false;
     try {
       if (state.dataOutChar && state.notificationsEnabled) {
         await state.dataOutChar.stopNotifications();
@@ -653,17 +694,17 @@
       };
       const finishText = finishMap[stage] || `[FINISH] 未知阶段 stage=0x${stage.toString(16).padStart(2, '0').toUpperCase()} value=${value}`;
       log('FINISH', finishText);
+      const finalizeStage = TARGETS.esp32.finalizeStage;
 
       // Update BLE stage flow based on FINISH notifications
       if (stage >= 0x01 && stage <= 0x04) {
-        setBleStage(5, 'OTA 刷写中...', null);
+        setBleStage(finalizeStage, 'OTA 刷写中...', null);
         setBleStageText(finishText.replace('[FINISH] ', ''));
       } else if (stage >= 0x05 && stage <= 0x06) {
-        setBleStage(5, '等待重启...', null);
+        setBleStage(finalizeStage, '等待重启...', null);
         setBleStageText(finishText.replace('[FINISH] ', ''));
       } else if (stage === 0x07) {
-        setBleStage(5, '即将重启', null);
-        setBleStage(6, '设备重启', null);
+        setBleStage(finalizeStage, '设备重启', null);
         setBleStageText('ESP32 即将重启');
         var bar = document.getElementById('bleStageBar');
         if (bar) bar.className = 'stage-status-bar ok';
@@ -686,6 +727,13 @@
         state.lastUploadStatus = 'failed';
         setBleStageError('OTA 刷写失败');
         showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '设备未上报', { text: '刷写失败', err: true });
+      } else if (stage === 0x85) {
+        showToast('ESP32 OTA 校验失败，未触发重启', 'error');
+        setProgress(0, '设备端 SHA-256 校验失败');
+        state.lastUploadStatus = 'failed';
+        setBleStage(5, 'SHA-256 ✗', null);
+        setBleStageError('设备端 SHA-256 校验失败');
+        showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '设备未上报', { text: '设备端校验失败，已中止 OTA', err: true });
       } else if (stage === 0x07) {
         showToast('ESP32 OTA 刷写完成，等待重启', 'success');
         // If device SHA-256 hasn't arrived yet, show what we have
@@ -716,27 +764,110 @@
       state.deviceSha256 = devSha;
       log('VERIFY', '设备端 SHA-256: ' + devSha);
 
-      // Compare with front-end SHA-256
+      // 设备端上报 SHA-256 后，前端仅做展示与状态同步。
       var frontSha = state.fileSha256;
+      var verifyStage = flowTarget().verifyStage;
       if (frontSha && frontSha.toUpperCase() === devSha) {
         log('VERIFY', 'SHA-256 校验通过，前端与设备端一致', 'I');
         showBleVerifyInfo(frontSha, devSha, { text: '校验通过 — SHA-256 一致', ok: true });
-        setBleStage(6, 'SHA-256 ✓', null);
+        setBleStage(verifyStage, 'SHA-256 ✓', null);
         setBleStageText('校验通过 — 固件完整性已确认');
       } else if (frontSha) {
         log('VERIFY', 'SHA-256 校验失败！前端: ' + frontSha + ' 设备: ' + devSha, 'E');
         showBleVerifyInfo(frontSha, devSha, { text: '校验失败 — SHA-256 不一致', err: true });
-        setBleStage(6, 'SHA-256 ✗', null);
+        setBleStage(verifyStage, 'SHA-256 ✗', null);
         setBleStageError('SHA-256 不一致');
       } else {
         showBleVerifyInfo(undefined, devSha, { text: '前端 SHA-256 不可用，无法比对' });
-        setBleStage(6, '无法比对', null);
+        setBleStage(verifyStage, '无法比对', null);
       }
       return;
     }
 
 
     log('NOTIFY', hex);
+  }
+
+
+  // ===== 重启设备 + 自动重连 =====
+  async function restartEsp32() {
+    if (!state.ctrlChar || !state.device) return;
+    if (!confirm('确定要重启 ESP32 吗？\n\n重启后页面会自动重连。')) return;
+    if (state.expectedReboot) return;
+    state.expectedReboot = true;
+    state.reconnectAttempts = 0;
+    els.connState.textContent = '重启中';
+    if (els.connState.parentElement) els.connState.parentElement.className = 'pill processing';
+    if (els.otaState) { els.otaState.textContent = '重启中'; els.otaState.className = 'v warn'; }
+    setConnectionState(!!state.server);
+    log('SYS', '=== 触发 ESP32 重启 (0xFA) ===');
+    showToast('ESP32 重启中...', 'success');
+    try {
+      await state.ctrlChar.writeValue(new Uint8Array([0xFA]));
+      log('SYS', '0xFA 已发，等待设备端推送 FINISH_REBOOT_NOW 后断开');
+    } catch (e) {
+      log('SYS', '0xFA 发送失败: ' + e.message, 'E');
+      showToast('0xFA 发送失败', 'error');
+      state.expectedReboot = false;
+      setConnectionState(!!state.server);
+    }
+  }
+
+  async function tryReconnect() {
+    if (!state.device || !state.expectedReboot) {
+      state.reconnecting = false;
+      return;
+    }
+    if (!state.device.gatt) {
+      // 设备引用已丧失，重连不了
+      state.reconnecting = false;
+      state.expectedReboot = false;
+      showToast('设备引用丧失，请手动重连', 'error');
+      return;
+    }
+    state.reconnecting = true;
+    state.reconnectAttempts += 1;
+    var attempt = state.reconnectAttempts;
+    // 退避：1s, 2s, 4s, 8s, 上限 10s
+    var backoff = Math.min(10000, 1000 * Math.pow(1.6, attempt - 1));
+    if (backoff > 200) await sleep(backoff);
+    els.connState.textContent = '重连中(' + attempt + ')';
+    if (els.connState.parentElement) els.connState.parentElement.className = 'pill processing';
+    if (els.otaState) { els.otaState.textContent = '重连中'; els.otaState.className = 'v warn'; }
+    setConnectionState(!!state.server);
+    log('BLE', '自动重连第 ' + attempt + ' 次' + (backoff > 0 ? '（等待 ' + Math.round(backoff) + 'ms）' : '') + '...', 'W');
+    try {
+      var server = await state.device.gatt.connect();
+      state.server = server;
+      state.service = await server.getPrimaryService(UUIDS.service);
+      state.ctrlChar = await state.service.getCharacteristic(UUIDS.ctrl);
+      state.dataInChar = await state.service.getCharacteristic(UUIDS.dataIn);
+      state.dataOutChar = await state.service.getCharacteristic(UUIDS.dataOut);
+      state.versionChar = await state.service.getCharacteristic(UUIDS.version);
+      state.notificationsEnabled = false;
+      await enableNotifications();
+      state.expectedReboot = false;
+      state.reconnecting = false;
+      state.reconnectAttempts = 0;
+      // 重连后重注 onDisconnected（{once: true}，旧的已被上次断开时消耗）
+      state.device.addEventListener('gattserverdisconnected', onDisconnected, { once: true });
+      log('BLE', '✅ 自动重连成功', 'I');
+      showToast('BLE 已重连', 'success');
+      setConnectionState(true);
+      // 重连后默认刷新一下版本
+      try { await readVersion(); } catch (_) {}
+    } catch (e) {
+      log('BLE', '重连第 ' + attempt + ' 次失败: ' + e.message, 'W');
+      if (state.expectedReboot && attempt < 12) {
+        tryReconnect();
+      } else {
+        state.reconnecting = false;
+        state.expectedReboot = false;
+        showToast('重连失败，请手动连接', 'error');
+        log('BLE', '自动重连放弃，请点击「连接设备」重连', 'E');
+        setConnectionState(!!state.server);
+      }
+    }
   }
 
   function waitForAck(cmd, expectedSeq, timeoutMs = 8000, opts = {}) {
@@ -937,6 +1068,7 @@
     if (!state.selectedFile || !state.dataInChar) return false;
 
     const cfg = currentTarget();
+    state.uploadTargetKey = els.targetChip.value;
     const payloadSize = Math.max(32, Math.min(498, Number(els.payloadSize.value) || 480));
     const file = state.selectedFile;
 
@@ -1079,15 +1211,33 @@
       setProgress(100, `[${cfg.label}] 固件数据已全部写入 DATA_IN`);
       state.lastUploadStatus = 'success';
 
-      // Stage 5: Completion trigger
+      // Stage 5: 发送 0xF8 + 32B 文件 SHA-256，由设备端执行收尾并完成比对
       if (cfg.label === 'ESP32') {
-        setBleStage(5, '自动完成', null);
-        setBleStage(5, '完成', null);
-        setBleStage(6, '等待设备校验...', null);
-        setBleStageText('ESP32 OTA 数据写入完成，等待设备端处理与校验');
-        // Show verify info — wait for device SHA-256
         state.deviceSha256 = null;
-        showBleVerifyInfo(fileSha256.toUpperCase(), '等待设备上报...', { text: '等待设备端处理并上报 SHA-256' });
+        const frontSha = fileSha256.toUpperCase();
+        const frontShaBytes = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) {
+          frontShaBytes[i] = parseInt(frontSha.slice(i * 2, i * 2 + 2), 16);
+        }
+        const trigger = new Uint8Array(33);
+        trigger[0] = 0xF8;
+        trigger.set(frontShaBytes, 1);
+        showBleVerifyInfo(frontSha, '等待设备端比对...', { text: '已发送文件 SHA-256，等待设备端校验结果' });
+        setBleStage(5, '发送校验...', 'active');
+        setBleStageText('发送 0xF8 + SHA-256，等待设备端收尾...');
+        try {
+          await state.ctrlChar.writeValue(trigger);
+          log('OTA', '0xF8 + 32B SHA-256 已发送，等待设备端比对并收尾');
+        } catch (e) {
+          state.lastUploadStatus = 'failed';
+          setProgress(0, `0xF8 发送失败: ${e.message}`);
+          log('OTA', `0xF8 发送失败: ${e.message}`, 'E');
+          setBleStageError('0xF8 发送失败');
+          return false;
+        }
+        setBleStage(5, '等待设备端校验', null);
+        setBleStage(6, '设备端收尾中', 'active');
+        setBleStageText('0xF8 已发，等待设备端 SHA 比对与 end+set_boot+reboot...');
         return true;
       }
 
@@ -1140,6 +1290,7 @@
         state.ackWaiter = null;
       }
       state.uploading = false;
+      state.uploadTargetKey = null;
       setConnectionState(!!state.server);
     }
   }
@@ -1190,7 +1341,8 @@
 
   els.connectBtn.addEventListener('click', connectBle);
   els.disconnectBtn.addEventListener('click', disconnectBle);
-  els.versionBtn.addEventListener('click', readVersion);
+  if (els.versionBtn) els.versionBtn.addEventListener('click', readVersion);
+  if (els.restartBtn) els.restartBtn.addEventListener('click', restartEsp32);
   els.uploadBtn.addEventListener('click', uploadFirmware);
   els.autoFlashBtn.addEventListener('click', autoFlash);
   els.abortBtn.addEventListener('click', abortTask);
