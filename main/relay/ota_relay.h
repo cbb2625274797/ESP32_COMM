@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ota_relay.h - OTA 中继核心状态机
  * T2.3, T3.1 - T3.7
  *
@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "transport/protocol.h"
 #include "transport/spi_master.h"
 #include "esp_partition.h"
@@ -66,7 +67,23 @@ public:
     static void taskEntry(void *pvParameters);
     ota_result_t startHandshake();
     ota_result_t forwardFirmware();
-    relay_state_t getState();
+
+    /* ---- 线程安全的状态访问接口 ----
+     * OTA 任务写、HTTP 任务读，通过 mutex 保证一致性。
+     * 状态机内部（OTA 任务）可直接写 static 成员，
+     * 跨任务读/写必须走这些 API。
+     */
+    static relay_state_t getState();
+    static uint32_t getRelaySeq();
+    static uint32_t getRelayTotalPackets();
+    static bool getGd32AppAlive();
+    static void getGd32Version(gd32_version_t *out);
+    static void setState(relay_state_t s);
+    static void setRelaySeq(uint32_t seq);
+    static void setRelayTotalPackets(uint32_t total);
+    static void setGd32AppAlive(bool alive);
+    static void setGd32Version(const gd32_version_t &ver);
+
     void reset();
 
     static esp_err_t flashWriteChunk(uint32_t offset, const uint8_t *data, size_t len);
@@ -75,8 +92,11 @@ public:
     static esp_err_t metaSave(const ota_meta_t *meta);
     static esp_err_t metaUpdate(uint32_t stored_size, uint32_t last_seq);
     static esp_err_t metaClear();
+    static esp_err_t computeFlashSha256(uint8_t out_sha256[32]);
+    static esp_err_t metaFinalizeChecksum();
+    static esp_err_t metaVerifyChecksum();
 
-    // 公开状态
+    // 公开状态（状态机内部直接访问；跨任务请用 getter/setter）
     static relay_state_t relayState;
     static uint32_t relaySeq;
     static uint32_t relayTotalPackets;
@@ -84,6 +104,26 @@ public:
     static gd32_version_t gd32Version;
     static QueueHandle_t dispatchQueue;
     static QueueHandle_t resultQueue;
+
+    // 线程安全锁
+    static SemaphoreHandle_t s_stateMutex;
+    static void initMutex();
+    static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(50);
+
+    class StateLockGuard {
+    public:
+        explicit StateLockGuard(TickType_t timeout = kLockTimeout) {
+            m_locked = (s_stateMutex && xSemaphoreTake(s_stateMutex, timeout) == pdTRUE);
+        }
+        ~StateLockGuard() {
+            if (m_locked && s_stateMutex) { xSemaphoreGive(s_stateMutex); }
+        }
+        bool isLocked() const { return m_locked; }
+        StateLockGuard(const StateLockGuard&) = delete;
+        StateLockGuard& operator=(const StateLockGuard&) = delete;
+    private:
+        bool m_locked = false;
+    };
 
     // 实例状态（public，供状态机方法访问）
     const esp_partition_t *m_gd32Partition = NULL;
@@ -100,7 +140,7 @@ public:
     ota_result_t sendHandshakeReq();
     ota_result_t sendNonceAndAuthenticate();
     ota_result_t sendFirmwareSize(uint32_t size);
-    ota_result_t relayPacketsFromFlash();
+    ota_result_t relayPacketsFromFlash(TickType_t deadline_tick = 0);
     ota_result_t finishOta();
 
     static int aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, uint8_t *out);
@@ -142,5 +182,3 @@ private:
 };
 
 #endif // OTA_RELAY_H
-
-

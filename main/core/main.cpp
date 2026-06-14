@@ -11,6 +11,7 @@
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_ota_ops.h"
 
 #include "monitor/health_monitor.h"
 #include "relay/ota_relay.h"
@@ -19,14 +20,24 @@
 #include "server/ble_ota.h"
 #include "transport/protocol.h"
 #include "monitor/debug_log.h"
+#include "app_config.h"
+#include "ota_mutex.h"
 
 /**
  * @brief 程序主入口，初始化系统组件并创建各 FreeRTOS 任务。
  */
+// 全局 ESP32 OTA 互斥变量（声明在 ota_mutex.h）
+SemaphoreHandle_t g_esp32OtaMutex = NULL;
+volatile bool g_esp32OtaOccupied = false;
+
 extern "C" void app_main(void)
 {
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
+
+    // 创建 ESP32 OTA 全局互斥 Mutex
+    g_esp32OtaMutex = xSemaphoreCreateMutex();
+    g_esp32OtaOccupied = false;
 
     // 初始化网络接口 + 事件循环（必须最早）
     ESP_ERROR_CHECK(esp_netif_init());
@@ -121,6 +132,16 @@ extern "C" void app_main(void)
         DEBUG_ERR("MAIN", "创建 ble_ota_task 失败");
     } else {
         DEBUG_INFO("MAIN", "BLE OTA 任务已创建");
+    }
+
+    // ★ OTA 回滚保护：标记当前固件有效
+    // 启用 CONFIG_APP_ROLLBACK_ENABLE 后，新固件首次启动必须调用此函数
+    // 若未调用就崩溃/重启，bootloader 会自动回退到上一个有效分区
+    esp_err_t ota_valid_err = esp_ota_mark_app_valid_cancel_rollback();
+    if (ota_valid_err == ESP_OK) {
+        DEBUG_INFO("MAIN", "OTA 回滚保护: 当前固件已标记有效");
+    } else {
+        DEBUG_WARN("MAIN", "OTA 回滚保护: 标记失败 (%s)，可能非 OTA 启动", esp_err_to_name(ota_valid_err));
     }
 
     DEBUG_INFO("MAIN", "========================================");

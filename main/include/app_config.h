@@ -1,4 +1,4 @@
-﻿/*
+/*
  * app_config.h - 统一配置文件（C++ 版本）
  * ESP32-C3 OTA 中继项目
  *
@@ -7,6 +7,7 @@
  */
 #pragma once
 #include <cstdint>
+#include "freertos/FreeRTOS.h"
 #include "version.h"
 
 // ============================================================
@@ -95,6 +96,7 @@ inline constexpr uint16_t    BLE_OTA_DATA_OUT_UUID = 0x0003;
 inline constexpr uint16_t    BLE_OTA_VERSION_UUID  = 0x0004;
 inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_GD32  = 0xF7;
 inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_ESP32 = 0xF8;
+inline constexpr uint8_t BLE_OTA_CTRL_VERIFY_SHA256 = 0xF9;  // SHA-256哈希验证命令
 inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;
 inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;
 inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;

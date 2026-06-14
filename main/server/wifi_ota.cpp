@@ -21,7 +21,12 @@
 #include "esp_event.h"
 #include "esp_mac.h"
 
+// SHA-256 哈希计算
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
+#include "mbedtls/private/sha256.h"
+
 #include "app_config.h"
+#include "ota_mutex.h"
 #include "wifi_ota.h"
 #include "ota_relay.h"
 #include "health_monitor.h"
@@ -75,6 +80,69 @@ static esp_err_t http_options_handler(httpd_req_t *req)
 }
 
 // ----------------------------------------
+// STA 后台重连任务（避免在系统事件回调中调用 esp_wifi_connect 死锁）
+// ----------------------------------------
+/**
+ * @brief 独立 FreeRTOS 任务，处理 STA 连接/重连的退避延迟和 esp_wifi_connect() 调用。
+ *        事件回调仅通过 xTaskNotifyGive 唤醒本任务，不直接在系统事件任务中阻塞或调用 WiFi API。
+ */
+void WifiOta::reconnectTask(void* pvParameters)
+{
+    (void)pvParameters;
+    while (1) {
+        // 等待事件回调通知（阻塞，不消耗 CPU）
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    
+        WifiOta& self = WifiOta::instance();
+    
+        // 已连接或已放弃，无需处理
+        if (self.getStaConnected() || self.getStaRetryExhausted()) {
+            continue;
+        }
+    
+        self.stateLock();
+    
+        // 达到最大重试次数
+        if (self.getStaRetryCount() >= WIFI_STA_MAX_RETRY) {
+            DEBUG_ERR("WIFI", "STA 重连失败 %d 次，放弃", self.getStaRetryCount());
+            self.setStaRetryExhausted(true);
+            self.stateUnlock();
+            continue;
+        }
+    
+        self.setStaRetryCount(self.getStaRetryCount() + 1);
+        int retryCount = self.getStaRetryCount();
+    
+        // 计算退避延迟：冷启动前 3 次递增退避，其余固定 1s
+        int delay_ms = 0;
+        if (self.m_coldBoot && retryCount <= 3) {
+            delay_ms = 2000 * retryCount;  // 2s, 4s, 6s
+            DEBUG_INFO("WIFI", "冷启动退避重连第 %d 次 (等 %dms)",
+                       retryCount, delay_ms);
+        } else if (retryCount > 1) {
+            delay_ms = 1000;  // 普通重连 1s 延迟
+            DEBUG_INFO("WIFI", "重连第 %d 次...", retryCount);
+        } else {
+            DEBUG_INFO("WIFI", "首次连接...");
+        }
+    
+        self.stateUnlock();
+    
+        if (delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        }
+    
+        // 延迟后再次检查状态，防止期间已连接或已放弃
+        if (!self.getStaConnected() && !self.getStaRetryExhausted()) {
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                DEBUG_ERR("WIFI", "esp_wifi_connect() 失败: %s", esp_err_to_name(err));
+            }
+        }
+    }
+}
+
+// ----------------------------------------
 // WiFi/IP 事件回调（事件驱动连接）
 // ----------------------------------------
 /**
@@ -87,45 +155,49 @@ static esp_err_t http_options_handler(httpd_req_t *req)
 void WifiOta::wifiEventHandler(void* arg, esp_event_base_t event_base,
                                       int32_t event_id, void* event_data)
 {
+    WifiOta& inst = WifiOta::instance();
+
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
         case WIFI_EVENT_STA_START:
             DEBUG_INFO("WIFI", "STA 已启动，开始连接...");
-            esp_wifi_connect();
+            inst.stateLock();
+            inst.setStaRetryCount(0);
+            inst.setStaRetryExhausted(false);
+            inst.stateUnlock();
+            if (inst.m_reconnectTask) {
+                xTaskNotifyGive(inst.m_reconnectTask);
+            }
             break;
 
         case WIFI_EVENT_STA_CONNECTED:
             DEBUG_INFO("WIFI", "STA 已关联到 AP");
-            WifiOta::instance().m_staConnected = true;
-            WifiOta::instance().m_staRetryCount = 0;
-            WifiOta::instance().m_staRetryExhausted = false;  // ★ 连接成功，重置耗尽标志
-            if (WifiOta::instance().m_staConnectedSem) {
-                xSemaphoreGive(WifiOta::instance().m_staConnectedSem);
+            inst.stateLock();
+            inst.setStaConnected(true);
+            inst.setStaRetryCount(0);
+            inst.setStaRetryExhausted(false);  // ★ 连接成功，重置耗尽标志
+            inst.stateUnlock();
+            if (inst.m_staConnectedSem) {
+                xSemaphoreGive(inst.m_staConnectedSem);
             }
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {
             wifi_event_sta_disconnected_t* disconn = (wifi_event_sta_disconnected_t*)event_data;
-            DEBUG_WARN("WIFI", "STA 断开, reason=%d, retry=%d", disconn->reason, WifiOta::instance().m_staRetryCount);
-            WifiOta::instance().m_staConnected = false;
+            inst.stateLock();
+            inst.setStaConnected(false);
+            bool exhausted = inst.getStaRetryExhausted();
+            int retryCount = inst.getStaRetryCount();
+            inst.stateUnlock();
 
-            if (WifiOta::instance().m_staRetryCount < WIFI_STA_MAX_RETRY) {
-                WifiOta::instance().m_staRetryCount++;
-                // ★ 冷启动首次连接失败时增加退避延迟
-                // 长时间断电后路由器可能还在初始化（ARP/DHCP/信道选择）
-                // reason 201=NO_AP_FOUND, 15=AUTH_FAIL, 2=AUTH_EXPIRE, 204=HANDSHAKE_TIMEOUT
-                if (WifiOta::instance().m_coldBoot && WifiOta::instance().m_staRetryCount <= 3) {
-                    int delay_ms = 2000 * WifiOta::instance().m_staRetryCount;  // 2s, 4s, 6s 递增退避
-                    DEBUG_INFO("WIFI", "冷启动退避重连第 %d 次 (reason=%d, 等 %dms)...",
-                               WifiOta::instance().m_staRetryCount, disconn->reason, delay_ms);
-                    vTaskDelay(pdMS_TO_TICKS(delay_ms));
-                } else {
-                    DEBUG_INFO("WIFI", "重连第 %d 次...", WifiOta::instance().m_staRetryCount);
+            if (!exhausted) {
+                DEBUG_WARN("WIFI", "STA 断开, reason=%d, retry=%d",
+                           disconn->reason, retryCount);
+                if (inst.m_reconnectTask) {
+                    xTaskNotifyGive(inst.m_reconnectTask);
                 }
-                esp_wifi_connect();
             } else {
-                DEBUG_ERR("WIFI", "STA 重连失败 %d 次，放弃", WifiOta::instance().m_staRetryCount);
-                WifiOta::instance().m_staRetryExhausted = true;
+                DEBUG_WARN("WIFI", "STA 断开, 重试次数已耗尽");
             }
             break;
         }
@@ -225,8 +297,8 @@ esp_err_t WifiOta::initSta()
     DEBUG_INFO("WIFI", "=== 初始化 WiFi STA 模式 ===");
 
     WifiOta::instance().m_wifiMode = OTA_WIFI_MODE_STA;
-    WifiOta::instance().m_staRetryCount = 0;
-    WifiOta::instance().m_staRetryExhausted = false;
+    WifiOta::instance().setStaRetryCount(0);
+    WifiOta::instance().setStaRetryExhausted(false);
 
     // ★ 设置国家代码：中国，允许信道 1-13
     // ESP32 默认国家是 US（只允许 1-11），中国路由可能用 12/13
@@ -307,18 +379,18 @@ esp_err_t WifiOta::waitStaConnected(char *ip_str, size_t ip_len)
                 }
                 DEBUG_INFO("WIFI", "%s 等待成功, 当前 IP: " IPSTR, wait_name, IP2STR(&ip_info.ip));
             }
-            WifiOta::instance().m_staConnected = true;
+            WifiOta::instance().setStaConnected(true);
             return ESP_OK;
         }
 
         // ★ 重试已耗尽，不再等待
-        if (WifiOta::instance().m_staRetryExhausted) {
-            DEBUG_ERR("WIFI", "STA 重试已耗尽 (%d 次)，立即切换 AP", WifiOta::instance().m_staRetryCount);
+        if (WifiOta::instance().getStaRetryExhausted()) {
+            DEBUG_ERR("WIFI", "STA 重试已耗尽 (%d 次)，立即切换 AP", WifiOta::instance().getStaRetryCount());
             return ESP_ERR_TIMEOUT;
         }
     }
 
-    DEBUG_ERR("WIFI", "等待 %s 超时 (%d ms), 重连次数: %d", wait_name, WIFI_STA_CONNECT_TIMEOUT_MS, WifiOta::instance().m_staRetryCount);
+    DEBUG_ERR("WIFI", "等待 %s 超时 (%d ms), 重连次数: %d", wait_name, WIFI_STA_CONNECT_TIMEOUT_MS, WifiOta::instance().getStaRetryCount());
     return ESP_ERR_TIMEOUT;
 }
 
@@ -355,6 +427,18 @@ void WifiOta::setStaticIp()
 
 // ----------------------------------------
 // ESP32 OTA 内部函数
+
+/**
+ * @brief 清理 WiFi OTA 的 SHA-256 上下文和哈希状态
+ */
+static void wifi_esp32_ota_cleanup_sha()
+{
+    WifiOta::instance().m_esp32HashComputed = false;
+    memset(WifiOta::instance().m_esp32Sha256, 0, sizeof(WifiOta::instance().m_esp32Sha256));
+    WifiOta::instance().m_hasFrontendSha256 = false;
+    memset(WifiOta::instance().m_frontendSha256, 0, sizeof(WifiOta::instance().m_frontendSha256));
+}
+
 /**
    * @brief 初始化 ESP32 自身的 OTA 写入流程。
  * @param total_size
@@ -362,6 +446,12 @@ void WifiOta::setStaticIp()
  */
 static esp_err_t esp32_ota_begin(size_t total_size)
 {
+    // ★ 全局互斥：检查 ESP32 OTA 是否已被其他通道占用
+    if (!esp32_ota_mutex_acquire(1000)) {
+        DEBUG_ERR("OTA", "ESP32 OTA 被其他通道占用，拒绝 WiFi OTA begin");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     const esp_partition_t *boot_partition = esp_ota_get_running_partition();
     DEBUG_INFO("OTA", "当前启动分区: %s, size=%u, address=0x%lx",
                boot_partition->label, boot_partition->size, boot_partition->address);
@@ -376,6 +466,7 @@ static esp_err_t esp32_ota_begin(size_t total_size)
 
     if (WifiOta::instance().m_esp32UpdatePartition == NULL) {
         DEBUG_ERR("OTA", "找不到可用的 OTA 分区");
+        esp32_ota_mutex_release();
         return ESP_FAIL;
     }
 
@@ -387,6 +478,7 @@ static esp_err_t esp32_ota_begin(size_t total_size)
     if (total_size > WifiOta::instance().m_esp32UpdatePartition->size) {
         DEBUG_ERR("OTA", "固件太大: %u > 分区大小: %u",
                   total_size, WifiOta::instance().m_esp32UpdatePartition->size);
+        esp32_ota_mutex_release();
         return ESP_FAIL;
     }
 
@@ -394,49 +486,199 @@ static esp_err_t esp32_ota_begin(size_t total_size)
     if (err != ESP_OK) {
         DEBUG_ERR("OTA", "esp_ota_begin 失败: %s", esp_err_to_name(err));
         WifiOta::instance().m_esp32UpdatePartition = NULL;
+        esp32_ota_mutex_release();
         return err;
     }
     WifiOta::instance().m_esp32Received = 0;
     WifiOta::instance().m_esp32OtaActive = true;
+
+    // 清理旧状态（SHA-256 将在重启前从分区读回计算，上传期间不再计算）
+    wifi_esp32_ota_cleanup_sha();
+
     DEBUG_INFO("OTA", "ESP32 OTA 开始，目标分区: %s", WifiOta::instance().m_esp32UpdatePartition->label);
     return ESP_OK;
 }
 
 /**
  * @brief HTTP POST /ota/update - 完成 ESP32 OTA 并重启
+ *   verify_only=true: 仅校验 SHA-256，不设置启动分区，不重启
+ *   verify_only=false或缺省: 完整流程（校验 + 设置启动分区 + 重启）
  * @param req
  * @return
  */
 static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
 {
-    (void)req;
     http_set_cors_headers(req);
     if (!WifiOta::instance().m_esp32OtaActive) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "OTA not started");
         return ESP_FAIL;
     }
 
-    DEBUG_INFO("OTA", "ESP32 OTA 完成, 共 %u 字节, 设置启动分区...", WifiOta::instance().m_esp32Received);
+    // 读取请求体，获取前端 SHA-256 和 verify_only 标志
+    char frontend_sha_hex[65] = {0};
+    bool has_frontend_sha = false;
+    bool verify_only = false;
+    if (req->content_len > 0 && req->content_len < 256) {
+        char buf[256] = {0};
+        int ret = httpd_req_recv(req, buf, req->content_len);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            cJSON *root = cJSON_Parse(buf);
+            if (root) {
+                cJSON *sha_item = cJSON_GetObjectItem(root, "sha256");
+                if (sha_item && cJSON_IsString(sha_item)) {
+                    const char *sha_str = cJSON_GetStringValue(sha_item);
+                    if (sha_str && strlen(sha_str) == 64) {
+                        strncpy(frontend_sha_hex, sha_str, 64);
+                        frontend_sha_hex[64] = '\0';
+                        has_frontend_sha = true;
+                        strncpy(WifiOta::instance().m_frontendSha256, sha_str, 64);
+                        WifiOta::instance().m_frontendSha256[64] = '\0';
+                        WifiOta::instance().m_hasFrontendSha256 = true;
+                        DEBUG_INFO("OTA", "Frontend SHA-256: %s", frontend_sha_hex);
+                    }
+                }
+                cJSON *verify_item = cJSON_GetObjectItem(root, "verify_only");
+                if (verify_item && cJSON_IsBool(verify_item)) {
+                    verify_only = cJSON_IsTrue(verify_item);
+                }
+                cJSON_Delete(root);
+            }
+        }
+    }
 
-    esp_err_t err = esp_ota_end(WifiOta::instance().m_esp32OtaHandle);
+    if (verify_only) {
+        DEBUG_INFO("OTA", "ESP32 OTA verify-only mode, %u bytes", (unsigned)WifiOta::instance().m_esp32Received);
+    } else {
+        DEBUG_INFO("OTA", "ESP32 OTA complete, %u bytes, setting boot partition...", (unsigned)WifiOta::instance().m_esp32Received);
+
+        esp_err_t err = esp_ota_end(WifiOta::instance().m_esp32OtaHandle);
+        if (err != ESP_OK) {
+            DEBUG_ERR("OTA", "esp_ota_end failed: %s", esp_err_to_name(err));
+            esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
+            esp32_ota_mutex_release();
+            WifiOta::instance().m_esp32OtaActive = false;
+            WifiOta::instance().m_esp32OtaHandle = 0;
+            wifi_esp32_ota_cleanup_sha();
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+            return ESP_FAIL;
+        }
+    }
+
+    // ── SHA-256 验证：从 OTA 分区读回并计算哈希 ──
+    if (has_frontend_sha && WifiOta::instance().m_esp32UpdatePartition != NULL) {
+        DEBUG_INFO("OTA", "Verifying: reading OTA partition for SHA-256...");
+        const esp_partition_t *part = WifiOta::instance().m_esp32UpdatePartition;
+        mbedtls_sha256_context verify_ctx;
+        mbedtls_sha256_init(&verify_ctx);
+        mbedtls_sha256_starts(&verify_ctx, 0);
+
+        uint8_t *read_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
+        if (!read_buf) {
+            DEBUG_ERR("OTA", "SHA-256 verify: malloc failed");
+            mbedtls_sha256_free(&verify_ctx);
+        } else {
+            size_t offset = 0;
+            while (offset < WifiOta::instance().m_esp32Received) {
+                size_t to_read = WifiOta::instance().m_esp32Received - offset;
+                if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
+                esp_err_t rd_err = esp_partition_read(part, offset, read_buf, to_read);
+                if (rd_err != ESP_OK) {
+                    DEBUG_ERR("OTA", "SHA-256 verify: partition read failed at offset %u", (unsigned int)offset);
+                    break;
+                }
+                mbedtls_sha256_update(&verify_ctx, read_buf, to_read);
+                offset += to_read;
+            }
+            free(read_buf);
+            mbedtls_sha256_finish(&verify_ctx, WifiOta::instance().m_esp32Sha256);
+            mbedtls_sha256_free(&verify_ctx);
+            WifiOta::instance().m_esp32HashComputed = true;
+
+            char device_sha_hex[65] = {0};
+            for (int i = 0; i < 32; ++i) {
+                snprintf(&device_sha_hex[i * 2], sizeof(device_sha_hex) - i * 2, "%02x", WifiOta::instance().m_esp32Sha256[i]);
+            }
+            DEBUG_INFO("OTA", "Device SHA-256: %s", device_sha_hex);
+
+            bool match = true;
+            for (int i = 0; i < 64; i++) {
+                if (tolower((unsigned char)frontend_sha_hex[i]) != tolower((unsigned char)device_sha_hex[i])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                DEBUG_INFO("OTA", "SHA-256 verified OK");
+                if (verify_only) {
+                    char ok_resp[256] = {0};
+                    snprintf(ok_resp, sizeof(ok_resp),
+                             "{\"status\": \"ok\", \"message\": \"SHA-256 verified\", \"sha256\": \"%s\"}",
+                             device_sha_hex);
+                    httpd_resp_set_type(req, "application/json");
+                    httpd_resp_send(req, ok_resp, strlen(ok_resp));
+                    return ESP_OK;
+                }
+            } else {
+                DEBUG_ERR("OTA", "SHA-256 mismatch! frontend=%s device=%s, abort", frontend_sha_hex, device_sha_hex);
+                if (!verify_only) {
+                    esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
+                }
+                wifi_esp32_ota_cleanup_sha();
+                esp32_ota_mutex_release();
+                WifiOta::instance().m_esp32OtaActive = false;
+                WifiOta::instance().m_esp32OtaHandle = 0;
+                WifiOta::instance().m_esp32UpdatePartition = NULL;
+                WifiOta::instance().m_esp32Received = 0;
+                char err_resp[256] = {0};
+                snprintf(err_resp, sizeof(err_resp),
+                         "{\"status\": \"error\", \"message\": \"SHA-256 mismatch\", \"frontend\": \"%s\", \"device\": \"%s\"}",
+                         frontend_sha_hex, device_sha_hex);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_send(req, err_resp, strlen(err_resp));
+                return ESP_FAIL;
+            }
+        }
+    }
+
+    // ── 非verify_only模式：设置启动分区并重启 ──
+    if (verify_only) {
+        // 没有前端SHA或验证被跳过，在verify_only下也返回ok
+        char ok_resp[128] = {0};
+        snprintf(ok_resp, sizeof(ok_resp),
+                 "{\"status\": \"ok\", \"message\": \"verify skipped, no SHA-256 provided\"}");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, ok_resp, strlen(ok_resp));
+        return ESP_OK;
+    }
+
+    esp_err_t err = esp_ota_set_boot_partition(WifiOta::instance().m_esp32UpdatePartition);
     if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "esp_ota_end 失败: %s", esp_err_to_name(err));
+        DEBUG_ERR("OTA", "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        esp32_ota_mutex_release();
         WifiOta::instance().m_esp32OtaActive = false;
+        wifi_esp32_ota_cleanup_sha();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
         return ESP_FAIL;
     }
-
-    err = esp_ota_set_boot_partition(WifiOta::instance().m_esp32UpdatePartition);
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
-        WifiOta::instance().m_esp32OtaActive = false;
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
-        return ESP_FAIL;
-    }
+    esp32_ota_mutex_release();
     WifiOta::instance().m_esp32OtaActive = false;
-    DEBUG_INFO("OTA", "ESP32 OTA 完成，重启中...");
+    DEBUG_INFO("OTA", "ESP32 OTA finished, rebooting...");
 
-    const char resp[] = "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\"}";
+    char resp[256] = {0};
+    if (WifiOta::instance().m_esp32HashComputed) {
+        char device_sha_hex[65] = {0};
+        for (int i = 0; i < 32; ++i) {
+            snprintf(&device_sha_hex[i * 2], sizeof(device_sha_hex) - i * 2, "%02x", WifiOta::instance().m_esp32Sha256[i]);
+        }
+        snprintf(resp, sizeof(resp),
+                 "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\", \"sha256\": \"%s\"}",
+                 device_sha_hex);
+    } else {
+        snprintf(resp, sizeof(resp),
+                 "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\"}");
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
 
@@ -580,14 +822,22 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
         esp_err_t err = esp32_ota_begin(total_size);
         if (err != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+            if (err == ESP_ERR_INVALID_STATE) {
+                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "ESP32 OTA occupied by another channel");
+            } else {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+            }
             return ESP_FAIL;
         }
-
 
         // 堆分配缓冲区，避免栈溢出（HTTP server 栈仅 8KB）
         uint8_t *fw_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
         if (!fw_buf) {
+            esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
+            esp32_ota_mutex_release();
+            WifiOta::instance().m_esp32OtaActive = false;
+            WifiOta::instance().m_esp32OtaHandle = 0;
+            wifi_esp32_ota_cleanup_sha();
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存分配失败");
             return ESP_FAIL;
         }
@@ -601,15 +851,34 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
 
             int ret = httpd_req_recv(req, (char *)fw_buf, to_read);
-            if (ret <= 0) break;
+            if (ret <= 0) {
+                DEBUG_ERR("WIFI", "HTTP recv failed (ret=%d), aborting OTA", ret);
+                free(fw_buf);
+                esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
+                esp32_ota_mutex_release();
+                WifiOta::instance().m_esp32OtaActive = false;
+                WifiOta::instance().m_esp32OtaHandle = 0;
+                wifi_esp32_ota_cleanup_sha();
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTP recv failed");
+                return ESP_FAIL;
+            }
 
             err = esp_ota_write(WifiOta::instance().m_esp32OtaHandle, fw_buf, (size_t)ret);
             if (err != ESP_OK) {
                 DEBUG_ERR("WIFI", "OTA write failed");
-                break;
+                free(fw_buf);
+                esp_ota_abort(WifiOta::instance().m_esp32OtaHandle);
+                esp32_ota_mutex_release();
+                WifiOta::instance().m_esp32OtaActive = false;
+                WifiOta::instance().m_esp32OtaHandle = 0;
+                wifi_esp32_ota_cleanup_sha();
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+                return ESP_FAIL;
             }
+
             total_firmware_written += ret;
             total_received += ret;
+            WifiOta::instance().m_esp32Received += ret;
 
             if (total_size > 0) {
                 int percent = (int)((total_firmware_written * 100) / total_size);
@@ -645,12 +914,14 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "firmware too large or alignment overflow");
         return ESP_FAIL;
     }
-    if (OtaRelay::relayState != RELAY_IDLE) {
-        DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", OtaRelay::relayState);
+    if (OtaRelay::getState() != RELAY_IDLE) {
+        DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", OtaRelay::getState());
         OtaRelay::instance().reset();
     }
-    WifiOta::instance().m_gd32StorageDone = false;
-    WifiOta::instance().m_relayTriggered = false;
+    WifiOta::instance().stateLock();
+    WifiOta::instance().setGd32StorageDone(false);
+    WifiOta::instance().setRelayTriggered(false);
+    WifiOta::instance().stateUnlock();
 
     const esp_partition_t *gd32_partition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "gd32_ota");
@@ -761,8 +1032,16 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     ota_meta_t final_meta;
     OtaRelay::metaLoad(&final_meta);
     if (final_meta.total_size > 0 && final_meta.stored_size >= final_meta.total_size) {
-        WifiOta::instance().m_gd32StorageDone = true;
-        DEBUG_INFO("WIFI", "GD32 firmware fully stored, auto-triggering relay");
+        WifiOta::instance().stateLock();
+        WifiOta::instance().setGd32StorageDone(true);
+        WifiOta::instance().stateUnlock();
+        DEBUG_INFO("WIFI", "GD32 firmware fully stored, computing SHA-256...");
+        // 计算并存储 SHA-256 校验和
+        esp_err_t sha_err = OtaRelay::metaFinalizeChecksum();
+        if (sha_err != ESP_OK) {
+            DEBUG_ERR("WIFI", "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
+        }
+        DEBUG_INFO("WIFI", "auto-triggering relay");
         // 自动触发中继
         if (OtaRelay::dispatchQueue) {
             uint32_t cmd = 1;  // 1 = start relay
@@ -794,14 +1073,18 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    if (WifiOta::instance().m_relayTriggered && OtaRelay::relayState != RELAY_IDLE &&
-        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_APP_VERIFY && OtaRelay::relayState != RELAY_ERROR) {
+    relay_state_t curState = OtaRelay::getState();
+    WifiOta::instance().stateLock();
+    if (WifiOta::instance().getRelayTriggered() && curState != RELAY_IDLE &&
+        curState != RELAY_DONE && curState != RELAY_APP_VERIFY && curState != RELAY_ERROR) {
+        WifiOta::instance().stateUnlock();
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "relay already triggered");
         return ESP_FAIL;
     }
     /* 上一轮中继已结束/失败/空闲，重置标志允许重新触发 */
-    WifiOta::instance().m_relayTriggered = false;
-    WifiOta::instance().m_gd32StorageDone = false;
+    WifiOta::instance().setRelayTriggered(false);
+    WifiOta::instance().setGd32StorageDone(false);
+    WifiOta::instance().stateUnlock();
 
     if (!OtaRelay::dispatchQueue) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay queue not ready");
@@ -809,7 +1092,7 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     }
 
     WifiOta::instance().signalRelay();
-    if (!WifiOta::instance().m_relayTriggered) {
+    if (!WifiOta::instance().getRelayTriggered()) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay trigger failed");
         return ESP_FAIL;
     }
@@ -840,18 +1123,20 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "\"storage_done\": %s, \"relay_state\": %d, \"gd32_app_alive\": %s}",
         (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
         (unsigned long)meta.last_seq,
-        WifiOta::instance().m_gd32StorageDone ? "true" : "false",
-        OtaRelay::relayState,
-        OtaRelay::gd32AppAlive ? "true" : "false");
+        WifiOta::instance().getGd32StorageDone() ? "true" : "false",
+        OtaRelay::getState(),
+        OtaRelay::getGd32AppAlive() ? "true" : "false");
 
+    gd32_version_t snapVer = {};
+    OtaRelay::getGd32Version(&snapVer);
     DEBUG_INFO("WIFI", "OTA 状态: total=%lu, stored=%lu, done=%s, app_alive=%s",
                (unsigned long)meta.total_size, (unsigned long)meta.stored_size,
-               WifiOta::instance().m_gd32StorageDone ? "true" : "false",
-               OtaRelay::gd32AppAlive ? "true" : "false",
-        OtaRelay::gd32Version.app_major, OtaRelay::gd32Version.app_minor,
-        OtaRelay::gd32Version.app_patch, OtaRelay::gd32Version.app_build,
-        OtaRelay::gd32Version.boot_major, OtaRelay::gd32Version.boot_minor,
-        OtaRelay::gd32Version.boot_patch, OtaRelay::gd32Version.boot_build);
+               WifiOta::instance().getGd32StorageDone() ? "true" : "false",
+               OtaRelay::getGd32AppAlive() ? "true" : "false",
+        snapVer.app_major, snapVer.app_minor,
+        snapVer.app_patch, snapVer.app_build,
+        snapVer.boot_major, snapVer.boot_minor,
+        snapVer.boot_patch, snapVer.boot_build);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -964,7 +1249,6 @@ static esp_err_t can_send_handler(httpd_req_t *req)
     if (tx_dlc == 0 && dlc > 0) {
         tx_dlc = (dlc > CAN_MAX_DLC) ? CAN_MAX_DLC : dlc;
     }
-
     cJSON_Delete(root);
 
     // 发送 CAN 帧到 GD32
@@ -1051,7 +1335,6 @@ static esp_err_t spi_send_handler(httpd_req_t *req)
 
     DEBUG_INFO("SPI", "WEB SPI: type=0x%02X, payload=%zu 字节",
                frame_type, payload_len);
-
     cJSON_Delete(root);
 
     char resp[1024];
@@ -1114,7 +1397,7 @@ static esp_err_t wifi_status_handler(httpd_req_t *req)
     char ip_str[16] = "0.0.0.0";
     int8_t rssi = -127;
 
-    if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().m_staConnected) {
+    if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().getStaConnected()) {
         esp_netif_ip_info_t ip_info;
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
@@ -1130,7 +1413,7 @@ static esp_err_t wifi_status_handler(httpd_req_t *req)
         "{\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}",
         WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_AP ? "AP" : "STA",
         ip_str, rssi,
-        (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA) ? (WifiOta::instance().m_staConnected ? "true" : "false") : "N/A");
+        (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA) ? (WifiOta::instance().getStaConnected() ? "true" : "false") : "N/A");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1144,7 +1427,7 @@ static esp_err_t wifi_status_handler(httpd_req_t *req)
 static esp_err_t version_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
-    gd32_version_t gv = OtaRelay::gd32Version;
+    gd32_version_t gv = {}; OtaRelay::getGd32Version(&gv);
     char resp[512];
     int len = snprintf(resp, sizeof(resp),
         "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", "
@@ -1152,7 +1435,7 @@ static esp_err_t version_handler(httpd_req_t *req)
         FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH,
         gv.app_major, gv.app_minor, gv.app_patch, gv.app_build,
         gv.boot_major, gv.boot_minor, gv.boot_patch, gv.boot_build,
-        OtaRelay::gd32AppAlive ? "true" : "false");
+        OtaRelay::getGd32AppAlive() ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
     return ESP_OK;
@@ -1170,7 +1453,7 @@ static esp_err_t system_status_handler(httpd_req_t *req)
     int8_t rssi = -127;
     bool connected = false;
 
-    if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().m_staConnected) {
+    if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().getStaConnected()) {
         esp_netif_ip_info_t ip_info;
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
@@ -1182,11 +1465,13 @@ static esp_err_t system_status_handler(httpd_req_t *req)
         }
         connected = true;
     }
+    gd32_version_t pingVer = {};
+    OtaRelay::getGd32Version(&pingVer);
 
     /* 若尚无 GD32 版本信息且 OTA 中继空闲，尝试一次 SPI PING 获取 */
-    if (OtaRelay::gd32Version.app_major == 0 &&
-        OtaRelay::gd32Version.boot_major == 0 &&
-        OtaRelay::relayState == RELAY_IDLE) {
+    if (pingVer.app_major == 0 &&
+        pingVer.boot_major == 0 &&
+        OtaRelay::getState() == RELAY_IDLE) {
         static uint32_t last_ping_ms = 0;
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         if (now_ms - last_ping_ms > 5000) {  /* 5 秒节流 */
@@ -1194,10 +1479,10 @@ static esp_err_t system_status_handler(httpd_req_t *req)
             uint32_t uptime = 0;
             gd32_version_t ver = {};
             if (SpiMaster::instance().appPing(500, &uptime, &ver) == ESP_OK) {
-                OtaRelay::gd32AppAlive = true;
-                OtaRelay::gd32Version = ver;
+                OtaRelay::setGd32AppAlive(true);
+                OtaRelay::setGd32Version(ver);
             } else {
-                OtaRelay::gd32AppAlive = false;
+                OtaRelay::setGd32AppAlive(false);
             }
         }
     }
@@ -1206,6 +1491,8 @@ static esp_err_t system_status_handler(httpd_req_t *req)
     memset(&meta, 0, sizeof(meta));
     OtaRelay::metaLoad(&meta);
 
+    gd32_version_t snapVer2 = {};
+    OtaRelay::getGd32Version(&snapVer2);
     char resp[1024];
     int len = snprintf(resp, sizeof(resp),
         "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, \"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}}",
@@ -1220,15 +1507,15 @@ static esp_err_t system_status_handler(httpd_req_t *req)
         connected ? "true" : "false",
         (unsigned long)meta.total_size,
         (unsigned long)meta.stored_size,
-        WifiOta::instance().m_gd32StorageDone ? "true" : "false",
-        OtaRelay::relayState,
-        (unsigned long)OtaRelay::relaySeq,
-        (unsigned long)OtaRelay::relayTotalPackets,
-        OtaRelay::gd32AppAlive ? "true" : "false",
-        OtaRelay::gd32Version.app_major, OtaRelay::gd32Version.app_minor,
-        OtaRelay::gd32Version.app_patch, OtaRelay::gd32Version.app_build,
-        OtaRelay::gd32Version.boot_major, OtaRelay::gd32Version.boot_minor,
-        OtaRelay::gd32Version.boot_patch, OtaRelay::gd32Version.boot_build);
+        WifiOta::instance().getGd32StorageDone() ? "true" : "false",
+        OtaRelay::getState(),
+        (unsigned long)OtaRelay::getRelaySeq(),
+        (unsigned long)OtaRelay::getRelayTotalPackets(),
+        OtaRelay::getGd32AppAlive() ? "true" : "false",
+        snapVer2.app_major, snapVer2.app_minor,
+        snapVer2.app_patch, snapVer2.app_build,
+        snapVer2.boot_major, snapVer2.boot_minor,
+        snapVer2.boot_patch, snapVer2.boot_build);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1247,6 +1534,8 @@ esp_err_t WifiOta::httpServerStart()
     config.server_port = HTTP_SERVER_PORT;
     config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
+    config.max_open_sockets = 4;   // LWIP_MAX_SOCKETS 默认 7，HTTP 内部占 3，最多 4
+    config.lru_purge_enable = true;  // socket 满时自动清理最久未用的连接
     config.recv_wait_timeout = 30;  // GD32 上传前会擦除 Flash，5 秒默认值过紧
     config.send_wait_timeout = 30;
 
@@ -1264,7 +1553,7 @@ esp_err_t WifiOta::httpServerStart()
         ota_meta_t boot_meta;
         if (OtaRelay::metaLoad(&boot_meta) == ESP_OK &&
             boot_meta.total_size > 0 && boot_meta.stored_size >= boot_meta.total_size) {
-            WifiOta::instance().m_gd32StorageDone = true;
+            WifiOta::instance().setGd32StorageDone(true);
             DEBUG_INFO("WIFI", "从 NVS 恢复: 固件已就绪 (%u bytes)", boot_meta.total_size);
         }
     }
@@ -1501,16 +1790,19 @@ void WifiOta::signalRelay()
                    (unsigned long)meta.stored_size, (unsigned long)meta.total_size);
         return;
     }
-
-    if (WifiOta::instance().m_relayTriggered && OtaRelay::relayState != RELAY_IDLE &&
-        OtaRelay::relayState != RELAY_DONE && OtaRelay::relayState != RELAY_APP_VERIFY && OtaRelay::relayState != RELAY_ERROR) {
-        DEBUG_WARN("WIFI", "转发正在执行中，状态: %d", OtaRelay::relayState);
+    relay_state_t st = OtaRelay::getState();
+    WifiOta::instance().stateLock();
+    if (WifiOta::instance().getRelayTriggered() && st != RELAY_IDLE &&
+        st != RELAY_DONE && st != RELAY_APP_VERIFY && st != RELAY_ERROR) {
+        WifiOta::instance().stateUnlock();
+        DEBUG_WARN("WIFI", "转发正在执行中，状态: %d", st);
         return;
     }
     /* 上一轮中继已结束/失败/空闲，重置标志 */
-    WifiOta::instance().m_relayTriggered = false;
-    WifiOta::instance().m_gd32StorageDone = false;
-    WifiOta::instance().m_relayTriggered = true;
+    WifiOta::instance().setRelayTriggered(false);
+    WifiOta::instance().setGd32StorageDone(false);
+    WifiOta::instance().setRelayTriggered(true);
+    WifiOta::instance().stateUnlock();
 
     if (OtaRelay::dispatchQueue) {
         uint32_t msg = 1;
@@ -1519,11 +1811,11 @@ void WifiOta::signalRelay()
             DEBUG_INFO("WIFI", "OTA 调度信号已发送到中继任务");
         } else {
             DEBUG_ERR("WIFI", "OTA 调度信号发送失败");
-            WifiOta::instance().m_relayTriggered = false;
+            WifiOta::instance().setRelayTriggered(false);
         }
     } else {
         DEBUG_ERR("WIFI", "OTA 中继队列尚未就绪");
-        WifiOta::instance().m_relayTriggered = false;
+        WifiOta::instance().setRelayTriggered(false);
     }
 }
 
@@ -1542,7 +1834,7 @@ ota_wifi_mode_t WifiOta::getMode()
  */
 int8_t WifiOta::getRssi()
 {
-    if (WifiOta::instance().m_wifiMode != OTA_WIFI_MODE_STA || !WifiOta::instance().m_staConnected) {
+    if (WifiOta::instance().m_wifiMode != OTA_WIFI_MODE_STA || !WifiOta::instance().getStaConnected()) {
         return -127;
     }
     wifi_ap_record_t ap_info;
@@ -1558,7 +1850,7 @@ int8_t WifiOta::getRssi()
  */
 bool WifiOta::isConnected()
 {
-    return WifiOta::instance().m_staConnected;
+    return WifiOta::instance().getStaConnected();
 }
 
 // ----------------------------------------
@@ -1631,10 +1923,34 @@ bool WifiOta::earlyInit()
         }
     }
 
+    // ★ 创建状态互斥锁（保护 WiFi 连接状态、OTA 中继标志等跨任务共享变量）
+    if (WifiOta::instance().getStateMutex() == NULL) {
+        SemaphoreHandle_t mtx = xSemaphoreCreateMutex();
+        if (mtx) {
+            // 通过临时获取再赋值（私有成员在同类内可访问）
+            WifiOta::instance().m_stateMutex = mtx;
+            DEBUG_INFO("WIFI", "状态互斥锁已创建");
+        } else {
+            DEBUG_ERR("WIFI", "创建状态互斥锁失败");
+        }
+    }
+
     WifiOta::instance().m_staConnectedSem = xSemaphoreCreateBinary();
     WifiOta::instance().m_staGotIpSem = xSemaphoreCreateBinary();
     if (!WifiOta::instance().m_staConnectedSem || !WifiOta::instance().m_staGotIpSem) {
         DEBUG_ERR("WIFI", "创建信号量失败");
+    }
+
+    // 创建后台重连任务：避免在系统事件任务中调用 esp_wifi_connect()/vTaskDelay 导致死锁
+    if (WifiOta::instance().m_reconnectTask == nullptr) {
+        BaseType_t ret = xTaskCreate(&WifiOta::reconnectTask, "wifi_reconnect",
+                                     4096, NULL, 5,
+                                     &WifiOta::instance().m_reconnectTask);
+        if (ret != pdPASS) {
+            DEBUG_ERR("WIFI", "创建重连任务失败");
+        } else {
+            DEBUG_INFO("WIFI", "WiFi 重连任务已创建");
+        }
     }
 
     // 注册 WiFi/IP 事件回调（必须在 esp_wifi_init 之前）
@@ -1775,6 +2091,4 @@ void WifiOta::taskEntry(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
-
-
 

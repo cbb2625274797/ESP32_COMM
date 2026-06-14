@@ -1,4 +1,4 @@
-﻿/*
+/*
  * wifi_ota.h - WiFi OTA 服务器
  * T4.1 - T4.5
  *
@@ -11,7 +11,9 @@
 #include "esp_ota_ops.h"
 #include "esp_http_server.h"
 #include "esp_event.h"
+#include <atomic>
 
+// SHA-256 验证所需类型前向声明
 typedef enum {
     OTA_WIFI_MODE_AP,
     OTA_WIFI_MODE_STA
@@ -29,28 +31,57 @@ public:
     static int8_t getRssi();
     static bool isConnected();
 
-    // 以下状态为 public，供 C 回调函数访问
+    // ── WiFi 连接状态（WiFi 事件回调 / HTTP / reconnect 任务共享，需 mutex 保护）──
+    bool getStaConnected() const          { return m_staConnected.load(); }
+    void setStaConnected(bool v)          { m_staConnected.store(v); }
+    int  getStaRetryCount() const         { return m_staRetryCount.load(); }
+    void setStaRetryCount(int v)          { m_staRetryCount.store(v); }
+    bool getStaRetryExhausted() const     { return m_staRetryExhausted.load(); }
+    void setStaRetryExhausted(bool v)     { m_staRetryExhausted.store(v); }
+    bool getGd32StorageDone() const       { return m_gd32StorageDone.load(); }
+    void setGd32StorageDone(bool v)       { m_gd32StorageDone.store(v); }
+    bool getRelayTriggered() const        { return m_relayTriggered.load(); }
+    void setRelayTriggered(bool v)        { m_relayTriggered.store(v); }
+
+    // ── 状态互斥锁（保护复合读-改-写操作）──
+    SemaphoreHandle_t getStateMutex() const { return m_stateMutex; }
+    void stateLock()   { if (m_stateMutex) xSemaphoreTake(m_stateMutex, portMAX_DELAY); }
+    void stateUnlock() { if (m_stateMutex) xSemaphoreGive(m_stateMutex); }
+
+    // ── 初始化/运行时状态（仅 OTA 任务访问，无需额外锁）──
     ota_wifi_mode_t m_wifiMode = OTA_WIFI_MODE_AP;
     bool m_coldBoot = false;
-    bool m_relayTriggered = false;
-    bool m_staConnected = false;
-    int m_staRetryCount = 0;
-    bool m_staRetryExhausted = false;
     SemaphoreHandle_t m_staConnectedSem = NULL;
     SemaphoreHandle_t m_staGotIpSem = NULL;
+    TaskHandle_t m_reconnectTask = nullptr;
 
     bool m_esp32OtaActive = false;
     esp_ota_handle_t m_esp32OtaHandle = 0;
     const esp_partition_t *m_esp32UpdatePartition = NULL;
     size_t m_esp32Received = 0;
-    bool m_gd32StorageDone = false;
     httpd_handle_t m_httpServer = NULL;
+
+    // ── SHA-256 哈希校验 ──
+    uint8_t m_esp32Sha256[32] = {0};                // 重启前验证计算的SHA-256哈希值
+    bool m_esp32HashComputed = false;               // 是否已计算哈希
+    char m_frontendSha256[65] = {0};                // 前端提供的SHA-256（上传时存储）
+    bool m_hasFrontendSha256 = false;               // 前端是否提供了SHA-256
+
+private:
+    // ── 跨任务共享状态（atomic + m_stateMutex 保护）──
+    std::atomic<bool> m_staConnected{false};
+    std::atomic<int>  m_staRetryCount{0};
+    std::atomic<bool> m_staRetryExhausted{false};
+    std::atomic<bool> m_gd32StorageDone{false};
+    std::atomic<bool> m_relayTriggered{false};
+    SemaphoreHandle_t m_stateMutex = NULL;
 
     void initAp();
     esp_err_t initSta();
     void setStaticIp();
     static void wifiEventHandler(void *arg, esp_event_base_t event_base,
                                  int32_t event_id, void *event_data);
+    static void reconnectTask(void *pvParameters);
     esp_err_t httpServerStart();
     esp_err_t waitStaConnected(char *ip_str, size_t ip_len);
 };

@@ -54,7 +54,7 @@ public:
     /** @brief 记录一条健康事件日志。 */
     void logEvent(const char *event, int value);
 
-    /** @brief 获取当前系统健康状态。 */
+    /** @brief 获取当前系统健康状态（线程安全）。 */
     health_state_t getCurrent();
 
     /** @brief 根据 WiFi RSSI 更新健康状态。 */
@@ -66,10 +66,13 @@ public:
     /** @brief 获取最近一次 WiFi RSSI 及其年龄。 */
     bool getLastWifiRssi(int8_t *out_rssi, uint32_t *out_age_ms);
 
-    /** @brief 全局健康状态（public，供外部读取）。 */
-    static health_state_t healthState;
-
 private:
+    /** @brief 加锁读取健康状态。 */
+    health_state_t getState();
+
+    /** @brief 加锁设置健康状态。 */
+    void setState(health_state_t newState);
+
     HealthMonitor() = default;
     ~HealthMonitor() = default;
     HealthMonitor(const HealthMonitor&) = delete;
@@ -77,6 +80,7 @@ private:
 
     SemaphoreHandle_t m_mutex = NULL;
     temperature_sensor_handle_t m_tempHandle = NULL;
+    health_state_t m_healthState = SYS_NORMAL;
     float m_lastTemperature = 0.0f;
     int8_t m_lastWifiRssi = -127;
     int64_t m_lastWifiRssiMs = 0;

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "soc/spi_struct.h"
 #include "esp_err.h"
@@ -32,7 +33,8 @@ SpiMaster& SpiMaster::instance()
 // 内部 SPI 传输
 // ============================================================
 esp_err_t SpiMaster::transferClocked(const uint8_t *tx_buf, size_t tx_len,
-                                     uint8_t *rx_buf, size_t rx_len)
+                                     uint8_t *rx_buf, size_t rx_len,
+                                     uint32_t timeout_ms)
 {
     if (m_spiDevice == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -75,21 +77,33 @@ esp_err_t SpiMaster::transferClocked(const uint8_t *tx_buf, size_t tx_len,
     t.tx_buffer = tx_ptr;
     t.rx_buffer = (rx_len > 0U) ? rx_ptr : NULL;
 
-    esp_err_t ret = spi_device_transmit(m_spiDevice, &t);
+    TickType_t ticks = (timeout_ms == 0U) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    esp_err_t ret = spi_device_queue_trans(m_spiDevice, &t, ticks);
     if (ret != ESP_OK) {
-        DEBUG_WARN("SPI", "spi_device_transmit fail: %s len=%u tx=%p rx=%p",
-                   esp_err_to_name(ret), (unsigned)(total_len * 8U), t.tx_buffer, t.rx_buffer);
+        DEBUG_WARN("SPI", "spi_device_queue_trans fail: %s len=%u",
+                   esp_err_to_name(ret), (unsigned)(total_len * 8U));
+        return ret;
     }
 
-    if (ret == ESP_OK && rx_len > 0U && rx_ptr != rx_buf) {
+    spi_transaction_t *ret_trans = NULL;
+    ret = spi_device_get_trans_result(m_spiDevice, &ret_trans, ticks);
+    (void)ret_trans;
+    if (ret != ESP_OK) {
+        DEBUG_WARN("SPI", "spi_device_get_trans_result timeout/fail: %s len=%u tx=%p rx=%p",
+                   esp_err_to_name(ret), (unsigned)(total_len * 8U), t.tx_buffer, t.rx_buffer);
+        return ret;
+    }
+
+    if (rx_len > 0U && rx_ptr != rx_buf) {
         memcpy(rx_buf, rx_ptr, rx_len);
     }
-    return ret;
+    return ESP_OK;
 }
 
 esp_err_t SpiMaster::transferRequestResponse(uint8_t cmd,
                                              const uint8_t *payload, size_t payload_len,
-                                             uint8_t *rx_buf, size_t rx_len)
+                                             uint8_t *rx_buf, size_t rx_len,
+                                             uint32_t timeout_ms)
 {
     if ((payload_len > 0U && payload == NULL) || (rx_len > 0U && rx_buf == NULL)) {
         return ESP_ERR_INVALID_ARG;
@@ -121,7 +135,8 @@ esp_err_t SpiMaster::transferRequestResponse(uint8_t cmd,
 
     esp_err_t ret = transferClocked(tx_staging, total_len,
                                     (rx_len > 0U) ? rx_staging : NULL,
-                                    (rx_len > 0U) ? total_len : 0U);
+                                    (rx_len > 0U) ? total_len : 0U,
+                                    timeout_ms);
     if (ret == ESP_OK && rx_len > 0U) {
         memcpy(rx_buf, &rx_staging[cmd_len + payload_len], rx_len);
     }
@@ -209,6 +224,14 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
 // ============================================================
 esp_err_t SpiMaster::init()
 {
+    LockGuard lock(m_mutex);
+    // 创建 SPI 总线互斥锁（必须在 SPI 设备初始化之前）
+    m_mutex = xSemaphoreCreateMutex();
+    if (m_mutex == NULL) {
+        DEBUG_ERR("SPI", "SPI 互斥锁创建失败");
+        return ESP_ERR_NO_MEM;
+    }
+
     DEBUG_INFO("SPI", "=== 初始化 SPI2 总线 ===");
 
     spi_bus_config_t bus_cfg = {};
@@ -255,19 +278,20 @@ esp_err_t SpiMaster::syncTransfer(uint8_t cmd, const uint8_t *payload,
                                   size_t payload_len, uint8_t *recv_buf,
                                   size_t recv_len, uint32_t timeout_ms)
 {
-    (void)timeout_ms;
-    return transferRequestResponse(cmd, payload, payload_len, recv_buf, recv_len);
+    LockGuard lock(m_mutex);
+    return transferRequestResponse(cmd, payload, payload_len, recv_buf, recv_len, timeout_ms);
 }
 
 esp_err_t SpiMaster::send(uint8_t cmd, const uint8_t *payload, size_t len)
 {
-    return transferRequestResponse(cmd, payload, len, NULL, 0);
+    LockGuard lock(m_mutex);
+    return transferRequestResponse(cmd, payload, len, NULL, 0, 0U);
 }
 
 esp_err_t SpiMaster::recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_ms)
 {
-    (void)timeout_ms;
-    return transferRequestResponse(cmd, NULL, 0, recv_buf, len);
+    LockGuard lock(m_mutex);
+    return transferRequestResponse(cmd, NULL, 0, recv_buf, len, timeout_ms);
 }
 
 // ============================================================
@@ -277,6 +301,7 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
                                  uint8_t *resp_type, uint8_t *resp_payload,
                                  size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
 {
+    LockGuard lock(m_mutex);
     uint8_t tx_frame[SPI_OTA_FRAME_MAX];
     size_t tx_len = 0;
     if (!otaBuildFrame(type, payload, payload_len, tx_frame, &tx_len)) {
@@ -285,17 +310,24 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
 
     DEBUG_DBG("SPI", "OTA TX: type=0x%02X len=%u first4=%02X%02X%02X%02X",
               type, (unsigned)tx_len, tx_frame[0], tx_frame[1], tx_frame[2], tx_frame[3]);
-    esp_err_t ret = transferClocked(tx_frame, tx_len, NULL, 0);
+    esp_err_t ret = transferClocked(tx_frame, tx_len, NULL, 0, timeout_ms);
     if (ret != ESP_OK) {
         DEBUG_WARN("SPI", "OTA 请求发送失败: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    return otaPollResponse(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
+    return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
 }
 
 esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
                                      size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
+{
+    LockGuard lock(m_mutex);
+    return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, timeout_ms);
+}
+
+esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_payload,
+                                             size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
 {
     constexpr size_t kPollBytes = 96U;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
@@ -305,7 +337,12 @@ esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
         uint8_t dummy[kPollBytes];
         memset(dummy, 0xFF, sizeof(dummy));
 
-        esp_err_t ret = transferClocked(dummy, sizeof(dummy), rx_raw, sizeof(rx_raw));
+        /* 用剩余时间作为单次 SPI 事务超时，避免总等待远超 deadline */
+        TickType_t now = xTaskGetTickCount();
+        uint32_t remain_ms = (deadline > now) ? ((deadline - now) * portTICK_PERIOD_MS) : 0U;
+        if (remain_ms == 0U) break;
+
+        esp_err_t ret = transferClocked(dummy, sizeof(dummy), rx_raw, sizeof(rx_raw), remain_ms);
         if (ret != ESP_OK) {
             DEBUG_WARN("SPI", "OTA 响应读取失败: %s", esp_err_to_name(ret));
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -355,6 +392,7 @@ esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
 
 esp_err_t SpiMaster::appRequestBootloader()
 {
+    LockGuard lock(m_mutex);
     DEBUG_INFO("SPI", "请求 GD32 APP 进入 Bootloader...");
 
     constexpr uint32_t kMaxRetries = 3U;
@@ -393,6 +431,7 @@ esp_err_t SpiMaster::appRequestBootloader()
 
 esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version)
 {
+    LockGuard lock(m_mutex);
     constexpr uint8_t kAppPingType = 0xA1U;
     constexpr size_t kAppPingPollBytes = 32U;
 
@@ -511,13 +550,14 @@ esp_err_t SpiMaster::transferWithRetry(uint8_t cmd, const uint8_t *payload,
                                        size_t payload_len, uint8_t *recv_buf,
                                        size_t recv_len, int max_retries)
 {
+    LockGuard lock(m_mutex);
     esp_err_t ret;
     int retry_count = 0;
 
     DEBUG_INFO("SPI", "SPI 传输 (带重试): cmd=0x%02X, 最大重试=%d", cmd, max_retries);
 
     while (retry_count < max_retries) {
-        ret = syncTransfer(cmd, payload, payload_len,
+        ret = syncTransferUnlocked(cmd, payload, payload_len,
                            recv_buf, recv_len, 3000);
         if (ret == ESP_OK) {
             if (retry_count > 0) {
@@ -544,6 +584,7 @@ int SpiMaster::canSend(can_channel_t channel, uint32_t ext_id,
                        uint8_t *recv_buf, uint8_t recv_max,
                        uint32_t timeout_ms)
 {
+    LockGuard lock(m_mutex);
     if (channel >= CAN_CHANNEL_MAX || dlc > CAN_MAX_DLC || !data) {
         return -1;
     }
@@ -559,7 +600,7 @@ int SpiMaster::canSend(can_channel_t channel, uint32_t ext_id,
     memcpy(&tx_buf[tx_len], data, dlc);
     tx_len += dlc;
 
-    esp_err_t ret = syncTransfer(0, tx_buf, tx_len, recv_buf, recv_max, timeout_ms);
+    esp_err_t ret = syncTransferUnlocked(0, tx_buf, tx_len, recv_buf, recv_max, timeout_ms);
     if (ret != ESP_OK) {
         return -1;
     }
@@ -570,6 +611,7 @@ int SpiMaster::canSend(can_channel_t channel, uint32_t ext_id,
 int SpiMaster::canSendNoReply(can_channel_t channel, uint32_t ext_id,
                               const uint8_t *data, uint8_t dlc)
 {
+    LockGuard lock(m_mutex);
     if (channel >= CAN_CHANNEL_MAX || dlc > CAN_MAX_DLC || !data) {
         return -1;
     }
@@ -585,7 +627,7 @@ int SpiMaster::canSendNoReply(can_channel_t channel, uint32_t ext_id,
     memcpy(&tx_buf[tx_len], data, dlc);
     tx_len += dlc;
 
-    esp_err_t ret = send(0, tx_buf, tx_len);
+    esp_err_t ret = sendUnlocked(0, tx_buf, tx_len);
     if (ret != ESP_OK) {
         return -1;
     }
@@ -593,4 +635,17 @@ int SpiMaster::canSendNoReply(can_channel_t channel, uint32_t ext_id,
     return 0;
 }
 
+// ============================================================
+// 无锁内部版本实现
+// ============================================================
+esp_err_t SpiMaster::syncTransferUnlocked(uint8_t cmd, const uint8_t *payload,
+                                          size_t payload_len, uint8_t *recv_buf,
+                                          size_t recv_len, uint32_t timeout_ms)
+{
+    return transferRequestResponse(cmd, payload, payload_len, recv_buf, recv_len, timeout_ms);
+}
 
+esp_err_t SpiMaster::sendUnlocked(uint8_t cmd, const uint8_t *payload, size_t len)
+{
+    return transferRequestResponse(cmd, payload, len, NULL, 0, 0U);
+}

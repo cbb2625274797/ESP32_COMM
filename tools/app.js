@@ -15,6 +15,87 @@ let isEsp32Rebooting = false;
 let rebootStartTime = 0;
 // ==================== 刷写进度 ====================
 var activePhase = null;  // 'esp32Ota' | 'gd32Upload' | 'gd32Relay' | null
+var currentOtaTarget = null;  // 'esp32' | 'gd32' | null — 当前 OTA 目标，决定显示哪套阶段
+// 切换 OTA 阶段面板显示
+function switchStageFlow(target) {
+  currentOtaTarget = target;
+  var esp32El = document.getElementById('esp32Stages');
+  var gd32El = document.getElementById('gd32Stages');
+  if (target === 'esp32') {
+    if (esp32El) esp32El.style.display = '';
+    if (gd32El) gd32El.style.display = 'none';
+  } else {
+    if (esp32El) esp32El.style.display = 'none';
+    if (gd32El) gd32El.style.display = '';
+  }
+  // 重置 ESP32 阶段节点
+  ['es1','es2','es3','es4','es5','es6'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.className = 'stage-node';
+  });
+  ['esd1','esd2','esd3','esd4','esd5','esd6'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = '';
+  });
+  // 重置 GD32 阶段节点
+  ['s1','s2','s3','s4','s5','s6'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.className = 'stage-node';
+  });
+  ['sd1','sd2','sd3','sd4','sd5','sd6'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = '';
+  });
+}
+// ESP32 OTA 阶段状态: 0=待机, 1=上传中, 2=OTA写入, 3=SHA-256校验, 4=应用固件, 5=重启中, 6=启动完成
+var esp32OtaPhase = 0;
+var esp32PhaseLabels = ['', '上传中', '写入中', '校验中', '应用中', '重启中', '已完成'];
+function updateEsp32StagesFromPhase(phase) {
+  esp32OtaPhase = phase;
+  var ids = ['es1', 'es2', 'es3', 'es4', 'es5', 'es6'];
+  var detailIds = ['esd1', 'esd2', 'esd3', 'esd4', 'esd5', 'esd6'];
+  var all = ids.map(function(id) { return document.getElementById(id); });
+  var details = detailIds.map(function(id) { return document.getElementById(id); });
+  all.forEach(function (s) { if (s) s.className = 'stage-node'; });
+  details.forEach(function (d) { if (d) d.textContent = ''; });
+  var statusBar = document.getElementById('stageStatusBar');
+  var statusText = document.getElementById('stageStatusText');
+  if (phase <= 0) {
+    if (statusBar) statusBar.className = 'stage-status-bar';
+    if (statusText) statusText.textContent = '待机';
+    return;
+  }
+  for (var i = 0; i < phase - 1 && i < 6; i++) {
+    if (all[i]) all[i].className = 'stage-node done';
+  }
+  if (phase >= 1 && phase <= 6) {
+    if (all[phase - 1]) all[phase - 1].className = 'stage-node live';
+    if (details[phase - 1]) details[phase - 1].textContent = esp32PhaseLabels[phase] || '';
+  }
+  if (statusBar && statusText) {
+    if (phase >= 6) {
+      statusBar.className = 'stage-status-bar ok';
+      statusText.textContent = 'ESP32 刷写完成';
+    } else {
+      statusBar.className = 'stage-status-bar active';
+      statusText.textContent = (esp32PhaseLabels[phase] || '进行中') + ' (' + phase + '/6)';
+    }
+  }
+}
+function updateEsp32StagesError() {
+  var ids = ['es1', 'es2', 'es3', 'es4', 'es5', 'es6'];
+  var all = ids.map(function(id) { return document.getElementById(id); });
+  all.forEach(function (s) { if (s) s.className = 'stage-node'; });
+  var statusBar = document.getElementById('stageStatusBar');
+  var statusText = document.getElementById('stageStatusText');
+  if (statusBar) statusBar.className = 'stage-status-bar err';
+  if (statusText) statusText.textContent = '校验/应用失败';
+}
+
+function showVerifyActions(type) {
+  // 已移除确认/重试/取消按钮：SHA-256 校验通过后自动重启，校验失败仅记录日志
+  void type;
+}
 
 function setActivePhase(phase) {
   activePhase = phase;
@@ -29,18 +110,16 @@ function setActivePhase(phase) {
   var fill = document.getElementById('progressFill');
   if (fill) fill.classList.remove('done');
 }
-
 function markPhaseDone(phase) {
   var stepMap = { esp32Ota: 'ppEsp32', gd32Upload: 'ppGd32Up', gd32Relay: 'ppGd32Relay' };
   var el = document.getElementById(stepMap[phase]);
   if (el) { el.classList.remove('active'); el.classList.add('done'); }
   // All done? turn progress bar green
-  if (phase === 'gd32Relay') {
+  if (phase === 'gd32Relay' || phase === 'esp32Ota') {
     var fill = document.getElementById('progressFill');
     if (fill) fill.classList.add('done');
   }
 }
-
 function setProgress(pct, text) {
   var fillEl = document.getElementById('progressFill');
   var txtEl = document.getElementById('progressTxt');
@@ -49,10 +128,11 @@ function setProgress(pct, text) {
   if (txtEl) txtEl.textContent = text;
   if (pctEl) pctEl.textContent = pct + '%';
 }
-
 function resetProgress() {
   setProgress(0, '等待操作...');
   activePhase = null;
+  esp32OtaPhase = 0;
+  switchStageFlow(null);
   ['ppEsp32', 'ppGd32Up', 'ppGd32Relay'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) el.classList.remove('active', 'done');
@@ -60,14 +140,12 @@ function resetProgress() {
   var fill = document.getElementById('progressFill');
   if (fill) fill.classList.remove('done');
 }
-
 // ==================== 工具函数 ====================
 function formatBytes(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
 }
-
 function formatTime(date) {
   var h = String(date.getHours()).padStart(2, '0');
   var m = String(date.getMinutes()).padStart(2, '0');
@@ -75,7 +153,6 @@ function formatTime(date) {
   var ms = String(date.getMilliseconds()).padStart(3, '0');
   return h + ':' + m + ':' + s + '.' + ms;
 }
-
 function formatUptime(sec) {
   if (!Number.isFinite(sec) || sec < 0) return '--';
   const d = Math.floor(sec / 86400);
@@ -87,13 +164,11 @@ function formatUptime(sec) {
   if (m > 0) return m + 'm ' + s + 's';
   return s + 's';
 }
-
 function formatHttpErrorDetail(text) {
   var detail = (text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
   if (detail.length > 180) detail = detail.slice(0, 177) + '...';
   return detail;
 }
-
 function showToast(message, type) {
   type = type || 'success';
   const toast = document.getElementById('toast');
@@ -104,32 +179,25 @@ function showToast(message, type) {
   msg.textContent = message;
   setTimeout(function () { toast.classList.remove('show'); }, 3000);
 }
-
 function getEspIp() {
   return document.getElementById('espIp').value.trim() || '192.168.31.127';
 }
-
 function getBaseUrl() {
   return 'http://' + getEspIp();
 }
-
 // ==================== 日志系统 (带去重 + 自动滚动) ====================
 function makeLogHash(level, tag, message) {
   return level + '|' + tag + '|' + message;
 }
-
 function addLog(level, tag, message) {
   var scroll = document.getElementById('logScroll');
   var time = formatTime(new Date());
   var hash = makeLogHash(level, tag, message);
   if (hash === lastLogHash) return; // 去重
   lastLogHash = hash;
-
   var entry = { time: time, level: level, tag: tag, message: message };
   logEntries.push(entry);
-
   if (logFilter !== 'all' && level !== logFilter) return;
-
   var div = document.createElement('div');
   div.className = 'log-line';
   div.innerHTML =
@@ -138,18 +206,15 @@ function addLog(level, tag, message) {
     '<span class="lg">[' + tag + ']</span>' +
     '<span class="lm">' + message + '</span>';
   scroll.appendChild(div);
-
   if (autoScroll) scroll.scrollTop = scroll.scrollHeight;
   document.getElementById('logCount').textContent = logEntries.length;
 }
-
 function clearLogs() {
   document.getElementById('logScroll').innerHTML = '';
   logEntries = [];
   lastLogHash = null;
   document.getElementById('logCount').textContent = '0';
 }
-
 function setLogFilter(level, btn) {
   document.querySelectorAll('.log-filter').forEach(function (b) { b.classList.remove('active'); });
   btn.classList.add('active');
@@ -170,27 +235,23 @@ function setLogFilter(level, btn) {
   });
   if (autoScroll) scroll.scrollTop = scroll.scrollHeight;
 }
-
 function toggleAutoScroll() {
   autoScroll = !autoScroll;
   var btn = document.getElementById('autoScrollBtn');
   btn.textContent = autoScroll ? '\uD83D\uDCCC 自动滚动' : '\u23F8\uFE0F 暂停滚动';
 }
-
 function updateUploadButtonLabel() {
   var esp32Btn = document.getElementById('uploadEsp32Btn');
   var gd32Btn = document.getElementById('uploadGd32Btn');
   if (esp32Btn) esp32Btn.disabled = !esp32File || isUploading;
   if (gd32Btn) gd32Btn.disabled = !gd32File || isUploading;
 }
-
 function setHelper(id, text, type) {
   var el = document.getElementById(id);
   if (!el) return;
   el.className = 'helper-note ' + (type || '');
   el.innerHTML = text;
 }
-
 function updateCanHint() {
   var dlc = parseInt(document.getElementById('canDlc').value) || 0;
   var dataHex = document.getElementById('canData').value.trim().replace(/\s/g, '');
@@ -213,14 +274,20 @@ function updateCanHint() {
   }
   setHelper('canHint', 'HEX 数据合法，当前长度 <b>' + bytes + '</b> 字节，与 DLC 一致。', 'ok');
 }
-
 function resetStageFlow() {
-  ['s1', 's2', 's3', 's4'].forEach(function (id) {
+  ['s1', 's2', 's3', 's4', 's5', 's6'].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.className = 'stage-node';
   });
+  ['sd1', 'sd2', 'sd3', 'sd4', 'sd5', 'sd6'].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = '';
+  });
+  var statusBar = document.getElementById('stageStatusBar');
+  if (statusBar) statusBar.className = 'stage-status-bar';
+  var statusText = document.getElementById('stageStatusText');
+  if (statusText) statusText.textContent = '待机';
 }
-
 function applyDisconnectedRuntimeState() {
   document.getElementById('pillIP').textContent = '--';
   document.getElementById('pillRSSI').textContent = '--';
@@ -233,43 +300,35 @@ function applyDisconnectedRuntimeState() {
   resetProgress();
   resetStageFlow();
 }
-
 function applyRebootingRuntimeState() {
   var pc = document.getElementById('pillConn');
   var pct = document.getElementById('pillConnTxt');
   pc.className = 'pill processing';
   var elapsed = Math.round((Date.now() - rebootStartTime) / 1000);
   pct.textContent = '重启中 ' + elapsed + 's';
-
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
   cs.className = 'conn-indicator warn';
   cst.textContent = 'ESP32 正在重启...';
-
   var bc = document.getElementById('bConn');
   bc.textContent = '重启中';
   bc.className = 'v warn';
-
   document.getElementById('pillRelayTxt').textContent = '重启中';
   document.getElementById('pillRelay').className = 'pill processing';
 }
-
 function applyUploadingRuntimeState() {
   var pc = document.getElementById('pillConn');
   var pct = document.getElementById('pillConnTxt');
   pc.className = 'pill processing';
   pct.textContent = '上传中';
-
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
   cs.className = 'conn-indicator warn';
   cst.textContent = '固件上传中，设备忙...';
-
   var bc = document.getElementById('bConn');
   bc.textContent = '上传中';
   bc.className = 'v warn';
 }
-
 // ==================== 连接管理 ====================
 function updateConnectionUi(connected, text) {
   // header pill
@@ -277,19 +336,16 @@ function updateConnectionUi(connected, text) {
   var pct = document.getElementById('pillConnTxt');
   pc.className = connected ? 'pill online' : 'pill offline';
   pct.textContent = text || (connected ? '已连接' : '未连接');
-
   // connection card indicator
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
   cs.className = connected ? 'conn-indicator ok' : 'conn-indicator err';
   cst.textContent = connected ? (text || '已连接') : '未连接';
-
   // primary badge
   var bc = document.getElementById('bConn');
   bc.textContent = connected ? '在线' : '离线';
   bc.className = 'v ' + (connected ? 'ok' : 'err');
 }
-
 function updateHealthUi(healthCode, freeHeap) {
   var healthNames = ['正常', '警告', '危险', '关机'];
   var health = healthCode !== undefined ? (healthNames[healthCode] || '未知') : '未知';
@@ -301,70 +357,93 @@ function updateHealthUi(healthCode, freeHeap) {
     document.getElementById('mHeap').textContent = formatBytes(freeHeap);
   }
 }
-
 // ==================== OTA 阶段驱动 (真实状态) ====================
+// Relay state → 6-stage mapping:
+//   Stage 1 (认证握手): rs 1-6  握手/挑战/会话密钥/认证
+//   Stage 2 (传输协商): rs 7-8  固件大小协商
+//   Stage 3 (数据转发): rs 9-13 数据包收发/ACK/重发
+//   Stage 4 (传输完成): rs 14-15 数据接收完毕
+//   Stage 5 (OTA刷写):  rs 16-17 OTA 结束/完成
+//   Stage 6 (校验验证): rs 18    APP 校验
+//   Error:              rs 255
+var relayStateDetailMap = {
+  0: '待机',
+  1: '等待握手', 2: '握手已发', 3: '挑战已发',
+  4: '收到握手响应', 5: '会话密钥已发', 6: '认证完成',
+  7: '大小已发', 8: '大小确认',
+  9: '接收中', 10: '转发中', 11: '数据包已发', 12: 'ACK正常', 13: '等待重发',
+  14: '接收完成', 15: '传输完成',
+  16: '结束已发', 17: 'OTA完成',
+  18: 'APP验证',
+  255: '错误'
+};
 function updateStagesFromRelayState(rs) {
-  var s1 = document.getElementById('s1');
-  var s2 = document.getElementById('s2');
-  var s3 = document.getElementById('s3');
-  var s4 = document.getElementById('s4');
-  var all = [s1, s2, s3, s4];
-
+  var ids = ['s1', 's2', 's3', 's4', 's5', 's6'];
+  var detailIds = ['sd1', 'sd2', 'sd3', 'sd4', 'sd5', 'sd6'];
+  var all = ids.map(function(id) { return document.getElementById(id); });
+  var details = detailIds.map(function(id) { return document.getElementById(id); });
   // reset all
-  all.forEach(function (s) { s.className = 'stage-node'; });
-
-  if (rs === undefined || rs === null) return;
-
-  if (rs === 255) {
-    s1.className = 'stage-node err';
-    s2.className = 'stage-node err';
-    s3.className = 'stage-node err';
-    s4.className = 'stage-node err';
+  all.forEach(function (s) { if (s) s.className = 'stage-node'; });
+  details.forEach(function (d) { if (d) d.textContent = ''; });
+  // status bar
+  var statusBar = document.getElementById('stageStatusBar');
+  var statusText = document.getElementById('stageStatusText');
+  if (rs === undefined || rs === null) {
+    if (statusBar) statusBar.className = 'stage-status-bar';
+    if (statusText) statusText.textContent = '待机';
     return;
   }
-
+  if (rs === 255) {
+    all.forEach(function (s) { if (s) s.className = 'stage-node err'; });
+    if (statusBar) statusBar.className = 'stage-status-bar err';
+    if (statusText) statusText.textContent = '错误';
+    return;
+  }
   var activeStage = 0;
   if (rs >= 1 && rs <= 6) activeStage = 1;
   else if (rs >= 7 && rs <= 8) activeStage = 2;
-  else if (rs >= 9 && rs <= 15) activeStage = 3;
-  else if (rs >= 16 && rs <= 18) activeStage = 4;
-
+  else if (rs >= 9 && rs <= 13) activeStage = 3;
+  else if (rs >= 14 && rs <= 15) activeStage = 4;
+  else if (rs >= 16 && rs <= 17) activeStage = 5;
+  else if (rs >= 18 && rs <= 18) activeStage = 6;
   for (var i = 0; i < activeStage - 1; i++) {
-    all[i].className = 'stage-node done';
+    if (all[i]) all[i].className = 'stage-node done';
   }
-  if (activeStage >= 1 && activeStage <= 4) {
-    all[activeStage - 1].className = 'stage-node live';
+  if (activeStage >= 1 && activeStage <= 6) {
+    if (all[activeStage - 1]) all[activeStage - 1].className = 'stage-node live';
+  }
+  // Show detail text for the active stage
+  var detailText = relayStateDetailMap[rs] || '';
+  if (activeStage >= 1 && activeStage <= 6 && details[activeStage - 1]) {
+    details[activeStage - 1].textContent = detailText;
+  }
+  // Update status bar
+  if (statusBar && statusText) {
+    if (rs === 0) {
+      statusBar.className = 'stage-status-bar';
+      statusText.textContent = '待机';
+    } else {
+      statusBar.className = 'stage-status-bar active';
+      statusText.textContent = (relayStateDetailMap[rs] || '未知') + ' (' + rs + ')';
+    }
   }
 }
-
 function updateSystemStatusUi(data) {
   if (!data) return;
   latestSystemStatus = data;
-
   var wifi = data.wifi || {};
   var ota = data.ota || {};
   var healthCode = data.health;
-
-  var relayStates = {
-    0: '待机', 1: '等待握手', 2: '握手已发', 3: '挑战已发',
-    4: '收到握手响应', 5: '会话密钥已发', 6: '认证完成',
-    7: '大小已发', 8: '大小确认', 9: '接收中', 10: '转发中',
-    11: '数据包已发', 12: 'ACK正常', 13: '等待重发',
-    14: '接收完成', 15: '传输完成', 16: '结束已发', 17: 'OTA完成', 18: 'APP验证', 255: '错误'
-  };
-
+  // Use global relayStateDetailMap defined in updateStagesFromRelayState section
   var connected = !!wifi.connected;
   var connText = connected ? (wifi.mode || 'STA') + ' 已连接' : (wifi.mode || 'STA') + ' 未连接';
-
   updateConnectionUi(connected, connText);
   updateHealthUi(healthCode, data.free_heap);
-
   // version
   if (data.version) {
     document.getElementById('pillVer').textContent = 'v' + data.version;
     document.getElementById('pillVer').title = data.build_time ? ('编译: ' + data.build_time) : '';
     document.getElementById('mVersion').textContent = 'v' + data.version + (data.build_time ? '  (' + data.build_time + ')' : '');
-
     // GD32 版本
     var mGd32App = document.getElementById('mGd32App');
     var mGd32Boot = document.getElementById('mGd32Boot');
@@ -387,28 +466,23 @@ function updateSystemStatusUi(data) {
       }
     }
   }
-
   // temperature
   document.getElementById('mTemp').textContent =
     Number.isFinite(data.temperature) ? data.temperature.toFixed(1) + '\u00B0C' : '--';
-
   // uptime
   var uptimeEl = document.getElementById('pillUptime');
   if (uptimeEl) uptimeEl.textContent = '\u23F1 ' + formatUptime(data.uptime_sec);
-
   // wifi / signal
   document.getElementById('mWifi').textContent = wifi.connected ? (wifi.ip || '已连接') : '未连接';
   document.getElementById('pillIP').textContent = wifi.ip || '--';
   var rssi = (wifi.rssi !== undefined && wifi.rssi !== -127) ? wifi.rssi + ' dBm' : '--';
   document.getElementById('mRSSI').textContent = rssi;
   document.getElementById('pillRSSI').textContent = rssi;
-
   // heap
   document.getElementById('mHeap').textContent =
     data.free_heap !== undefined ? formatBytes(data.free_heap) : '--';
   document.getElementById('mMinHeap').textContent =
     data.min_free_heap !== undefined ? formatBytes(data.min_free_heap) : '--';
-
   // ota cache
   var otaStored = ota.stored_size || 0;
   var mOtaCache = document.getElementById('mOtaCache');
@@ -421,17 +495,21 @@ function updateSystemStatusUi(data) {
       mOtaCache.className = 'v';
     }
   }
-
-  // relay state
+  // relay state - skip GD32 relay UI when ESP32 OTA is active
+  if (currentOtaTarget === 'esp32' && esp32OtaPhase > 0) {
+    document.getElementById('pillRelayTxt').textContent = esp32OtaPhase >= 6 ? 'ESP32 OTA 完成' : 'ESP32 OTA';
+    var pr = document.getElementById('pillRelay');
+    if (pr) pr.className = esp32OtaPhase >= 6 ? 'pill online' : 'pill processing';
+    return;
+  }
   var rs = ota.relay_state;
-  var relayText = relayStates[rs] || '待机';
+  var relayText = relayStateDetailMap[rs] || '待机';
   document.getElementById('pillRelayTxt').textContent = relayText;
   var pr = document.getElementById('pillRelay');
   if (rs === 255) pr.className = 'pill offline';
   else if (rs > 0 && rs < 17) pr.className = 'pill processing';
   else if (rs === 17 || rs === 18) pr.className = 'pill online';
   else pr.className = 'pill idle';
-
   // OTA cache progress (GD32 upload to ESP32 flash)
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
@@ -439,27 +517,46 @@ function updateSystemStatusUi(data) {
   var bp = document.getElementById('bOTAProgress');
   bp.textContent = storageProgress + '%';
   bp.className = 'v ' + (storageProgress === 100 ? 'ok' : storageProgress > 0 ? 'warn' : '');
-
   // GD32 relay forwarding progress
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
   var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
-
   var gd32AppAlive = ota.gd32_app_alive;
-  if (rs > 0 && rs < 17) {
-    // Relay is active — show relay progress
+  if (rs > 0 && rs <= 8) {
+    // Authentication or size negotiation phase
+    setActivePhase('gd32Relay');
+    if (rs <= 6) {
+      setProgress(0, '认证中: ' + (relayStateDetailMap[rs] || ''));
+    } else {
+      setProgress(0, '协商固件大小...');
+    }
+  } else if (rs >= 9 && rs <= 13) {
+    // Active data forwarding
     setActivePhase('gd32Relay');
     setProgress(relayProgress, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
-  } else if (rs === 17) {
-    // Relay done, waiting for APP verify
+  } else if (rs >= 14 && rs <= 15) {
+    // Transfer complete
     setActivePhase('gd32Relay');
-    setProgress(100, '转发完成，等待 APP 启动...');
+    setProgress(100, '数据转发完成 (' + relayTotal + ' 包)');
+  } else if (rs === 16) {
+    // OTA end sent
+    setActivePhase('gd32Relay');
+    setProgress(100, 'OTA 刷写中...');
+  } else if (rs === 17) {
+    // OTA complete
+    setActivePhase('gd32Relay');
+    setProgress(100, 'OTA 完成，等待 APP 启动...');
   } else if (rs === 18) {
     // APP verify phase
     setActivePhase('gd32Relay');
     if (gd32AppAlive) {
       markPhaseDone('gd32Relay');
       setProgress(100, 'GD32 刷写完成');
+      // Mark status bar as success
+      var sb = document.getElementById('stageStatusBar');
+      var st = document.getElementById('stageStatusText');
+      if (sb) sb.className = 'stage-status-bar ok';
+      if (st) st.textContent = 'GD32 刷写完成';
     } else {
       setProgress(100, '转发完成，验证 APP 存活...');
     }
@@ -471,46 +568,60 @@ function updateSystemStatusUi(data) {
     // Relay finished and reset, but APP is alive → truly done
     markPhaseDone('gd32Relay');
     setProgress(100, 'GD32 刷写完成');
+    var sb2 = document.getElementById('stageStatusBar');
+    var st2 = document.getElementById('stageStatusText');
+    if (sb2) sb2.className = 'stage-status-bar ok';
+    if (st2) st2.textContent = 'GD32 刷写完成';
   }
-
   // stage flow from real state
-  updateStagesFromRelayState(rs);
+  if (currentOtaTarget !== 'esp32') { updateStagesFromRelayState(rs); }
 }
-
 async function testConnection() {
-  if (!latestSystemStatus) {
-    addLog('W', '连接', '暂无同步数据，请等待 1 秒自动同步');
-    showToast('暂无同步数据，请稍等 1 秒', 'warning');
-    return;
+  // 如果在降速模式，先恢复正常轮询
+  if (pollSlowMode) {
+    addLog('I', '连接', '正在重新连接...');
+    restorePolling();
   }
-  var wifi = latestSystemStatus.wifi || {};
-  var connected = !!wifi.connected;
-  updateSystemStatusUi(latestSystemStatus);
-  addLog('I', '连接', connected
-    ? '当前已连接：' + (wifi.mode || 'STA') + ' ' + (wifi.ip || '')
-    : '当前未连接：' + (wifi.mode || 'STA'));
-  showToast(connected ? 'ESP32 当前在线' : 'ESP32 当前未连接',
-    connected ? 'success' : 'warning');
+  // 立即发一次请求检测
+  try {
+    var resp = await fetch(getBaseUrl() + '/system/status', {
+      signal: AbortSignal.timeout(3000)
+    });
+    if (resp.ok) {
+      var data = await resp.json();
+      latestSystemStatus = data;
+      updateSystemStatusUi(data);
+      var wifi = data.wifi || {};
+      addLog('I', '连接', wifi.connected
+        ? '已连接：' + (wifi.mode || 'STA') + ' ' + (wifi.ip || '')
+        : '未连接：' + (wifi.mode || 'STA'));
+      showToast(wifi.connected ? 'ESP32 当前在线' : 'ESP32 当前未连接',
+        wifi.connected ? 'success' : 'warning');
+    } else {
+      addLog('E', '连接', 'HTTP ' + resp.status);
+      showToast('设备响应异常: HTTP ' + resp.status, 'error');
+    }
+  } catch (e) {
+    addLog('E', '连接', '连接失败: ' + e.message);
+    // 连接失败时自动诊断
+    var diag = await diagnoseNetwork();
+    addLog('W', '诊断', diag);
+    showToast('无法连接: ' + diag, 'error');
+  }
 }
-
 // ==================== CAN 帧发送 ====================
 async function sendCanFrame() {
   var ch = parseInt(document.getElementById('canChannel').value);
   var idStr = document.getElementById('canId').value.trim();
   var dlc = parseInt(document.getElementById('canDlc').value) || 8;
   var dataStr = document.getElementById('canData').value.trim();
-
   var extId = 0;
   if (idStr.toLowerCase().indexOf('0x') === 0) extId = parseInt(idStr, 16);
   else { extId = parseInt(idStr, 10); if (isNaN(extId)) extId = parseInt(idStr, 16); }
-
   if (isNaN(extId)) { showToast('ID 格式错误', 'error'); return; }
-
   var dataHex = dataStr.replace(/\s/g, '');
   if (dataHex.length % 2 !== 0) { showToast('数据长度必须为偶数', 'error'); return; }
-
   addLog('I', 'CAN', '发送 CH' + ch + ' ID=0x' + extId.toString(16).toUpperCase() + ' DLC=' + dlc);
-
   try {
     var resp = await fetch(getBaseUrl() + '/can/send', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -534,7 +645,6 @@ async function sendCanFrame() {
     showToast('发送失败', 'error');
   }
 }
-
 function clearCanFields() {
   document.getElementById('canId').value = '0x18DA00F1';
   document.getElementById('canDlc').value = '8';
@@ -542,13 +652,11 @@ function clearCanFields() {
   document.getElementById('canResp').style.display = 'none';
   updateCanHint();
 }
-
 // ==================== SPI 发送 ====================
 function updateSpiHint() {
   var typeHex = document.getElementById('spiType').value.trim();
   var dataHex = document.getElementById('spiData').value.trim().replace(/\s/g, '');
   var hint = document.getElementById('spiHint');
-
   if (!typeHex || !/^[0-9a-fA-F]{1,2}$/.test(typeHex)) {
     hint.className = 'helper-note err';
     hint.innerHTML = 'type 需填 1 字节 hex（如 01, B0）。';
@@ -571,17 +679,14 @@ function updateSpiHint() {
     (bytes > 0 ? '，payload: <b>' + bytes + '</b>B' : '，无 payload') +
     '，线上 <b>' + totalOnWire + '</b>B（SOF+TYPE+LEN+PAYLOAD+CRC）';
 }
-
 async function sendSpiFrame() {
   var typeHex = document.getElementById('spiType').value.trim();
   var dataStr = document.getElementById('spiData').value.trim();
   var timeout = parseInt(document.getElementById('spiTimeout').value) || 1000;
-
   if (!typeHex || !/^[0-9a-fA-F]{1,2}$/.test(typeHex)) {
     showToast('type 需填 1 字节 hex', 'error');
     return;
   }
-
   var dataHex = dataStr.replace(/\s/g, '');
   if (dataHex && !/^[0-9a-fA-F]*$/.test(dataHex)) {
     showToast('数据包含非 HEX 字符', 'error');
@@ -591,14 +696,10 @@ async function sendSpiFrame() {
     showToast('HEX 数据长度必须为偶数', 'error');
     return;
   }
-
   var txBytes = dataHex ? dataHex.length / 2 : 0;
-
   addLog('I', 'SPI', 'type=0x' + typeHex.toUpperCase() +
     (txBytes > 0 ? ', payload=' + dataHex.toUpperCase() : ', 无负载'));
-
   var body = { type: typeHex, data: dataHex.toUpperCase(), timeout_ms: timeout };
-
   try {
     var resp = await fetch(getBaseUrl() + '/spi/send', {
       method: 'POST',
@@ -607,7 +708,6 @@ async function sendSpiFrame() {
       signal: AbortSignal.timeout(timeout + 2000)
     });
     var result = await resp.json();
-
     if (result.status === 'ok') {
       var recvHex = result.recv || '';
       var respTypeName = {'80': 'ACK', '81': 'WAIT', '82': 'ERROR'};
@@ -634,7 +734,6 @@ async function sendSpiFrame() {
     showToast('SPI 发送失败: ' + e.message, 'error');
   }
 }
-
 function clearSpiFields() {
   document.getElementById('spiType').value = '01';
   document.getElementById('spiData').value = '';
@@ -642,13 +741,11 @@ function clearSpiFields() {
   document.getElementById('spiResp').style.display = 'none';
   updateSpiHint();
 }
-
 // ==================== 文件处理 ====================
 function handleFileSelect(event, chip) {
   var file = event.target.files[0];
   if (file) processFile(file, chip);
 }
-
 // 通过 File System Access API 选择文件（支持热重载）
 async function pickFileViaFSAPI(chip) {
   if (!window.showOpenFilePicker) {
@@ -679,7 +776,6 @@ async function pickFileViaFSAPI(chip) {
   }
   return false;
 }
-
 function setupDropZone(zoneId, chip) {
   var zone = document.getElementById(zoneId);
   if (!zone) return;
@@ -697,15 +793,11 @@ function setupDropZone(zoneId, chip) {
 }
 setupDropZone('uploadZoneEsp32', 'esp32');
 setupDropZone('uploadZoneGd32', 'gd32');
-
 document.getElementById('canData').addEventListener('input', updateCanHint);
 document.getElementById('canDlc').addEventListener('input', updateCanHint);
-
 document.getElementById('spiType').addEventListener('input', updateSpiHint);
 document.getElementById('spiData').addEventListener('input', updateSpiHint);
-
 // ==================== Intel HEX → BIN 转换 ====================
-
 /**
  * 将 Intel HEX 字符串解析为原始 BIN 字节数组。
  *
@@ -720,17 +812,14 @@ function parseIntelHex(hexText) {
   var segments = [];     // { offset, data } 列表
   var minAddr = 0xFFFFFFFF;
   var maxAddr = 0;
-
   var lines = hexText.split(/\r?\n/);
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].trim();
     if (!line || line[0] !== ':') continue;
-
     // 解析行: :LLAAAATT[DD...]CC
     var byteCount = parseInt(line.substr(1, 2), 16);
     var addr16   = parseInt(line.substr(3, 4), 16);
     var recType  = parseInt(line.substr(7, 2), 16);
-
     // 校验和验证
     var sum = 0;
     for (var j = 1; j < line.length; j += 2) {
@@ -739,7 +828,6 @@ function parseIntelHex(hexText) {
     if ((sum & 0xFF) !== 0) {
       throw new Error('HEX 行 ' + (i + 1) + ' 校验和错误: ' + line);
     }
-
     if (recType === 0x01) {
       // EOF
       break;
@@ -763,11 +851,9 @@ function parseIntelHex(hexText) {
     }
     // 其他记录类型 (03, 05 等) 忽略
   }
-
   if (segments.length === 0) {
     throw new Error('HEX 文件中没有有效数据记录');
   }
-
   // 合并为连续 bin，间隙填 0xFF
   var totalSize = maxAddr - minAddr;
   var bin = new Uint8Array(totalSize);
@@ -778,10 +864,8 @@ function parseIntelHex(hexText) {
     var off = seg.offset - minAddr;
     bin.set(seg.data, off);
   }
-
   return { data: bin, baseAddr: minAddr, endAddr: maxAddr };
 }
-
 /**
  * 检测文件内容是否为 Intel HEX 格式。
  * 看前几个非空行是否以 ':' 开头。
@@ -795,13 +879,10 @@ function isIntelHexText(text) {
   }
   return false;
 }
-
 // ==================== 文件处理 ====================
-
 function processFile(file, chip) {
   var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
   var isHexByName = file.name.toLowerCase().endsWith('.hex');
-
   if (chip === 'gd32' && isHexByName) {
     // GD32 固件: .hex 文件自动转换为 .bin，然后替换文件对象
     var reader = new FileReader();
@@ -825,12 +906,10 @@ function processFile(file, chip) {
         var binBlob = new Blob([result.data], { type: 'application/octet-stream' });
         var binFile = new File([binBlob], binName, { type: 'application/octet-stream' });
         gd32File = binFile;
-
         var baseHex = '0x' + result.baseAddr.toString(16).toUpperCase().padStart(8, '0');
         addLog('I', '文件', 'HEX → BIN 转换完成: ' + file.name + ' → ' + binName);
         addLog('I', '文件', '基地址: ' + baseHex + ', 数据大小: ' + formatBytes(result.data.length));
         showToast('HEX 已自动转换为 BIN', 'success');
-
         document.getElementById('fileInfo' + suffix).classList.add('show');
         document.getElementById('fileName' + suffix).textContent = binName + ' (由 ' + file.name + ' 转换)';
         document.getElementById('fileType' + suffix).textContent = 'Binary (HEX转换)';
@@ -847,7 +926,6 @@ function processFile(file, chip) {
     reader.readAsText(file);
     return; // 异步，回调里设置 gd32File
   }
-
   // .bin 文件或 ESP32 文件: 直接使用
   if (chip === 'esp32') esp32File = file;
   else gd32File = file;
@@ -859,23 +937,41 @@ function processFile(file, chip) {
   updateUploadButtonLabel();
   addLog('I', '文件', chip.toUpperCase() + ' 已选择: ' + file.name + ' (' + formatBytes(file.size) + ')');
   showToast(chip.toUpperCase() + ' 文件已选择', 'success');
+  // ESP32 文件: 计算并显示 SHA-256
+  if (chip === 'esp32') {
+    var shaElem = document.getElementById('fileSha256' + suffix);
+    if (shaElem) {
+      shaElem.textContent = '计算中...';
+      file.arrayBuffer().then(function(buf) {
+        return crypto.subtle.digest('SHA-256', buf);
+      }).then(function(hashBuffer) {
+        var hashArray = Array.from(new Uint8Array(hashBuffer));
+        var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+        shaElem.textContent = hashHex.toUpperCase();
+        // 存储到全局变量供上传时使用
+        window._esp32FileSha256 = hashHex.toUpperCase();
+        addLog('I', '文件', 'ESP32 固件 SHA-256: ' + hashHex.toUpperCase());
+      }).catch(function(err) {
+        shaElem.textContent = '计算失败: ' + err.message;
+      });
+    }
+  }
 }
-
 function clearFile(chip) {
   var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
-  if (chip === 'esp32') { esp32File = null; esp32FileHandle = null; }
+  if (chip === 'esp32') { esp32File = null; esp32FileHandle = null; window._esp32FileSha256 = null; }
   else { gd32File = null; gd32FileHandle = null; }
   document.getElementById('fileInput' + suffix).value = '';
   document.getElementById('fileInfo' + suffix).classList.remove('show');
+  var shaElem = document.getElementById('fileSha256' + suffix);
+  if (shaElem) shaElem.textContent = '-';
   updateUploadButtonLabel();
   addLog('I', '文件', chip.toUpperCase() + ' 文件已清除');
 }
-
 // ==================== 上传固件 ====================
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file || isUploading) return;
-
   // 每次上传前尝试重新从本地读取文件
   var handle = chip === 'esp32' ? esp32FileHandle : gd32FileHandle;
   if (handle) {
@@ -911,21 +1007,43 @@ async function startUpload(chip) {
       return;
     }
   }
-
   isUploading = true;
   var uploadBtn = document.getElementById(chip === 'esp32' ? 'uploadEsp32Btn' : 'uploadGd32Btn');
   var origText = uploadBtn.textContent;
   uploadBtn.disabled = true;
   uploadBtn.textContent = '上传中...';
+  switchStageFlow(chip);
   setActivePhase(chip === 'esp32' ? 'esp32Ota' : 'gd32Upload');
+  if (chip === 'esp32') updateEsp32StagesFromPhase(1);
+  // Reset verification panel
+  var verifyInfo = document.getElementById('stageVerifyInfo');
+  if (verifyInfo) verifyInfo.style.display = 'none';
+  var sviFront = document.getElementById('sviFrontSha');
+  var sviDevice = document.getElementById('sviDeviceSha');
+  var sviResult = document.getElementById('sviResult');
+  if (sviFront) sviFront.textContent = '-';
+  if (sviDevice) sviDevice.textContent = '-';
+  if (sviResult) { sviResult.textContent = '-'; sviResult.className = 'svi-val'; }
   addLog('I', '上传', '开始上传: ' + file.name + ' \u2192 ' + chip.toUpperCase());
   showToast('开始上传固件到 ' + chip.toUpperCase(), 'success');
-
   try {
     var arrayBuffer = await file.arrayBuffer();
+    // 刷写时重新计算 SHA-256
+    if (chip === 'esp32') {
+      try {
+        var hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+        var hashArray = Array.from(new Uint8Array(hashBuffer));
+        var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+        window._esp32FileSha256 = hashHex.toUpperCase();
+        var shaElem = document.getElementById('fileSha256Esp32');
+        if (shaElem) shaElem.textContent = window._esp32FileSha256;
+        addLog('I', '文件', '刷写前重新计算 SHA-256: ' + window._esp32FileSha256);
+      } catch (e) {
+        addLog('W', '文件', 'SHA-256 重新计算失败: ' + e.message);
+      }
+    }
     var fileSize = file.size;
     var body, url = getBaseUrl() + '/ota/upload';
-
     if (chip === 'esp32') {
       var headerObj = { type: 'esp32', total_size: fileSize };
       var payload = arrayBuffer;
@@ -958,7 +1076,6 @@ async function startUpload(chip) {
         document.getElementById('bOTAProgress').textContent = pct + '%';
       }
     });
-
     xhr.addEventListener('load', function () {
       isUploading = false;
       uploadBtn.disabled = false;
@@ -970,22 +1087,19 @@ async function startUpload(chip) {
         setProgress(100, '上传完成');
         if (chip === 'esp32') {
           markPhaseDone('esp32Ota');
-          var countdown = 3;
-          addLog('I', 'OTA', countdown + ' 秒后自动调用 POST /ota/update 完成升级并重启...');
-          var timer = setInterval(function () {
-            countdown--;
-            if (countdown > 0) addLog('I', 'OTA', countdown + ' 秒后开始刷写...');
-            else {
-              clearInterval(timer);
-              addLog('I', 'OTA', '开始刷写！');
-              triggerEsp32Update();
-            }
-          }, 1000);
+          updateEsp32StagesFromPhase(2);  // OTA 写入阶段
+          addLog('I', 'OTA', '固件上传完成，准备 SHA-256 校验...');
+          verifyEsp32Firmware();
         } else {
+          switchStageFlow('gd32');
           markPhaseDone('gd32Upload');
           setActivePhase('gd32Relay');
           setProgress(0, '等待触发转发...');
         }
+      } else if (xhr.status === 403) {
+        addLog('E', '上传', 'ESP32 OTA 被其他通道占用（BLE/WiFi 互斥），请稍后重试');
+        showToast('ESP32 OTA 被其他通道占用，请稍后重试', 'error');
+        setProgress(0, 'OTA 被其他通道占用');
       } else {
         var detail = formatHttpErrorDetail(xhr.responseText);
         var message = '上传失败: HTTP ' + xhr.status + (detail ? ' - ' + detail : '');
@@ -993,7 +1107,6 @@ async function startUpload(chip) {
         showToast(detail ? ('上传失败: ' + detail) : '上传失败', 'error');
       }
     });
-
     xhr.addEventListener('error', function () {
       isUploading = false;
       uploadBtn.disabled = false;
@@ -1002,7 +1115,6 @@ async function startUpload(chip) {
       addLog('E', '上传', '上传过程发生错误');
       showToast('上传出错', 'error');
     });
-
     xhr.open('POST', url);
     xhr.send(body);
   } catch (e) {
@@ -1014,27 +1126,132 @@ async function startUpload(chip) {
     updateUploadButtonLabel();
   }
 }
-
 // ==================== ESP32 OTA 完成升级 ====================
-async function triggerEsp32Update() {
-  addLog('I', 'OTA', '=== ESP32 OTA 完成，开始重启 ===');
-  showToast('ESP32 正在重启...', 'success');
+// 一次调用完成：校验 SHA-256 → 设置启动分区 → 自动重启（无需确认按钮）
+async function verifyEsp32Firmware() {
+  updateEsp32StagesFromPhase(3);  // 校验中
+  var sha256 = window._esp32FileSha256;
+  if (sha256) {
+    addLog('I', 'OTA', '前端文件 SHA-256: ' + sha256);
+    var verifyInfo = document.getElementById('stageVerifyInfo');
+    if (verifyInfo) verifyInfo.style.display = 'block';
+    var frontSha = document.getElementById('sviFrontSha');
+    if (frontSha) frontSha.textContent = sha256;
+  }
+
+  showToast('ESP32 正在校验固件并应用...', 'success');
   try {
+    // verify_only=false: 服务器端会先校验 SHA-256，匹配后自动设置启动分区并重启
+    // 单次请求即完成全部流程，无需前端再发送"应用"请求
+    var requestBody = {};
+    if (sha256) requestBody.sha256 = sha256;
+    requestBody.verify_only = false;
+
     var resp = await fetch(getBaseUrl() + '/ota/update', {
-      method: 'POST', signal: AbortSignal.timeout(5000)
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(120000)
     });
-    if (resp.ok) {
-      var data = await resp.json();
-      addLog('I', 'OTA', '升级完成: ' + data.message);
-      showToast('ESP32 重启中...', 'success');
+
+    var data = await resp.json();
+
+    if (data.status === 'ok') {
+      addLog('I', 'OTA', '设备端 SHA-256: ' + (data.sha256 || '-'));
+      if (data.sha256) {
+        var deviceSha = document.getElementById('sviDeviceSha');
+        if (deviceSha) deviceSha.textContent = data.sha256;
+      }
+      var resultEl = document.getElementById('sviResult');
+      if (resultEl) {
+        if (sha256 && data.sha256 && sha256.toLowerCase() === data.sha256.toLowerCase()) {
+          resultEl.textContent = '验证通过';
+          resultEl.className = 'svi-val ok';
+        } else {
+          resultEl.textContent = '已应用（未比对 SHA）';
+          resultEl.className = 'svi-val ok';
+        }
+      }
+      // 服务器已设置启动分区并自动重启，前端直接进入重启等待状态
+      addLog('I', 'OTA', 'SHA-256 校验通过，设备自动重启中...');
+      showToast('校验通过，设备重启中...', 'success');
+      showVerifyActions('none');
+      updateEsp32StagesFromPhase(4);  // 应用固件
       isEsp32Rebooting = true;
+      updateEsp32StagesFromPhase(5);  // 重启中
       rebootStartTime = Date.now();
+    } else {
+      var detail = data.message || (data.device ? '不匹配' : '未知错误');
+      addLog('E', 'OTA', '校验失败: ' + detail);
+      showToast('校验失败: ' + detail, 'error');
+      var resultEl = document.getElementById('sviResult');
+      if (resultEl) { resultEl.textContent = '❌ ' + detail; resultEl.className = 'svi-val err'; }
+      updateEsp32StagesError();
+      showVerifyActions('retry');
     }
   } catch (e) {
-    addLog('E', 'OTA', '升级失败: ' + e.message);
-    showToast('升级失败', 'error');
+    addLog('W', 'OTA', '应用请求出现异常（设备可能已重启）: ' + e.message);
+    // 设备在收到请求后即会重启，网络中断属于正常现象，直接进入重启等待
+    showVerifyActions('none');
+    isEsp32Rebooting = true;
+    updateEsp32StagesFromPhase(5);
+    rebootStartTime = Date.now();
   }
 }
+
+async function retryEsp32Upload() {
+  addLog('I', 'OTA', '重新上传固件...');
+  showVerifyActions('none');
+  var verifyInfo = document.getElementById('stageVerifyInfo');
+  if (verifyInfo) verifyInfo.style.display = 'none';
+  var sviFront = document.getElementById('sviFrontSha');
+  var sviDevice = document.getElementById('sviDeviceSha');
+  var sviResult = document.getElementById('sviResult');
+  if (sviFront) sviFront.textContent = '-';
+  if (sviDevice) sviDevice.textContent = '-';
+  if (sviResult) { sviResult.textContent = '-'; sviResult.className = 'svi-val'; }
+  startUpload('esp32');
+}
+
+async function cancelEsp32Ota() {
+  addLog('I', 'OTA', '已取消 OTA 刷写');
+  showToast('已取消 OTA', 'error');
+  showVerifyActions('none');
+  resetProgress();
+}
+
+async function applyEsp32Firmware() {
+  addLog('I', 'OTA', '确认应用固件并重启 ESP32...');
+  showToast('正在应用固件并重启...', 'success');
+  try {
+    var resp = await fetch(getBaseUrl() + '/ota/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(120000)
+    });
+
+    if (resp.ok) {
+      var data = await resp.json();
+      addLog('I', 'OTA', '升级完成: ' + (data.message || ''));
+      updateEsp32StagesFromPhase(4);  // 应用固件
+      isEsp32Rebooting = true;
+      updateEsp32StagesFromPhase(5);  // 重启中
+      rebootStartTime = Date.now();
+    } else {
+      var detail = '应用失败: HTTP ' + resp.status;
+      try { var d = await resp.json(); detail += ' - ' + (d.message || ''); } catch (_) {}
+      addLog('E', 'OTA', detail);
+      showToast(detail, 'error');
+    }
+  } catch (e) {
+    addLog('W', 'OTA', '应用请求出现异常（设备可能已重启）: ' + e.message);
+    isEsp32Rebooting = true;
+    updateEsp32StagesFromPhase(5);
+    rebootStartTime = Date.now();
+  }
+}
+
 
 async function restartEsp32() {
   if (!confirm('确定要重启 ESP32 吗？')) return;
@@ -1056,12 +1273,10 @@ async function restartEsp32() {
     showToast('重启失败', 'error');
   }
 }
-
 // ==================== 触发 OTA 中继 (真实状态驱动) ====================
 async function triggerRelay() {
   addLog('I', 'OTA', '触发 GD32 OTA 中继...');
   showToast('正在触发 OTA 中继', 'success');
-
   try {
     var resp = await fetch(getBaseUrl() + '/ota/relay', {
       method: 'POST', signal: AbortSignal.timeout(5000)
@@ -1081,8 +1296,78 @@ async function triggerRelay() {
     showToast('触发失败', 'error');
   }
 }
-
 // ==================== 轮询状态 ====================
+var consecutivePollFailures = 0;
+var statusTimerId = null;
+var logsTimerId = null;
+var pollSlowMode = false;   // 降速模式（10s 一次）
+var lastDiagTime = 0;       // 上次诊断时间
+var diagResult = '';        // 最近一次诊断结果
+// 从设备 IP 推导网关 IP（取前三段 + .1）
+function getGatewayIp() {
+  var parts = getEspIp().split('.');
+  if (parts.length === 4) return parts[0] + '.' + parts[1] + '.' + parts[2] + '.1';
+  return '192.168.31.1';
+}
+// 网络诊断：区分浏览器离线 / 网关不通 / 仅设备不通
+async function diagnoseNetwork() {
+  lastDiagTime = Date.now();
+  var result = [];
+  // 1) 浏览器是否在线
+  if (navigator.onLine === false) {
+    result.push('浏览器无网络连接');
+    diagResult = result.join('；');
+    return diagResult;
+  }
+  // 2) 尝试触达网关（超时 2s）
+  var gwIp = getGatewayIp();
+  var gwOk = false;
+  try {
+    await fetch('http://' + gwIp + '/', { mode: 'no-cors', signal: AbortSignal.timeout(2000) });
+    gwOk = true; // no-cors 模式下不抛异常即视为可达
+  } catch (_) {}
+  if (!gwOk) {
+    // 再试一次 favicon（有些路由器不响应 /）
+    try {
+      await fetch('http://' + gwIp + '/favicon.ico', { mode: 'no-cors', signal: AbortSignal.timeout(1500) });
+      gwOk = true;
+    } catch (_) {}
+  }
+  if (!gwOk) {
+    result.push('网关 ' + gwIp + ' 不可达（本地网络不通）');
+  } else {
+    result.push('网关 ' + gwIp + ' 可达');
+    // 3) 网关通但设备不通 → 设备自身问题
+    result.push('设备 ' + getEspIp() + ' 不响应（可能断电、重启中或 WiFi 断开）');
+  }
+  diagResult = result.join('；');
+  return diagResult;
+}
+function startPolling() {
+  consecutivePollFailures = 0;
+  pollSlowMode = false;
+  if (statusTimerId) clearInterval(statusTimerId);
+  if (logsTimerId) clearInterval(logsTimerId);
+  statusTimerId = setInterval(pollStatus, 1000);
+  logsTimerId = setInterval(pollLogs, 1000);
+}
+function slowDownPolling() {
+  pollSlowMode = true;
+  if (statusTimerId) clearInterval(statusTimerId);
+  if (logsTimerId) clearInterval(logsTimerId);
+  statusTimerId = setInterval(pollStatus, 10000);
+  logsTimerId = setInterval(pollLogs, 10000);
+}
+function restorePolling() {
+  if (pollSlowMode) {
+    pollSlowMode = false;
+    consecutivePollFailures = 0;
+    if (statusTimerId) clearInterval(statusTimerId);
+    if (logsTimerId) clearInterval(logsTimerId);
+    statusTimerId = setInterval(pollStatus, 1000);
+    logsTimerId = setInterval(pollLogs, 1000);
+  }
+}
 async function pollStatus() {
   try {
     var resp = await fetch(getBaseUrl() + '/system/status', {
@@ -1090,14 +1375,43 @@ async function pollStatus() {
     });
     if (resp.ok) {
       var data = await resp.json();
+      // 恢复：如果之前在降速模式，切回 1 秒轮询
+      if (consecutivePollFailures > 0 || pollSlowMode) {
+        var wasSlow = pollSlowMode;
+        consecutivePollFailures = 0;
+        if (wasSlow) {
+          restorePolling();
+          addLog('I', '系统', '设备已恢复在线，轮询恢复正常');
+          showToast('设备已恢复在线', 'success');
+        }
+      }
       if (isEsp32Rebooting) {
         isEsp32Rebooting = false;
+        updateEsp32StagesFromPhase(6);  // 启动完成
+        addLog('I', '系统', 'ESP32 已恢复在线');
+        showToast('ESP32 已恢复在线', 'success');
+      } else if (currentOtaTarget === 'esp32' && esp32OtaPhase >= 3 && esp32OtaPhase < 6) {
+        updateEsp32StagesFromPhase(6);
         addLog('I', '系统', 'ESP32 已恢复在线');
         showToast('ESP32 已恢复在线', 'success');
       }
       updateSystemStatusUi(data);
     }
   } catch (e) {
+    consecutivePollFailures++;
+    // 传输中屏蔽网关无响应的检测功能（上传期间设备忙，无法响应轮询是正常的）
+    if (consecutivePollFailures === 5 && !pollSlowMode && !isUploading) {
+      addLog('W', '诊断', '设备连续 5 次无响应，正在诊断网络...');
+      var diag = await diagnoseNetwork();
+      addLog('W', '诊断', diag);
+      updateConnectionUi(false, '未连接');
+      applyDisconnectedRuntimeState();
+      var cst = document.getElementById('connStatusTxt');
+      if (cst) cst.textContent = '诊断中: ' + diag;
+      // 降速到 10 秒继续监测，等待设备恢复
+      slowDownPolling();
+      addLog('I', '系统', '已切换为慢速轮询（10s），持续监测设备恢复...');
+    }
     if (isUploading) {
       applyUploadingRuntimeState();
     } else if (isEsp32Rebooting) {
@@ -1111,14 +1425,13 @@ async function pollStatus() {
       } else {
         applyRebootingRuntimeState();
       }
-    } else {
+    } else if (!pollSlowMode) {
       updateConnectionUi(false, '未连接');
       applyDisconnectedRuntimeState();
     }
   }
 }
-setInterval(pollStatus, 1000);
-
+startPolling();
 // ==================== ESP32 实时日志拉取 (增量) ====================
 var lastLogTimestamp = 0;
 async function pollLogs() {
@@ -1129,7 +1442,6 @@ async function pollLogs() {
     if (!resp.ok) return;
     var logs = await resp.json();
     if (!Array.isArray(logs) || logs.length === 0) return;
-
     var levelMap = { E: 'E', W: 'W', I: 'I', D: 'D' };
     logs.forEach(function (line) {
       var m = line.match(/^\[([EWID])\]\[([^\]]+)\]\s*(.*)$/);
@@ -1141,13 +1453,20 @@ async function pollLogs() {
     });
   } catch (e) { /* 静默 */ }
 }
-setInterval(pollLogs, 1000);
-
 setTimeout(function () {
   updateUploadButtonLabel();
   updateCanHint();
   addLog('I', '系统', '控制台初始化完成，等待固件文件...');
   updateSpiHint();
+  // IP 输入变化时自动恢复轮询
+  var ipInput = document.getElementById('espIp');
+  if (ipInput) {
+    ipInput.addEventListener('change', function () {
+      if (pollSlowMode) {
+        addLog('I', '系统', 'IP 已修改，重新启动轮询...');
+        restorePolling();
+      }
+    });
+  }
 }, 500);
-
 

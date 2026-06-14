@@ -9,6 +9,8 @@
 
 #include <stdint.h>
 #include "driver/spi_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 // SPI 配置常量
 #define SPI_MASTER_CS_GPIO    (4)           // CS 片选引脚
@@ -23,7 +25,7 @@
 #define SPI_OTA_CMD_DATA      (0x02)
 #define SPI_OTA_CMD_CANCEL    (0x03)
 #define SPI_APP_ENTER_BOOT_CMD (0xB0)
-#define SPI_APP_ENTER_BOOT_ACK_OK (0xA5)
+#define SPI_APP_ENTER_BOOT_ACK_OK (0xB5)  // GD32 APP 固件须同步修改 ACK 字节为 0xB5
 #define SPI_OTA_RSP_ACK       (0x80)
 #define SPI_OTA_RSP_WAIT      (0x81)
 #define SPI_OTA_RSP_ERROR     (0x82)
@@ -140,13 +142,39 @@ private:
     SpiMaster& operator=(const SpiMaster&) = delete;
 
     spi_device_handle_t m_spiDevice = NULL;
+    SemaphoreHandle_t m_mutex = NULL;
+
+    // RAII 锁守卫
+    class LockGuard {
+    public:
+        explicit LockGuard(SemaphoreHandle_t mutex) : m_lock(mutex) {
+            if (m_lock) { xSemaphoreTake(m_lock, portMAX_DELAY); }
+        }
+        ~LockGuard() {
+            if (m_lock) { xSemaphoreGive(m_lock); }
+        }
+        LockGuard(const LockGuard&) = delete;
+        LockGuard& operator=(const LockGuard&) = delete;
+    private:
+        SemaphoreHandle_t m_lock;
+    };
 
     // 内部 SPI 传输
     esp_err_t transferClocked(const uint8_t *tx_buf, size_t tx_len,
-                              uint8_t *rx_buf, size_t rx_len);
+                              uint8_t *rx_buf, size_t rx_len,
+                              uint32_t timeout_ms = 0U);
     esp_err_t transferRequestResponse(uint8_t cmd, const uint8_t *payload, size_t payload_len,
-                                      uint8_t *rx_buf, size_t rx_len);
+                                      uint8_t *rx_buf, size_t rx_len,
+                                      uint32_t timeout_ms = 0U);
 
+
+    // 无锁内部版本（供已持锁的公共方法调用，避免递归死锁）
+    esp_err_t syncTransferUnlocked(uint8_t cmd, const uint8_t *payload,
+                                   size_t payload_len, uint8_t *recv_buf,
+                                   size_t recv_len, uint32_t timeout_ms);
+    esp_err_t sendUnlocked(uint8_t cmd, const uint8_t *payload, size_t len);
+    esp_err_t otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_payload,
+                                      size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
     // OTA 帧工具（静态，无状态）
     static uint8_t otaCrc8(const uint8_t *data, size_t len);
     static bool otaBuildFrame(uint8_t type, const uint8_t *payload, size_t payload_len,

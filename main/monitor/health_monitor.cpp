@@ -3,6 +3,8 @@
  * 包含：健康状态管理 + WiFi RSSI 监控 + 温度监控
  *
  * 所有功能封装为 HealthMonitor 类方法。
+ * 所有对 m_healthState / m_lastTemperature / m_lastWifiRssi 的访问
+ * 均通过 m_mutex 保护，消除跨任务竞态。
  */
 #include <stdio.h>
 #include <string.h>
@@ -17,11 +19,6 @@
 #include "health_monitor.h"
 #include "debug_log.h"
 #include "server/wifi_ota.h"
-
-// ============================================================
-// 静态成员
-// ============================================================
-health_state_t HealthMonitor::healthState = SYS_NORMAL;
 
 // ============================================================
 // 单例
@@ -44,36 +41,54 @@ void HealthMonitor::init()
 }
 
 // ============================================================
-// 获取当前健康状态
+// 线程安全的健康状态读写
+// ============================================================
+health_state_t HealthMonitor::getState()
+{
+    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
+    health_state_t s = m_healthState;
+    if (m_mutex) xSemaphoreGive(m_mutex);
+    return s;
+}
+
+void HealthMonitor::setState(health_state_t newState)
+{
+    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
+    m_healthState = newState;
+    if (m_mutex) xSemaphoreGive(m_mutex);
+}
+
+// ============================================================
+// 获取当前健康状态（public 接口）
 // ============================================================
 health_state_t HealthMonitor::getCurrent()
 {
-    health_state_t state;
-    if (m_mutex) {
-        xSemaphoreTake(m_mutex, portMAX_DELAY);
-    }
-    state = healthState;
-    if (m_mutex) {
-        xSemaphoreGive(m_mutex);
-    }
-    return state;
+    return getState();
 }
 
 float HealthMonitor::getLastTemperature()
 {
-    return m_lastTemperature;
+    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
+    float t = m_lastTemperature;
+    if (m_mutex) xSemaphoreGive(m_mutex);
+    return t;
 }
 
 bool HealthMonitor::getLastWifiRssi(int8_t *out_rssi, uint32_t *out_age_ms)
 {
-    if (m_lastWifiRssiMs <= 0) {
+    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
+    int64_t lastMs = m_lastWifiRssiMs;
+    int8_t  rssi   = m_lastWifiRssi;
+    if (m_mutex) xSemaphoreGive(m_mutex);
+
+    if (lastMs <= 0) {
         return false;
     }
 
     int64_t now_ms = esp_timer_get_time() / 1000;
-    uint32_t age_ms = (now_ms > m_lastWifiRssiMs) ? (uint32_t)(now_ms - m_lastWifiRssiMs) : 0;
+    uint32_t age_ms = (now_ms > lastMs) ? (uint32_t)(now_ms - lastMs) : 0;
 
-    if (out_rssi) *out_rssi = m_lastWifiRssi;
+    if (out_rssi)  *out_rssi  = rssi;
     if (out_age_ms) *out_age_ms = age_ms;
     return true;
 }
@@ -91,15 +106,18 @@ void HealthMonitor::tempMonitorCallback(void *arg)
         return;
     }
 
+    if (self.m_mutex) xSemaphoreTake(self.m_mutex, portMAX_DELAY);
     self.m_lastTemperature = temp;
+    if (self.m_mutex) xSemaphoreGive(self.m_mutex);
 
     if (temp >= TEMP_CRITICAL) {
-        healthState = SYS_SAFE_SHUTDOWN;
+        self.setState(SYS_SAFE_SHUTDOWN);
         DEBUG_ERR("TEMP", "!!! 危险 !!! 温度 %.1f°C >= %d°C，触发安全关机", temp, TEMP_CRITICAL);
         DEBUG_ERR("TEMP", "健康状态变更为: SYS_SAFE_SHUTDOWN");
     } else if (temp >= TEMP_WARNING) {
-        if (healthState < SYS_WARNING) {
-            healthState = SYS_WARNING;
+        health_state_t cur = self.getState();
+        if (cur < SYS_WARNING) {
+            self.setState(SYS_WARNING);
             DEBUG_WARN("TEMP", "警告: 温度 %.1f°C >= %d°C", temp, TEMP_WARNING);
             DEBUG_WARN("TEMP", "健康状态变更为: SYS_WARNING");
         }
@@ -144,8 +162,9 @@ void HealthMonitor::taskEntry(void *pvParameters)
         if (free_heap < HEAP_WARNING_MIN) {
             DEBUG_WARN("MON", "堆内存不足: %lu < %lu", free_heap, HEAP_WARNING_MIN);
         }
-        if (healthState >= SYS_CRITICAL) {
-            DEBUG_ERR("MON", "健康状态危险: %d", healthState);
+        health_state_t cur = self.getState();
+        if (cur >= SYS_CRITICAL) {
+            DEBUG_ERR("MON", "健康状态危险: %d", cur);
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
@@ -165,14 +184,15 @@ void HealthMonitor::logEvent(const char *event, int value)
 health_status_t HealthMonitor::checkBeforeOta()
 {
     health_status_t status = HEALTH_MON_OK;
+    health_state_t cur = getState();
 
-    if (healthState >= SYS_SAFE_SHUTDOWN) {
+    if (cur >= SYS_SAFE_SHUTDOWN) {
         DEBUG_WARN("HEALTH", "OTA 前检查: SYS_SAFE_SHUTDOWN，禁止传输");
         return HEALTH_MON_SHUTDOWN;
-    } else if (healthState >= SYS_CRITICAL) {
+    } else if (cur >= SYS_CRITICAL) {
         DEBUG_WARN("HEALTH", "OTA 前检查: SYS_CRITICAL，禁止传输");
         return HEALTH_MON_CRITICAL;
-    } else if (healthState >= SYS_WARNING) {
+    } else if (cur >= SYS_WARNING) {
         status = HEALTH_MON_WARNING;
         DEBUG_WARN("HEALTH", "OTA 前检查: SYS_WARNING，继续传输但需注意");
     }
@@ -210,18 +230,19 @@ health_status_t HealthMonitor::checkBeforeOta()
 health_status_t HealthMonitor::checkBeforeOtaRelay()
 {
     health_status_t status = HEALTH_MON_OK;
+    health_state_t cur = getState();
 
-    if (healthState >= SYS_SAFE_SHUTDOWN) {
+    if (cur >= SYS_SAFE_SHUTDOWN) {
         DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_SAFE_SHUTDOWN，禁止传输");
         return HEALTH_MON_SHUTDOWN;
-    } else if (healthState >= SYS_CRITICAL) {
+    } else if (cur >= SYS_CRITICAL) {
         /* SYS_CRITICAL 可能是由 WiFi RSSI 过低导致的，
          * 但 SPI 中继阶段不依赖 WiFi，只检查温度/硬件等本地状态。
-         * 温度达到 TEMP_CRITICAL(100°C) 时 g_health_state 会被设为
+         * 温度达到 TEMP_CRITICAL(100°C) 时 m_healthState 会被设为
          * SYS_SAFE_SHUTDOWN，在上面的分支已经拦截。
          * 所以 SYS_CRITICAL 在中继阶段只可能是 WiFi 导致的，允许继续。 */
         DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_CRITICAL (WiFi 相关)，SPI 中继允许继续");
-    } else if (healthState >= SYS_WARNING) {
+    } else if (cur >= SYS_WARNING) {
         status = HEALTH_MON_WARNING;
         DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_WARNING，继续传输");
     }
@@ -243,21 +264,23 @@ health_status_t HealthMonitor::checkBeforeOtaRelay()
 health_status_t HealthMonitor::updateFromWifiRssi(int8_t rssi)
 {
     if (rssi < WIFI_RSSI_CRITICAL) {
-        healthState = SYS_CRITICAL;
+        setState(SYS_CRITICAL);
         DEBUG_WARN("HEALTH", "WiFi RSSI 危险: %d dBm < %d dBm", rssi, WIFI_RSSI_CRITICAL);
         logEvent("WIFI危险", rssi);
         return HEALTH_MON_CRITICAL;
     } else if (rssi < WIFI_RSSI_NORMAL) {
-        if (healthState < SYS_WARNING) {
-            healthState = SYS_WARNING;
+        health_state_t cur = getState();
+        if (cur < SYS_WARNING) {
+            setState(SYS_WARNING);
             DEBUG_WARN("HEALTH", "WiFi RSSI 警告: %d dBm < %d dBm", rssi, WIFI_RSSI_NORMAL);
             logEvent("WIFI警告", rssi);
         }
         return HEALTH_MON_WARNING;
     }
 
-    if (healthState == SYS_WARNING && rssi >= WIFI_RSSI_NORMAL) {
-        healthState = SYS_NORMAL;
+    health_state_t cur = getState();
+    if (cur == SYS_WARNING && rssi >= WIFI_RSSI_NORMAL) {
+        setState(SYS_NORMAL);
         DEBUG_INFO("HEALTH", "WiFi RSSI 恢复: %d dBm >= %d dBm", rssi, WIFI_RSSI_NORMAL);
         logEvent("WIFI恢复", rssi);
     }

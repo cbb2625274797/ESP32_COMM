@@ -9,6 +9,9 @@
 #include "esp_err.h"
 #include "esp_ota_ops.h"
 
+// 前向声明 mbedtls_sha256_context
+typedef struct mbedtls_sha256_context mbedtls_sha256_context;
+
 class BleOta {
 public:
     static BleOta& instance();
@@ -31,6 +34,11 @@ public:
     bool m_esp32RebootPending = false;
     uint8_t m_esp32LastCmd = 0;
     uint16_t m_esp32LastSeq = 0xFFFFU;
+
+    // SHA-256 哈希校验
+    mbedtls_sha256_context *m_sha256Ctx = nullptr;  // SHA-256计算上下文
+    uint8_t m_esp32Sha256[32] = {0};                // 计算得到的SHA-256哈希值
+    bool m_esp32HashComputed = false;               // 是否已计算哈希
 };
 
 #endif // BLE_OTA_H

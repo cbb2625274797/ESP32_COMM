@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 OTA 中继控制台</title>
-<link rel="stylesheet" href="style.css?v=20260530b">
+<link rel="stylesheet" href="style.css?v=20260614c">
 </head>
 <body>
 <div class="container">
@@ -68,8 +68,11 @@
               <div class="file-meta-item"><span>类型</span><b id="fileTypeEsp32">-</b></div>
               <div class="file-meta-item"><span>大小</span><b id="fileSizeEsp32">-</b></div>
             </div>
+            <div class="file-meta-item" style="margin-top:6px;">
+              <span>SHA-256</span>
+              <b id="fileSha256Esp32" style="font-size:10px;word-break:break-all;font-family:monospace;">-</b>
+            </div>
           </div>
-          </label>
           <button class="btn btn-primary btn-block" id="uploadEsp32Btn" onclick="startUpload('esp32')" disabled style="margin-top:10px;">
             上传并升级 ESP32
           </button>
@@ -96,7 +99,6 @@
               <div class="file-meta-item"><span>大小</span><b id="fileSizeGd32">-</b></div>
             </div>
           </div>
-          </label>
           <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled style="margin-top:10px;margin-bottom:8px;">
             上传固件到缓存
           </button>
@@ -177,11 +179,32 @@
       <div class="card">
         <div class="card-head"><span class="ico">🔀</span> OTA 流程阶段</div>
         <div class="card-body">
-          <div class="stage-flow">
-            <div class="stage-node" id="s1"><div class="stage-dot">1</div><div class="stage-label">握手认证</div></div>
-            <div class="stage-node" id="s2"><div class="stage-dot">2</div><div class="stage-label">传输准备</div></div>
-            <div class="stage-node" id="s3"><div class="stage-dot">3</div><div class="stage-label">数据转发</div></div>
-            <div class="stage-node" id="s4"><div class="stage-dot">4</div><div class="stage-label">完成跳转</div></div>
+          <!-- ESP32 OTA stages -->
+          <div class="stage-flow" id="esp32Stages" style="display:none;">
+            <div class="stage-node" id="es1"><div class="stage-dot">1</div><div class="stage-label">固件上传</div><div class="stage-detail" id="esd1"></div></div>
+            <div class="stage-node" id="es2"><div class="stage-dot">2</div><div class="stage-label">OTA 写入</div><div class="stage-detail" id="esd2"></div></div>
+            <div class="stage-node" id="es3"><div class="stage-dot">3</div><div class="stage-label">SHA-256 校验</div><div class="stage-detail" id="esd3"></div></div>
+            <div class="stage-node" id="es4"><div class="stage-dot">4</div><div class="stage-label">应用固件</div><div class="stage-detail" id="esd4"></div></div>
+            <div class="stage-node" id="es5"><div class="stage-dot">5</div><div class="stage-label">重启中</div><div class="stage-detail" id="esd5"></div></div>
+            <div class="stage-node" id="es6"><div class="stage-dot">6</div><div class="stage-label">启动完成</div><div class="stage-detail" id="esd6"></div></div>
+          </div>
+          <!-- GD32 OTA stages -->
+          <div class="stage-flow" id="gd32Stages">
+            <div class="stage-node" id="s1"><div class="stage-dot">1</div><div class="stage-label">认证握手</div><div class="stage-detail" id="sd1"></div></div>
+            <div class="stage-node" id="s2"><div class="stage-dot">2</div><div class="stage-label">传输协商</div><div class="stage-detail" id="sd2"></div></div>
+            <div class="stage-node" id="s3"><div class="stage-dot">3</div><div class="stage-label">数据转发</div><div class="stage-detail" id="sd3"></div></div>
+            <div class="stage-node" id="s4"><div class="stage-dot">4</div><div class="stage-label">传输完成</div><div class="stage-detail" id="sd4"></div></div>
+            <div class="stage-node" id="s5"><div class="stage-dot">5</div><div class="stage-label">OTA 刷写</div><div class="stage-detail" id="sd5"></div></div>
+            <div class="stage-node" id="s6"><div class="stage-dot">6</div><div class="stage-label">校验验证</div><div class="stage-detail" id="sd6"></div></div>
+          </div>
+          <div class="stage-status-bar" id="stageStatusBar">
+            <span class="ssb-dot" id="stageStatusDot"></span>
+            <span class="ssb-text" id="stageStatusText">待机</span>
+          </div>
+          <div class="stage-verify-info" id="stageVerifyInfo" style="display:none;">
+            <div class="svi-row"><span class="svi-key">前端 SHA-256</span><span class="svi-val" id="sviFrontSha">-</span></div>
+            <div class="svi-row"><span class="svi-key">设备 SHA-256</span><span class="svi-val" id="sviDeviceSha">-</span></div>
+            <div class="svi-row"><span class="svi-key">校验结果</span><span class="svi-val" id="sviResult">-</span></div>
           </div>
         </div>
       </div>
@@ -271,7 +294,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260603b"></script>
+<script src="app.js?v=20260614f"></script>
 </body>
 </html>
 
