@@ -13,6 +13,11 @@ let logSocket = null;
 let latestSystemStatus = null;
 let isEsp32Rebooting = false;
 let rebootStartTime = 0;
+
+// ==================== 折叠面板 ====================
+function toggleCollapse(headEl) {
+  headEl.closest('.card').classList.toggle('collapsed');
+}
 // ==================== 刷写进度 ====================
 var activePhase = null;  // 'esp32Ota' | 'gd32Upload' | 'gd32Relay' | null
 var currentOtaTarget = null;  // 'esp32' | 'gd32' | null — 当前 OTA 目标，决定显示哪套阶段
@@ -293,10 +298,8 @@ function applyDisconnectedRuntimeState() {
   document.getElementById('pillRSSI').textContent = '--';
   document.getElementById('pillRelayTxt').textContent = '离线';
   document.getElementById('pillRelay').className = 'pill offline';
-  document.getElementById('mWifi').textContent = '未连接';
-  document.getElementById('mRSSI').textContent = '--';
-  document.getElementById('bOTAProgress').textContent = '--';
-  document.getElementById('bOTAProgress').className = 'v err';
+  var bp = document.getElementById('bOTAProgress');
+  if (bp) { bp.textContent = '--'; bp.className = 'v err'; }
   resetProgress();
   resetStageFlow();
 }
@@ -308,11 +311,11 @@ function applyRebootingRuntimeState() {
   pct.textContent = '重启中 ' + elapsed + 's';
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
-  cs.className = 'conn-indicator warn';
-  cst.textContent = 'ESP32 正在重启...';
+  if (cs) cs.className = 'conn-indicator warn';
+  if (cst) cst.textContent = 'ESP32 正在重启...';
   var bc = document.getElementById('bConn');
-  bc.textContent = '重启中';
-  bc.className = 'v warn';
+  if (bc) bc.textContent = '重启中';
+  if (bc) bc.className = 'v warn';
   document.getElementById('pillRelayTxt').textContent = '重启中';
   document.getElementById('pillRelay').className = 'pill processing';
 }
@@ -323,11 +326,11 @@ function applyUploadingRuntimeState() {
   pct.textContent = '上传中';
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
-  cs.className = 'conn-indicator warn';
-  cst.textContent = '固件上传中，设备忙...';
+  if (cs) cs.className = 'conn-indicator warn';
+  if (cst) cst.textContent = '固件上传中，设备忙...';
   var bc = document.getElementById('bConn');
-  bc.textContent = '上传中';
-  bc.className = 'v warn';
+  if (bc) bc.textContent = '上传中';
+  if (bc) bc.className = 'v warn';
 }
 // ==================== 连接管理 ====================
 function updateConnectionUi(connected, text) {
@@ -339,8 +342,8 @@ function updateConnectionUi(connected, text) {
   // connection card indicator
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
-  cs.className = connected ? 'conn-indicator ok' : 'conn-indicator err';
-  cst.textContent = connected ? (text || '已连接') : '未连接';
+  if (cs) cs.className = connected ? 'conn-indicator ok' : 'conn-indicator err';
+  if (cst) cst.textContent = connected ? (text || '已连接') : '未连接';
   // primary badge
   var bc = document.getElementById('bConn');
   bc.textContent = connected ? '在线' : '离线';
@@ -442,8 +445,7 @@ function updateSystemStatusUi(data) {
   // version
   if (data.version) {
     document.getElementById('pillVer').textContent = 'v' + data.version;
-    document.getElementById('pillVer').title = data.build_time ? ('编译: ' + data.build_time) : '';
-    document.getElementById('mVersion').textContent = 'v' + data.version + (data.build_time ? '  (' + data.build_time + ')' : '');
+    document.getElementById('pillVer').dataset.tooltip = data.build_time ? ('编译: ' + data.build_time) : '';
     // GD32 版本
     var mGd32App = document.getElementById('mGd32App');
     var mGd32Boot = document.getElementById('mGd32Boot');
@@ -473,10 +475,8 @@ function updateSystemStatusUi(data) {
   var uptimeEl = document.getElementById('pillUptime');
   if (uptimeEl) uptimeEl.textContent = '\u23F1 ' + formatUptime(data.uptime_sec);
   // wifi / signal
-  document.getElementById('mWifi').textContent = wifi.connected ? (wifi.ip || '已连接') : '未连接';
   document.getElementById('pillIP').textContent = wifi.ip || '--';
   var rssi = (wifi.rssi !== undefined && wifi.rssi !== -127) ? wifi.rssi + ' dBm' : '--';
-  document.getElementById('mRSSI').textContent = rssi;
   document.getElementById('pillRSSI').textContent = rssi;
   // heap
   document.getElementById('mHeap').textContent =
@@ -515,8 +515,10 @@ function updateSystemStatusUi(data) {
   var stored = ota.stored_size || 0;
   var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
   var bp = document.getElementById('bOTAProgress');
-  bp.textContent = storageProgress + '%';
-  bp.className = 'v ' + (storageProgress === 100 ? 'ok' : storageProgress > 0 ? 'warn' : '');
+  if (bp) {
+    bp.textContent = storageProgress + '%';
+    bp.className = 'v ' + (storageProgress === 100 ? 'ok' : storageProgress > 0 ? 'warn' : '');
+  }
   // GD32 relay forwarding progress
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
@@ -1073,7 +1075,8 @@ async function startUpload(chip) {
         var pct = Math.round((e.loaded / e.total) * 100);
         uploadProgress = pct;
         setProgress(pct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
-        document.getElementById('bOTAProgress').textContent = pct + '%';
+        var el = document.getElementById('bOTAProgress');
+        if (el) el.textContent = pct + '%';
       }
     });
     xhr.addEventListener('load', function () {

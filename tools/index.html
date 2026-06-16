@@ -23,6 +23,10 @@
       <span class="pill idle" id="pillRelay"><span class="indicator"></span><span id="pillRelayTxt">待机</span></span>
       <span class="pill" id="pillUptime">运行 --</span>
     </div>
+    <div class="header-sub">
+      <span class="pill">设备名: <b class="pill-val" id="deviceName">-</b></span>
+      <span class="pill">设备ID: <b class="pill-val" id="deviceId">-</b></span>
+    </div>
   </header>
 
   <!-- ====== MAIN LAYOUT ====== -->
@@ -33,8 +37,18 @@
 
       <!-- 1. Connection -->
       <div class="card">
-        <div class="card-head"><span class="ico">🔗</span> 设备连接</div>
+        <div class="card-head"><span class="ico">🔗</span> 设备连接
+          <span id="bleHeadActions" style="display:none;margin-left:auto;">
+            <button id="connectBtn" class="btn btn-sm btn-primary">连接设备</button>
+            <button id="disconnectBtn" class="btn btn-sm btn-outline" disabled>断开连接</button>
+          </span>
+        </div>
         <div class="card-body">
+          <div style="display:flex;gap:6px;margin-bottom:14px;">
+            <button id="modeWifiBtn" class="btn btn-primary" style="flex:1;font-size:12px;padding:7px 10px;" onclick="setConsoleMode('wifi')">WiFi OTA</button>
+            <button id="modeBleBtn" class="btn btn-outline" style="flex:1;font-size:12px;padding:7px 10px;" onclick="setConsoleMode('ble')">BLE 蓝牙</button>
+          </div>
+          <div id="wifiModeCards">
           <div class="form-row">
             <label class="form-label" for="espIp">ESP32 IP 地址</label>
             <div class="input-group">
@@ -42,27 +56,45 @@
               <button class="btn btn-outline" onclick="testConnection()">测试</button>
             </div>
           </div>
-          <div class="conn-indicator err" id="connStatus">
+          </div>
+          <div id="bleModeCards" style="display:none;">
+          <div class="row-2" id="bleParamRow" style="margin-top:0;">
+            <div class="form-row" style="margin:0;">
+              <label class="form-label" for="payloadSize">每包 Payload</label>
+              <input id="payloadSize" class="input" type="number" min="32" max="498" value="480">
+            </div>
+            <div class="form-row" style="margin:0;">
+              <label class="form-label" for="ctrlHex">触发命令（HEX）</label>
+              <input id="ctrlHex" class="input" type="text" value="F7" maxlength="8">
+            </div>
+          </div>
+          </div>
+          <div class="conn-indicator err" id="connStatus" style="margin-top:12px;">
             <span class="light"></span>
             <span id="connStatusTxt">等待连接</span>
           </div>
         </div>
       </div>
 
-      <!-- 2. ESP32 OTA -->
+      <!-- ====== Shared Target + Firmware + Actions ====== -->
       <div class="card">
-        <div class="card-head"><span class="ico">📦</span> ESP32 自身升级</div>
+        <div class="card-head"><span class="ico">🎯</span> 升级目标、固件文件与执行操作</div>
         <div class="card-body">
-          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">上传固件并执行 OTA，设备将自动重启</div>
-          <div class="upload-zone upload-zone-sm" id="uploadZoneEsp32" onclick="if(window.showOpenFilePicker){pickFileViaFSAPI('esp32')}else{document.getElementById('fileInputEsp32').click()}">
+          <div style="display:flex;gap:6px;margin-bottom:14px;">
+            <button id="targetGd32Tab" class="btn btn-outline" style="flex:1;font-size:12px;padding:7px 10px;" onclick="selectFlashTarget('gd32')">GD32</button>
+            <button id="targetEsp32Tab" class="btn btn-primary" style="flex:1;font-size:12px;padding:7px 10px;" onclick="selectFlashTarget('esp32')">ESP32</button>
+          </div>
+          <div style="border-top:1px solid var(--border);margin:0 -16px 14px;padding-top:14px;padding-left:16px;padding-right:16px;">
+          <div id="wifiEsp32UploadPane">
+          <div class="upload-zone upload-zone-sm" id="uploadZoneEsp32" onclick="pickSharedFirmware('esp32')">
             <div class="upload-ico">📤</div>
             <h4>点击或拖拽 ESP32 固件</h4>
           </div>
-          <input type="file" id="fileInputEsp32" accept=".bin" onchange="handleFileSelect(event, 'esp32')" style="display:none;">
+          <input type="file" id="fileInputEsp32" accept=".bin" onchange="handleSharedFileSelect(event, 'esp32')" style="display:none;">
           <div class="file-info" id="fileInfoEsp32">
             <div class="file-info-row">
               <span style="font-weight:600;">📄 <span id="fileNameEsp32">-</span></span>
-              <button class="btn btn-ghost btn-sm" onclick="clearFile('esp32')">清除</button>
+              <button class="btn btn-ghost btn-sm" onclick="clearSharedFirmware('esp32')">清除</button>
             </div>
             <div class="file-info-grid">
               <div class="file-meta-item"><span>类型</span><b id="fileTypeEsp32">-</b></div>
@@ -73,44 +105,81 @@
               <b id="fileSha256Esp32" style="font-size:10px;word-break:break-all;font-family:monospace;">-</b>
             </div>
           </div>
-          <button class="btn btn-primary btn-block" id="uploadEsp32Btn" onclick="startUpload('esp32')" disabled style="margin-top:10px;">
-            上传并升级 ESP32
-          </button>
-        </div>
-      </div>
+          </div>
 
-      <!-- 3. GD32 OTA -->
-      <div class="card">
-        <div class="card-head"><span class="ico">📦</span> GD32 SPI 中继</div>
-        <div class="card-body">
-          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">上传固件到缓存，再触发 SPI 中继刷写<br><span style="color:var(--accent);">支持 .bin 和 .hex（自动转换）</span></div>
-          <div class="upload-zone upload-zone-sm" id="uploadZoneGd32" onclick="if(window.showOpenFilePicker){pickFileViaFSAPI('gd32')}else{document.getElementById('fileInputGd32').click()}">
+          <div id="wifiGd32UploadPane" style="display:none;">
+          <div class="upload-zone upload-zone-sm" id="uploadZoneGd32" onclick="pickSharedFirmware('gd32')">
             <div class="upload-ico">📤</div>
             <h4>点击或拖拽 GD32 固件</h4>
+            <p>支持 .bin 和 .hex（自动转换）</p>
           </div>
-          <input type="file" id="fileInputGd32" accept=".hex,.bin" onchange="handleFileSelect(event, 'gd32')" style="display:none;">
+          <input type="file" id="fileInputGd32" accept=".hex,.bin" onchange="handleSharedFileSelect(event, 'gd32')" style="display:none;">
           <div class="file-info" id="fileInfoGd32">
             <div class="file-info-row">
               <span style="font-weight:600;">📄 <span id="fileNameGd32">-</span></span>
-              <button class="btn btn-ghost btn-sm" onclick="clearFile('gd32')">清除</button>
+              <button class="btn btn-ghost btn-sm" onclick="clearSharedFirmware('gd32')">清除</button>
             </div>
             <div class="file-info-grid">
               <div class="file-meta-item"><span>类型</span><b id="fileTypeGd32">-</b></div>
               <div class="file-meta-item"><span>大小</span><b id="fileSizeGd32">-</b></div>
             </div>
           </div>
-          <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled style="margin-top:10px;margin-bottom:8px;">
-            上传固件到缓存
-          </button>
-          <button class="btn btn-outline btn-block" id="relayBtn" onclick="triggerRelay()">
-            触发 GD32 OTA 中继
-          </button>
+          </div>
+
+          <div id="bleUploadPane" style="display:none;">
+          <div class="upload-zone upload-zone-sm" id="uploadZone" style="margin-bottom:12px;"
+               onclick="document.getElementById('firmwareFile').click()"
+               ondragover="event.preventDefault();this.classList.add('dragover')"
+               ondragleave="this.classList.remove('dragover')"
+               ondrop="event.preventDefault();this.classList.remove('dragover');var f=event.dataTransfer.files[0];if(f&&window.bleOta)window.bleOta.notifyFileChange(f,null);">
+            <div class="upload-ico">📤</div>
+            <h4>点击或拖拽文件到此处</h4>
+            <p>支持 .bin 和 .hex 格式</p>
+          </div>
+          <input id="firmwareFile" type="file" accept=".bin,.hex,application/octet-stream" style="display:none;">
+          <div class="file-info" id="fileInfo">
+            <div class="file-info-row">
+              <span style="font-weight:600;">📄 <span id="fileName">-</span></span>
+              <button id="clearFileBtn" class="btn btn-outline btn-sm" onclick="if(window.bleOta)window.bleOta.clearFile()">清除</button>
+            </div>
+            <div class="file-info-grid">
+              <div class="file-meta-item"><span>类型</span><b id="fileType">-</b></div>
+              <div class="file-meta-item"><span>大小</span><b id="fileSize">0 B</b></div>
+              <div class="file-meta-item"><span>总包数</span><b id="packetCount">0</b></div>
+              <div class="file-meta-item"><span>已写包</span><b id="sentCount">0</b></div>
+            </div>
+            <div class="file-meta-item" style="margin-top:8px;">
+              <span>SHA-256</span>
+              <b id="fileSha256" style="font-size:10px;word-break:break-all;font-family:var(--font-mono);">-</b>
+            </div>
+          </div>
+          <div class="footer-note">建议使用 Chrome / Edge。若首包失败，可将 Payload 从 480 降为 240 再试。</div>
+          </div>
+          <div style="height:12px"></div>
+          <div id="wifiEsp32ActionPane">
+            <button class="btn btn-primary btn-block" id="uploadEsp32Btn" onclick="startUpload('esp32')" disabled>
+              上传并升级 ESP32
+            </button>
+          </div>
+          <div id="wifiGd32ActionPane" style="display:none;">
+            <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled style="margin-bottom:8px;">
+              上传固件到缓存
+            </button>
+            <button class="btn btn-outline btn-block" id="relayBtn" onclick="triggerRelay()">
+              触发 GD32 OTA 中继
+            </button>
+          </div>
+          <div class="row-2" id="bleActionPane" style="display:none;">
+            <button id="autoFlashBtn" class="btn btn-primary" disabled>一键刷写</button>
+            <button id="abortBtn" class="btn btn-danger" disabled>中止任务</button>
+          </div>
+          </div>
         </div>
       </div>
 
-      <!-- 4. Flash Progress -->
+      <!-- 4. Flash Progress + Stage Flow -->
       <div class="card">
-        <div class="card-head"><span class="ico">⚡</span> 刷写进度</div>
+        <div class="card-head"><span class="ico">⚡</span> 刷写进度与流程阶段</div>
         <div class="card-body">
           <!-- Phase step indicators -->
           <div class="progress-phase-row">
@@ -126,11 +195,45 @@
               <span id="progressPct">0%</span>
             </div>
           </div>
+          <div style="height:14px"></div>
+          <!-- ESP32 OTA stages -->
+          <div class="stage-flow" id="esp32Stages" style="display:none;">
+            <div class="stage-node" id="es1"><div class="stage-dot">1</div><div class="stage-label">固件上传</div><div class="stage-detail" id="esd1"></div></div>
+            <div class="stage-node" id="es2"><div class="stage-dot">2</div><div class="stage-label">OTA 写入</div><div class="stage-detail" id="esd2"></div></div>
+            <div class="stage-node" id="es3"><div class="stage-dot">3</div><div class="stage-label">SHA-256 校验</div><div class="stage-detail" id="esd3"></div></div>
+            <div class="stage-node" id="es4"><div class="stage-dot">4</div><div class="stage-label">应用固件</div><div class="stage-detail" id="esd4"></div></div>
+            <div class="stage-node" id="es5"><div class="stage-dot">5</div><div class="stage-label">重启中</div><div class="stage-detail" id="esd5"></div></div>
+            <div class="stage-node" id="es6"><div class="stage-dot">6</div><div class="stage-label">启动完成</div><div class="stage-detail" id="esd6"></div></div>
+          </div>
+          <!-- BLE OTA stages -->
+          <div class="stage-flow" id="bleStages" style="display:none;">
+            <div class="stage-node" id="bs1"><div class="stage-dot">1</div><div class="stage-label">BLE 连接</div><div class="stage-detail" id="bsd1"></div></div>
+            <div class="stage-node" id="bs2"><div class="stage-dot">2</div><div class="stage-label">GATT 准备</div><div class="stage-detail" id="bsd2"></div></div>
+            <div class="stage-node" id="bs3"><div class="stage-dot">3</div><div class="stage-label">文件准备</div><div class="stage-detail" id="bsd3"></div></div>
+            <div class="stage-node" id="bs4"><div class="stage-dot">4</div><div class="stage-label">数据写入</div><div class="stage-detail" id="bsd4"></div></div>
+            <div class="stage-node" id="bs5"><div class="stage-dot">5</div><div class="stage-label" id="bsl5">校验比对</div><div class="stage-detail" id="bsd5"></div></div>
+            <div class="stage-node" id="bs6"><div class="stage-dot">6</div><div class="stage-label" id="bsl6">完成触发</div><div class="stage-detail" id="bsd6"></div></div>
+          </div>
+          <!-- GD32 OTA stages -->
+          <div class="stage-flow" id="gd32Stages">
+            <div class="stage-node" id="s1"><div class="stage-dot">1</div><div class="stage-label">认证握手</div><div class="stage-detail" id="sd1"></div></div>
+            <div class="stage-node" id="s2"><div class="stage-dot">2</div><div class="stage-label">传输协商</div><div class="stage-detail" id="sd2"></div></div>
+            <div class="stage-node" id="s3"><div class="stage-dot">3</div><div class="stage-label">数据转发</div><div class="stage-detail" id="sd3"></div></div>
+            <div class="stage-node" id="s4"><div class="stage-dot">4</div><div class="stage-label">传输完成</div><div class="stage-detail" id="sd4"></div></div>
+            <div class="stage-node" id="s5"><div class="stage-dot">5</div><div class="stage-label">OTA 刷写</div><div class="stage-detail" id="sd5"></div></div>
+            <div class="stage-node" id="s6"><div class="stage-dot">6</div><div class="stage-label">校验验证</div><div class="stage-detail" id="sd6"></div></div>
+          </div>
+          <div class="stage-status-bar" id="stageStatusBar">
+            <span class="ssb-dot" id="stageStatusDot"></span>
+            <span class="ssb-text" id="stageStatusText">待机</span>
+          </div>
+          <div class="stage-verify-info" id="stageVerifyInfo" style="display:none;">
+            <div class="svi-row"><span class="svi-key">前端 SHA-256</span><span class="svi-val" id="sviFrontSha">-</span></div>
+            <div class="svi-row"><span class="svi-key">设备 SHA-256</span><span class="svi-val" id="sviDeviceSha">-</span></div>
+            <div class="svi-row"><span class="svi-key">校验结果</span><span class="svi-val" id="sviResult">-</span></div>
+          </div>
           <div style="margin-top:12px;">
             <button class="btn btn-outline btn-block" onclick="restartEsp32()">重启 ESP32</button>
-            <a class="btn btn-outline btn-block" href="ble_ota.html?v=20260614-ota-order-fix" target="_blank" style="margin-top:10px;text-decoration:none;">
-              切换到 BLE 蓝牙刷写 ↗
-            </a>
           </div>
         </div>
       </div>
@@ -153,6 +256,14 @@
               <div class="v warn" id="bOTAProgress">0%</div>
               <div class="k">OTA 进度</div>
             </div>
+            <div class="badge-stat">
+              <div class="v err" id="connBadge">offline</div>
+              <div class="k">BLE 连接</div>
+            </div>
+            <div class="badge-stat">
+              <div class="v" id="gattState" style="font-size:16px;">未就绪</div>
+              <div class="k">GATT 状态</div>
+            </div>
           </div>
         </div>
       </div>
@@ -163,11 +274,8 @@
         <div class="card-body">
           <div class="metric-grid">
             <div class="metric"><div class="k">温度</div><div class="v" id="mTemp">--</div></div>
-            <div class="metric"><div class="k">WiFi / IP</div><div class="v" id="mWifi" style="font-size:14px;">--</div></div>
-            <div class="metric"><div class="k">信号强度</div><div class="v" id="mRSSI">--</div></div>
             <div class="metric"><div class="k">空闲堆</div><div class="v" id="mHeap" style="font-size:16px;">--</div></div>
             <div class="metric"><div class="k">最低空闲堆</div><div class="v" id="mMinHeap" style="font-size:16px;">--</div></div>
-            <div class="metric"><div class="k">ESP32 版本</div><div class="v" id="mVersion" style="font-size:16px;">--</div></div>
             <div class="metric"><div class="k">GD32 APP</div><div class="v" id="mGd32App" style="font-size:14px;">--</div></div>
             <div class="metric"><div class="k">GD32 BOOT</div><div class="v" id="mGd32Boot" style="font-size:14px;">--</div></div>
             <div class="metric"><div class="k">OTA 缓存</div><div class="v" id="mOtaCache" style="font-size:13px;">--</div></div>
@@ -175,43 +283,12 @@
         </div>
       </div>
 
-      <!-- OTA stage flow -->
-      <div class="card">
-        <div class="card-head"><span class="ico">🔀</span> OTA 流程阶段</div>
-        <div class="card-body">
-          <!-- ESP32 OTA stages -->
-          <div class="stage-flow" id="esp32Stages" style="display:none;">
-            <div class="stage-node" id="es1"><div class="stage-dot">1</div><div class="stage-label">固件上传</div><div class="stage-detail" id="esd1"></div></div>
-            <div class="stage-node" id="es2"><div class="stage-dot">2</div><div class="stage-label">OTA 写入</div><div class="stage-detail" id="esd2"></div></div>
-            <div class="stage-node" id="es3"><div class="stage-dot">3</div><div class="stage-label">SHA-256 校验</div><div class="stage-detail" id="esd3"></div></div>
-            <div class="stage-node" id="es4"><div class="stage-dot">4</div><div class="stage-label">应用固件</div><div class="stage-detail" id="esd4"></div></div>
-            <div class="stage-node" id="es5"><div class="stage-dot">5</div><div class="stage-label">重启中</div><div class="stage-detail" id="esd5"></div></div>
-            <div class="stage-node" id="es6"><div class="stage-dot">6</div><div class="stage-label">启动完成</div><div class="stage-detail" id="esd6"></div></div>
-          </div>
-          <!-- GD32 OTA stages -->
-          <div class="stage-flow" id="gd32Stages">
-            <div class="stage-node" id="s1"><div class="stage-dot">1</div><div class="stage-label">认证握手</div><div class="stage-detail" id="sd1"></div></div>
-            <div class="stage-node" id="s2"><div class="stage-dot">2</div><div class="stage-label">传输协商</div><div class="stage-detail" id="sd2"></div></div>
-            <div class="stage-node" id="s3"><div class="stage-dot">3</div><div class="stage-label">数据转发</div><div class="stage-detail" id="sd3"></div></div>
-            <div class="stage-node" id="s4"><div class="stage-dot">4</div><div class="stage-label">传输完成</div><div class="stage-detail" id="sd4"></div></div>
-            <div class="stage-node" id="s5"><div class="stage-dot">5</div><div class="stage-label">OTA 刷写</div><div class="stage-detail" id="sd5"></div></div>
-            <div class="stage-node" id="s6"><div class="stage-dot">6</div><div class="stage-label">校验验证</div><div class="stage-detail" id="sd6"></div></div>
-          </div>
-          <div class="stage-status-bar" id="stageStatusBar">
-            <span class="ssb-dot" id="stageStatusDot"></span>
-            <span class="ssb-text" id="stageStatusText">待机</span>
-          </div>
-          <div class="stage-verify-info" id="stageVerifyInfo" style="display:none;">
-            <div class="svi-row"><span class="svi-key">前端 SHA-256</span><span class="svi-val" id="sviFrontSha">-</span></div>
-            <div class="svi-row"><span class="svi-key">设备 SHA-256</span><span class="svi-val" id="sviDeviceSha">-</span></div>
-            <div class="svi-row"><span class="svi-key">校验结果</span><span class="svi-val" id="sviResult">-</span></div>
-          </div>
-        </div>
-      </div>
-
       <!-- CAN panel -->
-      <div class="card">
-        <div class="card-head"><span class="ico">📨</span> CAN 帧发送</div>
+      <div class="card collapsed">
+        <div class="card-head" onclick="toggleCollapse(this)">
+          <span class="ico">📨</span> CAN 帧发送
+          <span class="collapse-arrow">▼</span>
+        </div>
         <div class="card-body">
           <div class="can-grid">
             <div class="form-row" style="margin:0"><label class="form-label">通道</label>
@@ -240,8 +317,11 @@
       </div>
 
       <!-- SPI panel -->
-      <div class="card">
-        <div class="card-head"><span class="ico">⚡</span> SPI 发送</div>
+      <div class="card collapsed">
+        <div class="card-head" onclick="toggleCollapse(this)">
+          <span class="ico">⚡</span> SPI 发送
+          <span class="collapse-arrow">▼</span>
+        </div>
         <div class="card-body">
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
             <input class="input" type="text" id="spiType" value="01" maxlength="2" placeholder="type" title="帧类型 (hex)" style="width:52px;flex:none;">
@@ -295,6 +375,252 @@
 </div>
 
 <script src="app.js?v=20260614f"></script>
+<script>
+window.connectionMode = window.connectionMode || 'wifi';
+window.flashTarget = window.flashTarget || 'esp32';
+window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
+  esp32: { file: null, handle: null },
+  gd32: { file: null, handle: null }
+};
+(function () {
+  var originalSwitchStageFlow = window.switchStageFlow;
+  window.switchStageFlow = function (target) {
+    if (target === 'ble') {
+      window.currentOtaTarget = 'ble';
+      var esp32El = document.getElementById('esp32Stages');
+      var gd32El = document.getElementById('gd32Stages');
+      var bleEl = document.getElementById('bleStages');
+      if (esp32El) esp32El.style.display = 'none';
+      if (gd32El) gd32El.style.display = 'none';
+      if (bleEl) bleEl.style.display = '';
+      return;
+    }
+    if (typeof originalSwitchStageFlow === 'function') {
+      originalSwitchStageFlow(target);
+    }
+    var bleEl = document.getElementById('bleStages');
+    if (bleEl) bleEl.style.display = 'none';
+  };
+
+  window.setConsoleMode = function (mode) {
+    var isBle = mode === 'ble';
+    window.connectionMode = isBle ? 'ble' : 'wifi';
+    var wifiCards = document.getElementById('wifiModeCards');
+    var bleCards = document.getElementById('bleModeCards');
+    var wifiBtn = document.getElementById('modeWifiBtn');
+    var bleBtn = document.getElementById('modeBleBtn');
+    if (wifiCards) wifiCards.style.display = isBle ? 'none' : '';
+    if (bleCards) bleCards.style.display = isBle ? '' : 'none';
+    var headBtns = document.getElementById('bleHeadActions');
+    if (headBtns) headBtns.style.display = isBle ? '' : 'none';
+    if (wifiBtn) wifiBtn.className = isBle ? 'btn btn-outline' : 'btn btn-primary';
+    if (bleBtn) bleBtn.className = isBle ? 'btn btn-primary' : 'btn btn-outline';
+    applySharedModeUi();
+    syncBleFileFromSelectedTarget();
+    if (isBle) {
+      window.switchStageFlow('ble');
+      if (window.bleOta && typeof window.bleOta.refreshButtons === 'function') {
+        window.bleOta.refreshButtons();
+      }
+    } else {
+      window.switchStageFlow(window.activePhase === 'esp32Ota' ? 'esp32' : 'gd32');
+    }
+  };
+
+  window.selectFlashTarget = function (target) {
+    window.flashTarget = target === 'gd32' ? 'gd32' : 'esp32';
+    applySharedModeUi();
+    syncBleFileFromSelectedTarget();
+    if (window.connectionMode === 'ble') {
+      window.switchStageFlow('ble');
+    } else {
+      window.switchStageFlow(window.flashTarget);
+    }
+    if (window.bleOta && typeof window.bleOta.refreshTargetUi === 'function') {
+      window.bleOta.refreshTargetUi();
+    }
+  };
+
+  window.handleSharedFileSelect = function (event, chip) {
+    var file = event && event.target && event.target.files && event.target.files[0] ? event.target.files[0] : null;
+    if (file) {
+      window.sharedFirmwareFiles[chip] = { file: file, handle: null };
+    }
+    if (typeof window.handleFileSelect === 'function') {
+      window.handleFileSelect(event, chip);
+    }
+    window.flashTarget = chip === 'gd32' ? 'gd32' : 'esp32';
+    applySharedModeUi();
+    setTimeout(syncBleFileFromSelectedTarget, 0);
+  };
+
+  window.pickSharedFirmware = function (chip) {
+    window.flashTarget = chip === 'gd32' ? 'gd32' : 'esp32';
+    applySharedModeUi();
+    if (window.showOpenFilePicker && typeof window.pickFileViaFSAPI === 'function') {
+      var nativePicker = window.showOpenFilePicker;
+      var capturedHandle = null;
+      window.showOpenFilePicker = function () {
+        return nativePicker.apply(this, arguments).then(function (handles) {
+          capturedHandle = handles && handles.length ? handles[0] : null;
+          return handles;
+        });
+      };
+      Promise.resolve(window.pickFileViaFSAPI(chip)).then(function () {
+        window.showOpenFilePicker = nativePicker;
+        if (!capturedHandle || typeof capturedHandle.getFile !== 'function') {
+          syncBleFileFromSelectedTarget();
+          return;
+        }
+        capturedHandle.getFile().then(function (file) {
+          window.sharedFirmwareFiles[chip] = { file: file, handle: capturedHandle };
+          syncBleFileFromSelectedTarget();
+        }).catch(function () {
+          syncBleFileFromSelectedTarget();
+        });
+      }).catch(function (err) {
+        window.showOpenFilePicker = nativePicker;
+        if (err && err.name !== 'AbortError' && typeof window.addLog === 'function') {
+          window.addLog('W', '文件', 'FSAPI 选择失败: ' + err.message);
+        }
+      });
+    } else {
+      var input = document.getElementById(chip === 'gd32' ? 'fileInputGd32' : 'fileInputEsp32');
+      if (input) input.click();
+    }
+  };
+
+  window.clearSharedFirmware = function (chip) {
+    window.sharedFirmwareFiles[chip] = { file: null, handle: null };
+    if (typeof window.clearFile === 'function') {
+      window.clearFile(chip);
+    }
+    if (window.connectionMode === 'ble' && window.flashTarget === chip && window.bleOta && typeof window.bleOta.clearFile === 'function') {
+      window.bleOta.clearFile();
+    }
+  };
+
+  window.setBleFirmwareInputFile = function (file) {
+    var input = document.getElementById('firmwareFile');
+    if (!input || !file || typeof window.DataTransfer !== 'function') {
+      return;
+    }
+    try {
+      var dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+    } catch (err) {
+      // Some browsers restrict assignment to file inputs; BLE state is still synced via notifyFileChange.
+    }
+  };
+
+  window.syncBleFileFromSelectedTarget = function () {
+    if (window.connectionMode !== 'ble' || !window.bleOta || typeof window.bleOta.notifyFileChange !== 'function') {
+      return;
+    }
+    var isGd32 = window.flashTarget === 'gd32';
+    var chip = isGd32 ? 'gd32' : 'esp32';
+    var suffix = isGd32 ? 'Gd32' : 'Esp32';
+    var stored = window.sharedFirmwareFiles[chip];
+    if (stored && stored.handle && typeof stored.handle.getFile === 'function') {
+      stored.handle.getFile().then(function (file) {
+        stored.file = file;
+        setBleFirmwareInputFile(file);
+        window.bleOta.notifyFileChange(file, stored.handle);
+      }).catch(function () {
+        if (stored.file) {
+          setBleFirmwareInputFile(stored.file);
+          window.bleOta.notifyFileChange(stored.file, stored.handle);
+        }
+      });
+      return;
+    }
+    if (stored && stored.file) {
+      setBleFirmwareInputFile(stored.file);
+      window.bleOta.notifyFileChange(stored.file, stored.handle || null);
+      return;
+    }
+    var input = document.getElementById('fileInput' + suffix);
+    var info = document.getElementById('fileInfo' + suffix);
+    var hasInfo = info && info.classList.contains('show');
+    var file = input && input.files && input.files[0] ? input.files[0] : null;
+    if (file) {
+      window.sharedFirmwareFiles[chip] = { file: file, handle: null };
+      setBleFirmwareInputFile(file);
+      window.bleOta.notifyFileChange(file, null);
+      return;
+    }
+    if (!hasInfo) {
+      return;
+    }
+    var nameEl = document.getElementById('fileName' + suffix);
+    var typeEl = document.getElementById('fileType' + suffix);
+    var sizeEl = document.getElementById('fileSize' + suffix);
+    var bleInfo = document.getElementById('fileInfo');
+    var bleName = document.getElementById('fileName');
+    var bleType = document.getElementById('fileType');
+    var bleSize = document.getElementById('fileSize');
+    if (bleInfo) bleInfo.classList.add('show');
+    if (bleName && nameEl) bleName.textContent = nameEl.textContent;
+    if (bleType && typeEl) bleType.textContent = typeEl.textContent;
+    if (bleSize && sizeEl) bleSize.textContent = sizeEl.textContent;
+    var packetCount = document.getElementById('packetCount');
+    var sentCount = document.getElementById('sentCount');
+    if (packetCount) packetCount.textContent = '-';
+    if (sentCount) sentCount.textContent = '0';
+  };
+
+  window.attachSharedFirmwareDropBridge = function () {
+    ['esp32', 'gd32'].forEach(function (chip) {
+      var zone = document.getElementById(chip === 'gd32' ? 'uploadZoneGd32' : 'uploadZoneEsp32');
+      if (!zone) return;
+      zone.addEventListener('drop', function (event) {
+        var file = event && event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0] ? event.dataTransfer.files[0] : null;
+        if (file) {
+          window.sharedFirmwareFiles[chip] = { file: file, handle: null };
+        }
+        window.flashTarget = chip;
+        applySharedModeUi();
+        setTimeout(syncBleFileFromSelectedTarget, 120);
+      }, true);
+    });
+  };
+
+  window.applySharedModeUi = function () {
+    var isBle = window.connectionMode === 'ble';
+    var isGd32 = window.flashTarget === 'gd32';
+    var targetEsp32 = document.getElementById('targetEsp32Tab');
+    var targetGd32 = document.getElementById('targetGd32Tab');
+    if (targetEsp32) targetEsp32.className = isGd32 ? 'btn btn-outline' : 'btn btn-primary';
+    if (targetGd32) targetGd32.className = isGd32 ? 'btn btn-primary' : 'btn btn-outline';
+    var ids = {
+      wifiEsp32UploadPane: !isGd32,
+      wifiGd32UploadPane: isGd32,
+      bleUploadPane: false,
+      wifiEsp32ActionPane: !isBle && !isGd32,
+      wifiGd32ActionPane: !isBle && isGd32,
+      bleActionPane: isBle
+    };
+    Object.keys(ids).forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = ids[id] ? '' : 'none';
+    });
+    var hint = document.getElementById('readyHint');
+    if (hint) {
+      if (isBle) {
+        hint.innerHTML = 'BLE 模式：连接设备 → 选择固件 → 一键刷写。';
+      } else if (isGd32) {
+        hint.innerHTML = 'WiFi 模式：上传 GD32 固件到缓存后，再触发 SPI OTA 中继。';
+      } else {
+        hint.innerHTML = 'WiFi 模式：上传 ESP32 固件后自动执行 OTA 并重启。';
+      }
+    }
+  };
+
+  applySharedModeUi();
+})();
+</script>
+<script src="ble_ota.js?v=20260614f"></script>
 </body>
 </html>
 
