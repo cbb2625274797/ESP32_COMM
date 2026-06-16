@@ -42,6 +42,7 @@
 #include "ble_ota.h"
 #include "wifi_ota.h"
 #include "esp32_ota_core.h"
+#include "ota_coordinator.h"
 #include "ota_relay.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
@@ -59,6 +60,16 @@
 #define BLE_OTA_FINISH_ERR_GD32_SIZE 0x84   // GD32 固件超出分区大小
 #define BLE_OTA_FINISH_ERR_SHA_MISMATCH 0x85 // ESP32 OTA SHA-256 不匹配
 
+// ── 数据队列：将 OTA 数据处理从 NimBLE host task 卸载到工作线程 ──
+// 避免 flash 操作（esp_ota_begin / esp_ota_write）阻塞 BLE 协议栈导致连接断开。
+#define BLE_OTA_DATA_QUEUE_LEN 16
+
+struct BleOtaDataBatch {
+    uint8_t *data;
+    size_t   len;
+};
+static QueueHandle_t s_otaDataQueue = nullptr;
+
 // ============================================================
 // 前向声明
 // ============================================================
@@ -66,6 +77,7 @@ static void ble_ota_start_advertising(void);
 static void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes);
 static void sendFinishEvent(uint8_t stage, uint32_t value);
 static void esp32_reorder_free();
+static void ble_ota_data_worker_task(void *pvParameters);
 
 // ============================================================
 /**
@@ -100,8 +112,8 @@ static void ble_esp32_restart_task(void *pvParameters)
     DEBUG_INFO(TAG, "[RESTART] 推送 FINISH_REBOOT_NOW 后 500ms 重启");
     sendFinishEvent(BLE_OTA_FINISH_REBOOT_NOW, 0);
     vTaskDelay(pdMS_TO_TICKS(500));
+    OtaCoordinator::instance().notifyEsp32Rebooting();
     esp_restart();
-    // 不会返回
 }
 
 /**
@@ -135,6 +147,7 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
     }
 
     DEBUG_INFO(TAG, "ESP32 OTA 收尾: 共 %u 字节", (unsigned)core.getReceived());
+    OtaCoordinator::instance().notifyEsp32ReceiveComplete();
 
     // 关键：reboot=false，让 finalize 真正返回、拿到 device_sha_hex，
     // 再依次推送 SHA 通知 + FINISH_DONE + FINISH_REBOOT_NOW，
@@ -147,6 +160,7 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
                                   device_sha_hex);
 
     if (err == ESP_OK) {
+        OtaCoordinator::instance().notifyEsp32FinalizeComplete();
         // 1) 把设备端 SHA 通过 SHA256 通知推给前端
         if (device_sha_hex[0] != '\0') {
             uint8_t sha_pkt[33] = {0};
@@ -168,6 +182,7 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         // 4) 通知全部发出后延迟 500ms 重启
         DEBUG_INFO(TAG, "[FINISH] 通知已发送，500ms 后重启...");
         vTaskDelay(pdMS_TO_TICKS(500));
+        OtaCoordinator::instance().notifyEsp32Rebooting();
         esp_restart();
         // 不会返回
     } else if (err == ESP_ERR_INVALID_VERSION) {
@@ -524,12 +539,13 @@ static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
  */
 static esp_err_t ble_esp32_ota_begin(size_t total_size)
 {
-    esp_err_t err = Esp32OtaCore::instance().begin(total_size);
+    // ★ 通过全局协调器发起 ESP32 OTA
+    esp_err_t err = OtaCoordinator::instance().beginEsp32Ota(total_size);
     if (err == ESP_ERR_INVALID_STATE) {
-        // ★ OTA 锁被占用，走完整的状态机退出 + 清理锁，然后重试一次
-        DEBUG_WARN(TAG, "ESP32 OTA 锁被占用，强制清理状态机后重试");
+        // 协调器拒绝 → 尝试强制清理后重试
+        DEBUG_WARN(TAG, "ESP32 OTA 被协调器拒绝，强制清理状态机后重试");
         Esp32OtaCore::instance().forceCleanup();
-        err = Esp32OtaCore::instance().begin(total_size);
+        err = OtaCoordinator::instance().beginEsp32Ota(total_size);
     }
     if (err != ESP_OK) {
         return err;
@@ -645,15 +661,15 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
     DEBUG_INFO(TAG, "CTRL 写入: cmd=0x%02X len=%d", buf[0], len);
 
     if (buf[0] == BLE_OTA_CTRL_TRIGGER_GD32) {
-        // 检查固件是否存储完毕 → 触发 GD32 OTA 中继
+        // 检查固件是否存储完毕 → 通过协调器触发 GD32 OTA 中继
         ota_meta_t meta;
         esp_err_t err = OtaRelay::metaLoad(&meta);
         if (err == ESP_OK &&
             meta.total_size > 0 &&
             meta.stored_size >= meta.total_size) {
-            DEBUG_INFO(TAG, "GD32 固件就绪 (%" PRIu32 " / %" PRIu32 " 字节)，触发中继",
+            DEBUG_INFO(TAG, "GD32 固件就绪 (%" PRIu32 " / %" PRIu32 " 字节)，通过协调器触发中继",
                        meta.stored_size, meta.total_size);
-            BleOta::instance().signalRelay();
+            OtaCoordinator::instance().triggerGd32Relay();
         } else {
             DEBUG_WARN(TAG, "GD32 固件未就绪 (stored=%" PRIu32 ", total=%" PRIu32 ")",
                        meta.stored_size, meta.total_size);
@@ -770,9 +786,36 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
+    // 将数据拷贝到堆上并送入工作队列，避免在 NimBLE host task 中执行
+    // 耗时的 flash 操作（esp_ota_begin / esp_ota_write）导致 BLE 连接断开。
+    if (s_otaDataQueue) {
+        uint8_t *heap_buf = (uint8_t *)malloc((size_t)recv_len);
+        if (heap_buf) {
+            memcpy(heap_buf, buf, (size_t)recv_len);
+            BleOtaDataBatch item = { heap_buf, (size_t)recv_len };
+            if (xQueueSend(s_otaDataQueue, &item, 0) != pdTRUE) {
+                DEBUG_WARN(TAG, "DATA_IN 工作队列满，丢弃 %d 字节（等待客户端重传）", recv_len);
+                free(heap_buf);
+            }
+        } else {
+            DEBUG_ERR(TAG, "DATA_IN 堆内存不足 (%d 字节)，丢弃", recv_len);
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 处理一批 OTA 数据包（在工作线程上下文中调用）。
+ *        包含 ESP32 和 GD32 的数据接收逻辑。
+ * @param buf      数据缓冲区（包含一个或多个合并的包）。
+ * @param recv_len 数据长度。
+ */
+static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
+{
     // 循环处理 mbuf 中的所有完整数据包
     size_t offset = 0;
-    while (offset + 7 <= (size_t)recv_len) {
+    while (offset + 7 <= recv_len) {
         // 解析包头
         uint8_t  cmd        = buf[offset + 0];
         uint16_t seq        = (uint16_t)(buf[offset + 1] | (buf[offset + 2] << 8));
@@ -790,7 +833,7 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
             : (uint32_t)BLE_OTA_CHUNK_PAYLOAD;
 
         size_t data_len = (size_t)expected_payload;
-        size_t remaining_after_header = (size_t)recv_len - data_offset;
+        size_t remaining_after_header = recv_len - data_offset;
 
         // 如果缓冲区中实际可用数据不足，截断 data_len
         if (remaining_after_header < expected_payload) {
@@ -813,16 +856,15 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
             if (seq == 0) {
                 if (total_size == 0) {
                     DEBUG_ERR(TAG, "ESP32 固件大小非法: %" PRIu32, total_size);
-                    return BLE_ATT_ERR_UNLIKELY;
+                    return;
                 }
                 // 分区选择/大小校验/互斥由 Esp32OtaCore::begin 内部完成
                 esp_err_t err = ble_esp32_ota_begin(total_size);
                 if (err != ESP_OK) {
                     if (err == ESP_ERR_INVALID_STATE) {
                         sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
-                        return BLE_ATT_ERR_OTA_BUSY;
                     }
-                    return BLE_ATT_ERR_UNLIKELY;
+                    return;
                 }
             }
 
@@ -830,7 +872,7 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
             if (!Esp32OtaCore::instance().isActive()) {
                 DEBUG_WARN(TAG, "ESP32 OTA 会话无效，丢弃 seq=%u", seq);
                 offset += packet_len;
-                if (offset + 7 > (size_t)recv_len) break;
+                if (offset + 7 > recv_len) break;
                 continue;
             }
 
@@ -841,7 +883,7 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                            (unsigned)curReceived, total_size, seq);
                 sendWindowAck(cmd, seq, curReceived);
                 offset += packet_len;
-                if (offset + 7 > (size_t)recv_len) break;
+                if (offset + 7 > recv_len) break;
                 continue;
             }
 
@@ -851,24 +893,18 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                 DEBUG_ERR(TAG, "ESP32 OTA 写入失败: seq=%u err=%s",
                           seq, esp_err_to_name(err));
                 ble_esp32_ota_abort();  // core 内部完成 abort + mutex release + 状态复位
-                return BLE_ATT_ERR_UNLIKELY;
+                return;
             }
 
             DEBUG_DBG(TAG, "ESP32 OTA 写入成功: seq=%u received=%u",
                       seq, (unsigned int)Esp32OtaCore::instance().getReceived());
 
             // 完成判定：以实际按序写入字节数为准。
-            // reorder buffer 模式下，尾包可能是乱序到达被缓存的包，
-            // 此刻 getReceived() 尚未达到 total_size，不能据此判定完成。
-            // isLastPacket 仅记录"这是最后一包的形态"，不单独作为完成条件。
             bool isLastPacket = (expected_payload < BLE_OTA_CHUNK_PAYLOAD);
             bool transferComplete = (total_size > 0 &&
                                      Esp32OtaCore::instance().getReceived() >= total_size);
 
-            // ACK 触发条件：
-            //   - 窗口末尾包 (seq+1 是窗口整数倍)
-            //   - 数据全部按序写完（含 reorder flush 后达到 total_size）
-            //   - 尾包形态（兜底：即使 getReceived 不足也回一个 ACK，让客户端续传）
+            // ACK 触发条件
             if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
                 transferComplete ||
                 isLastPacket) {
@@ -879,17 +915,13 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                 sendWindowAck(cmd, seq, (uint32_t)Esp32OtaCore::instance().getReceived());
             }
 
-            // ★ 仅当数据真正全部按序写完时才标记传输完成。
-            //   尾包乱序缓存但缺口未填满时，不算完成（等待客户端续传缺口包）。
             if (transferComplete) {
                 DEBUG_INFO(TAG, "★ ESP32 固件接收完毕: %u / %" PRIu32 " 字节 (共 %u 块)",
                            (unsigned int)Esp32OtaCore::instance().getReceived(), total_size, seq + 1);
+                OtaCoordinator::instance().notifyEsp32ReceiveComplete();
                 BleOta::instance().m_esp32LastCmd = cmd;
                 BleOta::instance().m_esp32LastSeq = seq;
-                // ★ ESP32 OTA 传输完成：恢复 WiFi 射频
                 ble_ota_restore_wifi_ps();
-                // 注：与 WiFi 流程对齐，传输完成后由前端发送 0xF8 + SHA-256 触发 finalize，
-                //     设备端不再自动创建收尾任务。
             }
         }
         // --- GD32 OTA：首个分块时创建存储元数据 ---
@@ -900,7 +932,12 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                     DEBUG_ERR(TAG, "GD32 固件大小非法: raw=%" PRIu32 " rounded48=%" PRIu32 " max=%zu",
                               total_size, rounded_size, OTA_MAX_FIRMWARE_SIZE);
                     sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_SIZE, total_size);
-                    return BLE_ATT_ERR_UNLIKELY;
+                    return;
+                }
+
+                if (OtaCoordinator::instance().beginGd32Storage(total_size) != ESP_OK) {
+                    DEBUG_ERR(TAG, "GD32 OTA 协调器拒绝存储（系统忙）");
+                    return;
                 }
 
                 ota_meta_t meta = {};
@@ -911,49 +948,48 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                 esp_err_t err = OtaRelay::metaSave(&meta);
                 if (err != ESP_OK) {
                     DEBUG_ERR(TAG, "元数据保存失败");
-                    return BLE_ATT_ERR_UNLIKELY;
+                    OtaCoordinator::instance().abortCurrent();
+                    return;
                 }
 
                 DEBUG_INFO(TAG, "GD32 固件存储开始: total=%" PRIu32 ", payload=%zu",
                            meta.total_size, data_len);
-                // ★ GD32 BLE OTA 开始：降低 WiFi 射频占用
                 ble_ota_boost_wifi_ps();
             }
 
             ota_meta_t meta = {};
             if (OtaRelay::metaLoad(&meta) != ESP_OK || meta.total_size == 0) {
                 DEBUG_ERR(TAG, "GD32 元数据无效，拒绝写入: seq=%u", seq);
-                return BLE_ATT_ERR_UNLIKELY;
+                return;
             }
 
             if (seq > 0 && meta.last_seq != (uint32_t)(seq - 1)) {
                 DEBUG_ERR(TAG, "GD32 分包序号不连续: seq=%u last_seq=%" PRIu32,
                           seq, meta.last_seq);
-                return BLE_ATT_ERR_UNLIKELY;
+                return;
             }
 
             // --- GD32 写入 Flash ---
             uint32_t flash_offset = meta.stored_size;
-            // ★ 防重复写入保护：如果已存储字节 >= 声明大小，跳过重试引起的重复包
             if (flash_offset >= meta.total_size) {
                 DEBUG_WARN(TAG, "GD32 OTA 已收满 (%" PRIu32 " >= %" PRIu32 ")，跳过重复 seq=%u",
                            flash_offset, meta.total_size, seq);
                 sendWindowAck(cmd, seq, flash_offset);
                 offset += packet_len;
-                if (offset + 7 > (size_t)recv_len) break;
+                if (offset + 7 > recv_len) break;
                 continue;
             }
             if (flash_offset + (uint32_t)data_len > meta.total_size) {
                 DEBUG_ERR(TAG, "GD32 写入越界: offset=%" PRIu32 " len=%zu total=%" PRIu32,
                           flash_offset, data_len, meta.total_size);
-                return BLE_ATT_ERR_UNLIKELY;
+                return;
             }
 
             esp_err_t err = OtaRelay::flashWriteChunk(flash_offset, &buf[data_offset], data_len);
             if (err != ESP_OK) {
                 DEBUG_ERR(TAG, "Flash 写入失败: seq=%u offset=%" PRIu32 " err=%s",
                           seq, flash_offset, esp_err_to_name(err));
-                return BLE_ATT_ERR_UNLIKELY;
+                return;
             }
 
             uint32_t stored_size = flash_offset + (uint32_t)data_len;
@@ -977,9 +1013,8 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                 meta.stored_size >= meta.total_size) {
                 DEBUG_INFO(TAG, "★ GD32 固件接收完毕: %" PRIu32 " / %" PRIu32 " 字节 (共 %u 块)",
                            meta.stored_size, meta.total_size, seq + 1);
-                // ★ GD32 BLE OTA 传输完成：恢复 WiFi 射频
+                OtaCoordinator::instance().completeGd32Storage();
                 ble_ota_restore_wifi_ps();
-                // 计算并存储 SHA-256 校验和
                 esp_err_t sha_err = OtaRelay::metaFinalizeChecksum();
                 if (sha_err != ESP_OK) {
                     DEBUG_ERR(TAG, "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
@@ -993,10 +1028,38 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
         offset += packet_len;
 
         // 检查剩余数据是否足够组成一个完整的包头
-        if (offset + 7 > (size_t)recv_len) break;
+        if (offset + 7 > recv_len) break;
     }
+}
 
-    return 0;
+/**
+ * @brief OTA 数据工作线程：从队列接收数据并调用处理函数。
+ *        独立于 NimBLE host task，避免 flash 操作阻塞 BLE 协议栈。
+ */
+static void ble_ota_data_worker_task(void *pvParameters)
+{
+    (void)pvParameters;
+    DEBUG_INFO(TAG, "OTA 数据工作线程已启动");
+
+    while (1) {
+        BleOtaDataBatch item;
+        if (xQueueReceive(s_otaDataQueue, &item, portMAX_DELAY) == pdTRUE) {
+            if (!item.data || item.len == 0) {
+                free(item.data);
+                continue;
+            }
+
+            // 若 BLE 已断开，丢弃队列中的残留数据
+            if (!BleOta::instance().isConnected()) {
+                DEBUG_DBG(TAG, "BLE 已断开，丢弃 %zu 字节队列数据", item.len);
+                free(item.data);
+                continue;
+            }
+
+            ble_ota_process_data_batch(item.data, item.len);
+            free(item.data);
+        }
+    }
 }
 
 /*
@@ -1166,6 +1229,15 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         DEBUG_INFO(TAG, "BLE 客户端已断开: reason=%d",
                    event->disconnect.reason);
+
+        // ★ 断开时清空数据队列，丢弃属于旧会话的残留包
+        if (s_otaDataQueue) {
+            BleOtaDataBatch stale;
+            while (xQueueReceive(s_otaDataQueue, &stale, 0) == pdTRUE) {
+                free(stale.data);
+            }
+        }
+
         BleOta::instance().m_bleConnected = false;
         BleOta::instance().m_connHandle   = BLE_HS_CONN_HANDLE_NONE;
         // ★ BLE 断开时恢复 WiFi 射频，并中止未完成的 ESP32 OTA
@@ -1478,6 +1550,24 @@ void BleOta::taskEntry(void *pvParameters)
 {
     (void)pvParameters;
     DEBUG_INFO(TAG, "=== BLE OTA 任务启动 ===");
+
+    // 创建 OTA 数据队列和工作线程（在 NimBLE 初始化之前完成）
+    s_otaDataQueue = xQueueCreate(BLE_OTA_DATA_QUEUE_LEN, sizeof(BleOtaDataBatch));
+    if (s_otaDataQueue) {
+        BaseType_t wk_ok = xTaskCreate(ble_ota_data_worker_task,
+                                       "ble_ota_worker",
+                                       8192,   // 6KB→8KB，flash 操作需要足够栈空间
+                                       NULL,
+                                       10,     // 中等优先级，避免被 NimBLE host task 过度抢占
+                                       NULL);
+        if (wk_ok != pdPASS) {
+            DEBUG_ERR(TAG, "OTA 数据工作线程创建失败，BLE OTA 数据传输不可用");
+            vQueueDelete(s_otaDataQueue);
+            s_otaDataQueue = nullptr;
+        }
+    } else {
+        DEBUG_ERR(TAG, "OTA 数据队列创建失败，BLE OTA 数据传输不可用");
+    }
 
     esp_err_t err = BleOta::instance().serverStart();
     if (err != ESP_OK) {

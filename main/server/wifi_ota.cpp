@@ -25,6 +25,7 @@
 #include "ota_mutex.h"
 #include "wifi_ota.h"
 #include "esp32_ota_core.h"
+#include "ota_coordinator.h"
 #include "ota_relay.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
@@ -513,11 +514,13 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
     //   若 reboot=true，core 内部直接 esp_restart()，HTTP 响应永远发不出去，
     //   前端会得到 "Failed to fetch" 而错过核对结果。
     DEBUG_INFO("OTA", "ESP32 OTA finalize, %u bytes...", (unsigned)core.getReceived());
+    OtaCoordinator::instance().notifyEsp32ReceiveComplete();
     esp_err_t err = core.finalize(has_frontend_sha ? frontend_sha_hex : nullptr,
                                   /*reboot=*/false,
                                   device_sha_hex);
 
     if (err == ESP_OK) {
+        OtaCoordinator::instance().notifyEsp32FinalizeComplete();
         // 1) 把包含设备端 SHA 的响应发回前端
         char resp[320] = {0};
         snprintf(resp, sizeof(resp),
@@ -530,6 +533,7 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         // 2) 响应发完后延迟 500ms 重启，给 TCP 缓冲区时间 flush 到客户端
         DEBUG_INFO("OTA", "响应已发送，500ms 后重启...");
         vTaskDelay(pdMS_TO_TICKS(500));
+        OtaCoordinator::instance().notifyEsp32Rebooting();
         esp_restart();
         // 不会返回
         return ESP_OK;
@@ -566,6 +570,7 @@ static esp_err_t restart_handler(httpd_req_t *req)
     httpd_resp_send(req, resp, strlen(resp));
 
     vTaskDelay(pdMS_TO_TICKS(500));
+    OtaCoordinator::instance().notifyEsp32Rebooting();
     esp_restart();
     return ESP_OK;
 }
@@ -665,13 +670,13 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        Esp32OtaCore &core = Esp32OtaCore::instance();
-        esp_err_t err = core.begin(total_size);
+        // ★ 通过全局协调器发起 ESP32 OTA
+        esp_err_t err = OtaCoordinator::instance().beginEsp32Ota(total_size);
         if (err == ESP_ERR_INVALID_STATE) {
-            // ★ OTA 锁被占用，走完整的状态机退出 + 清理锁，然后重试一次
-            DEBUG_WARN("WIFI", "ESP32 OTA 锁被占用，强制清理状态机后重试");
-            core.forceCleanup();
-            err = core.begin(total_size);
+            // 协调器拒绝（系统忙或通道被占用）→ 尝试强制清理后重试
+            DEBUG_WARN("WIFI", "ESP32 OTA 被协调器拒绝，强制清理状态机后重试");
+            Esp32OtaCore::instance().forceCleanup();
+            err = OtaCoordinator::instance().beginEsp32Ota(total_size);
         }
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
@@ -681,6 +686,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             }
             return ESP_FAIL;
         }
+
+        Esp32OtaCore &core = Esp32OtaCore::instance();
 
         // 堆分配缓冲区，避免栈溢出（HTTP server 栈仅 8KB）
         uint8_t *fw_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
@@ -757,6 +764,14 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", OtaRelay::getState());
         OtaRelay::instance().reset();
     }
+
+    // ★ 通过全局协调器注册 GD32 存储开始
+    if (OtaCoordinator::instance().beginGd32Storage(gd32_valid_size) != ESP_OK) {
+        DEBUG_ERR("WIFI", "GD32 OTA 协调器拒绝存储（系统忙）");
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "system busy with another OTA operation");
+        return ESP_FAIL;
+    }
+
     WifiOta::instance().stateLock();
     WifiOta::instance().setGd32StorageDone(false);
     WifiOta::instance().setRelayTriggered(false);
@@ -870,6 +885,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     ota_meta_t final_meta;
     OtaRelay::metaLoad(&final_meta);
     if (final_meta.total_size > 0 && final_meta.stored_size >= final_meta.total_size) {
+        // ★ 通知协调器 GD32 存储完成
+        OtaCoordinator::instance().completeGd32Storage();
         WifiOta::instance().stateLock();
         WifiOta::instance().setGd32StorageDone(true);
         WifiOta::instance().stateUnlock();
@@ -880,11 +897,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             DEBUG_ERR("WIFI", "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
         }
         DEBUG_INFO("WIFI", "auto-triggering relay");
-        // 自动触发中继
-        if (OtaRelay::dispatchQueue) {
-            uint32_t cmd = 1;  // 1 = start relay
-            xQueueSend(OtaRelay::dispatchQueue, &cmd, 0);
-        }
+        // ★ 通过协调器触发中继
+        OtaCoordinator::instance().triggerGd32Relay();
     }
 
     const char resp[] = "{\"status\": \"ok\", \"progress\": 100, \"target\": \"gd32\"}";
@@ -911,27 +925,10 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    relay_state_t curState = OtaRelay::getState();
-    WifiOta::instance().stateLock();
-    if (WifiOta::instance().getRelayTriggered() && curState != RELAY_IDLE &&
-        curState != RELAY_DONE && curState != RELAY_APP_VERIFY && curState != RELAY_ERROR) {
-        WifiOta::instance().stateUnlock();
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "relay already triggered");
-        return ESP_FAIL;
-    }
-    /* 上一轮中继已结束/失败/空闲，重置标志允许重新触发 */
-    WifiOta::instance().setRelayTriggered(false);
-    WifiOta::instance().setGd32StorageDone(false);
-    WifiOta::instance().stateUnlock();
-
-    if (!OtaRelay::dispatchQueue) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay queue not ready");
-        return ESP_FAIL;
-    }
-
-    WifiOta::instance().signalRelay();
-    if (!WifiOta::instance().getRelayTriggered()) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "relay trigger failed");
+    // ★ 通过全局协调器触发 GD32 中继
+    esp_err_t trigger_err = OtaCoordinator::instance().triggerGd32Relay();
+    if (trigger_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "relay trigger failed - system busy or firmware not ready");
         return ESP_FAIL;
     }
 
@@ -1192,9 +1189,10 @@ static esp_err_t system_status_handler(httpd_req_t *req)
 
     gd32_version_t snapVer2 = {};
     OtaRelay::getGd32Version(&snapVer2);
-    char resp[1024];
+    ota_system_state_t sysState = OtaCoordinator::instance().getSystemState();
+    char resp[1280];
     int len = snprintf(resp, sizeof(resp),
-        "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, \"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}}",
+        "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, \"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}}",
         FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
@@ -1204,9 +1202,11 @@ static esp_err_t system_status_handler(httpd_req_t *req)
         ip_str,
         rssi,
         connected ? "true" : "false",
+        OtaCoordinator::instance().getSystemStateString(),
+        (int)sysState,
         (unsigned long)meta.total_size,
         (unsigned long)meta.stored_size,
-        WifiOta::instance().getGd32StorageDone() ? "true" : "false",
+        OtaCoordinator::instance().isGd32StorageDone() ? "true" : "false",
         OtaRelay::getState(),
         (unsigned long)OtaRelay::getRelaySeq(),
         (unsigned long)OtaRelay::getRelayTotalPackets(),
@@ -1394,35 +1394,20 @@ void WifiOta::signalRelay()
     ota_meta_t meta;
     memset(&meta, 0, sizeof(meta));
     if (OtaRelay::metaLoad(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
-        DEBUG_WARN("WIFI", "GD32 固件未完整存储，拒绝触发转发: stored=%lu total=%lu",
-                   (unsigned long)meta.stored_size, (unsigned long)meta.total_size);
+        DEBUG_WARN("WIFI", "GD32 固件未完整存储，拒绝触发转发: stored=%" PRIu32 " total=%" PRIu32,
+                   meta.stored_size, meta.total_size);
         return;
     }
-    relay_state_t st = OtaRelay::getState();
-    WifiOta::instance().stateLock();
-    if (WifiOta::instance().getRelayTriggered() && st != RELAY_IDLE &&
-        st != RELAY_DONE && st != RELAY_APP_VERIFY && st != RELAY_ERROR) {
-        WifiOta::instance().stateUnlock();
-        DEBUG_WARN("WIFI", "转发正在执行中，状态: %d", st);
-        return;
-    }
-    /* 上一轮中继已结束/失败/空闲，重置标志 */
-    WifiOta::instance().setRelayTriggered(false);
-    WifiOta::instance().setGd32StorageDone(false);
-    WifiOta::instance().setRelayTriggered(true);
-    WifiOta::instance().stateUnlock();
 
-    if (OtaRelay::dispatchQueue) {
-        uint32_t msg = 1;
-        BaseType_t ret = xQueueSend(OtaRelay::dispatchQueue, &msg, pdMS_TO_TICKS(100));
-        if (ret == pdTRUE) {
-            DEBUG_INFO("WIFI", "OTA 调度信号已发送到中继任务");
-        } else {
-            DEBUG_ERR("WIFI", "OTA 调度信号发送失败");
-            WifiOta::instance().setRelayTriggered(false);
-        }
+    // ★ 通过全局协调器触发中继
+    esp_err_t err = OtaCoordinator::instance().triggerGd32Relay();
+    if (err == ESP_OK) {
+        WifiOta::instance().stateLock();
+        WifiOta::instance().setRelayTriggered(true);
+        WifiOta::instance().stateUnlock();
+        DEBUG_INFO("WIFI", "OTA 中继已通过协调器触发");
     } else {
-        DEBUG_ERR("WIFI", "OTA 中继队列尚未就绪");
+        DEBUG_ERR("WIFI", "OTA 中继触发失败: %s", esp_err_to_name(err));
         WifiOta::instance().setRelayTriggered(false);
     }
 }

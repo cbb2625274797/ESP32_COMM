@@ -2,6 +2,7 @@
     SRCS
         "core/main.cpp"
         "ota/esp32_ota_core.cpp"
+        "ota/ota_coordinator.cpp"
         "relay/ota_relay.cpp"
         "transport/spi_master.cpp"
         "transport/protocol.cpp"

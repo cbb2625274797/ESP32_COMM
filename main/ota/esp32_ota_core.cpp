@@ -106,10 +106,15 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         return ESP_FAIL;
     }
 
-    // ★ 必须传分区大小，而非固件实际大小
-    // esp_ota_begin 用 size 参数决定擦除多少 flash 扇区
-    // 传固件大小只擦部分扇区，未擦除区域可能残留脏数据，导致 esp_ota_end 校验失败
-    esp_err_t err = esp_ota_begin(m_partition, m_partition->size, &m_handle);
+    // BLE OTA 修复：传固件实际大小而非分区全尺寸，避免全分区擦除导致
+    // 长时间阻塞触发 Task Watchdog（ESP32-C3 单核 5s 超时）。
+    // esp_ota_begin 按 image_size 擦除；esp_ota_end 仅校验已写数据，
+    // 未擦除残留扇区不影响校验。size 对齐到 64KB 块边界确保尾部干净。
+    size_t erase_size = (total_size + 0xFFFF) & ~0xFFFFULL;
+    if (erase_size > m_partition->size) {
+        erase_size = m_partition->size;
+    }
+    esp_err_t err = esp_ota_begin(m_partition, erase_size, &m_handle);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(err));
         m_partition = nullptr;

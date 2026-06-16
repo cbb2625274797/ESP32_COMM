@@ -15,6 +15,7 @@
 
 #include "monitor/health_monitor.h"
 #include "relay/ota_relay.h"
+#include "ota/ota_coordinator.h"
 #include "transport/spi_master.h"
 #include "server/wifi_ota.h"
 #include "server/ble_ota.h"
@@ -78,6 +79,10 @@ extern "C" void app_main(void)
 
     Protocol::instance().init();
     DEBUG_INFO("MAIN", "协议层初始化完成");
+
+    // ★ 全局 OTA 协调器初始化（在 OTA task 创建前，确保 mutex 就绪）
+    OtaCoordinator::instance().init();
+    DEBUG_INFO("MAIN", "OTA 全局协调器已初始化");
 
     esp_err_t ret = SpiMaster::instance().init();
     if (ret != ESP_OK) {
