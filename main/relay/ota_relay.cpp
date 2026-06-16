@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ota_relay.cpp - OTA 中继核心状态机实现
  * T2.3, T2.4, T3.1 - T3.7
  *
@@ -849,7 +849,7 @@ ota_result_t OtaRelay::sendNonceAndAuthenticate()
     uint32_t mem_addr = (uint32_t)(uintptr_t)m_nonceServer;
     uint32_t rand_seed = 0x12345678;
 
-    Protocol::scrambleGenerate(timestamp, mem_addr, rand_seed, m_nonceServer);
+    Protocol::instance().scrambleGenerate(timestamp, mem_addr, rand_seed, m_nonceServer);
 
     DEBUG_INFO("OTA", "--- 认证步骤 1: 发送 CHALLENGE ---");
     DEBUG_INFO("OTA", "发送 nonce_server (16B), timestamp=0x%08X", timestamp);

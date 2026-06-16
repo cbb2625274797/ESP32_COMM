@@ -610,6 +610,10 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     DEBUG_INFO("WIFI", "=== HTTP: POST /ota/upload ===");
     DEBUG_INFO("WIFI", "收到固件上传请求, 内容长度: %d 字节", req->content_len);
 
+    // ★ WiFi OTA 入口：强制恢复 WIFI_PS_NONE，防止 BLE OTA 残留省电模式导致断连
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    WifiOta::instance().setBleOtaActive(false);
+
     // 预读 1 字节判断是 JSON 还是 binary
     char peek;
     int peek_ret = httpd_req_recv(req, &peek, 1);
@@ -663,6 +667,12 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
         Esp32OtaCore &core = Esp32OtaCore::instance();
         esp_err_t err = core.begin(total_size);
+        if (err == ESP_ERR_INVALID_STATE) {
+            // ★ OTA 锁被占用，走完整的状态机退出 + 清理锁，然后重试一次
+            DEBUG_WARN("WIFI", "ESP32 OTA 锁被占用，强制清理状态机后重试");
+            core.forceCleanup();
+            err = core.begin(total_size);
+        }
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
                 httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "ESP32 OTA occupied by another channel");
@@ -1671,6 +1681,13 @@ void WifiOta::taskEntry(void *pvParameters)
     uint32_t tick = 0;
     while (1) {
         tick++;
+
+        // ★ BLE OTA 传输期间，暂停 WiFi RSSI 轮询，避免 esp_wifi_sta_get_ap_info()
+        //   触发射频活动干扰 BLE 连接事件
+        if (WifiOta::instance().m_bleOtaActive.load()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
 
         // 每 10 秒检查一次 RSSI
         if (tick % 10 == 0) {

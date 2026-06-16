@@ -175,7 +175,7 @@ ESP32_COMM/
 |------|------|------|
 | 1 | `begin(total_size)` | 选择非当前 OTA 分区，获取全局互斥，`esp_ota_begin` |
 | 2 | `write(data, len)` | 循环调用 `esp_ota_write`（WiFi 通过 HTTP 流，BLE 通过 GATT 块） |
-| 3 | `finalize(sha_hex, reboot)` | `esp_ota_end` → 从分区读回计算 SHA-256 → 比对前端 SHA → `esp_ota_set_boot_partition` → 可选重启 |
+| 3 | `finalize(sha_hex, reboot)` | 从分区读回计算 SHA-256 → 比对前端 SHA → `esp_ota_end` → `esp_ota_set_boot_partition` → 可选重启 |
 | - | `abort()` | 中止并清理（释放 mutex + 复位状态） |
 
 **SHA-256 校验**: 固件写入完成后从 OTA 分区读回计算，不做增量 SHA。前端与设备端比对一致才 set_boot，否则返回 `ESP_ERR_INVALID_VERSION`。
@@ -272,7 +272,7 @@ ESP32 通过 SPI 转发 CAN 帧到 GD32（GD32 端驱动外部 CAN 收发器）�
 
 - **ACK 窗口**: 每 32 包等待一次 DATA_OUT ACK（带累计字节数验证）
 - **窗口重传**: ACK 超时或字节数不足时重发整个窗口（最多 3 次）
-- **ESP32 收尾**: BLE 传输完成后由前端发 `0xF8 + 32B 文件 SHA-256`，设备端创建异步任务执行 finalize（含 SHA 比对），结果通过 FINISH 事件通知前端
+- **ESP32 收尾**: BLE 传输完成后由前端发 `0xF8 + 32B 文件 SHA-256`，设备端读回 OTA 分区做 SHA 比对，通过后完成 `esp_ota_end`、设置启动分区并重启；FINISH 仅上报完成/重启/错误
 - **GD32 触发**: 传输完成后自动发 `0xF7` 触发 SPI 中继
 - **合并包**: NimBLE 可能将多个 writeWithoutResponse 合并到同一 mbuf，接收端支持一次解析多个数据包
 

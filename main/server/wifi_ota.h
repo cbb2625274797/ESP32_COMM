@@ -97,6 +97,11 @@ public:
 
     httpd_handle_t m_httpServer = NULL;
 
+    // ★ BLE OTA 传输期间暂停 WiFi 射频活动（减少共存干扰）
+    std::atomic<bool> m_bleOtaActive{false};
+    /** @brief BLE OTA 开始传输时调用，暂停 WiFi RSSI 轮询等射频活动。 */
+    void setBleOtaActive(bool v) { m_bleOtaActive.store(v); }
+
 private:
     // ── 跨任务共享状态（atomic + m_stateMutex 保护）──
     std::atomic<bool> m_staConnected{false};

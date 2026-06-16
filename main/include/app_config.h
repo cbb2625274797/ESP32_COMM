@@ -1,4 +1,4 @@
-/*
+﻿/*
  * app_config.h - 统一配置文件（C++ 版本）
  * ESP32-C3 OTA 中继项目
  *
@@ -102,6 +102,8 @@ inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;
 inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;
 inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;
 inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;
+// Reorder buffer 窗口大小（吸收 BLE 窗口内乱序到达的包，须 >= BLE_OTA_ACK_WINDOW）
+inline constexpr size_t      BLE_OTA_REORDER_WINDOW = 32;
 
 // ============================================================
 // 安全常量（需与 GD32 固件团队确认）
@@ -112,10 +114,8 @@ inline constexpr uint8_t MASTER_KEY[] = {
     0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10
 };
 
-inline constexpr uint8_t SCRAMBLE_CONST[] = {
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-    0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00
-};
+// SCRAMBLE_CONST 已移至 Protocol 类，运行时由硬件 RNG 随机生成
+inline constexpr size_t SCRAMBLE_CONST_LEN = 16;
 
 // GD32_CHIP_UID 仅保留为默认占位，运行时以握手包解出的芯片地址 UID 为准。
 inline constexpr uint32_t DEVICE_SERIAL_ADDR_LSB = 0x1FFFF7E8U;

@@ -3,7 +3,7 @@
  *
  * 设计依据 WiFi 原流程（wifi_ota.cpp 旧实现），修复已知 bug:
  *   - 旧 wifi_ota.cpp:625 在 esp_ota_end 成功后又调 esp_ota_abort → 用 m_ended 标志避免
- *   - SHA 统一从分区读回计算，与 BLE 增量计算方式统一为本风格
+ *   - SHA 统一从分区读回计算，不在传输过程中做增量 SHA
  */
 #include <string.h>
 #include <ctype.h>
@@ -54,7 +54,14 @@ void Esp32OtaCore::resetState()
  */
 esp_err_t Esp32OtaCore::begin(size_t total_size)
 {
-    // 若本核心已有未完成会话，先中止并释放全局互斥
+    // ★ 全局互斥：必须在清理旧会话之前检查，
+    //   否则 WiFi 的 begin() 会先释放 BLE 持有的锁，再自己获取，导致互斥失效
+    if (!esp32_ota_mutex_acquire(1000)) {
+        DEBUG_ERR(TAG, "ESP32 OTA 被其他通道占用，拒绝 begin");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 若本核心已有未完成会话（同一通道的重试），先中止并释放全局互斥
     if (m_active) {
         DEBUG_WARN(TAG, "检测到未完成的 ESP32 OTA 会话，先中止旧会话");
         if (!m_ended) {
@@ -62,12 +69,11 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         }
         esp32_ota_mutex_release();
         resetState();
-    }
-
-    // ★ 全局互斥：检查 ESP32 OTA 是否已被其他通道占用
-    if (!esp32_ota_mutex_acquire(1000)) {
-        DEBUG_ERR(TAG, "ESP32 OTA 被其他通道占用，拒绝 begin");
-        return ESP_ERR_INVALID_STATE;
+        // 重新获取全局互斥（刚刚释放了）
+        if (!esp32_ota_mutex_acquire(1000)) {
+            DEBUG_ERR(TAG, "ESP32 OTA 重新获取互斥失败");
+            return ESP_ERR_INVALID_STATE;
+        }
     }
 
     const esp_partition_t *boot_partition = esp_ota_get_running_partition();
@@ -100,8 +106,10 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         return ESP_FAIL;
     }
 
-    // 统一传 total_size 给 esp_ota_begin（WiFi 风格）
-    esp_err_t err = esp_ota_begin(m_partition, total_size, &m_handle);
+    // ★ 必须传分区大小，而非固件实际大小
+    // esp_ota_begin 用 size 参数决定擦除多少 flash 扇区
+    // 传固件大小只擦部分扇区，未擦除区域可能残留脏数据，导致 esp_ota_end 校验失败
+    esp_err_t err = esp_ota_begin(m_partition, m_partition->size, &m_handle);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(err));
         m_partition = nullptr;
@@ -219,7 +227,7 @@ esp_err_t Esp32OtaCore::computeDeviceSha(char *out_device_sha_hex)
 }
 
 /**
-  * @brief 收尾 OTA 会话：end、校验 SHA、set_boot、可选重启。
+  * @brief 收尾 OTA 会话：校验 SHA、end、set_boot、可选重启。
  * @param frontend_sha_hex 前端提供的 64 字符 hex SHA-256。
  * @param reboot 成功后是否重启。
  * @param out_device_sha_hex 输出设备端 SHA hex 缓冲区。
@@ -233,26 +241,14 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         return ESP_ERR_INVALID_STATE;
     }
 
-    // ── esp_ota_end ──
-    DEBUG_INFO(TAG, "[FINALIZE] esp_ota_end...");
-    esp_err_t err = esp_ota_end(m_handle);
-    if (err != ESP_OK) {
-        DEBUG_ERR(TAG, "esp_ota_end 失败: %s", esp_err_to_name(err));
-        // end 失败时仍可 abort（未真正 end）
-        esp_ota_abort(m_handle);
-        m_ended = false;
-        esp32_ota_mutex_release();
-        resetState();
-        return err;
-    }
-    m_ended = true;  // ★ end 成功，后续不得再 abort
-    DEBUG_INFO(TAG, "[FINALIZE] esp_ota_end 完成");
-
-    // ── SHA-256 校验（若前端提供）──
+    // ── 先读回分区计算 SHA-256，并与前端文件 SHA 比对 ──
     if (frontend_sha_hex != nullptr && strlen(frontend_sha_hex) == 64) {
+        DEBUG_INFO(TAG, "ESP32 OTA 校验 SHA-256...");
         esp_err_t sha_err = computeShaFromPartition();
         if (sha_err != ESP_OK) {
             DEBUG_ERR(TAG, "SHA 计算失败: %s，中止", esp_err_to_name(sha_err));
+            esp_ota_abort(m_handle);
+            m_ended = false;
             esp32_ota_mutex_release();
             resetState();
             return sha_err;
@@ -263,11 +259,11 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
             snprintf(&device_hex[i * 2], sizeof(device_hex) - i * 2, "%02x", m_sha256[i]);
         }
 
-        bool match = true;
+        bool sha_match = true;
         for (int i = 0; i < 64; i++) {
             if (tolower((unsigned char)frontend_sha_hex[i]) !=
                 tolower((unsigned char)device_hex[i])) {
-                match = false;
+                sha_match = false;
                 break;
             }
         }
@@ -277,16 +273,19 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
             out_device_sha_hex[64] = '\0';
         }
 
-        if (!match) {
-            DEBUG_ERR(TAG, "SHA-256 不匹配! frontend=%s device=%s，中止",
+        if (sha_match) {
+            DEBUG_INFO(TAG, "SHA-256 校验通过");
+        } else {
+            DEBUG_ERR(TAG, "SHA-256 不匹配: frontend=%s device=%s",
                       frontend_sha_hex, device_hex);
+            esp_ota_abort(m_handle);
+            m_ended = false;
             esp32_ota_mutex_release();
             resetState();
-            return ESP_ERR_INVALID_VERSION;  // 调用方据此返回错误给前端
+            return ESP_ERR_INVALID_VERSION;
         }
-        DEBUG_INFO(TAG, "SHA-256 校验通过");
     } else if (out_device_sha_hex) {
-        // 未提供前端 SHA，但调用方仍想拿到设备端 SHA
+        // 未提供前端 SHA，但仍计算设备端 SHA 供输出
         if (computeShaFromPartition() == ESP_OK) {
             for (int i = 0; i < 32; ++i) {
                 snprintf(&out_device_sha_hex[i * 2], 65 - i * 2, "%02x", m_sha256[i]);
@@ -295,8 +294,20 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         }
     }
 
+    // ── esp_ota_end ──
+    esp_err_t err = esp_ota_end(m_handle);
+    if (err != ESP_OK) {
+        DEBUG_ERR(TAG, "esp_ota_end 失败: %s (0x%x)", esp_err_to_name(err), (unsigned)err);
+        // end 失败时仍可 abort（未真正 end）
+        esp_ota_abort(m_handle);
+        m_ended = false;
+        esp32_ota_mutex_release();
+        resetState();
+        return err;
+    }
+    m_ended = true;  // ★ end 成功，后续不得再 abort
+
     // ── 设置启动分区 ──
-    DEBUG_INFO(TAG, "[FINALIZE] esp_ota_set_boot_partition...");
     err = esp_ota_set_boot_partition(m_partition);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
@@ -304,7 +315,6 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         resetState();
         return err;
     }
-    DEBUG_INFO(TAG, "[FINALIZE] esp_ota_set_boot_partition 完成");
 
     esp32_ota_mutex_release();
     DEBUG_INFO(TAG, "ESP32 OTA 收尾完成，共 %u 字节", (unsigned)m_received);
@@ -313,7 +323,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
     // （此处不 reset，以便 BLE finish task 在重启前可查询状态）
 
     if (reboot) {
-        DEBUG_INFO(TAG, "[FINALIZE] 500ms 后重启...");
+        DEBUG_INFO(TAG, "500ms 后重启 ESP32");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
         // 不会返回
@@ -335,4 +345,43 @@ void Esp32OtaCore::abort()
     esp32_ota_mutex_release();
     resetState();
     DEBUG_INFO(TAG, "ESP32 OTA 已中止并清理");
+}
+
+/**
+  * @brief 强制退出 OTA 状态机并释放互斥锁。
+  *
+  * 用于新通道（WiFi/BLE）发现锁被残留占用时，主动走完整的状态机退出流程：
+  *   1. 若会话活跃（m_active）→ 走 abort() 完整清理（esp_ota_abort + 释放锁 + 复位状态）
+  *   2. 若会话不活跃但锁被占（g_esp32OtaOccupied）→ 仅释放残留锁
+  *   3. 否则无需操作
+  *
+  * @return true 执行了清理（调用方可重试 begin），false 无需清理。
+  */
+bool Esp32OtaCore::forceCleanup()
+{
+    if (m_active) {
+        // 会话仍活跃（前一个通道未正常结束），走完整 abort 流程
+        DEBUG_WARN(TAG, "强制清理: 中止活跃的 OTA 会话 (received=%u)", (unsigned)m_received);
+        abort();
+        return true;
+    }
+
+    // 会话不活跃，但锁可能被残留占用
+    if (!g_esp32OtaMutex) return false;
+
+    // 在互斥保护下检查 g_esp32OtaOccupied
+    if (xSemaphoreTake(g_esp32OtaMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+
+    bool was_occupied = g_esp32OtaOccupied;
+    if (was_occupied) {
+        g_esp32OtaOccupied = false;
+    }
+    xSemaphoreGive(g_esp32OtaMutex);
+
+    if (was_occupied) {
+        DEBUG_WARN(TAG, "强制清理: 释放残留 OTA 锁（无活跃会话）");
+        return true;
+    }
+
+    return false;
 }

@@ -19,7 +19,6 @@
 
 // 安全常量（定义在 app_config.h 中）
 inline constexpr size_t MASTER_KEY_HERE_LEN = 16;
-inline constexpr size_t SCRAMBLE_CONST_HERE_LEN = 16;
 inline constexpr size_t CHIP_UID_LEN = 12;
 
 // AES 会话上下文
@@ -55,7 +54,7 @@ public:
      * @param rand_seed 随机种子。
      * @param nonce_out 输出的 16 字节 nonce 缓冲区。
      */
-    static void scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
+    void scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
                                  uint32_t rand_seed, uint8_t *nonce_out);
     /**
       * @brief 会话密钥初始化，将密钥拷贝到会话上下文。
@@ -76,6 +75,7 @@ private:
     Protocol(const Protocol&) = delete;
     Protocol& operator=(const Protocol&) = delete;
 
+    uint8_t m_scrambleConst[SCRAMBLE_CONST_LEN] = {0};
     bool m_initialized = false;
 };
 

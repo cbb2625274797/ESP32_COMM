@@ -9,8 +9,9 @@ echo   ESP32 COMM Host Server
 echo   PORT: %PORT%
 echo ========================================
 echo.
-echo   WiFi OTA:   http://localhost:%PORT%/index.html
-echo   BLE  OTA:   http://localhost:%PORT%/ble_ota.html
+echo   OTA Console:   http://localhost:%PORT%/index.html
+echo.
+echo   Switch WiFi / BLE mode in the "Device Connect" card.
 echo.
 echo   Press Ctrl+C to stop
 echo ========================================

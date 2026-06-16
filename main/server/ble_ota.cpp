@@ -24,6 +24,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 
 // NimBLE 协议栈
 #include "nimble/nimble_port.h"
@@ -39,6 +40,7 @@
 #include "app_config.h"
 #include "ota_mutex.h"
 #include "ble_ota.h"
+#include "wifi_ota.h"
 #include "esp32_ota_core.h"
 #include "ota_relay.h"
 #include "health_monitor.h"
@@ -48,15 +50,9 @@
 #define BLE_OTA_NOTIFY_ACK 0xA1
 #define BLE_OTA_NOTIFY_FINISH 0xB1
 #define BLE_OTA_NOTIFY_SHA256 0xC1   // 设备端 SHA-256 上报（[0xC1] + [32字节]）
-#define BLE_OTA_FINISH_BEGIN_OTA_END 0x01
-#define BLE_OTA_FINISH_DONE_OTA_END 0x02
-#define BLE_OTA_FINISH_BEGIN_SET_BOOT 0x03
-#define BLE_OTA_FINISH_DONE_SET_BOOT 0x04
-#define BLE_OTA_FINISH_BEGIN_DELAY 0x05
-#define BLE_OTA_FINISH_DONE_DELAY 0x06
+#define BLE_OTA_FINISH_DONE 0x02
 #define BLE_OTA_FINISH_REBOOT_NOW 0x07
-#define BLE_OTA_FINISH_ERR_OTA_END 0x81
-#define BLE_OTA_FINISH_ERR_SET_BOOT 0x82
+#define BLE_OTA_FINISH_ERR_FINALIZE 0x81
 #define BLE_OTA_ACK_WINDOW 32
 #define BLE_ATT_ERR_OTA_BUSY 0x80           // ESP32 OTA 被其他通道占用
 #define BLE_OTA_FINISH_ERR_MUTEX 0x83       // 互斥拒绝: OTA 被其他通道占用
@@ -69,6 +65,7 @@
 static void ble_ota_start_advertising(void);
 static void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes);
 static void sendFinishEvent(uint8_t stage, uint32_t value);
+static void esp32_reorder_free();
 
 // ============================================================
 /**
@@ -89,8 +86,8 @@ static uint16_t s_data_out_val_handle = 0;
 /**
  * @brief 异步完成 ESP32 OTA 收尾并触发重启。
  *
- * 实际的 esp_ota_end / SHA 校验 / esp_ota_set_boot_partition / esp_restart 全部
- * 由 Esp32OtaCore::finalize 完成。本任务仅负责：补发 ACK → 调 finalize → 上报 SHA → 通知前端。
+ * 实际的 SHA 校验 / esp_ota_end / esp_ota_set_boot_partition 全部由
+ * Esp32OtaCore::finalize 完成。本任务仅负责：补发 ACK → 调 finalize → 上报 SHA → 通知前端。
  * @param pvParameters 任务参数，当前未使用。
  */
 /**
@@ -132,17 +129,15 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         DEBUG_WARN(TAG, "异步收尾时 OTA 状态无效，放弃重启");
         if (frontend_sha_hex) free(frontend_sha_hex);
         BleOta::instance().m_esp32RebootPending = false;
+        esp32_reorder_free();
         vTaskDelete(NULL);
         return;
     }
 
     DEBUG_INFO(TAG, "ESP32 OTA 收尾: 共 %u 字节", (unsigned)core.getReceived());
 
-    // 通知前端：开始 finalize
-    sendFinishEvent(BLE_OTA_FINISH_BEGIN_OTA_END, 0);
-
     // 关键：reboot=false，让 finalize 真正返回、拿到 device_sha_hex，
-    // 再依次推送 SHA 通知 + FINISH_DONE_OTA_END + FINISH_REBOOT_NOW，
+    // 再依次推送 SHA 通知 + FINISH_DONE + FINISH_REBOOT_NOW，
     // 最后延迟重启。若 reboot=true，core 内部直接 esp_restart()，
     // 下面所有 notifyResponse / sendFinishEvent 都不会执行，
     // 前端也就拿不到设备端 SHA 与"收尾完成/即将重启"事件。
@@ -167,7 +162,7 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(150));
 
         // 3) 推送"OTA 收尾完成"与"即将重启"事件
-        sendFinishEvent(BLE_OTA_FINISH_DONE_OTA_END, 0);
+        sendFinishEvent(BLE_OTA_FINISH_DONE, 0);
         sendFinishEvent(BLE_OTA_FINISH_REBOOT_NOW, 0);
 
         // 4) 通知全部发出后延迟 500ms 重启
@@ -179,14 +174,56 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         DEBUG_ERR(TAG, "[FINISH] SHA-256 不匹配，OTA 已中止");
         sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH, 0);
         BleOta::instance().m_esp32RebootPending = false;
+        // ★ finalize 内部已 abort 并释放 mutex，这里释放 reorder buffer
+        esp32_reorder_free();
     } else {
         DEBUG_ERR(TAG, "[FINISH] OTA 收尾失败: %s", esp_err_to_name(err));
-        sendFinishEvent(BLE_OTA_FINISH_ERR_OTA_END, (uint32_t)err);
+        sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)err);
         BleOta::instance().m_esp32RebootPending = false;
+        // ★ finalize 内部已 abort 并释放 mutex，这里释放 reorder buffer
+        esp32_reorder_free();
     }
 
     if (frontend_sha_hex) free(frontend_sha_hex);
     vTaskDelete(NULL);
+}
+
+// ============================================================
+// WiFi 共存优化：BLE OTA 传输期间降低 WiFi 射频占用
+// ============================================================
+static bool s_wifi_ps_boosted = false;
+
+/**
+ * @brief BLE OTA 开始时，将 WiFi 切换到最大省电模式，减少射频抢占。
+ *        WiFi STA 仍保持连接，但信标监听间隔大幅拉长，BLE 获得更多空中时间。
+ */
+static void ble_ota_boost_wifi_ps()
+{
+    if (s_wifi_ps_boosted) return;
+    esp_err_t err = esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    if (err == ESP_OK) {
+        s_wifi_ps_boosted = true;
+        WifiOta::instance().setBleOtaActive(true);  // ★ 暂停 WiFi RSSI 轮询
+        DEBUG_INFO(TAG, "WiFi 已切换到 MAX_MODEM 省电模式（BLE OTA 传输优化）");
+    } else {
+        DEBUG_WARN(TAG, "WiFi 省电模式切换失败: %s", esp_err_to_name(err));
+    }
+}
+
+/**
+ * @brief BLE OTA 结束/中止时，恢复 WiFi 省电策略为 WIFI_PS_NONE。
+ */
+static void ble_ota_restore_wifi_ps()
+{
+    if (!s_wifi_ps_boosted) return;
+    esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err == ESP_OK) {
+        s_wifi_ps_boosted = false;
+        WifiOta::instance().setBleOtaActive(false);  // ★ 恢复 WiFi RSSI 轮询
+        DEBUG_INFO(TAG, "WiFi 已恢复 WIFI_PS_NONE 模式");
+    } else {
+        DEBUG_WARN(TAG, "WiFi 省电模式恢复失败: %s", esp_err_to_name(err));
+    }
 }
 
 // ============================================================
@@ -207,6 +244,273 @@ static int ble_ota_mbuf_to_buf(struct os_mbuf *om, uint8_t *buf, size_t buf_len)
     return (int)copy_len;
 }
 
+// ============================================================
+// ESP32 OTA 包序号顺序保护：Reorder Buffer（TCP 接收窗口模式）
+//
+// 背景：
+//   esp_ota_write 是顺序追加写入，不支持 seek。
+//   客户端窗口内使用 writeValueWithoutResponse（fire-and-forget），
+//   BLE 空口会导致同一窗口的包乱序到达设备端。
+//
+// 策略（窗口级 reorder buffer）：
+//   - seq < expected                → 重复包，丢弃
+//   - seq == expected               → 写入 flash，expected++，
+//                                     并 flush 连续紧邻的缓存包
+//   - seq > expected 且在窗口范围内 → 暂存到 slot，不写 flash
+//   - seq 超出窗口范围              → 防御性丢弃 + ACK 报告缺口
+//
+// 与旧"丢弃策略"的区别：乱序包不再丢弃，而是暂存到 buffer，
+// 当缺口（expected）的包到达时按序 flush，从而吸收窗口内乱序，
+// 彻底消除"重传包与原发包再次乱序"导致的重传风暴。
+//
+// 内存：slots 指针/长度数组在 OTA begin 时分配（常驻 ~384B），
+//       每个 slot 的 payload 缓冲区按需 lazy malloc（最多 480B），
+//       flush 后立即 free。OTA 结束/abort 时统一释放。
+//       若 begin 时分配失败 → active=false，自动回退到丢弃策略。
+//
+// ACK 协议不变：getReceived() 仅在真正按序写入 flash 时增长，
+//              客户端 resumeSeq = ceil(bytes/payloadSize) 仍正确。
+// ============================================================
+
+/**
+  * @brief ESP32 OTA reorder buffer 状态。
+  *        窗口级缓存，吸收 BLE 乱序到达的包。
+  */
+struct Esp32OtaReorderBuf {
+    bool      active = false;      ///< 是否已启用（分配成功）
+    bool      fallback = false;    ///< 是否回退到丢弃策略（buffer 分配失败时）
+    uint32_t  expected = 0;        ///< 下一个期望按序写入的 seq
+    uint32_t  windowBase = 0;      ///< 当前窗口起始 seq（= 上次 flush 后的 expected）
+    uint32_t  windowSize = 0;      ///< 窗口大小（= BLE_OTA_REORDER_WINDOW）
+    uint8_t  **slots = nullptr;    ///< slots[i]：窗口内第 i 个包的 payload 拷贝（nullptr=未占）
+    size_t   *lens = nullptr;      ///< lens[i]：slots[i] 的 payload 长度
+    size_t    payloadCap = 0;      ///< 每个 slot 的容量（= BLE_OTA_CHUNK_PAYLOAD）
+};
+
+static Esp32OtaReorderBuf s_reorder;
+static uint32_t s_fallback_ooo_count = 0;  // 回退模式下自上次 ACK 以来的乱序包计数
+
+// 前向声明（alloc/free 互相引用）
+static void esp32_reorder_free();
+
+/**
+ * @brief 分配 reorder buffer（slots 指针/长度数组）。
+ *        在 ble_esp32_ota_begin() 中调用。分配失败则置 fallback=true，
+ *        后续自动回退到丢弃策略。
+ */
+static void esp32_reorder_alloc()
+{
+    // 已分配则先释放（防御性）
+    if (s_reorder.slots || s_reorder.lens) {
+        esp32_reorder_free();
+    }
+
+    s_reorder.expected    = 0;
+    s_reorder.windowBase  = 0;
+    s_reorder.windowSize  = (uint32_t)BLE_OTA_REORDER_WINDOW;
+    s_reorder.payloadCap  = BLE_OTA_CHUNK_PAYLOAD;
+    s_reorder.slots = (uint8_t **)calloc(s_reorder.windowSize, sizeof(uint8_t *));
+    s_reorder.lens  = (size_t  *)calloc(s_reorder.windowSize, sizeof(size_t));
+    s_fallback_ooo_count  = 0;
+
+    if (!s_reorder.slots || !s_reorder.lens) {
+        DEBUG_WARN(TAG, "Reorder buffer 分配失败 (slots=%p lens=%p)，回退到丢弃策略。"
+                   "heap: free=%u min=%u",
+                   s_reorder.slots, s_reorder.lens,
+                   (unsigned)esp_get_free_heap_size(),
+                   (unsigned)esp_get_minimum_free_heap_size());
+        // 释放可能部分成功的分配
+        free(s_reorder.slots); s_reorder.slots = nullptr;
+        free(s_reorder.lens);  s_reorder.lens  = nullptr;
+        s_reorder.active   = false;
+        s_reorder.fallback = true;
+        return;
+    }
+    s_reorder.active   = true;
+    s_reorder.fallback = false;
+    DEBUG_INFO(TAG, "Reorder buffer 已启用: window=%u payloadCap=%u heap=%u",
+               (unsigned)s_reorder.windowSize, (unsigned)s_reorder.payloadCap,
+               (unsigned)esp_get_free_heap_size());
+}
+
+/**
+ * @brief 释放 reorder buffer 全部内存（含已占用的 slot）。
+ *        同时复位 expected/windowBase 等状态，供下次 OTA begin 重新分配。
+ */
+static void esp32_reorder_free()
+{
+    if (s_reorder.slots) {
+        for (uint32_t i = 0; i < s_reorder.windowSize; ++i) {
+            if (s_reorder.slots[i]) {
+                free(s_reorder.slots[i]);
+                s_reorder.slots[i] = nullptr;
+            }
+        }
+        free(s_reorder.slots);
+        s_reorder.slots = nullptr;
+    }
+    if (s_reorder.lens) {
+        free(s_reorder.lens);
+        s_reorder.lens = nullptr;
+    }
+    s_reorder.expected    = 0;
+    s_reorder.windowBase  = 0;
+    s_reorder.active      = false;
+    s_reorder.fallback    = false;
+    s_reorder.windowSize  = 0;
+    s_reorder.payloadCap  = 0;
+    s_fallback_ooo_count  = 0;
+}
+
+/**
+ * @brief flush expected 对应的连续缓存包到 flash，并释放对应 slot。
+ *        由 esp32_write_ordered 在每次 expected 推进后调用。
+ * @return flush 的包数（不含当前已写入的包）。
+ */
+static uint32_t esp32_reorder_flush()
+{
+    uint32_t flushed = 0;
+    while (s_reorder.active) {
+        uint32_t idx = s_reorder.expected - s_reorder.windowBase;
+        // idx 应始终 < windowSize（窗口未越界）
+        if (idx >= s_reorder.windowSize) break;
+        if (!s_reorder.slots[idx]) break;  // 缺口：后续虽有缓存但不连续
+
+        uint8_t *data = s_reorder.slots[idx];
+        size_t   len  = s_reorder.lens[idx];
+        esp_err_t err = Esp32OtaCore::instance().write(data, len);
+        // 释放 slot
+        free(s_reorder.slots[idx]);
+        s_reorder.slots[idx] = nullptr;
+        s_reorder.lens[idx]  = 0;
+
+        if (err != ESP_OK) {
+            DEBUG_ERR(TAG, "Reorder flush 写入失败: seq=%u err=%s",
+                      (unsigned)s_reorder.expected, esp_err_to_name(err));
+            // 写入失败不推进 expected，交由上层 abort
+            return flushed;
+        }
+        s_reorder.expected++;
+        flushed++;
+    }
+    return flushed;
+}
+
+/**
+ * @brief 按序号顺序写入 ESP32 OTA 数据。
+ *
+ * 启用 reorder buffer 时：吸收窗口内乱序，缺口填满后按序 flush。
+ * 回退模式（buffer 分配失败）：执行旧丢弃策略（乱序包丢弃 + ACK 报告缺口）。
+ *
+ * @param seq        包序号。
+ * @param cmd        数据命令字节（用于 ACK）。
+ * @param data       负载数据指针。
+ * @param data_len   负载数据长度。
+ * @return ESP_OK 写入成功或被安全跳过，其他为失败。
+ */
+static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
+                                     const uint8_t *data, size_t data_len)
+{
+    // ── 回退模式：旧丢弃策略 ──
+    if (s_reorder.fallback) {
+        // 重复包
+        if (seq < s_reorder.expected) {
+            DEBUG_DBG(TAG, "ESP32 重复包: seq=%u < expected=%u，跳过",
+                      seq, (unsigned)s_reorder.expected);
+            return ESP_OK;
+        }
+        // 乱序包：丢弃 + 节流 ACK 报告缺口
+        // ★ 节流策略：每 BLE_OTA_ACK_WINDOW 个乱序包才发一次 ACK，
+        //   或在窗口边界处发 ACK。避免大量乱序包涌入时触发 ACK 风暴，
+        //   耗尽 NimBLE mbuf 池导致 ESP_ERR_NO_MEM。
+        if (seq > s_reorder.expected) {
+            s_fallback_ooo_count++;
+            bool shouldAck =
+                (s_fallback_ooo_count >= BLE_OTA_ACK_WINDOW) ||
+                ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U);
+            if (shouldAck) {
+                uint32_t curReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
+                DEBUG_WARN(TAG, "ESP32 乱序包跳过(回退): seq=%u (expected=%u)，节流 ACK bytes=%u (ooo=%u)",
+                           seq, (unsigned)s_reorder.expected, (unsigned)curReceived,
+                           (unsigned)s_fallback_ooo_count);
+                sendWindowAck(cmd, s_reorder.expected > 0 ? (uint16_t)(s_reorder.expected - 1) : 0,
+                              curReceived);
+                s_fallback_ooo_count = 0;
+            } else {
+                DEBUG_DBG(TAG, "ESP32 乱序包跳过(回退): seq=%u (expected=%u)，抑制 ACK (ooo=%u)",
+                          seq, (unsigned)s_reorder.expected,
+                          (unsigned)s_fallback_ooo_count);
+            }
+            return ESP_OK;
+        }
+        // seq == expected：正常写入
+        esp_err_t err = Esp32OtaCore::instance().write(data, data_len);
+        if (err != ESP_OK) return err;
+        s_reorder.expected++;
+        return ESP_OK;
+    }
+
+    // ── Reorder buffer 模式 ──
+    // 窗口推进检测：若 expected 已超出当前窗口基址，滑动窗口
+    if (s_reorder.expected >= s_reorder.windowBase + s_reorder.windowSize) {
+        s_reorder.windowBase = s_reorder.expected;
+    }
+
+    // 重复包：seq < expected → 已写入，跳过
+    if (seq < s_reorder.expected) {
+        DEBUG_DBG(TAG, "ESP32 重复包: seq=%u < expected=%u，跳过",
+                  seq, (unsigned)s_reorder.expected);
+        return ESP_OK;
+    }
+
+    // seq == expected：正常写入 + flush 连续缓存包
+    if (seq == s_reorder.expected) {
+        esp_err_t err = Esp32OtaCore::instance().write(data, data_len);
+        if (err != ESP_OK) return err;
+        s_reorder.expected++;
+        uint32_t flushed = esp32_reorder_flush();
+        if (flushed > 0) {
+            DEBUG_DBG(TAG, "Reorder flush: seq=%u 后连续写入 %u 包 (expected→%u)",
+                      seq, (unsigned)flushed, (unsigned)s_reorder.expected);
+        }
+        return ESP_OK;
+    }
+
+    // seq > expected：暂存到 slot（若在窗口范围内）
+    uint32_t idx = seq - s_reorder.windowBase;
+    if (idx < s_reorder.windowSize) {
+        if (s_reorder.slots[idx]) {
+            // 该 slot 已被占用（重复的乱序包），跳过
+            DEBUG_DBG(TAG, "Reorder slot 已占: seq=%u idx=%u，跳过重复包",
+                      seq, (unsigned)idx);
+            return ESP_OK;
+        }
+        // data 可能来自静态 buf（ble_ota_data_in_access 的合并缓冲区），
+        // 后续包处理会覆盖它，必须拷贝一份
+        uint8_t *copy = (uint8_t *)malloc(data_len);
+        if (!copy) {
+            DEBUG_WARN(TAG, "Reorder slot malloc 失败: seq=%u，丢弃该包（靠客户端重传）",
+                       seq);
+            return ESP_OK;  // 不算失败，靠客户端重传补
+        }
+        memcpy(copy, data, data_len);
+        s_reorder.slots[idx] = copy;
+        s_reorder.lens[idx]  = data_len;
+        DEBUG_DBG(TAG, "Reorder 缓存乱序包: seq=%u idx=%u (expected=%u)",
+                  seq, (unsigned)idx, (unsigned)s_reorder.expected);
+        return ESP_OK;
+    }
+
+    // seq 超出窗口范围（防御性，理论不会发生）
+    uint32_t curReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
+    DEBUG_WARN(TAG, "ESP32 包超出 reorder 窗口: seq=%u (expected=%u base=%u win=%u)，ACK bytes=%u",
+               seq, (unsigned)s_reorder.expected, (unsigned)s_reorder.windowBase,
+               (unsigned)s_reorder.windowSize, (unsigned)curReceived);
+    sendWindowAck(cmd, s_reorder.expected > 0 ? (uint16_t)(s_reorder.expected - 1) : 0,
+                  curReceived);
+    return ESP_OK;
+}
+
 // ─────────────────────────────────────────────────────────────
 // ESP32 OTA 薄包装：实际 begin/write/finalize 已抽离到 Esp32OtaCore
 // 此处仅保留 BLE 侧的状态复位与日志，供 data_in_access 调用。
@@ -221,6 +525,12 @@ static int ble_ota_mbuf_to_buf(struct os_mbuf *om, uint8_t *buf, size_t buf_len)
 static esp_err_t ble_esp32_ota_begin(size_t total_size)
 {
     esp_err_t err = Esp32OtaCore::instance().begin(total_size);
+    if (err == ESP_ERR_INVALID_STATE) {
+        // ★ OTA 锁被占用，走完整的状态机退出 + 清理锁，然后重试一次
+        DEBUG_WARN(TAG, "ESP32 OTA 锁被占用，强制清理状态机后重试");
+        Esp32OtaCore::instance().forceCleanup();
+        err = Esp32OtaCore::instance().begin(total_size);
+    }
     if (err != ESP_OK) {
         return err;
     }
@@ -228,6 +538,10 @@ static esp_err_t ble_esp32_ota_begin(size_t total_size)
     BleOta::instance().m_esp32RebootPending = false;
     BleOta::instance().m_esp32LastCmd = 0;
     BleOta::instance().m_esp32LastSeq = 0xFFFFU;
+    // ★ 分配 reorder buffer（失败则自动回退丢弃策略）
+    esp32_reorder_alloc();
+    // ★ BLE OTA 开始：降低 WiFi 射频占用
+    ble_ota_boost_wifi_ps();
     return ESP_OK;
 }
 
@@ -238,6 +552,10 @@ static void ble_esp32_ota_abort()
 {
     Esp32OtaCore::instance().abort();
     BleOta::instance().m_esp32RebootPending = false;
+    // ★ 释放 reorder buffer
+    esp32_reorder_free();
+    // ★ BLE OTA 中止：恢复 WiFi 射频
+    ble_ota_restore_wifi_ps();
 }
 
 /**
@@ -354,14 +672,14 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         // 一致走 end+set_boot+reboot，不一致返回 0x85 ERR_SHA_MISMATCH。
         if (len < 33) {
             DEBUG_WARN(TAG, "CTRL 0xF8 数据长度不足 33（前端 SHA-256 必传），拒绝触发");
-            sendFinishEvent(BLE_OTA_FINISH_ERR_OTA_END, (uint32_t)ESP_ERR_INVALID_ARG);
+            sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)ESP_ERR_INVALID_ARG);
             return 0;
         }
 
         char *frontend_sha_hex = (char *)malloc(65);
         if (!frontend_sha_hex) {
             DEBUG_ERR(TAG, "CTRL 0xF8 申请内存失败");
-            sendFinishEvent(BLE_OTA_FINISH_ERR_OTA_END, (uint32_t)ESP_ERR_NO_MEM);
+            sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)ESP_ERR_NO_MEM);
             return 0;
         }
         for (int i = 0; i < 32; ++i) {
@@ -508,7 +826,27 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                 }
             }
 
-            esp_err_t err = Esp32OtaCore::instance().write(&buf[data_offset], data_len);
+            // ★ 会话有效性检查：如果 begin() 失败（如互斥拒绝），后续包也应丢弃
+            if (!Esp32OtaCore::instance().isActive()) {
+                DEBUG_WARN(TAG, "ESP32 OTA 会话无效，丢弃 seq=%u", seq);
+                offset += packet_len;
+                if (offset + 7 > (size_t)recv_len) break;
+                continue;
+            }
+
+            // ★ 防重复写入保护：如果已接收字节 >= 声明大小，跳过（重试引起的重复包）
+            uint32_t curReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
+            if (total_size > 0 && curReceived >= total_size) {
+                DEBUG_WARN(TAG, "ESP32 OTA 已收满 (%u >= %" PRIu32 ")，跳过重复 seq=%u",
+                           (unsigned)curReceived, total_size, seq);
+                sendWindowAck(cmd, seq, curReceived);
+                offset += packet_len;
+                if (offset + 7 > (size_t)recv_len) break;
+                continue;
+            }
+
+            // ★ 使用带序号顺序保护的写入：拒绝乱序包并立即 ACK 通知发送端
+            esp_err_t err = esp32_write_ordered(seq, cmd, &buf[data_offset], data_len);
             if (err != ESP_OK) {
                 DEBUG_ERR(TAG, "ESP32 OTA 写入失败: seq=%u err=%s",
                           seq, esp_err_to_name(err));
@@ -519,26 +857,37 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
             DEBUG_DBG(TAG, "ESP32 OTA 写入成功: seq=%u received=%u",
                       seq, (unsigned int)Esp32OtaCore::instance().getReceived());
 
-            // 尾包检测: 期望 payload < 标准负载说明是真正的最后一包
-            // 使用 expected_payload 而非 data_len，避免缓冲区截断导致误触发重启
+            // 完成判定：以实际按序写入字节数为准。
+            // reorder buffer 模式下，尾包可能是乱序到达被缓存的包，
+            // 此刻 getReceived() 尚未达到 total_size，不能据此判定完成。
+            // isLastPacket 仅记录"这是最后一包的形态"，不单独作为完成条件。
             bool isLastPacket = (expected_payload < BLE_OTA_CHUNK_PAYLOAD);
+            bool transferComplete = (total_size > 0 &&
+                                     Esp32OtaCore::instance().getReceived() >= total_size);
 
+            // ACK 触发条件：
+            //   - 窗口末尾包 (seq+1 是窗口整数倍)
+            //   - 数据全部按序写完（含 reorder flush 后达到 total_size）
+            //   - 尾包形态（兜底：即使 getReceived 不足也回一个 ACK，让客户端续传）
             if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
-                (total_size > 0 && Esp32OtaCore::instance().getReceived() >= total_size) ||
+                transferComplete ||
                 isLastPacket) {
-                if (isLastPacket) {
-                    DEBUG_INFO(TAG, "ESP32 尾包检测: seq=%u data_len=%zu received=%u total=%" PRIu32,
+                if (isLastPacket || transferComplete) {
+                    DEBUG_INFO(TAG, "ESP32 尾包/完成检测: seq=%u data_len=%zu received=%u total=%" PRIu32,
                                seq, data_len, (unsigned int)Esp32OtaCore::instance().getReceived(), total_size);
                 }
                 sendWindowAck(cmd, seq, (uint32_t)Esp32OtaCore::instance().getReceived());
             }
 
-            if ((total_size > 0 && Esp32OtaCore::instance().getReceived() >= total_size) || isLastPacket) {
-                DEBUG_INFO(TAG, "★ ESP32 固件接收完毕: %u / %" PRIu32 " 字节 (共 %u 块)%s",
-                           (unsigned int)Esp32OtaCore::instance().getReceived(), total_size, seq + 1,
-                           isLastPacket ? " [尾包]" : "");
+            // ★ 仅当数据真正全部按序写完时才标记传输完成。
+            //   尾包乱序缓存但缺口未填满时，不算完成（等待客户端续传缺口包）。
+            if (transferComplete) {
+                DEBUG_INFO(TAG, "★ ESP32 固件接收完毕: %u / %" PRIu32 " 字节 (共 %u 块)",
+                           (unsigned int)Esp32OtaCore::instance().getReceived(), total_size, seq + 1);
                 BleOta::instance().m_esp32LastCmd = cmd;
                 BleOta::instance().m_esp32LastSeq = seq;
+                // ★ ESP32 OTA 传输完成：恢复 WiFi 射频
+                ble_ota_restore_wifi_ps();
                 // 注：与 WiFi 流程对齐，传输完成后由前端发送 0xF8 + SHA-256 触发 finalize，
                 //     设备端不再自动创建收尾任务。
             }
@@ -567,6 +916,8 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
 
                 DEBUG_INFO(TAG, "GD32 固件存储开始: total=%" PRIu32 ", payload=%zu",
                            meta.total_size, data_len);
+                // ★ GD32 BLE OTA 开始：降低 WiFi 射频占用
+                ble_ota_boost_wifi_ps();
             }
 
             ota_meta_t meta = {};
@@ -583,6 +934,15 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
 
             // --- GD32 写入 Flash ---
             uint32_t flash_offset = meta.stored_size;
+            // ★ 防重复写入保护：如果已存储字节 >= 声明大小，跳过重试引起的重复包
+            if (flash_offset >= meta.total_size) {
+                DEBUG_WARN(TAG, "GD32 OTA 已收满 (%" PRIu32 " >= %" PRIu32 ")，跳过重复 seq=%u",
+                           flash_offset, meta.total_size, seq);
+                sendWindowAck(cmd, seq, flash_offset);
+                offset += packet_len;
+                if (offset + 7 > (size_t)recv_len) break;
+                continue;
+            }
             if (flash_offset + (uint32_t)data_len > meta.total_size) {
                 DEBUG_ERR(TAG, "GD32 写入越界: offset=%" PRIu32 " len=%zu total=%" PRIu32,
                           flash_offset, data_len, meta.total_size);
@@ -617,6 +977,8 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
                 meta.stored_size >= meta.total_size) {
                 DEBUG_INFO(TAG, "★ GD32 固件接收完毕: %" PRIu32 " / %" PRIu32 " 字节 (共 %u 块)",
                            meta.stored_size, meta.total_size, seq + 1);
+                // ★ GD32 BLE OTA 传输完成：恢复 WiFi 射频
+                ble_ota_restore_wifi_ps();
                 // 计算并存储 SHA-256 校验和
                 esp_err_t sha_err = OtaRelay::metaFinalizeChecksum();
                 if (sha_err != ESP_OK) {
@@ -661,7 +1023,15 @@ static int ble_ota_version_access(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     const char *version = FW_VERSION;
-    int rc = os_mbuf_append(ctxt->om, version, strlen(version));
+    // 版本字符串: "vX.Y.Z YYYY-MM-DD HH:MM:SS"
+    char ver_buf[64];
+    int ver_len = snprintf(ver_buf, sizeof(ver_buf), "%s %s", FW_VERSION, FW_BUILD_TIME);
+    if (ver_len < 0 || ver_len >= (int)sizeof(ver_buf)) {
+        ver_len = strlen(version);
+        int rc = os_mbuf_append(ctxt->om, version, ver_len);
+        return (rc == 0) ? 0 : BLE_ATT_ERR_UNLIKELY;
+    }
+    int rc = os_mbuf_append(ctxt->om, ver_buf, ver_len);
     return (rc == 0) ? 0 : BLE_ATT_ERR_UNLIKELY;
 }
 
@@ -796,9 +1166,14 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         DEBUG_INFO(TAG, "BLE 客户端已断开: reason=%d",
                    event->disconnect.reason);
-        /** @brief BLE GATT 客户端连接状态。 */
         BleOta::instance().m_bleConnected = false;
-                BleOta::instance().m_connHandle   = BLE_HS_CONN_HANDLE_NONE;
+        BleOta::instance().m_connHandle   = BLE_HS_CONN_HANDLE_NONE;
+        // ★ BLE 断开时恢复 WiFi 射频，并中止未完成的 ESP32 OTA
+        ble_ota_restore_wifi_ps();
+        if (Esp32OtaCore::instance().isActive()) {
+            DEBUG_WARN(TAG, "BLE 断开，中止未完成的 ESP32 OTA");
+            ble_esp32_ota_abort();
+        }
         // 恢复广播以接受新连接
         ble_ota_start_advertising();
         return 0;

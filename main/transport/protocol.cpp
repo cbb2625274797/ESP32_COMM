@@ -40,6 +40,15 @@ void Protocol::init()
     DEBUG_INFO("PROT", "=== 初始化协议层 ===");
     DEBUG_INFO("PROT", "协议层功能: nonce 扰码 + 会话密钥管理");
 
+    esp_fill_random(m_scrambleConst, SCRAMBLE_CONST_LEN);
+
+    {
+        char hex[SCRAMBLE_CONST_LEN * 2 + 1] = {0};
+        for (size_t i = 0; i < SCRAMBLE_CONST_LEN; ++i)
+            snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", m_scrambleConst[i]);
+        DEBUG_INFO("PROT", "SCRAMBLE_CONST (RNG): %s", hex);
+    }
+
     m_initialized = true;
     DEBUG_INFO("PROT", "协议层就绪");
 }
@@ -55,11 +64,11 @@ void Protocol::scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
     memcpy(&state[0], &timestamp, 4);
     memcpy(&state[4], &mem_addr, 4);
     memcpy(&state[8], &rand_seed, 4);
-    memcpy(&state[12], SCRAMBLE_CONST, 4);
+    memcpy(&state[12], m_scrambleConst, 4);
 
     for (int round = 0; round < 3; round++) {
         for (int i = 0; i < 16; i++) {
-            state[i] ^= SCRAMBLE_CONST[i];
+            state[i] ^= m_scrambleConst[i];
             state[i] = (state[i] << 1) | (state[i] >> 7);
         }
     }
@@ -67,7 +76,7 @@ void Protocol::scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
     for (int round = 0; round < 2; round++) {
         uint32_t *words = (uint32_t *)state;
         for (int i = 0; i < 4; i++) {
-            words[i] ^= SCRAMBLE_CONST[i * 4 % 16] | ((uint32_t)SCRAMBLE_CONST[i * 4 + 1] << 8);
+            words[i] ^= m_scrambleConst[i * 4 % 16] | ((uint32_t)m_scrambleConst[i * 4 + 1] << 8);
         }
     }
 

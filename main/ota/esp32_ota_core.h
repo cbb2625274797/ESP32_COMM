@@ -7,7 +7,7 @@
  * 统一以 WiFi 流程为基准：
  *   - esp_ota_begin 第二参数传 total_size
  *   - SHA-256 在 finalize 时从 OTA 分区读回计算（不在上传期间增量计算）
- *   - finalize 顺序: esp_ota_end → 比对前端 SHA → esp_ota_set_boot_partition → 可选重启
+ *   - finalize 顺序: 读回 SHA-256 → 比对前端 SHA → esp_ota_end → esp_ota_set_boot_partition → 可选重启
  *   - m_ended 标志位防止 esp_ota_end 成功后再次 esp_ota_abort 同一 handle
  *
  * WiFi 与 BLE 仅传输方式不同（HTTP / GATT），OTA 写入与收尾逻辑完全复用本核心。
@@ -48,7 +48,7 @@ public:
      */
     esp_err_t write(const uint8_t *data, size_t len);
 
-    // ── 阶段 3：收尾（end → 校验 SHA → set_boot → 可选重启）──
+    // ── 阶段 3：收尾（校验 SHA → end → set_boot → 可选重启）──
     //   frontend_sha_hex: 前端提供的 64 字符 hex SHA-256，nullptr 表示跳过校验直接应用
     //   reboot:           true 则 set_boot 成功后延时 500ms 调 esp_restart()
     //   out_device_sha_hex: 输出设备端计算出的 SHA hex（缓冲区至少 65 字节），可为 nullptr
@@ -57,7 +57,7 @@ public:
     //     ESP_ERR_INVALID_VERSION  SHA 不匹配（已 abort 并清理）
     //     其他                     end/set_boot 失败（已清理）
     /**
-      * @brief 收尾 OTA 会话：end、校验 SHA、set_boot、可选重启。
+      * @brief 收尾 OTA 会话：校验 SHA、end、set_boot、可选重启。
      * @param frontend_sha_hex 前端提供的 64 字符 hex SHA-256。
      * @param reboot 成功后是否重启。
      * @param out_device_sha_hex 输出设备端 SHA hex 缓冲区。
@@ -84,16 +84,21 @@ public:
      */
     void abort();
 
+    // ── 强制退出状态机并释放互斥锁 ──
+    //   用于新通道发现锁被残留占用时，主动走完整的状态机退出流程：
+    //   活跃会话 → abort()；仅锁残留 → 直接释放；均无 → 不操作
+    //   返回 true = 执行了清理（调用方可重试 begin）
+    /**
+      * @brief 强制退出 OTA 状态机并释放互斥锁。
+     * @return true 执行了清理，false 无需清理。
+     */
+    bool forceCleanup();
+
     // ── 状态查询 ──
     /** @brief 查询 OTA 是否激活。 */
     bool   isActive() const  { return m_active; }
     /** @brief 获取已接收的字节数。 */
     size_t getReceived() const { return m_received; }
-    /** @brief 查询是否等待重启。 */
-    bool   isRebootPending() const { return m_rebootPending; }
-    /** @brief 设置重启待处理标志。 */
-    void   setRebootPending(bool v) { m_rebootPending = v; }
-
 private:
     Esp32OtaCore() = default;
 
@@ -117,7 +122,6 @@ private:
     uint8_t              m_sha256[32] = {0};
     bool                 m_shaComputed = false;
     bool                 m_ended = false;          // ★ esp_ota_end 成功后置 true，防 abort 误用
-    bool                 m_rebootPending = false;  // BLE 收尾任务去重用
 };
 
 #endif // ESP32_OTA_CORE_H
