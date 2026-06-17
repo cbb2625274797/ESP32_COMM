@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
@@ -1164,21 +1165,37 @@ static esp_err_t system_status_handler(httpd_req_t *req)
     gd32_version_t pingVer = {};
     OtaRelay::getGd32Version(&pingVer);
 
-    /* 若尚无 GD32 版本信息且 OTA 中继空闲，尝试一次 SPI PING 获取 */
-    if (pingVer.app_major == 0 &&
+    /* 若尚无 GD32 版本信息且 OTA 中继空闲，尝试 SPI PING 获取（最多 5 次） */
+    // ★ 修复：OTA 活跃期间（存储/中继/ESP32 OTA）跳过 appPing()，
+    //   避免 HTTP 任务长期持有 SPI mutex 与 relay 任务争用，
+    //   导致优先级继承异常 → vTaskPriorityDisinheritAfterTimeout assert。
+    ota_system_state_t curSysState = OtaCoordinator::instance().getSystemState();
+    bool ota_busy = (curSysState == OTA_SYS_GD32_STORING ||
+                     curSysState == OTA_SYS_GD32_RELAYING ||
+                     curSysState == OTA_SYS_ESP32_RECEIVING ||
+                     curSysState == OTA_SYS_ESP32_FINALIZING ||
+                     curSysState == OTA_SYS_ESP32_REBOOTING);
+    if (!ota_busy &&
+        pingVer.app_major == 0 &&
         pingVer.boot_major == 0 &&
         OtaRelay::getState() == RELAY_IDLE) {
         static uint32_t last_ping_ms = 0;
+        static uint8_t  ping_attempts = 0;
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        if (now_ms - last_ping_ms > 5000) {  /* 5 秒节流 */
+        if (ping_attempts < 5 && now_ms - last_ping_ms > 5000) {  /* 5 秒节流 */
             last_ping_ms = now_ms;
+            ++ping_attempts;
             uint32_t uptime = 0;
             gd32_version_t ver = {};
             if (SpiMaster::instance().appPing(500, &uptime, &ver) == ESP_OK) {
                 OtaRelay::setGd32AppAlive(true);
                 OtaRelay::setGd32Version(ver);
+                ping_attempts = 0;  /* 成功后重置，允许后续更新 */
             } else {
                 OtaRelay::setGd32AppAlive(false);
+                if (ping_attempts >= 5) {
+                    DEBUG_WARN("STATUS", "GD32 版本号读取失败，已达最大重试次数 (5)，停止尝试");
+                }
             }
         }
     }
@@ -1502,7 +1519,7 @@ bool WifiOta::earlyInit()
             nvs_erase_all(nvs_handle);
             nvs_commit(nvs_handle);
             nvs_close(nvs_handle);
-            DEBUG_INFO("WIFI", "冷启动: 已清除 WiFi NVS 缓存 (nvs.net80211)");
+            DEBUG_DBG("WIFI", "冷启动: 已清除 WiFi NVS 缓存 (nvs.net80211)");
         } else {
             DEBUG_INFO("WIFI", "冷启动: 无 WiFi NVS 缓存分区，跳过清除");
         }
@@ -1512,7 +1529,7 @@ bool WifiOta::earlyInit()
             nvs_erase_all(nvs_handle);
             nvs_commit(nvs_handle);
             nvs_close(nvs_handle);
-            DEBUG_INFO("WIFI", "冷启动: 已清除 PHY 校准缓存，将重新校准");
+            DEBUG_DBG("WIFI", "冷启动: 已清除 PHY 校准缓存，将重新校准");
         }
     }
 
@@ -1522,7 +1539,7 @@ bool WifiOta::earlyInit()
         if (mtx) {
             // 通过临时获取再赋值（私有成员在同类内可访问）
             WifiOta::instance().m_stateMutex = mtx;
-            DEBUG_INFO("WIFI", "状态互斥锁已创建");
+            DEBUG_DBG("WIFI", "状态互斥锁已创建");
         } else {
             DEBUG_ERR("WIFI", "创建状态互斥锁失败");
         }
@@ -1542,14 +1559,14 @@ bool WifiOta::earlyInit()
         if (ret != pdPASS) {
             DEBUG_ERR("WIFI", "创建重连任务失败");
         } else {
-            DEBUG_INFO("WIFI", "WiFi 重连任务已创建");
+            DEBUG_DBG("WIFI", "WiFi 重连任务已创建");
         }
     }
 
     // 注册 WiFi/IP 事件回调（必须在 esp_wifi_init 之前）
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiOta::wifiEventHandler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &WifiOta::wifiEventHandler, NULL));
-    DEBUG_INFO("WIFI", "WiFi/IP 事件回调已注册");
+    DEBUG_DBG("WIFI", "WiFi/IP 事件回调已注册");
 
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta_netif == NULL) {
@@ -1557,11 +1574,17 @@ bool WifiOta::earlyInit()
         if (sta_netif == NULL) {
             DEBUG_ERR("WIFI", "创建 STA netif 失败");
         } else {
-            DEBUG_INFO("WIFI", "STA netif 已创建");
+            DEBUG_DBG("WIFI", "STA netif 已创建");
         }
     } else {
         DEBUG_INFO("WIFI", "STA netif 已存在，跳过创建");
     }
+
+    // ★ 压制 WiFi 框架内部 INFO 日志（pp/net80211/wifi/wifi_init 等 tag 大量启动打印）
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    esp_log_level_set("wifi_init", ESP_LOG_WARN);
+    esp_log_level_set("pp", ESP_LOG_WARN);
+    esp_log_level_set("net80211", ESP_LOG_WARN);
 
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));

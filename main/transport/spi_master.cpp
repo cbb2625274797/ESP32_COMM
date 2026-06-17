@@ -285,13 +285,18 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
  */
 esp_err_t SpiMaster::init()
 {
-    LockGuard lock(m_mutex);
-    // 创建 SPI 总线互斥锁（必须在 SPI 设备初始化之前）
-    m_mutex = xSemaphoreCreateMutex();
-    if (m_mutex == NULL) {
-        DEBUG_ERR("SPI", "SPI 互斥锁创建失败");
-        return ESP_ERR_NO_MEM;
+    // ★ 修复：先创建 mutex，再使用 LockGuard。
+    //   旧代码在 LockGuard 构造时 m_mutex 仍为 NULL，
+    //   虽然 LockGuard 会跳过 NULL take/give，但在极端情况下
+    //   其他任务可能在 mutex 创建后立即尝试 take，产生竞态。
+    if (!m_mutex) {
+        m_mutex = xSemaphoreCreateMutex();
+        if (m_mutex == NULL) {
+            DEBUG_ERR("SPI", "SPI 互斥锁创建失败");
+            return ESP_ERR_NO_MEM;
+        }
     }
+    LockGuard lock(m_mutex);
 
     DEBUG_INFO("SPI", "=== 初始化 SPI2 总线 ===");
 
@@ -560,7 +565,6 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
 {
     LockGuard lock(m_mutex);
     constexpr uint8_t kAppPingType = 0xA1U;
-    constexpr size_t kAppPingPollBytes = 32U;
 
     uint8_t tx_frame[8] = {0};
     size_t tx_len = 0U;
@@ -574,7 +578,14 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
     while (xTaskGetTickCount() <= deadline) {
         ++attempt;
 
-        esp_err_t err = transferClocked(tx_frame, tx_len, NULL, 0U);
+        /* 发送 PING 帧，填充至 16 字节：
+         * GD32 SPI 从机可能在 CS 断言时丢失首字节（EXTI/SPI 中断竞态），
+         * 填充确保即使首字节丢失，后续仍有完整 0xA5 帧头可供扫描定位。 */
+        uint8_t tx_padded[16];
+        memset(tx_padded, 0xFF, sizeof(tx_padded));
+        memcpy(tx_padded, tx_frame, tx_len);  /* [0..4]=PING帧, [5..15]=0xFF */
+
+        esp_err_t err = transferClocked(tx_padded, sizeof(tx_padded), NULL, 0U);
         if (err != ESP_OK) {
             DEBUG_DBG("SPI", "APP PING 请求发送失败[%lu]: %s",
                       (unsigned long)attempt, esp_err_to_name(err));
@@ -583,10 +594,10 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
         }
 
         /* 给 GD32 充足时间处理 CS 释放中断并准备响应帧 */
-        vTaskDelay(pdMS_TO_TICKS(3));
+        vTaskDelay(pdMS_TO_TICKS(10));
 
-        uint8_t rx_raw[kAppPingPollBytes];
-        uint8_t dummy[kAppPingPollBytes];
+        uint8_t rx_raw[48];  /* 增大缓冲区，吸收 SPI 字节偏移 */
+        uint8_t dummy[48];
         memset(dummy, 0xFF, sizeof(dummy));
         memset(rx_raw, 0xFF, sizeof(rx_raw));
 

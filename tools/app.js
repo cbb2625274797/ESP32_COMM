@@ -507,8 +507,8 @@ function updateSystemStatusUi(data) {
   document.getElementById('pillRelayTxt').textContent = relayText;
   var pr = document.getElementById('pillRelay');
   if (rs === 255) pr.className = 'pill offline';
-  else if (rs > 0 && rs < 17) pr.className = 'pill processing';
-  else if (rs === 17 || rs === 18) pr.className = 'pill online';
+  else if (rs > 0 && rs < 5) pr.className = 'pill processing';
+  else if (rs === 5) pr.className = 'pill online';
   else pr.className = 'pill idle';
   // OTA cache progress (GD32 upload to ESP32 flash)
   var total = ota.total_size || 0;
@@ -524,44 +524,39 @@ function updateSystemStatusUi(data) {
   var relayTotal = ota.relay_total_packets || 0;
   var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
   var gd32AppAlive = ota.gd32_app_alive;
-  if (rs > 0 && rs <= 8) {
-    // Authentication or size negotiation phase
+  // ★ 修复：后端实际状态机枚举 (main/relay/ota_relay.h)：
+  //   0=RELAY_IDLE, 1=RELAY_HANDSHAKING, 2=RELAY_SIZE_NEG,
+  //   3=RELAY_TRANSFERRING, 4=RELAY_FINISHING, 5=RELAY_DONE, 0xFF=RELAY_ERROR
+  //   旧版 1-18 范围判断已与新状态机不匹配，进度条永远停在认证中阶段。
+  if (rs === 1) {
+    // HANDSHAKING: 握手 + 挑战认证
     setActivePhase('gd32Relay');
-    if (rs <= 6) {
-      setProgress(0, '认证中: ' + (relayStateDetailMap[rs] || ''));
-    } else {
-      setProgress(0, '协商固件大小...');
-    }
-  } else if (rs >= 9 && rs <= 13) {
-    // Active data forwarding
+    setProgress(0, '握手与认证中...');
+  } else if (rs === 2) {
+    // SIZE_NEG: 固件大小协商
+    setActivePhase('gd32Relay');
+    setProgress(0, '协商固件大小...');
+  } else if (rs === 3) {
+    // TRANSFERRING: 数据包传输
     setActivePhase('gd32Relay');
     setProgress(relayProgress, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
-  } else if (rs >= 14 && rs <= 15) {
-    // Transfer complete
-    setActivePhase('gd32Relay');
-    setProgress(100, '数据转发完成 (' + relayTotal + ' 包)');
-  } else if (rs === 16) {
-    // OTA end sent
-    setActivePhase('gd32Relay');
-    setProgress(100, 'OTA 刷写中...');
-  } else if (rs === 17) {
-    // OTA complete
-    setActivePhase('gd32Relay');
-    setProgress(100, 'OTA 完成，等待 APP 启动...');
-  } else if (rs === 18) {
-    // APP verify phase
+  } else if (rs === 4) {
+    // FINISHING: 结束OTA + APP存活验证
     setActivePhase('gd32Relay');
     if (gd32AppAlive) {
       markPhaseDone('gd32Relay');
       setProgress(100, 'GD32 刷写完成');
-      // Mark status bar as success
       var sb = document.getElementById('stageStatusBar');
       var st = document.getElementById('stageStatusText');
       if (sb) sb.className = 'stage-status-bar ok';
       if (st) st.textContent = 'GD32 刷写完成';
     } else {
-      setProgress(100, '转发完成，验证 APP 存活...');
+      setProgress(100, '收尾中，等待 APP 启动...');
     }
+  } else if (rs === 5) {
+    // DONE: 中继完成（metaClear 已清空，relaySeq/relayTotal 会被 reset 为 0）
+    setActivePhase('gd32Relay');
+    setProgress(100, 'OTA 完成');
   } else if (total > 0 && stored < total && !isUploading) {
     // GD32 upload to cache in progress (handled by upload progress if uploading)
     setActivePhase('gd32Upload');

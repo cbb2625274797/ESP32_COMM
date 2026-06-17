@@ -420,8 +420,6 @@ ota_result_t OtaRelay::forwardFirmware()
     }
 
     // 全局超时计算
-    // ★ 收敛到 1 min：30.8 KB / 30 KB·s ≈ 1 s 数据 + 握手/认证/等待 ≈ 2~3 s，
-    //   1 min 已是数十倍安全余量。旧 10 min 会在中继异常时把协调器锁住极久。
     constexpr uint32_t kMinGlobalTimeoutMs = 20U * 1000U;        // 20 s 最小超时
     constexpr uint32_t kMaxGlobalTimeoutMs = 60U * 1000U;        // 60 s 硬上限
     uint32_t dynamic_ms = kMinGlobalTimeoutMs + (meta.total_size / 1024U) * 50U;  // 50 ms / KB
@@ -444,10 +442,6 @@ ota_result_t OtaRelay::forwardFirmware()
     if (res != OTA_RESULT_OK) goto cleanup;
 
     // 步骤2: SIZE_NEG（内部完成大小协商 → TRANSFERRING）
-    // ★ 此处检查在 SIZE_NEG handler 执行之前。从日志看握手刚完成（~0.6 s）就触发超限，
-    //   真实根因：handleSizeNeg 是同步阻塞的——它本身就会跑完整个 doSendFirmwareSize，
-    //   真正的"步骤2 超限"应在 handler 之后检查。修复：把"前已超限"检查全部删除，
-    //   改为在 processEvent 之后用 deadline 校验返回值。handler 内部已经有自己的超时。
     res = processEvent(RELAY_EVT_START, nullptr, 0);
     if (res != OTA_RESULT_OK) goto cleanup;
 

@@ -174,8 +174,12 @@ private:
     OtaCoordinator& operator=(const OtaCoordinator&) = delete;
 
     // 线程安全辅助
-    void lock();
-    void unlock();
+    // ★ lock() 返回是否成功 take；unlock(handle) 据此决定是否 give。
+    //   旧实现用共享 bool m_locked 记录 take 结果，多任务并发 lock() 时
+    //   超时方会把 m_locked 置 false，覆盖持锁方的 true，导致 unlock() 跳过 give，
+    //   mutex 永久死锁 → 后续 take 超时触发 vTaskPriorityDisinherit assert → PANIC。
+    bool lock();
+    void unlock(bool handle);
 
     // ★ 卡死自愈检查：若忙状态停留超过 watchdog 超时，强制转为 ERROR。
     //   用于在中继 task 因任何原因（崩溃/SPI 死锁/看门狗复位残留）未能回调
@@ -194,7 +198,6 @@ private:
 
     // 互斥锁
     SemaphoreHandle_t m_mutex = nullptr;
-    bool              m_locked = false;  // ★ 记录最近一次 lock() 是否成功 take;unlock() 据此跳过错误 give
     static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(100);
 
     // ★ 忙状态 watchdog 超时。GD32 中继理论最大耗时 ≈ 60s(全局超时) + 15s(APP存活轮询) + 1s(bootloader) ≈ 76s，

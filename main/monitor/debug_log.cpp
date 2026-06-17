@@ -196,7 +196,7 @@ esp_err_t DebugLog::uartInit()
     }
 
     m_uartInitialized = true;
-    ESP_LOGI(TAG, "UART0 调试输出已初始化 (TX=GPIO%d, RX=GPIO%d, %d baud)",
+    ESP_LOGD(TAG, "UART0 调试输出已初始化 (TX=GPIO%d, RX=GPIO%d, %d baud)",
              UART_DEBUG_TX_GPIO, UART_DEBUG_RX_GPIO, UART_DEBUG_BAUD_RATE);
 
     return ESP_OK;
