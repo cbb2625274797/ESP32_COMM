@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 OTA 中继控制台</title>
-<link rel="stylesheet" href="style.css?v=20260614c">
+<link rel="stylesheet" href="style.css?v=20260617a">
 </head>
 <body>
 <div class="container">
@@ -162,11 +162,8 @@
             </button>
           </div>
           <div id="wifiGd32ActionPane" style="display:none;">
-            <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled style="margin-bottom:8px;">
-              上传固件到缓存
-            </button>
-            <button class="btn btn-outline btn-block" id="relayBtn" onclick="triggerRelay()">
-              触发 GD32 OTA 中继
+            <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled>
+              GD32 OTA
             </button>
           </div>
           <div class="row-2" id="bleActionPane" style="display:none;">
@@ -184,8 +181,7 @@
           <!-- Phase step indicators -->
           <div class="progress-phase-row">
             <div class="pp-step active" id="ppEsp32"><span class="pp-ico">📦</span><span class="pp-txt">ESP32 OTA</span></div>
-            <div class="pp-step" id="ppGd32Up"><span class="pp-ico">📤</span><span class="pp-txt">GD32 上传</span></div>
-            <div class="pp-step" id="ppGd32Relay"><span class="pp-ico">🔀</span><span class="pp-txt">GD32 转发</span></div>
+            <div class="pp-step" id="ppGd32Ota"><span class="pp-ico">📤</span><span class="pp-txt">GD32 OTA</span></div>
           </div>
           <!-- Unified progress bar -->
           <div class="progress-wrap show" id="progressWrap">
@@ -374,7 +370,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260614f"></script>
+<script src="app.js?v=20260617b"></script>
 <script>
 window.connectionMode = window.connectionMode || 'wifi';
 window.flashTarget = window.flashTarget || 'esp32';
@@ -423,7 +419,7 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
         window.bleOta.refreshButtons();
       }
     } else {
-      window.switchStageFlow(window.activePhase === 'esp32Ota' ? 'esp32' : 'gd32');
+      window.switchStageFlow(window.flashTarget || (window.activePhase === 'esp32Ota' ? 'esp32' : 'gd32'));
     }
   };
 
@@ -610,7 +606,7 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
       if (isBle) {
         hint.innerHTML = 'BLE 模式：连接设备 → 选择固件 → 一键刷写。';
       } else if (isGd32) {
-        hint.innerHTML = 'WiFi 模式：上传 GD32 固件到缓存后，再触发 SPI OTA 中继。';
+        hint.innerHTML = 'WiFi 模式：上传 GD32 固件后自动执行 SPI OTA。';
       } else {
         hint.innerHTML = 'WiFi 模式：上传 ESP32 固件后自动执行 OTA 并重启。';
       }
@@ -620,7 +616,6 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   applySharedModeUi();
 })();
 </script>
-<script src="ble_ota.js?v=20260614f"></script>
+<script src="ble_ota.js?v=20260617b"></script>
 </body>
 </html>
-

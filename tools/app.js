@@ -19,7 +19,7 @@ function toggleCollapse(headEl) {
   headEl.closest('.card').classList.toggle('collapsed');
 }
 // ==================== 刷写进度 ====================
-var activePhase = null;  // 'esp32Ota' | 'gd32Upload' | 'gd32Relay' | null
+var activePhase = null;  // 'esp32Ota' | 'gd32Ota' | null
 var currentOtaTarget = null;  // 'esp32' | 'gd32' | null — 当前 OTA 目标，决定显示哪套阶段
 // 切换 OTA 阶段面板显示
 function switchStageFlow(target) {
@@ -103,8 +103,9 @@ function showVerifyActions(type) {
 }
 
 function setActivePhase(phase) {
+  if (phase === 'gd32Upload' || phase === 'gd32Relay') phase = 'gd32Ota';
   activePhase = phase;
-  var stepMap = { esp32Ota: 'ppEsp32', gd32Upload: 'ppGd32Up', gd32Relay: 'ppGd32Relay' };
+  var stepMap = { esp32Ota: 'ppEsp32', gd32Ota: 'ppGd32Ota' };
   Object.keys(stepMap).forEach(function(p) {
     var el = document.getElementById(stepMap[p]);
     if (!el) return;
@@ -116,11 +117,12 @@ function setActivePhase(phase) {
   if (fill) fill.classList.remove('done');
 }
 function markPhaseDone(phase) {
-  var stepMap = { esp32Ota: 'ppEsp32', gd32Upload: 'ppGd32Up', gd32Relay: 'ppGd32Relay' };
+  if (phase === 'gd32Upload' || phase === 'gd32Relay') phase = 'gd32Ota';
+  var stepMap = { esp32Ota: 'ppEsp32', gd32Ota: 'ppGd32Ota' };
   var el = document.getElementById(stepMap[phase]);
   if (el) { el.classList.remove('active'); el.classList.add('done'); }
   // All done? turn progress bar green
-  if (phase === 'gd32Relay' || phase === 'esp32Ota') {
+  if (phase === 'gd32Ota' || phase === 'esp32Ota') {
     var fill = document.getElementById('progressFill');
     if (fill) fill.classList.add('done');
   }
@@ -138,7 +140,7 @@ function resetProgress() {
   activePhase = null;
   esp32OtaPhase = 0;
   switchStageFlow(null);
-  ['ppEsp32', 'ppGd32Up', 'ppGd32Relay'].forEach(function(id) {
+  ['ppEsp32', 'ppGd32Ota'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) el.classList.remove('active', 'done');
   });
@@ -361,23 +363,16 @@ function updateHealthUi(healthCode, freeHeap) {
   }
 }
 // ==================== OTA 阶段驱动 (真实状态) ====================
-// Relay state → 6-stage mapping:
-//   Stage 1 (认证握手): rs 1-6  握手/挑战/会话密钥/认证
-//   Stage 2 (传输协商): rs 7-8  固件大小协商
-//   Stage 3 (数据转发): rs 9-13 数据包收发/ACK/重发
-//   Stage 4 (传输完成): rs 14-15 数据接收完毕
-//   Stage 5 (OTA刷写):  rs 16-17 OTA 结束/完成
-//   Stage 6 (校验验证): rs 18    APP 校验
-//   Error:              rs 255
+// Relay state comes from relay_state_t in main/relay/ota_relay.h:
+//   0=IDLE, 1=HANDSHAKING, 2=SIZE_NEG, 3=TRANSFERRING,
+//   4=FINISHING, 5=DONE, 255=ERROR.
 var relayStateDetailMap = {
   0: '待机',
-  1: '等待握手', 2: '握手已发', 3: '挑战已发',
-  4: '收到握手响应', 5: '会话密钥已发', 6: '认证完成',
-  7: '大小已发', 8: '大小确认',
-  9: '接收中', 10: '转发中', 11: '数据包已发', 12: 'ACK正常', 13: '等待重发',
-  14: '接收完成', 15: '传输完成',
-  16: '结束已发', 17: 'OTA完成',
-  18: 'APP验证',
+  1: '认证握手',
+  2: '传输协商',
+  3: '数据转发',
+  4: '收尾验证',
+  5: 'OTA完成',
   255: '错误'
 };
 function updateStagesFromRelayState(rs) {
@@ -403,16 +398,17 @@ function updateStagesFromRelayState(rs) {
     return;
   }
   var activeStage = 0;
-  if (rs >= 1 && rs <= 6) activeStage = 1;
-  else if (rs >= 7 && rs <= 8) activeStage = 2;
-  else if (rs >= 9 && rs <= 13) activeStage = 3;
-  else if (rs >= 14 && rs <= 15) activeStage = 4;
-  else if (rs >= 16 && rs <= 17) activeStage = 5;
-  else if (rs >= 18 && rs <= 18) activeStage = 6;
+  if (rs === 1) activeStage = 1;
+  else if (rs === 2) activeStage = 2;
+  else if (rs === 3) activeStage = 3;
+  else if (rs === 4) activeStage = 5;
+  else if (rs === 5) activeStage = 6;
   for (var i = 0; i < activeStage - 1; i++) {
     if (all[i]) all[i].className = 'stage-node done';
   }
-  if (activeStage >= 1 && activeStage <= 6) {
+  if (rs === 5) {
+    if (all[5]) all[5].className = 'stage-node done';
+  } else if (activeStage >= 1 && activeStage <= 6) {
     if (all[activeStage - 1]) all[activeStage - 1].className = 'stage-node live';
   }
   // Show detail text for the active stage
@@ -503,75 +499,97 @@ function updateSystemStatusUi(data) {
     return;
   }
   var rs = ota.relay_state;
-  var relayText = relayStateDetailMap[rs] || '待机';
+  var sysState = ota.sys_state || '';
+  var sysStateCode = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
+  var isGd32Storing = sysState === 'GD32_STORING' || sysStateCode === 1;
+  var isGd32Relaying = sysState === 'GD32_RELAYING' || sysStateCode === 3;
+  var isGd32Complete = sysState === 'GD32_COMPLETE' || sysStateCode === 4;
+  var isGd32Error = sysState === 'ERROR' || sysStateCode === 8 || rs === 255;
+  var relayText = isGd32Complete ? 'GD32 OTA 完成'
+    : isGd32Storing ? 'GD32 OTA 上传中'
+    : (relayStateDetailMap[rs] || '待机');
   document.getElementById('pillRelayTxt').textContent = relayText;
   var pr = document.getElementById('pillRelay');
-  if (rs === 255) pr.className = 'pill offline';
-  else if (rs > 0 && rs < 5) pr.className = 'pill processing';
-  else if (rs === 5) pr.className = 'pill online';
+  if (isGd32Error) pr.className = 'pill offline';
+  else if (isGd32Complete || rs === 5) pr.className = 'pill online';
+  else if (isGd32Storing || isGd32Relaying || (rs > 0 && rs < 5)) pr.className = 'pill processing';
   else pr.className = 'pill idle';
   // OTA cache progress (GD32 upload to ESP32 flash)
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
   var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
   var bp = document.getElementById('bOTAProgress');
-  if (bp) {
-    bp.textContent = storageProgress + '%';
-    bp.className = 'v ' + (storageProgress === 100 ? 'ok' : storageProgress > 0 ? 'warn' : '');
+  function setOtaProgressBadge(pct) {
+    var safePct = Math.max(0, Math.min(100, Math.round(pct || 0)));
+    if (bp) {
+      bp.textContent = safePct + '%';
+      bp.className = 'v ' + (safePct >= 100 ? 'ok' : safePct > 0 ? 'warn' : '');
+    }
   }
   // GD32 relay forwarding progress
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
   var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
   var gd32AppAlive = ota.gd32_app_alive;
-  // ★ 修复：后端实际状态机枚举 (main/relay/ota_relay.h)：
-  //   0=RELAY_IDLE, 1=RELAY_HANDSHAKING, 2=RELAY_SIZE_NEG,
-  //   3=RELAY_TRANSFERRING, 4=RELAY_FINISHING, 5=RELAY_DONE, 0xFF=RELAY_ERROR
-  //   旧版 1-18 范围判断已与新状态机不匹配，进度条永远停在认证中阶段。
-  if (rs === 1) {
+  var displayRelayState = isGd32Complete ? 5 : (isGd32Relaying && rs === 0 ? 1 : rs);
+  if (currentOtaTarget !== 'esp32') { updateStagesFromRelayState(displayRelayState); }
+
+  if (isGd32Error) {
+    setActivePhase('gd32Ota');
+    setOtaProgressBadge(0);
+    setProgress(0, 'GD32 OTA 失败');
+  } else if (isGd32Complete || rs === 5 || (gd32AppAlive && sysState === 'GD32_COMPLETE')) {
+    markPhaseDone('gd32Ota');
+    setOtaProgressBadge(100);
+    setProgress(100, 'GD32 刷写完成');
+    var sbDone = document.getElementById('stageStatusBar');
+    var stDone = document.getElementById('stageStatusText');
+    if (sbDone) sbDone.className = 'stage-status-bar ok';
+    if (stDone) stDone.textContent = 'GD32 刷写完成';
+  } else if (isGd32Storing || (total > 0 && stored < total && !isUploading)) {
+    setActivePhase('gd32Ota');
+    var storeOverall = Math.min(45, Math.round(storageProgress * 0.45));
+    setOtaProgressBadge(storeOverall);
+    if (!isUploading) {
+      setProgress(storeOverall, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
+    }
+  } else if (rs === 1) {
     // HANDSHAKING: 握手 + 挑战认证
-    setActivePhase('gd32Relay');
-    setProgress(0, '握手与认证中...');
+    setActivePhase('gd32Ota');
+    setOtaProgressBadge(50);
+    setProgress(50, '握手与认证中...');
   } else if (rs === 2) {
     // SIZE_NEG: 固件大小协商
-    setActivePhase('gd32Relay');
-    setProgress(0, '协商固件大小...');
+    setActivePhase('gd32Ota');
+    setOtaProgressBadge(55);
+    setProgress(55, '协商固件大小...');
   } else if (rs === 3) {
     // TRANSFERRING: 数据包传输
-    setActivePhase('gd32Relay');
-    setProgress(relayProgress, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
+    setActivePhase('gd32Ota');
+    var relayOverall = 60 + Math.round(relayProgress * 0.30);
+    setOtaProgressBadge(relayOverall);
+    setProgress(relayOverall, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
   } else if (rs === 4) {
     // FINISHING: 结束OTA + APP存活验证
-    setActivePhase('gd32Relay');
+    setActivePhase('gd32Ota');
+    setOtaProgressBadge(95);
     if (gd32AppAlive) {
-      markPhaseDone('gd32Relay');
+      markPhaseDone('gd32Ota');
       setProgress(100, 'GD32 刷写完成');
       var sb = document.getElementById('stageStatusBar');
       var st = document.getElementById('stageStatusText');
       if (sb) sb.className = 'stage-status-bar ok';
       if (st) st.textContent = 'GD32 刷写完成';
     } else {
-      setProgress(100, '收尾中，等待 APP 启动...');
+      setProgress(95, '收尾中，等待 APP 启动...');
     }
-  } else if (rs === 5) {
-    // DONE: 中继完成（metaClear 已清空，relaySeq/relayTotal 会被 reset 为 0）
-    setActivePhase('gd32Relay');
-    setProgress(100, 'OTA 完成');
-  } else if (total > 0 && stored < total && !isUploading) {
-    // GD32 upload to cache in progress (handled by upload progress if uploading)
-    setActivePhase('gd32Upload');
-    setProgress(storageProgress, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
-  } else if (gd32AppAlive && rs === 0 && total > 0 && stored >= total) {
-    // Relay finished and reset, but APP is alive → truly done
-    markPhaseDone('gd32Relay');
-    setProgress(100, 'GD32 刷写完成');
-    var sb2 = document.getElementById('stageStatusBar');
-    var st2 = document.getElementById('stageStatusText');
-    if (sb2) sb2.className = 'stage-status-bar ok';
-    if (st2) st2.textContent = 'GD32 刷写完成';
+  } else if (total > 0 && stored >= total) {
+    setActivePhase('gd32Ota');
+    setOtaProgressBadge(45);
+    setProgress(45, '上传完成，等待自动启动 GD32 OTA...');
+  } else {
+    setOtaProgressBadge(storageProgress);
   }
-  // stage flow from real state
-  if (currentOtaTarget !== 'esp32') { updateStagesFromRelayState(rs); }
 }
 async function testConnection() {
   // 如果在降速模式，先恢复正常轮询
@@ -876,51 +894,61 @@ function isIntelHexText(text) {
   }
   return false;
 }
+/**
+ * 公共 HEX→BIN 转换：如果文件是 .hex 格式，自动解析为 bin。
+ * BLE / WiFi 共用此函数，避免转换逻辑重复。
+ * @param {File} file 原始文件
+ * @returns {Promise<{file: File, converted: boolean, baseAddr: number|null}>}
+ */
+async function convertHexFileToBin(file) {
+  if (!file || !file.name.toLowerCase().endsWith('.hex')) {
+    return { file: file, converted: false, baseAddr: null };
+  }
+  var text = await file.text();
+  if (!isIntelHexText(text)) {
+    return { file: file, converted: false, baseAddr: null };
+  }
+  var result = parseIntelHex(text);
+  var binName = file.name.replace(/\.hex$/i, '.bin');
+  var binBlob = new Blob([result.data], { type: 'application/octet-stream' });
+  var binFile = new File([binBlob], binName, { type: 'application/octet-stream', lastModified: file.lastModified });
+  return { file: binFile, converted: true, baseAddr: result.baseAddr, endAddr: result.endAddr };
+}
 // ==================== 文件处理 ====================
 function processFile(file, chip) {
   var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
   var isHexByName = file.name.toLowerCase().endsWith('.hex');
   if (chip === 'gd32' && isHexByName) {
     // GD32 固件: .hex 文件自动转换为 .bin，然后替换文件对象
-    var reader = new FileReader();
-    reader.onload = function (e) {
-      try {
-        var text = e.target.result;
-        // 二次确认: 内容也像 HEX
-        if (!isIntelHexText(text)) {
-          // 文件名 .hex 但内容不像，直接用原始文件
-          addLog('W', '文件', file.name + ' 扩展名为 .hex 但内容不像 HEX 格式，按原始文件处理');
-          gd32File = file;
-          document.getElementById('fileInfo' + suffix).classList.add('show');
-          document.getElementById('fileName' + suffix).textContent = file.name;
-          document.getElementById('fileType' + suffix).textContent = 'Binary(?)';
-          document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
-          updateUploadButtonLabel();
-          return;
-        }
-        var result = parseIntelHex(text);
-        var binName = file.name.replace(/\.hex$/i, '.bin');
-        var binBlob = new Blob([result.data], { type: 'application/octet-stream' });
-        var binFile = new File([binBlob], binName, { type: 'application/octet-stream' });
-        gd32File = binFile;
-        var baseHex = '0x' + result.baseAddr.toString(16).toUpperCase().padStart(8, '0');
-        addLog('I', '文件', 'HEX → BIN 转换完成: ' + file.name + ' → ' + binName);
-        addLog('I', '文件', '基地址: ' + baseHex + ', 数据大小: ' + formatBytes(result.data.length));
-        showToast('HEX 已自动转换为 BIN', 'success');
+    convertHexFileToBin(file).then(function(result) {
+      if (!result.converted) {
+        // 文件名 .hex 但内容不像，直接用原始文件
+        addLog('W', '文件', file.name + ' 扩展名为 .hex 但内容不像 HEX 格式，按原始文件处理');
+        gd32File = file;
         document.getElementById('fileInfo' + suffix).classList.add('show');
-        document.getElementById('fileName' + suffix).textContent = binName + ' (由 ' + file.name + ' 转换)';
-        document.getElementById('fileType' + suffix).textContent = 'Binary (HEX转换)';
-        document.getElementById('fileSize' + suffix).textContent = formatBytes(result.data.length);
+        document.getElementById('fileName' + suffix).textContent = file.name;
+        document.getElementById('fileType' + suffix).textContent = 'Binary(?)';
+        document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
         updateUploadButtonLabel();
-      } catch (err) {
-        addLog('E', '文件', 'HEX 解析失败: ' + err.message);
-        showToast('HEX 文件解析失败: ' + err.message, 'error');
-        gd32File = null;
-        document.getElementById('fileInfo' + suffix).classList.remove('show');
-        updateUploadButtonLabel();
+        return;
       }
-    };
-    reader.readAsText(file);
+      gd32File = result.file;
+      var baseHex = '0x' + result.baseAddr.toString(16).toUpperCase().padStart(8, '0');
+      addLog('I', '文件', 'HEX → BIN 转换完成: ' + file.name + ' → ' + result.file.name);
+      addLog('I', '文件', '基地址: ' + baseHex + ', 数据大小: ' + formatBytes(result.file.size));
+      showToast('HEX 已自动转换为 BIN', 'success');
+      document.getElementById('fileInfo' + suffix).classList.add('show');
+      document.getElementById('fileName' + suffix).textContent = result.file.name + ' (由 ' + file.name + ' 转换)';
+      document.getElementById('fileType' + suffix).textContent = 'Binary (HEX转换)';
+      document.getElementById('fileSize' + suffix).textContent = formatBytes(result.file.size);
+      updateUploadButtonLabel();
+    }).catch(function(err) {
+      addLog('E', '文件', 'HEX 解析失败: ' + err.message);
+      showToast('HEX 文件解析失败: ' + err.message, 'error');
+      gd32File = null;
+      document.getElementById('fileInfo' + suffix).classList.remove('show');
+      updateUploadButtonLabel();
+    });
     return; // 异步，回调里设置 gd32File
   }
   // .bin 文件或 ESP32 文件: 直接使用
@@ -1010,7 +1038,7 @@ async function startUpload(chip) {
   uploadBtn.disabled = true;
   uploadBtn.textContent = '上传中...';
   switchStageFlow(chip);
-  setActivePhase(chip === 'esp32' ? 'esp32Ota' : 'gd32Upload');
+  setActivePhase(chip === 'esp32' ? 'esp32Ota' : 'gd32Ota');
   if (chip === 'esp32') updateEsp32StagesFromPhase(1);
   // Reset verification panel
   var verifyInfo = document.getElementById('stageVerifyInfo');
@@ -1069,9 +1097,16 @@ async function startUpload(chip) {
       if (e.lengthComputable) {
         var pct = Math.round((e.loaded / e.total) * 100);
         uploadProgress = pct;
-        setProgress(pct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
-        var el = document.getElementById('bOTAProgress');
-        if (el) el.textContent = pct + '%';
+        if (chip === 'gd32') {
+          var overallPct = Math.min(45, Math.round(pct * 0.45));
+          setProgress(overallPct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
+          var el = document.getElementById('bOTAProgress');
+          if (el) el.textContent = overallPct + '%';
+        } else {
+          setProgress(pct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
+          var el = document.getElementById('bOTAProgress');
+          if (el) el.textContent = pct + '%';
+        }
       }
     });
     xhr.addEventListener('load', function () {
@@ -1081,7 +1116,7 @@ async function startUpload(chip) {
       updateUploadButtonLabel();
       if (xhr.status === 200) {
         addLog('I', '上传', '固件上传完成！');
-        showToast('固件上传成功', 'success');
+        showToast(chip === 'gd32' ? '上传完成，GD32 OTA 已自动开始' : '固件上传成功', 'success');
         setProgress(100, '上传完成');
         if (chip === 'esp32') {
           markPhaseDone('esp32Ota');
@@ -1090,9 +1125,8 @@ async function startUpload(chip) {
           verifyEsp32Firmware();
         } else {
           switchStageFlow('gd32');
-          markPhaseDone('gd32Upload');
-          setActivePhase('gd32Relay');
-          setProgress(0, '等待触发转发...');
+          setActivePhase('gd32Ota');
+          setProgress(45, '上传完成，已自动触发 GD32 OTA...');
         }
       } else if (xhr.status === 403) {
         addLog('E', '上传', 'ESP32 OTA 被其他通道占用（BLE/WiFi 互斥），请稍后重试');
@@ -1271,20 +1305,20 @@ async function restartEsp32() {
     showToast('重启失败', 'error');
   }
 }
-// ==================== 触发 OTA 中继 (真实状态驱动) ====================
+// ==================== 手动触发 GD32 OTA (调试/旧页面兜底) ====================
 async function triggerRelay() {
-  addLog('I', 'OTA', '触发 GD32 OTA 中继...');
-  showToast('正在触发 OTA 中继', 'success');
+  addLog('I', 'OTA', '手动触发 GD32 OTA...');
+  showToast('正在触发 GD32 OTA', 'success');
   try {
     var resp = await fetch(getBaseUrl() + '/ota/relay', {
       method: 'POST', signal: AbortSignal.timeout(5000)
     });
     if (resp.ok) {
-      addLog('I', 'OTA', 'OTA 中继已触发，等待 GD32 响应...');
+      addLog('I', 'OTA', 'GD32 OTA 已触发，等待设备响应...');
       // 不再使用假的 setTimeout 推进阶段。
       // pollStatus 的 updateSystemStatusUi 会从 ota.relay_state
       // 自动更新 stage flow 和 header 状态。
-      showToast('中继已触发，等待设备响应', 'success');
+      showToast('GD32 OTA 已触发，等待设备响应', 'success');
     } else {
       addLog('E', 'OTA', '触发失败: HTTP ' + resp.status);
       showToast('触发失败', 'error');
@@ -1463,4 +1497,3 @@ setTimeout(function () {
     });
   }
 }, 500);
-

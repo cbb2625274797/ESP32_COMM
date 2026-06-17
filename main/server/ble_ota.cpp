@@ -9,7 +9,7 @@
  *
  * GATT 服务:
  *   Service UUID: 0xFFFF
- *   - CTRL (0x0001, Write):     0xF7=触发GD32中继, 0xF8=触发ESP32 OTA升级（含 32B SHA-256 校验并 reboot），0xFA=重启ESP32
+ *   - CTRL (0x0001, Write):     0xF7=触发GD32中继（含 32B SHA-256 校验）, 0xF8=触发ESP32 OTA升级（含 32B SHA-256 校验并 reboot），0xFA=重启ESP32
  *   - DATA_IN (0x0002, Write):  cmd=0x00=GD32数据, cmd=0x01=ESP32数据
  *   - DATA_OUT (0x0003, Notify): 推送响应
  *   - VERSION (0x0004, Read):   固件版本
@@ -53,12 +53,15 @@
 #define BLE_OTA_NOTIFY_SHA256 0xC1   // 设备端 SHA-256 上报（[0xC1] + [32字节]）
 #define BLE_OTA_FINISH_DONE 0x02
 #define BLE_OTA_FINISH_REBOOT_NOW 0x07
+#define BLE_OTA_FINISH_GD32_RELAY_START 0x10
+#define BLE_OTA_FINISH_GD32_RELAY_DONE 0x11
 #define BLE_OTA_FINISH_ERR_FINALIZE 0x81
 #define BLE_OTA_ACK_WINDOW 32
 #define BLE_ATT_ERR_OTA_BUSY 0x80           // ESP32 OTA 被其他通道占用
 #define BLE_OTA_FINISH_ERR_MUTEX 0x83       // 互斥拒绝: OTA 被其他通道占用
 #define BLE_OTA_FINISH_ERR_GD32_SIZE 0x84   // GD32 固件超出分区大小
-#define BLE_OTA_FINISH_ERR_SHA_MISMATCH 0x85 // ESP32 OTA SHA-256 不匹配
+#define BLE_OTA_FINISH_ERR_SHA_MISMATCH 0x85 // OTA SHA-256 不匹配
+#define BLE_OTA_FINISH_ERR_GD32_RELAY 0x86  // GD32 SPI OTA 转发失败
 
 // ── 数据队列：将 OTA 数据处理从 NimBLE host task 卸载到工作线程 ──
 // 避免 flash 操作（esp_ota_begin / esp_ota_write）阻塞 BLE 协议栈导致连接断开。
@@ -70,14 +73,27 @@ struct BleOtaDataBatch {
 };
 static QueueHandle_t s_otaDataQueue = nullptr;
 
+struct BleGd32RelayWaitCtx {
+    uint16_t session_id;
+};
+
+struct BleEsp32FinishCtx {
+    char sha_hex[65];
+    uint16_t session_id;
+};
+
 // ============================================================
 // 前向声明
 // ============================================================
 static void ble_ota_start_advertising(void);
 static void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes);
 static void sendFinishEvent(uint8_t stage, uint32_t value);
+static uint32_t packBleFinishValue(uint16_t session_id, uint16_t code);
+static void shaBytesToHexUpper(const uint8_t sha[32], char out_hex[65]);
+static void sendSha256Notify(const uint8_t sha[32], uint16_t session_id);
 static void esp32_reorder_free();
 static void ble_ota_data_worker_task(void *pvParameters);
+static void ble_gd32_relay_wait_task(void *pvParameters);
 
 // ============================================================
 /**
@@ -118,12 +134,13 @@ static void ble_esp32_restart_task(void *pvParameters)
 
 /**
   * @brief 异步完成 ESP32 OTA 收尾并触发重启。
- * @param pvParameters 前端 SHA-256 十六进制字符串（堆分配，任务负责释放）。
+ * @param pvParameters BleEsp32FinishCtx（堆分配，任务负责释放）。
  */
 static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 {
-    // pvParameters: heap-allocated char[65] frontend SHA hex string (or nullptr)
-    char *frontend_sha_hex = (char *)pvParameters;
+    BleEsp32FinishCtx *ctx = (BleEsp32FinishCtx *)pvParameters;
+    char *frontend_sha_hex = ctx ? ctx->sha_hex : nullptr;
+    uint16_t session_id = ctx ? ctx->session_id : 0;
     DEBUG_INFO(TAG, "ESP32 OTA 异步收尾任务启动");
 
     Esp32OtaCore &core = Esp32OtaCore::instance();
@@ -139,7 +156,9 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 
     if (!core.isActive()) {
         DEBUG_WARN(TAG, "异步收尾时 OTA 状态无效，放弃重启");
-        if (frontend_sha_hex) free(frontend_sha_hex);
+        sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
+                        packBleFinishValue(session_id, 1));
+        if (ctx) free(ctx);
         BleOta::instance().m_esp32RebootPending = false;
         esp32_reorder_free();
         vTaskDelete(NULL);
@@ -163,21 +182,20 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         OtaCoordinator::instance().notifyEsp32FinalizeComplete();
         // 1) 把设备端 SHA 通过 SHA256 通知推给前端
         if (device_sha_hex[0] != '\0') {
-            uint8_t sha_pkt[33] = {0};
-            sha_pkt[0] = BLE_OTA_NOTIFY_SHA256;
+            uint8_t device_sha[32] = {0};
             for (int i = 0; i < 32; ++i) {
                 unsigned int byte = 0;
                 sscanf(&device_sha_hex[i * 2], "%02x", &byte);
-                sha_pkt[1 + i] = (uint8_t)byte;
+                device_sha[i] = (uint8_t)byte;
             }
-            BleOta::instance().notifyResponse(sha_pkt, sizeof(sha_pkt));
+            sendSha256Notify(device_sha, session_id);
         }
         // 2) 等待 SHA 通知从 NimBLE host 队列送出
         vTaskDelay(pdMS_TO_TICKS(150));
 
         // 3) 推送"OTA 收尾完成"与"即将重启"事件
-        sendFinishEvent(BLE_OTA_FINISH_DONE, 0);
-        sendFinishEvent(BLE_OTA_FINISH_REBOOT_NOW, 0);
+        sendFinishEvent(BLE_OTA_FINISH_DONE, packBleFinishValue(session_id, 0));
+        sendFinishEvent(BLE_OTA_FINISH_REBOOT_NOW, packBleFinishValue(session_id, 0));
 
         // 4) 通知全部发出后延迟 500ms 重启
         DEBUG_INFO(TAG, "[FINISH] 通知已发送，500ms 后重启...");
@@ -187,19 +205,20 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         // 不会返回
     } else if (err == ESP_ERR_INVALID_VERSION) {
         DEBUG_ERR(TAG, "[FINISH] SHA-256 不匹配，OTA 已中止");
-        sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH, 0);
+        sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH, packBleFinishValue(session_id, 0));
         BleOta::instance().m_esp32RebootPending = false;
         // ★ finalize 内部已 abort 并释放 mutex，这里释放 reorder buffer
         esp32_reorder_free();
     } else {
         DEBUG_ERR(TAG, "[FINISH] OTA 收尾失败: %s", esp_err_to_name(err));
-        sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)err);
+        sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
+                        packBleFinishValue(session_id, 1));
         BleOta::instance().m_esp32RebootPending = false;
         // ★ finalize 内部已 abort 并释放 mutex，这里释放 reorder buffer
         esp32_reorder_free();
     }
 
-    if (frontend_sha_hex) free(frontend_sha_hex);
+    if (ctx) free(ctx);
     vTaskDelete(NULL);
 }
 
@@ -623,6 +642,66 @@ static void sendFinishEvent(uint8_t stage, uint32_t value)
     }
 }
 
+static uint32_t packBleFinishValue(uint16_t session_id, uint16_t code)
+{
+    return ((uint32_t)code << 16) | (uint32_t)session_id;
+}
+
+static void shaBytesToHexUpper(const uint8_t sha[32], char out_hex[65])
+{
+    if (!sha || !out_hex) return;
+    for (int i = 0; i < 32; ++i) {
+        snprintf(&out_hex[i * 2], 3, "%02X", sha[i]);
+    }
+    out_hex[64] = '\0';
+}
+
+static void sendSha256Notify(const uint8_t sha[32], uint16_t session_id)
+{
+    if (!sha) return;
+
+    uint8_t sha_pkt[35] = {0};
+    sha_pkt[0] = BLE_OTA_NOTIFY_SHA256;
+    memcpy(&sha_pkt[1], sha, 32);
+    sha_pkt[33] = (uint8_t)(session_id & 0xFFU);
+    sha_pkt[34] = (uint8_t)((session_id >> 8) & 0xFFU);
+    BleOta::instance().notifyResponse(sha_pkt, sizeof(sha_pkt));
+}
+
+static void ble_gd32_relay_wait_task(void *pvParameters)
+{
+    BleGd32RelayWaitCtx *ctx = (BleGd32RelayWaitCtx *)pvParameters;
+    uint16_t session_id = ctx ? ctx->session_id : 0;
+    if (ctx) free(ctx);
+
+    uint32_t result_msg = (uint32_t)OTA_RESULT_ERR_TIMEOUT;
+    bool got_result = false;
+    if (OtaRelay::resultQueue) {
+        got_result = (xQueueReceive(OtaRelay::resultQueue, &result_msg, pdMS_TO_TICKS(120000)) == pdTRUE);
+    }
+
+    if (!got_result) {
+        DEBUG_ERR(TAG, "GD32 BLE OTA 等待中继结果超时");
+        sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                        packBleFinishValue(session_id, (uint16_t)(-OTA_RESULT_ERR_TIMEOUT)));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ota_result_t result = (ota_result_t)((int32_t)result_msg);
+    if (result == OTA_RESULT_OK) {
+        DEBUG_INFO(TAG, "GD32 BLE OTA 中继完成，通知前端");
+        sendFinishEvent(BLE_OTA_FINISH_GD32_RELAY_DONE,
+                        packBleFinishValue(session_id, 0));
+    } else {
+        uint16_t code = (uint16_t)(result < 0 ? -result : result);
+        DEBUG_ERR(TAG, "GD32 BLE OTA 中继失败: result=%d", (int)result);
+        sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                        packBleFinishValue(session_id, code));
+    }
+    vTaskDelete(NULL);
+}
+
 
 // ============================================================
 // GATT 访问回调
@@ -661,26 +740,119 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
     DEBUG_INFO(TAG, "CTRL 写入: cmd=0x%02X len=%d", buf[0], len);
 
     if (buf[0] == BLE_OTA_CTRL_TRIGGER_GD32) {
+        uint16_t session_id = 0;
+        if (len >= 35) {
+            session_id = (uint16_t)(buf[33] | (buf[34] << 8));
+        } else if (len >= 3) {
+            session_id = (uint16_t)(buf[1] | (buf[2] << 8));
+        }
+
+        if (len < 35) {
+            DEBUG_WARN(TAG, "CTRL 0xF7 数据长度不足 35（前端 SHA-256 必传），拒绝触发 GD32 中继");
+            sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH,
+                            packBleFinishValue(session_id, 1));
+            return 0;
+        }
+
         // 检查固件是否存储完毕 → 通过协调器触发 GD32 OTA 中继
-        ota_meta_t meta;
+        ota_meta_t meta = {};
         esp_err_t err = OtaRelay::metaLoad(&meta);
         if (err == ESP_OK &&
             meta.total_size > 0 &&
             meta.stored_size >= meta.total_size) {
-            DEBUG_INFO(TAG, "GD32 固件就绪 (%" PRIu32 " / %" PRIu32 " 字节)，通过协调器触发中继",
+            const uint8_t *frontend_sha = &buf[1];
+            char frontend_sha_hex[65] = {0};
+            char device_sha_hex[65] = {0};
+            shaBytesToHexUpper(frontend_sha, frontend_sha_hex);
+
+            err = OtaRelay::metaFinalizeChecksum();
+            if (err != ESP_OK) {
+                DEBUG_ERR(TAG, "GD32 缓存 SHA-256 计算失败: %s", esp_err_to_name(err));
+                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                                packBleFinishValue(session_id, 3));
+                return 0;
+            }
+
+            err = OtaRelay::metaLoad(&meta);
+            if (err != ESP_OK) {
+                DEBUG_ERR(TAG, "GD32 SHA-256 元数据读取失败: %s", esp_err_to_name(err));
+                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                                packBleFinishValue(session_id, 3));
+                return 0;
+            }
+
+            shaBytesToHexUpper(meta.checksum, device_sha_hex);
+            sendSha256Notify(meta.checksum, session_id);
+            DEBUG_INFO(TAG, "GD32 前端 SHA-256: %s, session=%u", frontend_sha_hex, session_id);
+            DEBUG_INFO(TAG, "GD32 缓存 SHA-256: %s", device_sha_hex);
+
+            if (memcmp(meta.checksum, frontend_sha, 32) != 0) {
+                DEBUG_ERR(TAG, "GD32 缓存 SHA-256 与前端文件不匹配，拒绝触发 SPI 中继");
+                sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH,
+                                packBleFinishValue(session_id, 0));
+                return 0;
+            }
+
+            DEBUG_INFO(TAG, "GD32 固件就绪且 SHA-256 匹配 (%" PRIu32 " / %" PRIu32 " 字节)，通过协调器触发中继",
                        meta.stored_size, meta.total_size);
-            OtaCoordinator::instance().triggerGd32Relay();
+            if (OtaRelay::resultQueue) {
+                uint32_t stale = 0;
+                while (xQueueReceive(OtaRelay::resultQueue, &stale, 0) == pdTRUE) {
+                    DEBUG_WARN(TAG, "清理旧 GD32 中继结果: %" PRIu32, stale);
+                }
+            }
+            esp_err_t trig_err = OtaCoordinator::instance().triggerGd32Relay();
+            if (trig_err != ESP_OK) {
+                DEBUG_ERR(TAG, "GD32 中继触发失败: %s", esp_err_to_name(trig_err));
+                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                                packBleFinishValue(session_id, 1));
+                return 0;
+            }
+
+            sendFinishEvent(BLE_OTA_FINISH_GD32_RELAY_START,
+                            packBleFinishValue(session_id, 0));
+
+            BleGd32RelayWaitCtx *ctx = (BleGd32RelayWaitCtx *)malloc(sizeof(BleGd32RelayWaitCtx));
+            if (!ctx) {
+                DEBUG_ERR(TAG, "GD32 中继等待任务上下文分配失败");
+                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                                packBleFinishValue(session_id, 2));
+                return 0;
+            }
+            ctx->session_id = session_id;
+            BaseType_t ok = xTaskCreate(ble_gd32_relay_wait_task,
+                                        "ble_gd32_wait",
+                                        3072,
+                                        ctx,
+                                        5,
+                                        NULL);
+            if (ok != pdPASS) {
+                DEBUG_ERR(TAG, "创建 GD32 中继等待任务失败");
+                free(ctx);
+                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                                packBleFinishValue(session_id, 2));
+            }
         } else {
             DEBUG_WARN(TAG, "GD32 固件未就绪 (stored=%" PRIu32 ", total=%" PRIu32 ")",
                        meta.stored_size, meta.total_size);
+            sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                            packBleFinishValue(session_id, 1));
         }
     } else if (buf[0] == BLE_OTA_CTRL_TRIGGER_ESP32) {
+        uint16_t session_id = 0;
+        if (len >= 35) {
+            session_id = (uint16_t)(buf[33] | (buf[34] << 8));
+        }
         if (!Esp32OtaCore::instance().isActive()) {
             DEBUG_WARN(TAG, "ESP32 OTA 未激活，无法触发升级");
+            sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
+                            packBleFinishValue(session_id, 1));
             return 0;
         }
         if (BleOta::instance().m_esp32RebootPending) {
             DEBUG_WARN(TAG, "ESP32 OTA 收尾已在进行中，忽略重复 CTRL");
+            sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
+                            packBleFinishValue(session_id, 1));
             return 0;
         }
 
@@ -692,28 +864,30 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
             return 0;
         }
 
-        char *frontend_sha_hex = (char *)malloc(65);
-        if (!frontend_sha_hex) {
+        BleEsp32FinishCtx *finish_ctx = (BleEsp32FinishCtx *)malloc(sizeof(BleEsp32FinishCtx));
+        if (!finish_ctx) {
             DEBUG_ERR(TAG, "CTRL 0xF8 申请内存失败");
-            sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)ESP_ERR_NO_MEM);
+            sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
+                            packBleFinishValue(session_id, (uint16_t)ESP_ERR_NO_MEM));
             return 0;
         }
         for (int i = 0; i < 32; ++i) {
-            snprintf(&frontend_sha_hex[i * 2], 3, "%02x", buf[1 + i]);
+            snprintf(&finish_ctx->sha_hex[i * 2], 3, "%02x", buf[1 + i]);
         }
-        frontend_sha_hex[64] = '\0';
-        DEBUG_INFO(TAG, "前端 SHA-256: %s", frontend_sha_hex);
+        finish_ctx->sha_hex[64] = '\0';
+        finish_ctx->session_id = session_id;
+        DEBUG_INFO(TAG, "前端 SHA-256: %s, session=%u", finish_ctx->sha_hex, session_id);
 
         BleOta::instance().m_esp32RebootPending = true;
         BaseType_t ok = xTaskCreate(ble_esp32_finish_and_reboot_task,
                                     "ble_ota_finish",
                                     4096,
-                                    frontend_sha_hex,  // heap string; task 负责 free
+                                    finish_ctx,  // heap context; task 负责 free
                                     5,
                                     NULL);
         if (ok != pdPASS) {
             DEBUG_ERR(TAG, "创建 ESP32 OTA 收尾任务失败");
-            free(frontend_sha_hex);
+            free(finish_ctx);
             BleOta::instance().m_esp32RebootPending = false;
         } else {
             DEBUG_INFO(TAG, "ESP32 OTA 收尾任务已创建（前端 SHA 已传入）");

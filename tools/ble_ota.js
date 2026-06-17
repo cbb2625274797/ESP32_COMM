@@ -15,6 +15,15 @@
   const BLE_OTA_NOTIFY_FINISH = 0xB1;
   const BLE_OTA_NOTIFY_SHA256 = 0xC1;
   const BLE_OTA_ACK_WINDOW = 32;
+  const BLE_OTA_FINISH_ESP32_DONE = 0x02;
+  const BLE_OTA_FINISH_REBOOT_NOW = 0x07;
+  const BLE_OTA_FINISH_GD32_RELAY_START = 0x10;
+  const BLE_OTA_FINISH_GD32_RELAY_DONE = 0x11;
+  const BLE_OTA_FINISH_ERR_FINALIZE = 0x81;
+  const BLE_OTA_FINISH_ERR_MUTEX = 0x83;
+  const BLE_OTA_FINISH_ERR_GD32_SIZE = 0x84;
+  const BLE_OTA_FINISH_ERR_SHA_MISMATCH = 0x85;
+  const BLE_OTA_FINISH_ERR_GD32_RELAY = 0x86;
 
   const TARGETS = {
     gd32: {
@@ -63,6 +72,9 @@
     lastAckSeq: -1,
     lastAckBytes: 0,
     ackWaiter: null,
+    otaResultWaiter: null,
+    otaRunId: 0,
+    lastEsp32DoneSession: null,
     fileSha256: null,
     deviceSha256: null,
     expectedReboot: false,        // 发送 0xFA 后置 true，重连后清
@@ -183,6 +195,71 @@
     var bar = document.getElementById('stageStatusBar');
     if (bar) bar.className = 'stage-status-bar err';
     setBleStageText('错误: ' + (detail || ''));
+  }
+
+  function clearOtaResultWaiter() {
+    if (state.otaResultWaiter) {
+      clearTimeout(state.otaResultWaiter.timer);
+      state.otaResultWaiter = null;
+    }
+  }
+
+  function resolveOtaResult(status, detail) {
+    if (!state.otaResultWaiter) return;
+    var waiter = state.otaResultWaiter;
+    state.otaResultWaiter = null;
+    clearTimeout(waiter.timer);
+    waiter.resolve({ status: status, detail: detail || {} });
+  }
+
+  function rejectOtaResult(message, detail) {
+    if (!state.otaResultWaiter) return;
+    var waiter = state.otaResultWaiter;
+    state.otaResultWaiter = null;
+    clearTimeout(waiter.timer);
+    var err = new Error(message || 'OTA 收尾失败');
+    err.detail = detail || {};
+    waiter.reject(err);
+  }
+
+  function nextOtaSessionId() {
+    state.otaRunId = (state.otaRunId + 1) & 0xFFFF;
+    if (state.otaRunId === 0) state.otaRunId = 1;
+    return state.otaRunId;
+  }
+
+  function finishBelongsToWaiter(targetKey, value) {
+    if (!state.otaResultWaiter || state.otaResultWaiter.targetKey !== targetKey) return false;
+    return (value & 0xFFFF) === state.otaResultWaiter.sessionId;
+  }
+
+  function finishSessionId(value) {
+    return value & 0xFFFF;
+  }
+
+  function hasCurrentWaiter(targetKey) {
+    return !!(state.otaResultWaiter && state.otaResultWaiter.targetKey === targetKey);
+  }
+
+  function waitForOtaResult(targetKey, sessionId, timeoutMs) {
+    clearOtaResultWaiter();
+    var runId = state.otaRunId;
+    return new Promise(function(resolve, reject) {
+      var timer = setTimeout(function() {
+        if (state.otaResultWaiter && state.otaResultWaiter.runId === runId) {
+          state.otaResultWaiter = null;
+        }
+        reject(new Error(targetKey === 'gd32' ? '等待 GD32 OTA 转发结果超时' : '等待 ESP32 OTA 收尾结果超时'));
+      }, timeoutMs);
+      state.otaResultWaiter = {
+        targetKey: targetKey,
+        sessionId: sessionId,
+        runId: runId,
+        timer: timer,
+        resolve: resolve,
+        reject: reject,
+      };
+    });
   }
 
   function showBleVerifyInfo(frontSha, devSha, result) {
@@ -479,22 +556,71 @@
       const stage = bytes[1];
       const value = (bytes[2]) | (bytes[3] << 8) | (bytes[4] << 16) | (bytes[5] << 24);
       const finishMap = {
-        0x02: '[FINISH] ESP32 OTA 收尾完成',
-        0x07: '[FINISH] ESP32 即将重启',
-        0x81: `[FINISH] ESP32 OTA 收尾失败: err=${value}`,
-        0x83: '[FINISH] ESP32 OTA 被其他通道占用，互斥拒绝',
-        0x84: `[FINISH] GD32 固件超出分区大小: ${formatBytes(value)} (上限 216KB)`,
-        0x85: '[FINISH] ESP32 OTA SHA-256 校验失败',
+        [BLE_OTA_FINISH_ESP32_DONE]: '[FINISH] ESP32 OTA 收尾完成',
+        [BLE_OTA_FINISH_REBOOT_NOW]: '[FINISH] ESP32 即将重启',
+        [BLE_OTA_FINISH_GD32_RELAY_START]: '[FINISH] GD32 OTA 转发已开始',
+        [BLE_OTA_FINISH_GD32_RELAY_DONE]: '[FINISH] GD32 OTA 转发完成',
+        [BLE_OTA_FINISH_ERR_FINALIZE]: `[FINISH] ESP32 OTA 收尾失败: err=${value}`,
+        [BLE_OTA_FINISH_ERR_MUTEX]: '[FINISH] OTA 被其他通道占用，互斥拒绝',
+        [BLE_OTA_FINISH_ERR_GD32_SIZE]: `[FINISH] GD32 固件超出分区大小: ${formatBytes(value)} (上限 216KB)`,
+        [BLE_OTA_FINISH_ERR_SHA_MISMATCH]: '[FINISH] OTA SHA-256 校验失败',
+        [BLE_OTA_FINISH_ERR_GD32_RELAY]: `[FINISH] GD32 OTA 转发失败: result=${value >> 16}`,
       };
       const finishText = finishMap[stage] || `[FINISH] 未知阶段 stage=0x${stage.toString(16).padStart(2, '0').toUpperCase()} value=${value}`;
       bleLog('FINISH', finishText);
       const finalizeStage = TARGETS.esp32.finalizeStage;
+      const resultCode = (value >>> 16);
+
+      if (stage === BLE_OTA_FINISH_GD32_RELAY_START) {
+        if (!finishBelongsToWaiter('gd32', value)) return;
+        if (typeof switchStageFlow === 'function') switchStageFlow('gd32');
+        if (typeof setActivePhase === 'function') setActivePhase('gd32Ota');
+        if (typeof updateStagesFromRelayState === 'function') updateStagesFromRelayState(1);
+        setProgress(50, '[GD32] OTA 转发已开始，正在认证握手...');
+        showBleVerifyInfo(state.fileSha256 || '-', '等待 GD32 APP 启动确认...', { text: '缓存写入完成，正在通过 SPI 转发' });
+        return;
+      }
+
+      if (stage === BLE_OTA_FINISH_GD32_RELAY_DONE) {
+        if (!finishBelongsToWaiter('gd32', value)) return;
+        if (typeof switchStageFlow === 'function') switchStageFlow('gd32');
+        if (typeof updateStagesFromRelayState === 'function') updateStagesFromRelayState(5);
+        if (typeof markPhaseDone === 'function') markPhaseDone('gd32Ota');
+        setProgress(100, '[GD32] OTA 转发完成，APP 已启动');
+        showBleVerifyInfo(state.fileSha256 || '-', 'GD32 APP 已确认启动', { text: 'GD32 OTA 完成', ok: true });
+        var gd32Bar = document.getElementById('stageStatusBar');
+        var gd32Text = document.getElementById('stageStatusText');
+        if (gd32Bar) gd32Bar.className = 'stage-status-bar ok';
+        if (gd32Text) gd32Text.textContent = 'GD32 刷写完成';
+        state.lastUploadStatus = 'success';
+        showToast('GD32 OTA 刷写完成', 'success');
+        resolveOtaResult('success', { stage: stage, value: value });
+        return;
+      }
+
+      if (stage === BLE_OTA_FINISH_ERR_GD32_RELAY) {
+        if (!finishBelongsToWaiter('gd32', value)) return;
+        if (typeof switchStageFlow === 'function') switchStageFlow('gd32');
+        if (typeof updateStagesFromRelayState === 'function') updateStagesFromRelayState(255);
+        setProgress(0, '[GD32] OTA 转发失败');
+        state.lastUploadStatus = 'failed';
+        showToast('GD32 OTA 转发失败', 'error');
+        showBleVerifyInfo(state.fileSha256 || '-', 'GD32 未完成转发', { text: 'GD32 OTA 转发失败: ' + resultCode, err: true });
+        rejectOtaResult('GD32 OTA 转发失败: ' + resultCode, { stage: stage, value: value });
+        return;
+      }
 
       // Update BLE stage flow based on FINISH notifications
-      if (stage === 0x02) {
+      if (stage === BLE_OTA_FINISH_ESP32_DONE) {
+        if (!finishBelongsToWaiter('esp32', value)) return;
+        state.lastEsp32DoneSession = finishSessionId(value);
         setBleStage(finalizeStage, '收尾完成', null);
         setBleStageText('OTA 收尾完成，等待重启');
-      } else if (stage === 0x07) {
+        state.lastUploadStatus = 'success';
+        setProgress(100, '[ESP32] OTA 收尾完成，等待重启');
+        resolveOtaResult('success', { stage: stage, value: value });
+      } else if (stage === BLE_OTA_FINISH_REBOOT_NOW) {
+        if (state.lastEsp32DoneSession !== null && state.lastEsp32DoneSession !== finishSessionId(value)) return;
         state.expectedReboot = true;
         setBleStage(finalizeStage, '设备重启', null);
         setBleStageText('ESP32 即将重启');
@@ -503,30 +629,45 @@
       }
 
       // OTA 结果 toast 提示（用户可见，不只是在日志里）
-      if (stage === 0x83) {
-        showToast('ESP32 OTA 被其他通道占用，请稍后重试', 'error');
+      if (stage === BLE_OTA_FINISH_ERR_MUTEX) {
+        if (hasCurrentWaiter('esp32') && !finishBelongsToWaiter('esp32', value)) return;
+        if (hasCurrentWaiter('gd32') && !finishBelongsToWaiter('gd32', value)) return;
+        showToast('OTA 被其他通道占用，请稍后重试', 'error');
         setProgress(0, 'OTA 被其他通道占用');
         state.lastUploadStatus = 'failed';
         setBleStageError('OTA 被其他通道占用');
-      } else if (stage === 0x84) {
+        rejectOtaResult('OTA 被其他通道占用', { stage: stage, value: value });
+      } else if (stage === BLE_OTA_FINISH_ERR_GD32_SIZE) {
+        if (hasCurrentWaiter('gd32') && !finishBelongsToWaiter('gd32', value)) return;
         showToast(`GD32 固件超出分区大小 (${formatBytes(value)}，上限 216KB)`, 'error');
         setProgress(0, 'GD32 固件太大，无法刷写');
         state.lastUploadStatus = 'failed';
         setBleStageError('固件超出分区大小');
-      } else if (stage === 0x81) {
+        rejectOtaResult('GD32 固件超出分区大小', { stage: stage, value: value });
+      } else if (stage === BLE_OTA_FINISH_ERR_FINALIZE) {
+        if (!finishBelongsToWaiter('esp32', value)) return;
         showToast('ESP32 OTA 刷写失败', 'error');
         setProgress(0, '刷写失败');
         state.lastUploadStatus = 'failed';
         setBleStageError('OTA 刷写失败');
         showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '设备未上报', { text: '刷写失败', err: true });
-      } else if (stage === 0x85) {
-        showToast('ESP32 OTA 校验失败，未触发重启', 'error');
+        rejectOtaResult('ESP32 OTA 刷写失败', { stage: stage, value: value });
+      } else if (stage === BLE_OTA_FINISH_ERR_SHA_MISMATCH) {
+        const isGd32Waiter = hasCurrentWaiter('gd32');
+        const targetKey = isGd32Waiter ? 'gd32' : 'esp32';
+        if (!finishBelongsToWaiter(targetKey, value)) return;
+        const msg = isGd32Waiter
+          ? 'GD32 缓存 SHA-256 校验失败，未进入 SPI 转发'
+          : 'ESP32 OTA 校验失败，未触发重启';
+        showToast(msg, 'error');
         setProgress(0, '设备端 SHA-256 校验失败');
         state.lastUploadStatus = 'failed';
-        setBleStage(5, 'SHA-256 ✗', null);
+        setBleStage(flowTarget().verifyStage, 'SHA-256 ✗', null);
         setBleStageError('设备端 SHA-256 校验失败');
-        showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '设备未上报', { text: '设备端校验失败，已中止 OTA', err: true });
-      } else if (stage === 0x07) {
+        showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '设备未上报', { text: msg, err: true });
+        rejectOtaResult(msg, { stage: stage, value: value });
+      } else if (stage === BLE_OTA_FINISH_REBOOT_NOW) {
+        if (state.lastEsp32DoneSession !== null && state.lastEsp32DoneSession !== finishSessionId(value)) return;
         showToast('ESP32 OTA 刷写完成，等待重启', 'success');
         // If device SHA-256 hasn't arrived yet, show what we have
         var devSha = state.deviceSha256 || '设备未上报';
@@ -556,6 +697,14 @@
 
     // SHA-256 verification from device (after transfer complete)
     if (bytes[0] === BLE_OTA_NOTIFY_SHA256 && bytes.length >= 33) {
+      if (bytes.length >= 35) {
+        var shaSessionId = bytes[33] | (bytes[34] << 8);
+        if (!state.otaResultWaiter ||
+            state.otaResultWaiter.sessionId !== shaSessionId) {
+          bleLog('VERIFY', '忽略非本轮 SHA-256 通知: session=' + shaSessionId, 'W');
+          return;
+        }
+      }
       var devSha = Array.from(bytes.slice(1, 33)).map(function(b) {
         return b.toString(16).padStart(2, '0');
       }).join('').toUpperCase();
@@ -735,7 +884,63 @@
       else els.fileInfo.classList.remove('show');
     }
 
-    // SHA-256 computation and display
+    // ★ HEX → BIN 自动转换：复用 app.js 公共函数 convertHexFileToBin
+    if (file && file.name.toLowerCase().endsWith('.hex') && typeof convertHexFileToBin === 'function') {
+      return convertHexFileToBin(file).then(function(result) {
+        if (!result.converted) {
+          bleLog('FILE', file.name + ' 扩展名为 .hex 但内容不像 HEX 格式，按原始文件处理', 'W');
+          finalizeFileInfo(file);
+          computeFileSha256(file);
+          return;
+        }
+        state.selectedFile = result.file;
+        var baseHex = '0x' + result.baseAddr.toString(16).toUpperCase().padStart(8, '0');
+        bleLog('FILE', 'HEX → BIN 转换完成: ' + file.name + ' → ' + result.file.name + ' (基地址 ' + baseHex + ', ' + formatBytes(result.file.size) + ')');
+        showToast('HEX 已自动转换为 BIN', 'success');
+        // 更新 UI 显示转换后的信息
+        els.fileName.textContent = result.file.name + ' (由 ' + file.name + ' 转换)';
+        els.fileType.textContent = 'Binary (HEX转换)';
+        els.fileSize.textContent = formatBytes(result.file.size);
+        var newPackets = Math.ceil(result.file.size / payloadSize);
+        els.packetCount.textContent = String(newPackets);
+        finalizeFileInfo(result.file);
+        computeFileSha256(result.file);
+      }).catch(function(err) {
+        bleLog('FILE', 'HEX 解析失败: ' + err.message, 'E');
+        showToast('HEX 文件解析失败: ' + err.message, 'error');
+        state.selectedFile = null;
+        state.fileSha256 = null;
+        if (els.fileInfo) els.fileInfo.classList.remove('show');
+        setConnectionState(!!state.server);
+      });
+    }
+
+    // 非 HEX 文件直接完成
+    finalizeFileInfo(file);
+    computeFileSha256(file);
+    return Promise.resolve();
+  }
+
+  function finalizeFileInfo(file) {
+    setConnectionState(!!state.server);
+    if (file) {
+      setProgress(0, `已选择 ${file.name}`);
+      bleLog('FILE', `已选择: ${file.name} (${formatBytes(file.size)}), 目标=${currentTarget().label}`);
+      if (state.server) {
+        setBleStage(3, '计算哈希...', 'active');
+        setBleStageText('正在计算文件 SHA-256...');
+      }
+    } else {
+      setProgress(0, '等待选择文件');
+      if (state.server) {
+        resetBleStages();
+        setBleStage(3, '', null);
+        setBleStageText('BLE 连接就绪，请选择固件文件');
+      }
+    }
+  }
+
+  function computeFileSha256(file) {
     var shaElem = document.getElementById('fileSha256');
     if (file && shaElem) {
       shaElem.textContent = '计算中...';
@@ -761,31 +966,13 @@
       shaElem.textContent = '-';
       state.fileSha256 = null;
     }
-
-    setConnectionState(!!state.server);
-    if (file) {
-      setProgress(0, `已选择 ${file.name}`);
-      bleLog('FILE', `已选择: ${file.name} (${formatBytes(file.size)}), 目标=${currentTarget().label}`);
-      // If connected, show stage 3 as active
-      if (state.server) {
-        setBleStage(3, '计算哈希...', 'active');
-        setBleStageText('正在计算文件 SHA-256...');
-      }
-    } else {
-      setProgress(0, '等待选择文件');
-      if (state.server) {
-        resetBleStages();
-        setBleStage(3, '', null);
-        setBleStageText('BLE 连接就绪，请选择固件文件');
-      }
-    }
   }
 
-  function syncSelectedFileFromInput() {
+  async function syncSelectedFileFromInput() {
     // FSAPI 选择的文件以 selectedFileHandle 为准，不从 input 元素同步，避免切标签页回来误清空
     if (state.selectedFileHandle) return;
     const file = (els.firmwareFile && els.firmwareFile.files && els.firmwareFile.files[0]) || null;
-    updateFileInfo(file);
+    await updateFileInfo(file);
   }
 
   // 通过 File System Access API 选择文件（支持热重载）
@@ -803,7 +990,7 @@
         const handle = handles[0];
         const file = await handle.getFile();
         state.selectedFileHandle = handle;
-        updateFileInfo(file);
+        await updateFileInfo(file);
         bleLog('FILE', '已通过 FSAPI 选择文件（支持热重载）: ' + file.name);
         return true;
       }
@@ -856,13 +1043,14 @@
     if (state.selectedFileHandle) {
       try {
         const freshFile = await state.selectedFileHandle.getFile();
-        updateFileInfo(freshFile);
-        bleLog('FILE', '已重新读取本地文件: ' + freshFile.name + ' (' + formatBytes(freshFile.size) + ')');
+        await updateFileInfo(freshFile);
+        var actualFile = state.selectedFile || freshFile;
+        bleLog('FILE', '已重新读取本地文件: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')');
       } catch (e) {
         bleLog('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
       }
     } else {
-      syncSelectedFileFromInput();
+      await syncSelectedFileFromInput();
     }
     if (!state.selectedFile || !state.dataInChar) return false;
 
@@ -874,12 +1062,15 @@
     state.abortRequested = false;
     state.uploading = true;
     state.lastUploadStatus = 'uploading';
+    const otaSessionId = nextOtaSessionId();
+    clearOtaResultWaiter();
     switchStageFlow('ble');
     state.lastAckCmd = null;
     state.lastAckSeq = -1;
     state.lastAckBytes = 0;
     state.ackGeneration = 0;
     state.deviceSha256 = null;
+    state.lastEsp32DoneSession = null;
     if (state.ackWaiter) {
       clearTimeout(state.ackWaiter.timer);
       state.ackWaiter = null;
@@ -1056,8 +1247,7 @@
 
       // Stage 4 done
       setBleStage(4, '完成', null);
-      setProgress(100, `[${cfg.label}] 固件数据已全部写入 DATA_IN`);
-      state.lastUploadStatus = 'success';
+      setProgress(cfg.label === 'GD32' ? 45 : 90, `[${cfg.label}] 固件数据已全部写入 DATA_IN`);
 
       // Stage 5: 发送 0xF8 + 32B 文件 SHA-256，由设备端执行收尾并完成比对
       if (cfg.label === 'ESP32') {
@@ -1067,9 +1257,12 @@
         for (let i = 0; i < 32; i++) {
           frontShaBytes[i] = parseInt(frontSha.slice(i * 2, i * 2 + 2), 16);
         }
-        const trigger = new Uint8Array(33);
+        const trigger = new Uint8Array(35);
         trigger[0] = 0xF8;
         trigger.set(frontShaBytes, 1);
+        trigger[33] = otaSessionId & 0xFF;
+        trigger[34] = (otaSessionId >> 8) & 0xFF;
+        const resultPromise = waitForOtaResult('esp32', otaSessionId, 45000);
         showBleVerifyInfo(frontSha, '等待设备端比对...', { text: '已发送文件 SHA-256，等待设备端校验结果' });
         setBleStage(5, '发送校验...', 'active');
         setBleStageText('发送 0xF8 + SHA-256，等待设备端校验...');
@@ -1077,6 +1270,7 @@
           await state.ctrlChar.writeValue(trigger);
           bleLog('OTA', '0xF8 + 32B SHA-256 已发送，等待设备端校验');
         } catch (e) {
+          clearOtaResultWaiter();
           state.lastUploadStatus = 'failed';
           setProgress(0, `0xF8 发送失败: ${e.message}`);
           bleLog('OTA', `0xF8 发送失败: ${e.message}`, 'E');
@@ -1086,20 +1280,44 @@
         setBleStage(5, '等待设备端校验', null);
         setBleStage(6, '设备端收尾中', 'active');
         setBleStageText('0xF8 已发，等待设备端完成 OTA 收尾...');
+        try {
+          await resultPromise;
+        } catch (e) {
+          state.lastUploadStatus = 'failed';
+          setProgress(0, e.message);
+          setBleStageError(e.message);
+          clearOtaResultWaiter();
+          return false;
+        }
         return true;
       }
 
-      // GD32: send trigger command
+      // GD32: send 0xF7 + 32B SHA-256 + session, then wait for SPI relay result.
+      const frontSha = fileSha256.toUpperCase();
+      const frontShaBytes = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        frontShaBytes[i] = parseInt(frontSha.slice(i * 2, i * 2 + 2), 16);
+      }
+      state.deviceSha256 = null;
       setBleStage(5, '发送触发...', 'active');
-      setBleStageText('正在发送触发命令...');
+      setBleStageText('发送 0xF7 + SHA-256，等待设备端缓存校验...');
+      showBleVerifyInfo(frontSha, '等待设备端比对...', { text: '已发送文件 SHA-256，等待 GD32 缓存校验' });
       await sleep(30);
       const cmdHex = els.ctrlHex.value || cfg.ctrlHex;
-      const cmd = hexToBytes(cmdHex);
+      const cmdBase = hexToBytes(cmdHex);
+      const cmd = new Uint8Array(cmdBase.length + 32 + 2);
+      cmd.set(cmdBase, 0);
+      cmd.set(frontShaBytes, cmdBase.length);
+      cmd[cmdBase.length + 32] = otaSessionId & 0xFF;
+      cmd[cmdBase.length + 33] = (otaSessionId >> 8) & 0xFF;
+      const resultPromise = waitForOtaResult('gd32', otaSessionId, 120000);
       try {
         await state.ctrlChar.writeValue(cmd);
         setBleStage(5, '已触发', null);
-        bleLog('OTA', `触发命令已发送: ${toHex(cmd)}`);
+        setBleStage(6, '等待设备端校验', 'active');
+        bleLog('OTA', `0xF7 + 32B SHA-256 已发送，等待设备端缓存校验与转发`);
       } catch (_) {
+        clearOtaResultWaiter();
         state.lastUploadStatus = 'failed';
         setProgress(0, `触发命令发送失败: ${toHex(cmd)}`);
         bleLog('OTA', `触发命令发送失败: ${toHex(cmd)}`, 'E');
@@ -1107,24 +1325,18 @@
         return false;
       }
 
-      // Stage 6: SHA-256 verification (GD32 mode)
-      setBleStage(6, 'GD32 无回传', null);
-      setBleStageText('GD32 OTA 中继已触发');
-      state.deviceSha256 = null;
-      showBleVerifyInfo(fileSha256.toUpperCase(), 'GD32 中继不回传 SHA', { text: 'GD32 模式无设备端校验（仅前端 SHA-256）' });
-
-      bleLog('OTA', `✅ 固件刷写完成！`);
-      bleLog('OTA', `📊 文件 SHA-256: ${fileSha256.toUpperCase()}`);
-
-      // Mark all stages done
-      for (var si = 0; si < bleStageIds.length; si++) {
-        var el = document.getElementById(bleStageIds[si]);
-        if (el && el.className !== 'stage-node err') el.className = 'stage-node done';
+      setBleStageText('GD32 缓存校验已发起，等待 SPI 转发流程...');
+      try {
+        await resultPromise;
+      } catch (e) {
+        state.lastUploadStatus = 'failed';
+        setProgress(0, e.message);
+        setBleStageError(e.message);
+        clearOtaResultWaiter();
+        return false;
       }
-      var bar = document.getElementById('stageStatusBar');
-      if (bar) bar.className = 'stage-status-bar ok';
-      setBleStageText('刷写完成');
-
+      bleLog('OTA', `✅ GD32 OTA 刷写完成！`);
+      bleLog('OTA', `📊 文件 SHA-256: ${fileSha256.toUpperCase()}`);
       return true;
     } catch (err) {
       state.lastUploadStatus = 'failed';
@@ -1139,6 +1351,9 @@
       if (state.ackWaiter) {
         clearTimeout(state.ackWaiter.timer);
         state.ackWaiter = null;
+      }
+      if (state.lastUploadStatus === 'failed') {
+        clearOtaResultWaiter();
       }
       state.uploading = false;
       state.uploadTargetKey = null;
@@ -1155,19 +1370,22 @@
         // （name/size/lastModified 任一不同即视为变化）
         // 避免对同一文件重复触发 updateFileInfo → 产生重复的 [FILE] SHA-256 日志
         const cached = state.selectedFile;
+        // HEX 文件转换后 cached.name 是 .bin 而 freshFile.name 是 .hex，
+        // 因此 HEX 文件用 lastModified 判断是否变化，避免每次都重新转换
+        const isHex = freshFile.name.toLowerCase().endsWith('.hex');
         const changed = !cached ||
-                        cached.name !== freshFile.name ||
-                        cached.size !== freshFile.size ||
+                        (isHex ? false : (cached.name !== freshFile.name || cached.size !== freshFile.size)) ||
                         cached.lastModified !== freshFile.lastModified;
         if (changed) {
-          updateFileInfo(freshFile);
-          bleLog('FILE', '已重新读取本地文件（已变更）: ' + freshFile.name + ' (' + formatBytes(freshFile.size) + ')');
+          await updateFileInfo(freshFile);
+          var actualFile = state.selectedFile || freshFile;
+          bleLog('FILE', '已重新读取本地文件（已变更）: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')');
         }
       } catch (e) {
         bleLog('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
       }
     } else {
-      syncSelectedFileFromInput();
+      await syncSelectedFileFromInput();
     }
     if (!state.selectedFile || !state.server) return;
 
@@ -1180,11 +1398,12 @@
         bleLog('AUTO', '一键刷写中止', 'W');
         return;
       }
-      setProgress(100, `[${cfg.label}] 刷写完成`);
       if (cfg.label === 'ESP32') {
+        setProgress(100, '[ESP32] OTA 完成，等待设备重启');
         bleLog('AUTO', 'ESP32 OTA 完成，等待设备重启');
       } else {
-        bleLog('AUTO', 'GD32 OTA 中继已触发');
+        setProgress(100, '[GD32] OTA 转发完成，APP 已启动');
+        bleLog('AUTO', 'GD32 OTA 完成');
       }
     } catch (err) {
       bleLog('AUTO', `一键刷写异常: ${err && err.message ? err.message : err}`, 'E');
@@ -1226,10 +1445,10 @@
     },
     disconnect: disconnectBle,
     showToast: showToast,
-    notifyFileChange: function(file, handle) {
+    notifyFileChange: async function(file, handle) {
       if (file) {
         if (handle) state.selectedFileHandle = handle;
-        updateFileInfo(file);
+        await updateFileInfo(file);
       }
     },
     clearFile: clearSelectedFile,

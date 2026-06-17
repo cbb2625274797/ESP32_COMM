@@ -846,40 +846,29 @@ esp_err_t OtaRelay::flashWriteChunk(uint32_t offset, const uint8_t *data, size_t
         }
     }
 
-    if (offset % 4 != 0) {
-        DEBUG_ERR("OTA", "flashWriteChunk offset非4对齐: offset=%" PRIu32, offset);
-        return ESP_ERR_INVALID_ARG;
-    }
-
     const esp_partition_t *part = instance().m_gd32Partition;
 
-    if (len % 4 == 0) {
-        if (offset + len > part->size) {
-            DEBUG_ERR("OTA", "flashWriteChunk越界: offset=%" PRIu32 " len=%zu part_size=%" PRIu32,
-                      offset, len, part->size);
-            return ESP_ERR_INVALID_SIZE;
-        }
-        return esp_partition_write(part, offset, data, len);
-    }
+    // ★ 计算 head/tail padding，使写入地址和长度都对齐到 4 字节
+    //   WiFi HTTP chunk 边界不一定 4 对齐，flash 写入必须对齐。
+    size_t head_pad = offset % 4;
+    uint32_t aligned_offset = offset - head_pad;
+    size_t total = head_pad + len;
+    size_t aligned_len = (total + 3) & ~(size_t)3;
 
-    size_t aligned_len = (len + 3) & ~(size_t)3;
-
-    if (offset + aligned_len > part->size) {
-        DEBUG_ERR("OTA", "flashWriteChunk对齐后越界: offset=%" PRIu32 " len=%zu aligned=%zu part=%" PRIu32,
-                  offset, len, aligned_len, part->size);
+    if (aligned_offset + aligned_len > part->size) {
+        DEBUG_ERR("OTA", "flashWriteChunk越界: offset=%" PRIu32 " len=%zu aligned_off=%" PRIu32 " aligned_len=%zu part=%" PRIu32,
+                  offset, len, aligned_offset, aligned_len, part->size);
         return ESP_ERR_INVALID_SIZE;
     }
 
-    DEBUG_WARN("OTA", "flashWriteChunk len非4对齐: len=%zu aligned_len=%zu offset=%" PRIu32,
-               len, aligned_len, offset);
+    // 快速路径：offset 和 len 都对齐
+    if (head_pad == 0 && len % 4 == 0) {
+        return esp_partition_write(part, offset, data, len);
+    }
 
-    size_t pad_len = aligned_len - len;
-    uint8_t pad[4] = {0};
-    esp_err_t err = esp_partition_read(part, offset + len, pad, pad_len);
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "flashWriteChunk读回padding失败: offset=%" PRIu32 " pad=%zu err=%s",
-                  offset + len, pad_len, esp_err_to_name(err));
-        return err;
+    if (head_pad > 0 || len % 4 != 0) {
+        DEBUG_WARN("OTA", "flashWriteChunk 非对齐: offset=%" PRIu32 " len=%zu head=%zu aligned_len=%zu",
+                   offset, len, head_pad, aligned_len);
     }
 
     uint8_t *aligned_buf = (uint8_t *)malloc(aligned_len);
@@ -887,10 +876,34 @@ esp_err_t OtaRelay::flashWriteChunk(uint32_t offset, const uint8_t *data, size_t
         DEBUG_ERR("OTA", "flashWriteChunk malloc失败: %zu字节", aligned_len);
         return ESP_ERR_NO_MEM;
     }
-    memcpy(aligned_buf, data, len);
-    memcpy(aligned_buf + len, pad, pad_len);
 
-    err = esp_partition_write(part, offset, aligned_buf, aligned_len);
+    // 读回 head padding（offset 之前的字节，属于上一次写入的尾部）
+    if (head_pad > 0) {
+        esp_err_t err = esp_partition_read(part, aligned_offset, aligned_buf, head_pad);
+        if (err != ESP_OK) {
+            DEBUG_ERR("OTA", "flashWriteChunk读回head失败: offset=%" PRIu32 " head=%zu err=%s",
+                      aligned_offset, head_pad, esp_err_to_name(err));
+            free(aligned_buf);
+            return err;
+        }
+    }
+
+    // 拷贝实际数据
+    memcpy(aligned_buf + head_pad, data, len);
+
+    // 读回 tail padding（数据末尾到 4 字节边界的字节）
+    size_t tail_pad = aligned_len - total;
+    if (tail_pad > 0) {
+        esp_err_t err = esp_partition_read(part, aligned_offset + total, aligned_buf + total, tail_pad);
+        if (err != ESP_OK) {
+            DEBUG_ERR("OTA", "flashWriteChunk读回tail失败: offset=%" PRIu32 " tail=%zu err=%s",
+                      aligned_offset + total, tail_pad, esp_err_to_name(err));
+            free(aligned_buf);
+            return err;
+        }
+    }
+
+    esp_err_t err = esp_partition_write(part, aligned_offset, aligned_buf, aligned_len);
     free(aligned_buf);
     return err;
 }
@@ -1189,6 +1202,8 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
                             result = OTA_RESULT_ERR_GD32;
                             break;
                         }
+                        // ★ resend 前延迟
+                        vTaskDelay(pdMS_TO_TICKS(1));
                         goto resend_packet;
                     }
                     if (isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
@@ -1215,12 +1230,14 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
                     continue;
                 }
 
-                DEBUG_WARN("OTA", "包 %" PRIu32 " 轮询耗尽未匹配，重发 (retry=%" PRIu32 "/3)", seq, retry_count + 1);
+                DEBUG_WARN("OTA", "包 %" PRIu32 " 轮询耗尽未匹配，重发 (retry=%" PRIu32 "/10)", seq, retry_count + 1);
                 if (++retry_count >= 10U) {
                     DEBUG_ERR("OTA", "包 %" PRIu32 " 重发次数超限", seq);
                     result = OTA_RESULT_ERR_GD32;
                     break;
                 }
+                // ★ resend 前延迟：给 GD32 时间处理上一包并更新 SPI 响应缓冲区
+                vTaskDelay(pdMS_TO_TICKS(1));
                 goto resend_packet;
             }
 
@@ -1236,6 +1253,12 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
         if (seq % (m_transferTotalPackets / 10 + 1) == 0) {
             uint32_t progress = (relaySeq * 100U) / m_transferTotalPackets;
             DEBUG_INFO("OTA", "转发进度: %" PRIu32 "/%" PRIu32 " 包 (%" PRIu32 "%%)", relaySeq, m_transferTotalPackets, progress);
+        }
+
+        // ★ 包间延迟：给 GD32 Bootloader 充足时间完成 flash 写入并准备下一包 ACK。
+        //   无此延迟时，ESP32 立即 poll 会读到上一包的 stale ACK，导致误判为丢包。
+        if (seq < m_transferTotalPackets - 1) {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
     return result;

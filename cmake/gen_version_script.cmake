@@ -5,15 +5,28 @@
 #   SOURCE_DIR   - 项目根目录 (ESP32_COMM)
 #   OUTPUT_FILE  - 输出的 version.h 路径
 
-# 版本号（可手动修改）
+# 主/次版本号（手动修改，大版本时改）
 set(FW_VERSION_MAJOR 0)
 set(FW_VERSION_MINOR 3)
-set(FW_VERSION_PATCH 12)
 
-# 获取编译时间
+# PATCH 自动递增：git 总提交次数，每次新提交 +1
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD
+        WORKING_DIRECTORY ${SOURCE_DIR}
+        OUTPUT_VARIABLE FW_VERSION_PATCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+else()
+    set(FW_VERSION_PATCH 0)
+endif()
+
+# 编译时间
 string(TIMESTAMP BUILD_TIME "%Y-%m-%d %H:%M:%S")
 
-# 获取 Git 信息
+# Git 短 hash
 find_package(Git QUIET)
 if(GIT_FOUND)
     execute_process(
@@ -27,7 +40,7 @@ else()
     set(GIT_HASH "unknown")
 endif()
 
-# 生成版本头文件内容
+# 生成版本头文件
 set(VERSION_HEADER_CONTENT
 "// Auto-generated version info - DO NOT EDIT
 #pragma once
