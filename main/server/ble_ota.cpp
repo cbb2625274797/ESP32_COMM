@@ -194,14 +194,17 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         DEBUG_ERR(TAG, "[FINISH] SHA-256 不匹配，OTA 已中止");
         sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH, packBleFinishValue(session_id, 0));
         BleOta::instance().m_esp32RebootPending = false;
-        // ★ finalize 内部已 abort 并释放 mutex，这里释放 reorder buffer
+        // ★ finalize 内部已 abort 并释放 mutex，这里补充通知协调器复位状态机，
+        //   避免 m_sysState 卡在 ESP32_FINALIZING 导致下次 OTA 被假拒绝。
+        OtaCoordinator::instance().abortCurrent();
         esp32_reorder_free();
     } else {
         DEBUG_ERR(TAG, "[FINISH] OTA 收尾失败: %s", esp_err_to_name(fr.err));
         sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
                         packBleFinishValue(session_id, 1));
         BleOta::instance().m_esp32RebootPending = false;
-        // ★ finalize 内部已 abort 并释放 mutex，这里释放 reorder buffer
+        // ★ 同上：finalize 已 abort core，这里通知协调器复位状态机
+        OtaCoordinator::instance().abortCurrent();
         esp32_reorder_free();
     }
 
@@ -561,9 +564,18 @@ static esp_err_t ble_esp32_ota_begin(size_t total_size)
 
 /**
  * @brief 中止 ESP32 OTA 会话并清理（薄包装）。
+ *
+ * 关键：必须先通知协调器释放 m_sysState（避免下次 begin 被 ESP32_RECEIVING
+ *   状态假拒绝），再调 core.abort() 释放 mutex。两者重复 abort 幂等安全。
  */
 static void ble_esp32_ota_abort()
 {
+    // ★ 通知协调器释放 ESP32 通道占用（m_sysState → IDLE），
+    //   否则后续 begin() 会因协调器仍记为 ESP32_RECEIVING 而假拒绝。
+    ota_system_state_t cur = OtaCoordinator::instance().getSystemState();
+    if (cur == OTA_SYS_ESP32_RECEIVING || cur == OTA_SYS_ESP32_FINALIZING) {
+        OtaCoordinator::instance().abortCurrent();
+    }
     Esp32OtaCore::instance().abort();
     BleOta::instance().m_esp32RebootPending = false;
     // ★ 释放 reorder buffer
