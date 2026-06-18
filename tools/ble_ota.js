@@ -81,6 +81,8 @@
     reconnecting: false,          // 自动重连中
     reconnectAttempts: 0,         // 重连尝试次数
     uploadTargetKey: null,
+    activeTotalSize: 0,
+    activePacketTotal: 0,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -314,6 +316,25 @@
     }
   }
 
+  // ★ 以设备端 ACK 字节数为唯一进度数据源
+  // 仅当处于上传阶段（state.uploading）且未中止时才刷 UI，避免陈旧 ACK / abort 后覆盖
+  function updateProgressFromAck(totalSize, packetTotal, ackBytes) {
+    if (!state.uploading) return;
+    if (state.abortRequested) return;
+    if (!Number.isFinite(totalSize) || totalSize <= 0) return;
+    const safeBytes = Math.max(0, Math.min(totalSize, ackBytes >>> 0));
+    const percent = (safeBytes / totalSize) * 100;
+    const payloadSize = Math.max(1, Number(els.payloadSize.value) || 480);
+    const ackedPackets = Math.min(packetTotal, Math.ceil(safeBytes / payloadSize));
+    const cfg = currentTarget();
+    setProgress(percent, `[${cfg.label}] 已确认 ${ackedPackets}/${packetTotal} 包`);
+    els.sentCount.textContent = String(ackedPackets);
+    // 阶段 4 detail 文本：只在写入阶段刷新，避免与 stage 5/6 冲突
+    var detailEl = document.getElementById('bsd4');
+    if (detailEl) detailEl.textContent = `${ackedPackets}/${packetTotal} 包`;
+    setBleStageText(`数据写入 ${Math.round(percent)}%`);
+  }
+
   function setReadyHint(html) {
     const el = $('readyHint');
     if (el) el.innerHTML = html;
@@ -441,6 +462,12 @@
       setConnectionState(true);
       bleLog('BLE', 'GATT 服务与特征获取完成');
       await enableNotifications();
+      // ★ enableNotifications 内部已包含重试 + 主动断开逻辑；
+      //   若返回时仍为 false，说明连接半死，UI 已被断开事件重置，不要继续推进到 Stage 3
+      if (!state.notificationsEnabled) {
+        bleLog('BLE', '连接就绪但 DATA_OUT 通知开启失败，等待用户重连', 'E');
+        return;
+      }
       // Mark stages 1-2 as done
       setBleStage(3, '', null);
       setBleStageText('BLE 连接就绪，请选择固件文件');
@@ -517,9 +544,32 @@
       const ackCmd = bytes[1];
       const ackSeq = bytes[2] | (bytes[3] << 8);
       const ackBytes = (bytes[4]) | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24);
+      // ★ 保护：陈旧 ACK 来自跨 run / 旧窗口时直接丢弃。
+      //   仅以「本 run 上界」过滤（ackSeq 不能超过文件总包数 + 一个窗口余量），
+      //   不再用 ackMinSeenSeq 作下界 —— 因为本 run 第一个窗口的 seq 本身就是 0..31，
+      //   下界过严会把正常 ACK 也误判为越界（导致 ackBytes 永远 0）。
+      if (state.uploading && state.activeTotalSize > 0) {
+        const payloadSize = Math.max(1, Number(els.payloadSize.value) || 480);
+        const maxExpectedSeq = Math.ceil(state.activeTotalSize / payloadSize) - 1;
+        if (ackSeq > maxExpectedSeq + BLE_OTA_ACK_WINDOW) {
+          bleLog('ACK', `忽略越界 ACK: seq=${ackSeq} (run 范围 0..${maxExpectedSeq})`, 'W');
+          return;
+        }
+      } else if (!state.uploading) {
+        // 非上传阶段：清空状态，避免污染下次 run
+        state.lastAckCmd = null;
+        state.lastAckSeq = -1;
+        state.lastAckBytes = 0;
+        return;
+      }
       state.lastAckCmd = ackCmd;
       state.lastAckSeq = ackSeq;
       state.lastAckBytes = ackBytes >>> 0;
+
+      // ★ 以设备端真实 ACK 字节数驱动 UI 进度
+      if (state.uploading && state.activeTotalSize > 0 && state.activePacketTotal > 0) {
+        updateProgressFromAck(state.activeTotalSize, state.activePacketTotal, state.lastAckBytes);
+      }
 
       const ackText = `[ACK] cmd=0x${ackCmd.toString(16).padStart(2, '0').toUpperCase()} seq=${ackSeq} bytes=${state.lastAckBytes} (${formatBytes(state.lastAckBytes)}) raw=${hex}`;
       bleLog('ACK', ackText);
@@ -577,7 +627,7 @@
         if (typeof setActivePhase === 'function') setActivePhase('gd32Ota');
         if (typeof updateStagesFromRelayState === 'function') updateStagesFromRelayState(1);
         setProgress(50, '[GD32] OTA 转发已开始，正在认证握手...');
-        showBleVerifyInfo(state.fileSha256 || '-', '等待 GD32 APP 启动确认...', { text: '缓存写入完成，正在通过 SPI 转发' });
+        showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '等待设备端上报...', { text: '缓存写入完成，正在通过 SPI 转发' });
         return;
       }
 
@@ -587,7 +637,7 @@
         if (typeof updateStagesFromRelayState === 'function') updateStagesFromRelayState(5);
         if (typeof markPhaseDone === 'function') markPhaseDone('gd32Ota');
         setProgress(100, '[GD32] OTA 转发完成，APP 已启动');
-        showBleVerifyInfo(state.fileSha256 || '-', 'GD32 APP 已确认启动', { text: 'GD32 OTA 完成', ok: true });
+        showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '设备未上报', { text: 'GD32 OTA 完成', ok: true });
         var gd32Bar = document.getElementById('stageStatusBar');
         var gd32Text = document.getElementById('stageStatusText');
         if (gd32Bar) gd32Bar.className = 'stage-status-bar ok';
@@ -623,9 +673,14 @@
         if (state.lastEsp32DoneSession !== null && state.lastEsp32DoneSession !== finishSessionId(value)) return;
         state.expectedReboot = true;
         setBleStage(finalizeStage, '设备重启', null);
-        setBleStageText('ESP32 即将重启');
-        var bar = document.getElementById('stageStatusBar');
-        if (bar) bar.className = 'stage-status-bar ok';
+        // ★ ESP32 收尾完成 = 成功路径：保持 status bar 绿色，不要切回 active 蓝
+        var rebootBar = document.getElementById('stageStatusBar');
+        var rebootBarTxt = document.getElementById('stageStatusText');
+        if (rebootBar) rebootBar.className = 'stage-status-bar ok';
+        if (rebootBarTxt) rebootBarTxt.textContent = 'ESP32 刷写完成，等待重启';
+        if (typeof markPhaseDone === 'function') {
+          markPhaseDone('esp32Ota');
+        }
       }
 
       // OTA 结果 toast 提示（用户可见，不只是在日志里）
@@ -718,7 +773,14 @@
         bleLog('VERIFY', 'SHA-256 校验通过，前端与设备端一致', 'I');
         showBleVerifyInfo(frontSha, devSha, { text: '校验通过 — SHA-256 一致', ok: true });
         setBleStage(verifyStage, 'SHA-256 ✓', null);
-        setBleStageText('校验通过 — 固件完整性已确认');
+        // ★ 校验通过 = 刷写成功：status bar 标绿 + 顶部胶囊推进
+        var okBar = document.getElementById('stageStatusBar');
+        var okTxt = document.getElementById('stageStatusText');
+        if (okBar) okBar.className = 'stage-status-bar ok';
+        if (okTxt) okTxt.textContent = '刷写成功 — SHA-256 校验通过';
+        if (typeof markPhaseDone === 'function') {
+          markPhaseDone(state.uploadTargetKey === 'gd32' ? 'gd32Ota' : 'esp32Ota');
+        }
       } else if (frontSha) {
         bleLog('VERIFY', 'SHA-256 校验失败！前端: ' + frontSha + ' 设备: ' + devSha, 'E');
         showBleVerifyInfo(frontSha, devSha, { text: '校验失败 — SHA-256 不一致', err: true });
@@ -853,18 +915,36 @@
   }
 
   async function enableNotifications() {
-    try {
-      await state.dataOutChar.startNotifications();
-      state.dataOutChar.removeEventListener('characteristicvaluechanged', handleNotify);
-      state.dataOutChar.addEventListener('characteristicvaluechanged', handleNotify);
-      state.notificationsEnabled = true;
-      setConnectionState(!!state.server);
-      bleLog('BLE', 'DATA_OUT 通知已自动开启');
-    } catch (err) {
-      state.notificationsEnabled = false;
-      setConnectionState(!!state.server);
-      bleLog('BLE', `自动开启 DATA_OUT 通知失败: ${err.message}`, 'E');
+    // 修复偶发的 GATT CCC 竞态：startNotifications 与 NimBLE gap 完成握手存在窗口冲突。
+    // 现象：Chrome 报 "GATT operation failed for unknown reason"，NimBLE 实际返回 EBUSY/ENOTCONN。
+    // 处理：内部退避重试 + 最终失败时主动断开，让上层进入干净的重连路径，而不是带着半死连接去刷写。
+    const MAX_RETRY = 3;
+    for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+      try {
+        await state.dataOutChar.startNotifications();
+        state.dataOutChar.removeEventListener('characteristicvaluechanged', handleNotify);
+        state.dataOutChar.addEventListener('characteristicvaluechanged', handleNotify);
+        state.notificationsEnabled = true;
+        setConnectionState(!!state.server);
+        bleLog('BLE', 'DATA_OUT 通知已自动开启' + (attempt > 1 ? ` (重试 ${attempt}/${MAX_RETRY} 成功)` : ''));
+        return;
+      } catch (err) {
+        bleLog('BLE', `自动开启 DATA_OUT 通知失败(第 ${attempt}/${MAX_RETRY} 次): ${err.message}`, 'E');
+        if (attempt < MAX_RETRY) {
+          // 200ms / 400ms 退避，给 NimBLE 主机任务时间把 connect/MTU 事件消化完
+          await new Promise(r => setTimeout(r, 200 * attempt));
+        }
+      }
     }
+    state.notificationsEnabled = false;
+    setConnectionState(!!state.server);
+    // ★ 最终失败：连接处于半死状态，主动断开让用户重连，避免带着残废连接走到刷写
+    try {
+      if (state.device && state.device.gatt && state.device.gatt.connected) {
+        state.device.gatt.disconnect();
+      }
+    } catch (_) {}
+    bleLog('BLE', 'DATA_OUT 通知开启彻底失败，已主动断开，请重连后重试', 'E');
   }
 
   function updateFileInfo(file) {
@@ -1064,6 +1144,9 @@
     state.lastUploadStatus = 'uploading';
     const otaSessionId = nextOtaSessionId();
     clearOtaResultWaiter();
+    if (typeof setActivePhase === 'function') {
+      setActivePhase(cfg.label === 'GD32' ? 'gd32Ota' : 'esp32Ota');
+    }
     switchStageFlow('ble');
     state.lastAckCmd = null;
     state.lastAckSeq = -1;
@@ -1071,6 +1154,8 @@
     state.ackGeneration = 0;
     state.deviceSha256 = null;
     state.lastEsp32DoneSession = null;
+    state.activeTotalSize = 0;
+    state.activePacketTotal = 0;
     if (state.ackWaiter) {
       clearTimeout(state.ackWaiter.timer);
       state.ackWaiter = null;
@@ -1120,6 +1205,11 @@
 
       setBleStage(4, '写入中...', null);
       setBleStageText(`正在写入 ${packetTotal} 包数据...`);
+      // ★ 写入阶段已读出文件大小/包数，记录到 state 供 handleNotify 在 ACK 到达时使用
+      state.activeTotalSize = totalSize;
+      state.activePacketTotal = packetTotal;
+      els.sentCount.textContent = '0';
+      setProgress(0, `[${cfg.label}] 等待设备确认 0/${packetTotal} 包`);
       bleLog('OTA', `开始写入 DATA_IN: target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`);
 
       const MAX_WINDOW_RETRIES = 3;
@@ -1131,6 +1221,7 @@
         const endSeq = Math.min(windowStart + BLE_OTA_ACK_WINDOW, packetTotal) - 1;
 
         // 流水线发送：不逐包 await，减少 BLE 栈 per-packet 开销
+        // ★ 不再在循环内 setProgress：进度完全由设备 ACK 后的 state.lastAckBytes 驱动
         for (let seq = windowStart; seq <= endSeq; seq++) {
           const start = seq * payloadSize;
           const end = Math.min(start + payloadSize, totalSize);
@@ -1162,12 +1253,6 @@
             state.dataInChar.writeValueWithoutResponse(packet);  // fire-and-forget
           }
           bleWriteTs = performance.now();
-
-          const percent = ((seq + 1) / packetTotal) * 100;
-          els.sentCount.textContent = String(seq + 1);
-          setProgress(percent, `[${cfg.label}] 已写 ${seq + 1}/${packetTotal} 包`);
-          setBleStage(4, `${seq + 1}/${packetTotal} 包`, null);
-          setBleStageText(`数据写入 ${Math.round(percent)}%`);
         }
 
         state.ackGeneration++;
@@ -1246,8 +1331,16 @@
       }
 
       // Stage 4 done
+      // ★ 不再用本地 seq 推算固定百分比：进度以设备端 ACK 字节数为准
+      const confirmedPct = state.activeTotalSize > 0
+        ? Math.min(100, (state.lastAckBytes >>> 0) / state.activeTotalSize * 100)
+        : 100;
+      // 阶段 4 完成后，base 进度：GD32 留 55% 给中继/校验，ESP32 留 10% 给收尾
+      const phaseBase = cfg.label === 'GD32' ? 45 : 90;
+      // ACK 推进到的进度 = 阶段 4 在整体里占的份额 (phaseBase) × 设备真实确认比例
+      const stage4Share = phaseBase * (confirmedPct / 100);
       setBleStage(4, '完成', null);
-      setProgress(cfg.label === 'GD32' ? 45 : 90, `[${cfg.label}] 固件数据已全部写入 DATA_IN`);
+      setProgress(Math.min(phaseBase, stage4Share), `[${cfg.label}] 固件数据已全部写入 DATA_IN`);
 
       // Stage 5: 发送 0xF8 + 32B 文件 SHA-256，由设备端执行收尾并完成比对
       if (cfg.label === 'ESP32') {

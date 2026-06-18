@@ -180,6 +180,16 @@ public:
      * @brief 校验固件完整性（SHA-256）.
      */
     static esp_err_t metaVerifyChecksum();
+    /**
+     * @brief 校验前端提供的 SHA-256 是否与设备端计算的一致。
+     *        BLE/WiFi 传输层共用：内部完成 metaFinalizeChecksum → metaLoad → memcmp。
+     *        无论是否匹配，都会通过 out_device_sha 回传设备端 SHA（便于前端核对）。
+     * @param frontend_sha32  前端 32 字节原始 SHA（非 hex）。
+     * @param out_device_sha  可为 nullptr；非空时输出设备端 32 字节 SHA。
+     * @return ESP_OK 匹配；ESP_ERR_INVALID_CRC 不匹配；其他 = 元数据/计算失败。
+     */
+    static esp_err_t verifyFrontendSha(const uint8_t frontend_sha32[32],
+                                       uint8_t out_device_sha[32]);
 
     // ── 公开状态成员 ──
     static relay_state_t relayState;

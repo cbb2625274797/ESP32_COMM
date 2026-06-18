@@ -16,6 +16,7 @@
 #include "esp_err.h"
 #include "driver/temperature_sensor.h"
 
+#include "esp_heap_caps.h"
 #include "health_monitor.h"
 #include "debug_log.h"
 #include "server/wifi_ota.h"
@@ -197,7 +198,9 @@ void HealthMonitor::taskEntry(void *pvParameters)
     while (1) {
         uint32_t free_heap = esp_get_free_heap_size();
         if (free_heap < HEAP_WARNING_MIN) {
-            DEBUG_WARN("MON", "堆内存不足: %lu < %lu", free_heap, HEAP_WARNING_MIN);
+            uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+            DEBUG_WARN("MON", "堆内存不足: free=%lu min=%lu largest_blk=%lu",
+                       free_heap, esp_get_minimum_free_heap_size(), largest_block);
         }
         health_state_t cur = self.getState();
         if (cur >= SYS_CRITICAL) {

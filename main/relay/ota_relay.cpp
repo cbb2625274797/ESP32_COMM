@@ -835,6 +835,28 @@ esp_err_t OtaRelay::metaVerifyChecksum()
     return ESP_OK;
 }
 
+esp_err_t OtaRelay::verifyFrontendSha(const uint8_t frontend_sha32[32],
+                                      uint8_t out_device_sha[32])
+{
+    if (!frontend_sha32) return ESP_ERR_INVALID_ARG;
+
+    // 1) 计算设备端 SHA 并写入 meta.checksum（metaFinalizeChecksum 内部已校验固件完整性）
+    esp_err_t err = metaFinalizeChecksum();
+    if (err != ESP_OK) return err;
+
+    // 2) 读回 meta 拿到 checksum，回传给调用方
+    ota_meta_t meta;
+    err = metaLoad(&meta);
+    if (err != ESP_OK) return err;
+    if (out_device_sha) memcpy(out_device_sha, meta.checksum, 32);
+
+    // 3) 比对前端 SHA 与设备端 SHA
+    if (memcmp(meta.checksum, frontend_sha32, 32) != 0) {
+        return ESP_ERR_INVALID_CRC;
+    }
+    return ESP_OK;
+}
+
 esp_err_t OtaRelay::flashWriteChunk(uint32_t offset, const uint8_t *data, size_t len)
 {
     if (!instance().m_gd32Partition) {
@@ -1167,8 +1189,13 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
             }
             if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
                 DEBUG_WARN("OTA", "数据包 %" PRIu32 " 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu", seq, err, resp_type, resp_len);
-                result = OTA_RESULT_ERR_TIMEOUT;
-                break;
+                if (++retry_count >= 10U) {
+                    DEBUG_ERR("OTA", "包 %" PRIu32 " 重发次数超限", seq);
+                    result = OTA_RESULT_ERR_TIMEOUT;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;  // 重发本包
             }
 
             uint32_t expected_ack = (seq == m_transferTotalPackets - 1) ? 0xF0F0F0F0U : (seq + 1U);

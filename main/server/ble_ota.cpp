@@ -127,15 +127,13 @@ static void ble_esp32_restart_task(void *pvParameters)
     (void)pvParameters;
     DEBUG_INFO(TAG, "[RESTART] 推送 FINISH_REBOOT_NOW 后 500ms 重启");
     sendFinishEvent(BLE_OTA_FINISH_REBOOT_NOW, 0);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    OtaCoordinator::instance().notifyEsp32Rebooting();
-    esp_restart();
+    OtaCoordinator::instance().restartEsp32();   // 内部 notify + delay + esp_restart，不返回
 }
 
 /**
   * @brief 异步完成 ESP32 OTA 收尾并触发重启。
- * @param pvParameters BleEsp32FinishCtx（堆分配，任务负责释放）。
- */
+  * @param pvParameters BleEsp32FinishCtx（堆分配，任务负责释放）。
+  */
 static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 {
     BleEsp32FinishCtx *ctx = (BleEsp32FinishCtx *)pvParameters;
@@ -166,26 +164,17 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
     }
 
     DEBUG_INFO(TAG, "ESP32 OTA 收尾: 共 %u 字节", (unsigned)core.getReceived());
-    OtaCoordinator::instance().notifyEsp32ReceiveComplete();
 
-    // 关键：reboot=false，让 finalize 真正返回、拿到 device_sha_hex，
-    // 再依次推送 SHA 通知 + FINISH_DONE + FINISH_REBOOT_NOW，
-    // 最后延迟重启。若 reboot=true，core 内部直接 esp_restart()，
-    // 下面所有 notifyResponse / sendFinishEvent 都不会执行，
-    // 前端也就拿不到设备端 SHA 与"收尾完成/即将重启"事件。
-    char device_sha_hex[65] = {0};
-    esp_err_t err = core.finalize(frontend_sha_hex,
-                                  /*reboot=*/false,
-                                  device_sha_hex);
+    // ★ 收尾序列（notify + finalize）由协调器统一封装，reboot=false 让 device_sha 可被读取
+    Esp32FinalizeResult fr = OtaCoordinator::instance().finalizeForReboot(frontend_sha_hex);
 
-    if (err == ESP_OK) {
-        OtaCoordinator::instance().notifyEsp32FinalizeComplete();
+    if (fr.err == ESP_OK) {
         // 1) 把设备端 SHA 通过 SHA256 通知推给前端
-        if (device_sha_hex[0] != '\0') {
+        if (fr.device_sha_hex[0] != '\0') {
             uint8_t device_sha[32] = {0};
             for (int i = 0; i < 32; ++i) {
                 unsigned int byte = 0;
-                sscanf(&device_sha_hex[i * 2], "%02x", &byte);
+                sscanf(&fr.device_sha_hex[i * 2], "%02x", &byte);
                 device_sha[i] = (uint8_t)byte;
             }
             sendSha256Notify(device_sha, session_id);
@@ -193,24 +182,22 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         // 2) 等待 SHA 通知从 NimBLE host 队列送出
         vTaskDelay(pdMS_TO_TICKS(150));
 
-        // 3) 推送"OTA 收尾完成"与"即将重启"事件
+        // 3) 推送"OTA 收尾完成"事件
         sendFinishEvent(BLE_OTA_FINISH_DONE, packBleFinishValue(session_id, 0));
         sendFinishEvent(BLE_OTA_FINISH_REBOOT_NOW, packBleFinishValue(session_id, 0));
 
-        // 4) 通知全部发出后延迟 500ms 重启
-        DEBUG_INFO(TAG, "[FINISH] 通知已发送，500ms 后重启...");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        OtaCoordinator::instance().notifyEsp32Rebooting();
-        esp_restart();
-        // 不会返回
-    } else if (err == ESP_ERR_INVALID_VERSION) {
+        // 4) 通知全部发出后由协调器统一重启（notify + delay + esp_restart）
+        DEBUG_INFO(TAG, "[FINISH] 通知已发送，重启...");
+        if (ctx) free(ctx);
+        OtaCoordinator::instance().restartEsp32();   // 不返回
+    } else if (fr.err == ESP_ERR_INVALID_VERSION) {
         DEBUG_ERR(TAG, "[FINISH] SHA-256 不匹配，OTA 已中止");
         sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH, packBleFinishValue(session_id, 0));
         BleOta::instance().m_esp32RebootPending = false;
         // ★ finalize 内部已 abort 并释放 mutex，这里释放 reorder buffer
         esp32_reorder_free();
     } else {
-        DEBUG_ERR(TAG, "[FINISH] OTA 收尾失败: %s", esp_err_to_name(err));
+        DEBUG_ERR(TAG, "[FINISH] OTA 收尾失败: %s", esp_err_to_name(fr.err));
         sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
                         packBleFinishValue(session_id, 1));
         BleOta::instance().m_esp32RebootPending = false;
@@ -223,41 +210,39 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 }
 
 // ============================================================
-// WiFi 共存优化：BLE OTA 传输期间降低 WiFi 射频占用
+// WiFi 共存策略：BLE OTA 传输期间的处理
+//
+// 历史：曾在此处把 WiFi 切到 WIFI_PS_MAX_MODEM 以把空中时间让给 BLE。
+//   但 MAX_MODEM 下 STA 监听间隔被拉到极大，HTTP server 的 TCP 握手/数据包
+//   会大量丢失或延迟到超时 → BLE OTA 期间任何 WiFi 请求（包括互斥拒绝应返回的
+//   403）都到不了设备，前端 XHR 长时间无响应，表现为"Wifi 上传既不成功也不报错"。
+//
+// 现策略：不切换 WiFi 省电模式（保持 WIFI_PS_NONE），让 STA 全程可用，
+//   协调器照常以 403 拒绝并发 OTA。ESP32-C3 coex 默认调度已能保证 BLE OTA 可用。
+//   仍保留 setBleOtaActive() 暂停 RSSI 轮询（避免 get_ap_info 的射频活动干扰 BLE）。
 // ============================================================
 static bool s_wifi_ps_boosted = false;
 
 /**
- * @brief BLE OTA 开始时，将 WiFi 切换到最大省电模式，减少射频抢占。
- *        WiFi STA 仍保持连接，但信标监听间隔大幅拉长，BLE 获得更多空中时间。
+ * @brief BLE OTA 开始时的 WiFi 共存处理（暂停 RSSI 轮询，不切省电模式）。
  */
 static void ble_ota_boost_wifi_ps()
 {
     if (s_wifi_ps_boosted) return;
-    esp_err_t err = esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-    if (err == ESP_OK) {
-        s_wifi_ps_boosted = true;
-        WifiOta::instance().setBleOtaActive(true);  // ★ 暂停 WiFi RSSI 轮询
-        DEBUG_INFO(TAG, "WiFi 已切换到 MAX_MODEM 省电模式（BLE OTA 传输优化）");
-    } else {
-        DEBUG_WARN(TAG, "WiFi 省电模式切换失败: %s", esp_err_to_name(err));
-    }
+    s_wifi_ps_boosted = true;
+    WifiOta::instance().setBleOtaActive(true);  // ★ 暂停 WiFi RSSI 轮询
+    DEBUG_INFO(TAG, "BLE OTA 进行中：暂停 WiFi RSSI 轮询（保持 WIFI_PS_NONE，STA 仍可响应 HTTP）");
 }
 
 /**
- * @brief BLE OTA 结束/中止时，恢复 WiFi 省电策略为 WIFI_PS_NONE。
+ * @brief BLE OTA 结束/中止时恢复 WiFi RSSI 轮询。
  */
 static void ble_ota_restore_wifi_ps()
 {
     if (!s_wifi_ps_boosted) return;
-    esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
-    if (err == ESP_OK) {
-        s_wifi_ps_boosted = false;
-        WifiOta::instance().setBleOtaActive(false);  // ★ 恢复 WiFi RSSI 轮询
-        DEBUG_INFO(TAG, "WiFi 已恢复 WIFI_PS_NONE 模式");
-    } else {
-        DEBUG_WARN(TAG, "WiFi 省电模式恢复失败: %s", esp_err_to_name(err));
-    }
+    s_wifi_ps_boosted = false;
+    WifiOta::instance().setBleOtaActive(false);  // ★ 恢复 WiFi RSSI 轮询
+    DEBUG_INFO(TAG, "BLE OTA 结束：恢复 WiFi RSSI 轮询");
 }
 
 // ============================================================
@@ -558,14 +543,8 @@ static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
  */
 static esp_err_t ble_esp32_ota_begin(size_t total_size)
 {
-    // ★ 通过全局协调器发起 ESP32 OTA
-    esp_err_t err = OtaCoordinator::instance().beginEsp32Ota(total_size);
-    if (err == ESP_ERR_INVALID_STATE) {
-        // 协调器拒绝 → 尝试强制清理后重试
-        DEBUG_WARN(TAG, "ESP32 OTA 被协调器拒绝，强制清理状态机后重试");
-        Esp32OtaCore::instance().forceCleanup();
-        err = OtaCoordinator::instance().beginEsp32Ota(total_size);
-    }
+    // ★ 通过协调器发起（内部已含 forceCleanup 重试）
+    esp_err_t err = OtaCoordinator::instance().beginEsp32OtaWithRetry(total_size);
     if (err != ESP_OK) {
         return err;
     }
@@ -765,31 +744,23 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
             char device_sha_hex[65] = {0};
             shaBytesToHexUpper(frontend_sha, frontend_sha_hex);
 
-            err = OtaRelay::metaFinalizeChecksum();
-            if (err != ESP_OK) {
-                DEBUG_ERR(TAG, "GD32 缓存 SHA-256 计算失败: %s", esp_err_to_name(err));
-                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
-                                packBleFinishValue(session_id, 3));
-                return 0;
-            }
-
-            err = OtaRelay::metaLoad(&meta);
-            if (err != ESP_OK) {
-                DEBUG_ERR(TAG, "GD32 SHA-256 元数据读取失败: %s", esp_err_to_name(err));
-                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
-                                packBleFinishValue(session_id, 3));
-                return 0;
-            }
-
-            shaBytesToHexUpper(meta.checksum, device_sha_hex);
-            sendSha256Notify(meta.checksum, session_id);
+            // ★ 统一走共享 helper：计算设备端 SHA → 比对前端 SHA
+            uint8_t device_sha[32] = {0};
+            err = OtaRelay::verifyFrontendSha(frontend_sha, device_sha);
+            shaBytesToHexUpper(device_sha, device_sha_hex);
+            sendSha256Notify(device_sha, session_id);
             DEBUG_INFO(TAG, "GD32 前端 SHA-256: %s, session=%u", frontend_sha_hex, session_id);
             DEBUG_INFO(TAG, "GD32 缓存 SHA-256: %s", device_sha_hex);
 
-            if (memcmp(meta.checksum, frontend_sha, 32) != 0) {
+            if (err == ESP_ERR_INVALID_CRC) {
                 DEBUG_ERR(TAG, "GD32 缓存 SHA-256 与前端文件不匹配，拒绝触发 SPI 中继");
                 sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH,
                                 packBleFinishValue(session_id, 0));
+                return 0;
+            } else if (err != ESP_OK) {
+                DEBUG_ERR(TAG, "GD32 SHA-256 计算/读取失败: %s", esp_err_to_name(err));
+                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
+                                packBleFinishValue(session_id, 3));
                 return 0;
             }
 
@@ -1032,13 +1003,22 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
                     DEBUG_ERR(TAG, "ESP32 固件大小非法: %" PRIu32, total_size);
                     return;
                 }
-                // 分区选择/大小校验/互斥由 Esp32OtaCore::begin 内部完成
-                esp_err_t err = ble_esp32_ota_begin(total_size);
-                if (err != ESP_OK) {
-                    if (err == ESP_ERR_INVALID_STATE) {
-                        sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
+                // ★ 幂等保护：若已有活跃 ESP32 OTA 会话，说明这是客户端因 ACK 超时
+                //   重传的 seq=0（同一会话续传）。若再次走 begin，会被协调器以
+                //   "OTA 已 ESP32_RECEIVING" 拒绝 → 误报"被其他通道占用"并中止整条
+                //   OTA 流程。此处跳过 begin 复用现有会话，后续 reorder buffer 会
+                //   按 seq 去重（seq=0 < expected 时作为重复包丢弃）。
+                if (Esp32OtaCore::instance().isActive()) {
+                    DEBUG_INFO(TAG, "ESP32 OTA 会话已激活，seq=0 视为重传，跳过 begin");
+                } else {
+                    // 分区选择/大小校验/互斥由 Esp32OtaCore::begin 内部完成
+                    esp_err_t err = ble_esp32_ota_begin(total_size);
+                    if (err != ESP_OK) {
+                        if (err == ESP_ERR_INVALID_STATE) {
+                            sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
+                        }
+                        return;
                     }
-                    return;
                 }
             }
 

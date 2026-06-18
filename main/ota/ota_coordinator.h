@@ -36,6 +36,15 @@ typedef enum {
 } ota_system_state_t;
 
 /**
+ * @brief ESP32 OTA 收尾结果（由 finalizeForReboot 返回）。
+ *        err 为 ESP_OK 时 device_sha_hex 有效；SHA 不匹配时也填充 device_sha_hex 供前端核对。
+ */
+typedef struct {
+    esp_err_t err;                ///< ESP_OK / ESP_ERR_INVALID_VERSION(SHA不匹配) / 其他
+    char      device_sha_hex[65]; ///< 设备端 SHA hex（成功或 SHA 不匹配时填充）
+} Esp32FinalizeResult;
+
+/**
  * @brief 全局 OTA 协调器（单例）
  *
  * 提供系统级 OTA 状态管理与操作串行化。
@@ -102,6 +111,14 @@ public:
     esp_err_t beginEsp32Ota(uint32_t total_size);
 
     /**
+     * @brief 发起 ESP32 OTA，若被 ESP_ERR_INVALID_STATE 拒绝则 forceCleanup 后重试一次。
+     *        封装 BLE/WiFi 两端完全相同的重试模式，调用方只需调一次。
+     * @param total_size 固件总字节数。
+     * @return ESP_OK 成功；其他 = 协调器拒绝或 Esp32OtaCore::begin 失败。
+     */
+    esp_err_t beginEsp32OtaWithRetry(uint32_t total_size);
+
+    /**
      * @brief ESP32 OTA 固件接收完毕，准备收尾。
      *        更新系统状态为 OTA_SYS_ESP32_FINALIZING。
      */
@@ -116,6 +133,23 @@ public:
      * @brief ESP32 即将重启。
      */
     void notifyEsp32Rebooting();
+
+    /**
+     * @brief ESP32 OTA 收尾（统一封装 BLE/WiFi 两端重复的收尾序列）。
+     *        步骤：notifyEsp32ReceiveComplete → Esp32OtaCore::finalize(reboot=false)
+     *        → 成功则 notifyEsp32FinalizeComplete。
+     *        不重启；调用方负责把 device_sha_hex 上报前端后再调 restartEsp32()。
+     * @param frontend_sha_hex 前端 64 字符 hex SHA-256，nullptr 表示跳过比对。
+     * @return Esp32FinalizeResult，err 为 ESP_OK/ESP_ERR_INVALID_VERSION/其他。
+     */
+    Esp32FinalizeResult finalizeForReboot(const char *frontend_sha_hex);
+
+    /**
+     * @brief 重启 ESP32（统一封装 BLE/WiFi 两端重复的重启序列）。
+     *        步骤：notifyEsp32Rebooting → vTaskDelay(500ms) → esp_restart()。
+     *        应在 finalizeForReboot 成功并完成前端上报后调用。不会返回。
+     */
+    void restartEsp32();
 
     // ── 中止 ──
     /**
@@ -166,6 +200,14 @@ public:
      * @brief 完全复位协调器和所有子系统状态。
      */
     void reset();
+
+    // ── ESP32 OTA finalize 错误分类（BLE/WiFi 共用）──
+    /**
+     * @brief 把 finalize 返回的 esp_err_t 映射为前端可读的事件码。
+     *        统一 BLE/WiFi 两端语义，便于日志/状态一致。
+     * @return 0=成功；1=SHA 不匹配；2=其他失败。
+     */
+    static int esp32FinalizeErrCategory(esp_err_t err);
 
 private:
     OtaCoordinator() = default;

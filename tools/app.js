@@ -10,6 +10,7 @@ let logEntries = [];
 let lastLogHash = null;
 let autoScroll = true;
 let logSocket = null;
+let pageVisible = !document.hidden;   // 页面可见性：切到后台/最小化/切标签会变 false
 let latestSystemStatus = null;
 let isEsp32Rebooting = false;
 let rebootStartTime = 0;
@@ -298,10 +299,6 @@ function resetStageFlow() {
 function applyDisconnectedRuntimeState() {
   document.getElementById('pillIP').textContent = '--';
   document.getElementById('pillRSSI').textContent = '--';
-  document.getElementById('pillRelayTxt').textContent = '离线';
-  document.getElementById('pillRelay').className = 'pill offline';
-  var bp = document.getElementById('bOTAProgress');
-  if (bp) { bp.textContent = '--'; bp.className = 'v err'; }
   resetProgress();
   resetStageFlow();
 }
@@ -318,8 +315,6 @@ function applyRebootingRuntimeState() {
   var bc = document.getElementById('bConn');
   if (bc) bc.textContent = '重启中';
   if (bc) bc.className = 'v warn';
-  document.getElementById('pillRelayTxt').textContent = '重启中';
-  document.getElementById('pillRelay').className = 'pill processing';
 }
 function applyUploadingRuntimeState() {
   var pc = document.getElementById('pillConn');
@@ -493,9 +488,6 @@ function updateSystemStatusUi(data) {
   }
   // relay state - skip GD32 relay UI when ESP32 OTA is active
   if (currentOtaTarget === 'esp32' && esp32OtaPhase > 0) {
-    document.getElementById('pillRelayTxt').textContent = esp32OtaPhase >= 6 ? 'ESP32 OTA 完成' : 'ESP32 OTA';
-    var pr = document.getElementById('pillRelay');
-    if (pr) pr.className = esp32OtaPhase >= 6 ? 'pill online' : 'pill processing';
     return;
   }
   var rs = ota.relay_state;
@@ -505,15 +497,6 @@ function updateSystemStatusUi(data) {
   var isGd32Relaying = sysState === 'GD32_RELAYING' || sysStateCode === 3;
   var isGd32Complete = sysState === 'GD32_COMPLETE' || sysStateCode === 4;
   var isGd32Error = sysState === 'ERROR' || sysStateCode === 8 || rs === 255;
-  var relayText = isGd32Complete ? 'GD32 OTA 完成'
-    : isGd32Storing ? 'GD32 OTA 上传中'
-    : (relayStateDetailMap[rs] || '待机');
-  document.getElementById('pillRelayTxt').textContent = relayText;
-  var pr = document.getElementById('pillRelay');
-  if (isGd32Error) pr.className = 'pill offline';
-  else if (isGd32Complete || rs === 5) pr.className = 'pill online';
-  else if (isGd32Storing || isGd32Relaying || (rs > 0 && rs < 5)) pr.className = 'pill processing';
-  else pr.className = 'pill idle';
   // OTA cache progress (GD32 upload to ESP32 flash)
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
@@ -994,9 +977,50 @@ function clearFile(chip) {
   addLog('I', '文件', chip.toUpperCase() + ' 文件已清除');
 }
 // ==================== 上传固件 ====================
+// ★ 跨通道互斥检查：WiFi 与 BLE 共用同一个 ESP32 OTA 状态机与全局互斥，
+//   但前端只用一个 `isUploading` bool 锁同一通道。这里在每次 startUpload
+//   入口主动查询 /system/status，若发现另一通道已经进入 OTA 活跃态
+//   （ESP32 三个状态或 GD32 存储/中继），直接拒绝并提示用户。
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file || isUploading) return;
+  // ★ 必须先抢锁再 await：守卫同步设置，await 期间重复点击才能被拦下。
+  //   旧实现把 isUploading 设在 await handle.getFile() 之后 → 用户在 BLE 期间
+  //   狂点 WiFi 上传按钮时，多个 startUpload 都能通过守卫，最终并发 xhr.send，
+  //   设备端互斥被绕过、403 路径走漏。
+  isUploading = true;
+  // 跨通道互斥前置检查
+  try {
+    var probe = await fetch(getBaseUrl() + '/system/status', {
+      signal: AbortSignal.timeout(2000)
+    });
+    if (probe.ok) {
+      var st = await probe.json();
+      var ota = st.ota || {};
+      var ssc = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
+      // ESP32 三种活跃态（5=RECEIVING, 6=FINALIZING, 7=REBOOTING）
+      var esp32Busy = (ssc === 5 || ssc === 6 || ssc === 7);
+      // GD32 存储/中继（1=STORING, 3=RELAYING）→ 阻止新上传，避免 NVS 与 Flash 互踩
+      var gd32Busy = (ssc === 1 || ssc === 3);
+      // 同通道（chip=esp32）已在进行中：本通道会重入；不做阻拦
+      // 另一通道活跃：拒绝
+      if (chip === 'esp32' && (esp32Busy || gd32Busy)) {
+        addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 ESP32 上传');
+        showToast('设备正在 OTA 中，请等待结束后再试', 'error');
+        isUploading = false;
+        return;
+      }
+      if (chip === 'gd32' && (esp32Busy || gd32Busy)) {
+        addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 GD32 上传');
+        showToast('设备正在 OTA 中，请等待结束后再试', 'error');
+        isUploading = false;
+        return;
+      }
+    }
+  } catch (e) {
+    // 探测失败：可能是设备瞬时忙或网络问题。保守继续走，由后端 403 兜底。
+    addLog('W', '上传', '跨通道互斥状态探测失败: ' + e.message + '（继续尝试，由设备端兜底）');
+  }
   // 每次上传前尝试重新从本地读取文件
   var handle = chip === 'esp32' ? esp32FileHandle : gd32FileHandle;
   if (handle) {
@@ -1029,10 +1053,10 @@ async function startUpload(chip) {
       addLog('E', '文件', '本地文件已变更或失效，请重新选择文件');
       showToast('文件已变更，请重新选择', 'error');
       clearFile(chip);
+      isUploading = false;
       return;
     }
   }
-  isUploading = true;
   var uploadBtn = document.getElementById(chip === 'esp32' ? 'uploadEsp32Btn' : 'uploadGd32Btn');
   var origText = uploadBtn.textContent;
   uploadBtn.disabled = true;
@@ -1053,7 +1077,7 @@ async function startUpload(chip) {
   showToast('开始上传固件到 ' + chip.toUpperCase(), 'success');
   try {
     var arrayBuffer = await file.arrayBuffer();
-    // 刷写时重新计算 SHA-256
+    // 刷写时重新计算 SHA-256（ESP32 和 GD32 都算）
     if (chip === 'esp32') {
       try {
         var hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
@@ -1065,6 +1089,17 @@ async function startUpload(chip) {
         addLog('I', '文件', '刷写前重新计算 SHA-256: ' + window._esp32FileSha256);
       } catch (e) {
         addLog('W', '文件', 'SHA-256 重新计算失败: ' + e.message);
+      }
+    } else if (chip === 'gd32') {
+      try {
+        var hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+        var hashArray = Array.from(new Uint8Array(hashBuffer));
+        var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+        window._gd32FileSha256 = hashHex.toUpperCase();
+        addLog('I', '文件', 'GD32 SHA-256: ' + window._gd32FileSha256);
+      } catch (e) {
+        addLog('W', '文件', 'GD32 SHA-256 重新计算失败: ' + e.message);
+        window._gd32FileSha256 = null;
       }
     }
     var fileSize = file.size;
@@ -1126,7 +1161,8 @@ async function startUpload(chip) {
         } else {
           switchStageFlow('gd32');
           setActivePhase('gd32Ota');
-          setProgress(45, '上传完成，已自动触发 GD32 OTA...');
+          setProgress(45, '上传完成，校验并触发 GD32 OTA...');
+          triggerGd32Relay();
         }
       } else if (xhr.status === 403) {
         addLog('E', '上传', 'ESP32 OTA 被其他通道占用（BLE/WiFi 互斥），请稍后重试');
@@ -1305,28 +1341,54 @@ async function restartEsp32() {
     showToast('重启失败', 'error');
   }
 }
-// ==================== 手动触发 GD32 OTA (调试/旧页面兜底) ====================
-async function triggerRelay() {
-  addLog('I', 'OTA', '手动触发 GD32 OTA...');
+// ==================== GD32 OTA 触发（带 SHA-256 校验，对齐 BLE 0xF7）====================
+async function triggerGd32Relay() {
+  var sha256 = window._gd32FileSha256;
+  if (!sha256) {
+    addLog('E', 'OTA', '缺少 GD32 文件 SHA-256，请先上传文件');
+    showToast('SHA-256 缺失', 'error');
+    return;
+  }
+  addLog('I', 'OTA', 'GD32 SHA-256: ' + sha256 + ' → 触发中继...');
   showToast('正在触发 GD32 OTA', 'success');
   try {
     var resp = await fetch(getBaseUrl() + '/ota/relay', {
-      method: 'POST', signal: AbortSignal.timeout(5000)
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha256: sha256 }),
+      signal: AbortSignal.timeout(30000)  // 中继可能耗时较长
     });
+    var text = await resp.text();
     if (resp.ok) {
+      try {
+        var data = JSON.parse(text);
+        if (data.sha256) addLog('I', 'OTA', '设备端 SHA-256: ' + data.sha256);
+      } catch (_) {}
       addLog('I', 'OTA', 'GD32 OTA 已触发，等待设备响应...');
-      // 不再使用假的 setTimeout 推进阶段。
-      // pollStatus 的 updateSystemStatusUi 会从 ota.relay_state
-      // 自动更新 stage flow 和 header 状态。
-      showToast('GD32 OTA 已触发，等待设备响应', 'success');
+      showToast('GD32 OTA 已触发', 'success');
     } else {
-      addLog('E', 'OTA', '触发失败: HTTP ' + resp.status);
-      showToast('触发失败', 'error');
+      // 尝试解析错误响应中的 device SHA
+      try {
+        var err = JSON.parse(text);
+        if (err.device) {
+          addLog('E', 'OTA', 'GD32 SHA-256 不匹配: 设备=' + err.device + ' 前端=' + sha256);
+          showToast('SHA-256 不匹配', 'error');
+          return;
+        }
+      } catch (_) {}
+      addLog('E', 'OTA', 'GD32 触发失败: HTTP ' + resp.status + ' ' + text);
+      showToast('GD32 触发失败', 'error');
     }
   } catch (e) {
-    addLog('E', 'OTA', '触发失败: ' + e.message);
-    showToast('触发失败', 'error');
+    addLog('E', 'OTA', 'GD32 触发失败: ' + e.message);
+    showToast('GD32 触发失败', 'error');
   }
+}
+
+// ==================== 手动触发 GD32 OTA (调试/旧页面兜底) ====================
+async function triggerRelay() {
+  // 转发到统一入口：自动使用最近一次上传的 GD32 文件 SHA
+  await triggerGd32Relay();
 }
 // ==================== 轮询状态 ====================
 var consecutivePollFailures = 0;
@@ -1426,9 +1488,11 @@ async function pollStatus() {
       updateSystemStatusUi(data);
     }
   } catch (e) {
-    consecutivePollFailures++;
+    // 后台期间 setInterval 会被 Chrome/Edge 节流到最低 1 分钟/次，
+    // 因此后台累积的失败计数不应递增，避免切回前台瞬间误触发 5-fail 诊断。
+    if (pageVisible) consecutivePollFailures++;
     // 传输中屏蔽网关无响应的检测功能（上传期间设备忙，无法响应轮询是正常的）
-    if (consecutivePollFailures === 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting) {
+    if (pageVisible && consecutivePollFailures >= 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting) {
       addLog('W', '诊断', '设备连续 5 次无响应，正在诊断网络...');
       var diag = await diagnoseNetwork();
       addLog('W', '诊断', diag);
@@ -1460,6 +1524,19 @@ async function pollStatus() {
   }
 }
 startPolling();
+// ==================== Page Visibility 补偿 ====================
+// Chrome/Edge 在标签隐藏/窗口最小化时会把 setInterval 节流到最低 1 分钟/次。
+// 切回前台时立即拉一次状态 + 日志，并清零后台期间累积的失败计数，
+// 避免在"刚切回前台那一轮"被误判为 5-fail 离线。
+document.addEventListener('visibilitychange', function () {
+  pageVisible = !document.hidden;
+  if (!pageVisible) return;
+  consecutivePollFailures = 0;
+  pollStatus();
+  pollLogs();
+  // 之前若在慢速模式（10s），切回前台先用 1s 观察一会儿
+  if (pollSlowMode) restorePolling();
+});
 // ==================== ESP32 实时日志拉取 (增量) ====================
 var lastLogTimestamp = 0;
 async function pollLogs() {

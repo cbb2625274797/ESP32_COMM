@@ -48,6 +48,9 @@ WifiOta& WifiOta::instance()
 
 static constexpr uint32_t GD32_OTA_FLASH_SECTOR_SIZE = 4096U;
 
+// ★ OTA 接收共享缓冲区：由 OtaCoordinator 互斥串行化，无并发风险，避免频繁 malloc/free 导致堆碎片化
+static uint8_t s_ota_recv_buf[OTA_BLOCK_SIZE];
+
 /**
   * @brief 按指定对齐值向上取整。
  * @param value 待对齐的值。
@@ -509,47 +512,39 @@ static esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    // ── 完整模式：finalize 不重启，先把含设备端 SHA 的结果返回给前端 ──
-    //   关键：reboot=false，让 core.finalize 真正返回，才能拿到 device_sha_hex
-    //   并把响应发回前端；待响应发完后再延迟重启。
-    //   若 reboot=true，core 内部直接 esp_restart()，HTTP 响应永远发不出去，
-    //   前端会得到 "Failed to fetch" 而错过核对结果。
+    // ── 完整模式：收尾+重启序列由协调器统一封装 ──
+    //   关键：reboot=false 行为由 finalizeForReboot 内部封装，
+    //   响应发回前端后再由 restartEsp32() 统一通知+delay+esp_restart。
     DEBUG_INFO("OTA", "ESP32 OTA finalize, %u bytes...", (unsigned)core.getReceived());
-    OtaCoordinator::instance().notifyEsp32ReceiveComplete();
-    esp_err_t err = core.finalize(has_frontend_sha ? frontend_sha_hex : nullptr,
-                                  /*reboot=*/false,
-                                  device_sha_hex);
+    Esp32FinalizeResult fr = OtaCoordinator::instance().finalizeForReboot(
+        has_frontend_sha ? frontend_sha_hex : nullptr);
 
-    if (err == ESP_OK) {
-        OtaCoordinator::instance().notifyEsp32FinalizeComplete();
+    if (fr.err == ESP_OK) {
         // 1) 把包含设备端 SHA 的响应发回前端
         char resp[320] = {0};
         snprintf(resp, sizeof(resp),
                  "{\"status\": \"ok\", \"message\": \"OTA finished, rebooting\", "
                  "\"sha256\": \"%s\"}",
-                 device_sha_hex);
+                 fr.device_sha_hex);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, strlen(resp));
 
-        // 2) 响应发完后延迟 500ms 重启，给 TCP 缓冲区时间 flush 到客户端
-        DEBUG_INFO("OTA", "响应已发送，500ms 后重启...");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        OtaCoordinator::instance().notifyEsp32Rebooting();
-        esp_restart();
-        // 不会返回
+        // 2) 响应发完后由协调器统一重启（notify + delay + esp_restart）
+        DEBUG_INFO("OTA", "响应已发送，重启...");
+        OtaCoordinator::instance().restartEsp32();   // 不返回
         return ESP_OK;
     }
 
     // 失败：core 已内部清理（abort + mutex release）
-    if (err == ESP_ERR_INVALID_VERSION) {
+    if (fr.err == ESP_ERR_INVALID_VERSION) {
         char err_resp[256] = {0};
         snprintf(err_resp, sizeof(err_resp),
                  "{\"status\": \"error\", \"message\": \"SHA-256 mismatch\", \"frontend\": \"%s\", \"device\": \"%s\"}",
-                 frontend_sha_hex, device_sha_hex);
+                 frontend_sha_hex, fr.device_sha_hex);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, err_resp, strlen(err_resp));
     } else {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(fr.err));
     }
     return ESP_FAIL;
 }
@@ -564,15 +559,13 @@ static esp_err_t restart_handler(httpd_req_t *req)
     (void)req;
     http_set_cors_headers(req);
 
-    DEBUG_INFO("OTA", "收到重启请求，500ms 后重启...");
+    DEBUG_INFO("OTA", "收到重启请求，重启...");
 
     const char resp[] = "{\"status\": \"ok\", \"message\": \"rebooting\"}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
 
-    vTaskDelay(pdMS_TO_TICKS(500));
-    OtaCoordinator::instance().notifyEsp32Rebooting();
-    esp_restart();
+    OtaCoordinator::instance().restartEsp32();   // 内部 notify + delay + esp_restart，不返回
     return ESP_OK;
 }
 
@@ -613,7 +606,8 @@ static int recv_json_header(httpd_req_t *req, char *buf, int buf_size)
 static esp_err_t ota_upload_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
-    DEBUG_INFO("WIFI", "=== HTTP: POST /ota/upload ===");
+    // ★ 入口追踪：用于确认 HTTP 请求是否真的到达设备（排查"前端点了但设备没反应"）
+    DEBUG_WARN("WIFI", "=== HTTP: POST /ota/upload === content_len=%d", req->content_len);
     DEBUG_INFO("WIFI", "收到固件上传请求, 内容长度: %d 字节", req->content_len);
 
     // ★ WiFi OTA 入口：强制恢复 WIFI_PS_NONE，防止 BLE OTA 残留省电模式导致断连
@@ -671,14 +665,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        // ★ 通过全局协调器发起 ESP32 OTA
-        esp_err_t err = OtaCoordinator::instance().beginEsp32Ota(total_size);
-        if (err == ESP_ERR_INVALID_STATE) {
-            // 协调器拒绝（系统忙或通道被占用）→ 尝试强制清理后重试
-            DEBUG_WARN("WIFI", "ESP32 OTA 被协调器拒绝，强制清理状态机后重试");
-            Esp32OtaCore::instance().forceCleanup();
-            err = OtaCoordinator::instance().beginEsp32Ota(total_size);
-        }
+        // ★ 通过协调器发起（内部已含 forceCleanup 重试）
+        esp_err_t err = OtaCoordinator::instance().beginEsp32OtaWithRetry(total_size);
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
                 httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "ESP32 OTA occupied by another channel");
@@ -690,13 +678,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
         Esp32OtaCore &core = Esp32OtaCore::instance();
 
-        // 堆分配缓冲区，避免栈溢出（HTTP server 栈仅 8KB）
-        uint8_t *fw_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
-        if (!fw_buf) {
-            core.abort();
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存分配失败");
-            return ESP_FAIL;
-        }
+        // ★ 使用文件级 static 缓冲区，避免堆碎片化（HTTP server 栈仅 8KB）
+        uint8_t *fw_buf = s_ota_recv_buf;
 
         size_t total_firmware_written = 0;
         size_t total_received = json_header_len;  // 已消费的字节数
@@ -709,7 +692,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             int ret = httpd_req_recv(req, (char *)fw_buf, to_read);
             if (ret <= 0) {
                 DEBUG_ERR("WIFI", "HTTP recv failed (ret=%d), aborting OTA", ret);
-                free(fw_buf);
                 core.abort();
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTP recv failed");
                 return ESP_FAIL;
@@ -718,7 +700,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             err = core.write(fw_buf, (size_t)ret);
             if (err != ESP_OK) {
                 DEBUG_ERR("WIFI", "OTA write failed: %s", esp_err_to_name(err));
-                free(fw_buf);
                 core.abort();
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
                 return ESP_FAIL;
@@ -737,7 +718,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             }
         }
 
-        free(fw_buf);
         DEBUG_INFO("WIFI", "ESP32 OTA 存储完成: %u 字节 (跳过 JSON 头 %d 字节)", (unsigned int)core.getReceived(), json_header_len);
         const char resp[] = "{\"status\": \"ok\", \"message\": \"stored, call POST /ota/update to finish\", \"target\": \"esp32\"}";
         httpd_resp_set_type(req, "application/json");
@@ -805,11 +785,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     }
     OtaRelay::metaClear();
 
-    uint8_t *buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
-    if (!buf) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存分配失败");
-        return ESP_FAIL;
-    }
+    uint8_t *buf = s_ota_recv_buf;
 
     int received = 0;
 
@@ -837,7 +813,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
             if (err != ESP_OK) {
                 DEBUG_ERR("WIFI", "GD32 first chunk write failed: len=%d err=%s",
                           first_chunk_len, esp_err_to_name(err));
-                free(buf);
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
                 return ESP_FAIL;
             }
@@ -857,7 +832,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         if (ret <= 0) {
             DEBUG_ERR("WIFI", "GD32 upload interrupted: received=%d expected=%d",
                       received, req->content_len);
-            free(buf);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "upload interrupted");
             return ESP_FAIL;
         }
@@ -866,7 +840,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         if (err != ESP_OK) {
             DEBUG_ERR("WIFI", "GD32 write failed: offset=%u len=%d err=%s",
                       (unsigned)gd32_offset, ret, esp_err_to_name(err));
-            free(buf);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
             return ESP_FAIL;
         }
@@ -874,8 +847,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         received += ret;
         gd32_offset += (uint32_t)ret;
     }
-
-    free(buf);
 
     // update meta with written size
     OtaRelay::metaUpdate(gd32_offset, (uint32_t)(gd32_offset / OTA_BLOCK_SIZE));
@@ -891,18 +862,17 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         WifiOta::instance().stateLock();
         WifiOta::instance().setGd32StorageDone(true);
         WifiOta::instance().stateUnlock();
-        DEBUG_INFO("WIFI", "GD32 firmware fully stored, computing SHA-256...");
-        // 计算并存储 SHA-256 校验和
+        DEBUG_INFO("WIFI", "GD32 firmware fully stored, pre-computing SHA-256...");
+        // 预计算 SHA-256（写入 NVS），由前端在 /ota/relay 时再校验通过后触发中继
         esp_err_t sha_err = OtaRelay::metaFinalizeChecksum();
         if (sha_err != ESP_OK) {
             DEBUG_ERR("WIFI", "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
         }
-        DEBUG_INFO("WIFI", "auto-triggering relay");
-        // ★ 通过协调器触发中继
-        OtaCoordinator::instance().triggerGd32Relay();
+        // ★ 不再自动 triggerGd32Relay：安全闸门已统一在 /ota/relay 处理（带 SHA 校验）
     }
 
-    const char resp[] = "{\"status\": \"ok\", \"progress\": 100, \"target\": \"gd32\"}";
+    const char resp[] = "{\"status\": \"ok\", \"progress\": 100, \"target\": \"gd32\", "
+                       "\"message\": \"stored, call POST /ota/relay with sha256 to trigger\"}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
@@ -910,8 +880,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
 /**
  * @brief HTTP POST /ota/relay 处理器
- * @param req
- * @return
+ *        必传 body: {"sha256": "<64-char hex>"}。
+ *        校验通过后触发 GD32 中继；响应回传设备端 SHA（对齐 BLE 的 sendSha256Notify）。
  */
 static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
 {
@@ -919,6 +889,7 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     DEBUG_INFO("WIFI", "=== HTTP: POST /ota/relay ===");
     DEBUG_INFO("WIFI", "收到触发 OTA 中继请求");
 
+    // 1) 固件就绪检查
     ota_meta_t meta;
     memset(&meta, 0, sizeof(meta));
     if (OtaRelay::metaLoad(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
@@ -926,14 +897,72 @@ static esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // ★ 通过全局协调器触发 GD32 中继
-    esp_err_t trigger_err = OtaCoordinator::instance().triggerGd32Relay();
-    if (trigger_err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "relay trigger failed - system busy or firmware not ready");
+    // 2) 解析前端 SHA-256（必须 64 字符 hex）
+    char frontend_sha_hex[65] = {0};
+    if (req->content_len > 0 && req->content_len < 512) {
+        char buf[512] = {0};
+        int ret = httpd_req_recv(req, buf, req->content_len);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            cJSON *root = cJSON_Parse(buf);
+            if (root) {
+                cJSON *sha_item = cJSON_GetObjectItem(root, "sha256");
+                if (sha_item && cJSON_IsString(sha_item) &&
+                    strlen(cJSON_GetStringValue(sha_item)) == 64) {
+                    strncpy(frontend_sha_hex, cJSON_GetStringValue(sha_item), 64);
+                    frontend_sha_hex[64] = '\0';
+                }
+                cJSON_Delete(root);
+            }
+        }
+    }
+    if (frontend_sha_hex[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "missing sha256 in body (frontend SHA-256 required)");
         return ESP_FAIL;
     }
 
-    const char resp[] = "{\"status\": \"ok\", \"message\": \"OTA relay triggered\"}";
+    // 3) hex(64) → 32 字节
+    uint8_t frontend_sha[32] = {0};
+    for (int i = 0; i < 32; ++i) {
+        char hex[3] = { frontend_sha_hex[i*2], frontend_sha_hex[i*2+1], 0 };
+        frontend_sha[i] = (uint8_t)strtoul(hex, nullptr, 16);
+    }
+
+    // 4) 共享 helper：计算设备端 SHA → 比对 → 回传 device_sha（无论是否匹配都回传）
+    uint8_t device_sha[32] = {0};
+    char device_sha_hex[65] = {0};
+    esp_err_t verify_err = OtaRelay::verifyFrontendSha(frontend_sha, device_sha);
+    for (int i = 0; i < 32; ++i) {
+        snprintf(&device_sha_hex[i*2], 3, "%02X", device_sha[i]);
+    }
+
+    if (verify_err == ESP_ERR_INVALID_CRC) {
+        char err_resp[256];
+        snprintf(err_resp, sizeof(err_resp),
+                 "{\"status\": \"error\", \"message\": \"SHA-256 mismatch\", "
+                 "\"device\": \"%s\"}", device_sha_hex);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, err_resp, strlen(err_resp));
+        return ESP_FAIL;
+    } else if (verify_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SHA compute failed");
+        return ESP_FAIL;
+    }
+
+    // 5) 校验通过 → 触发中继
+    esp_err_t trigger_err = OtaCoordinator::instance().triggerGd32Relay();
+    if (trigger_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "relay trigger failed - system busy or firmware not ready");
+        return ESP_FAIL;
+    }
+
+    // 6) 成功响应回传设备端 SHA（对齐 BLE 的 sendSha256Notify）
+    char resp[256];
+    snprintf(resp, sizeof(resp),
+             "{\"status\": \"ok\", \"message\": \"OTA relay triggered\", "
+             "\"sha256\": \"%s\"}", device_sha_hex);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
 

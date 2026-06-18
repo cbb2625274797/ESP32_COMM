@@ -8,6 +8,9 @@
 #include "esp32_ota_core.h"
 #include "relay/ota_relay.h"
 #include "monitor/debug_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define TAG "OTA_COORD"
 
@@ -283,11 +286,18 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size)
     // ★ 卡死自愈检查
     if (h) watchdogCheckLocked();
 
-    // 系统忙检查
+    // 系统忙检查：GD32 传输/中继进行中，或另一通道的 ESP32 OTA 进行中，均拒绝。
+    //   ★ 必须显式拒绝 ESP32_RECEIVING/FINALIZING/REBOOTING：
+    //     若放行，本调用会落到 Esp32OtaCore::begin 去抢全局互斥失败而返回 INVALID_STATE，
+    //     随后 beginEsp32OtaWithRetry 的 forceCleanup 会把另一通道的活跃会话
+    //     （esp_ota_abort + 释放互斥）误中止 → 两通道并发写同一 OTA 分区。
     if (h && (m_sysState == OTA_SYS_GD32_STORING ||
-        m_sysState == OTA_SYS_GD32_RELAYING)) {
-        DEBUG_WARN(TAG, "GD32 正在 %s，拒绝 ESP32 OTA",
-                   m_sysState == OTA_SYS_GD32_STORING ? "存储" : "中继");
+              m_sysState == OTA_SYS_GD32_RELAYING ||
+              m_sysState == OTA_SYS_ESP32_RECEIVING ||
+              m_sysState == OTA_SYS_ESP32_FINALIZING ||
+              m_sysState == OTA_SYS_ESP32_REBOOTING)) {
+        DEBUG_WARN(TAG, "系统忙 (state=%d, %s)，拒绝 ESP32 OTA",
+                   (int)m_sysState, getSystemStateString());
         unlock(h);
         return ESP_ERR_INVALID_STATE;
     }
@@ -306,6 +316,29 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size)
     }
 
     unlock(h);
+    return err;
+}
+
+esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size)
+{
+    esp_err_t err = beginEsp32Ota(total_size);
+    if (err == ESP_ERR_INVALID_STATE) {
+        // ★ 仅当系统确实空闲（无任何活跃 OTA）时才允许 forceCleanup：
+        //   这种情况只可能是"锁残留"——前一次 OTA 异常退出没释放全局互斥，
+        //   而协调器状态已回 IDLE。
+        //   若系统正处于任何活跃 OTA（ESP32/GD32），绝不强制清理——那会
+        //   把另一通道正在进行的 esp_ota_handle 中止、释放互斥，导致
+        //   两通道并发写同一 OTA 分区（之前 BLE 与 WiFi 可同时 OTA 的根因）。
+        if (!isIdle()) {
+            DEBUG_WARN(TAG, "ESP32 OTA 被拒绝且系统非空闲 (state=%d)，不强制清理，直接失败",
+                       (int)getSystemState());
+            return err;
+        }
+        // 协调器空闲但 Esp32OtaCore.begin 仍被拒 → 锁残留，强制清理后重试
+        DEBUG_WARN(TAG, "ESP32 OTA 被拒绝但系统空闲，判定为锁残留，强制清理状态机后重试");
+        Esp32OtaCore::instance().forceCleanup();
+        err = beginEsp32Ota(total_size);
+    }
     return err;
 }
 
@@ -337,6 +370,40 @@ void OtaCoordinator::notifyEsp32Rebooting()
         DEBUG_INFO(TAG, "ESP32 即将重启, 系统状态 → ESP32_REBOOTING");
     }
     unlock(h);
+}
+
+// ============================================================
+// ESP32 OTA 收尾+重启序列（BLE/WiFi 共用封装）
+// 关键：finalize() 内部已 end+set_boot+释放锁，reboot=false 返回后
+//   m_active 仍为 true、m_ended 为 true，调用方可在重启前自由查询状态。
+// ============================================================
+Esp32FinalizeResult OtaCoordinator::finalizeForReboot(const char *frontend_sha_hex)
+{
+    Esp32FinalizeResult r = {};
+    notifyEsp32ReceiveComplete();
+    // reboot=false：让 core.finalize 真正返回，由调用方上报 device_sha 后再调 restartEsp32
+    r.err = Esp32OtaCore::instance().finalize(frontend_sha_hex,
+                                              /*reboot=*/false,
+                                              r.device_sha_hex);
+    if (r.err == ESP_OK) {
+        notifyEsp32FinalizeComplete();
+    }
+    return r;
+}
+
+void OtaCoordinator::restartEsp32()
+{
+    notifyEsp32Rebooting();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    // 不会返回
+}
+
+int OtaCoordinator::esp32FinalizeErrCategory(esp_err_t err)
+{
+    if (err == ESP_OK)                  return 0;  // 成功
+    if (err == ESP_ERR_INVALID_VERSION) return 1;  // SHA 不匹配
+    return 2;                                       // 其他失败
 }
 
 // ============================================================

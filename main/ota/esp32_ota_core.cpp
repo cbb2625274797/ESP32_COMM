@@ -171,30 +171,24 @@ esp_err_t Esp32OtaCore::computeShaFromPartition()
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts(&ctx, 0);
 
-    uint8_t *read_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
-    if (!read_buf) {
-        DEBUG_ERR(TAG, "SHA 计算: malloc 失败");
-        mbedtls_sha256_free(&ctx);
-        return ESP_ERR_NO_MEM;
-    }
+    // ★ static 缓冲区：OTA 操作由 OtaCoordinator 互斥串行化，无并发风险
+    static uint8_t s_sha_read_buf[OTA_BLOCK_SIZE];
 
     size_t offset = 0;
     while (offset < m_received) {
         size_t to_read = m_received - offset;
         if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
-        esp_err_t rd_err = esp_partition_read(m_partition, offset, read_buf, to_read);
+        esp_err_t rd_err = esp_partition_read(m_partition, offset, s_sha_read_buf, to_read);
         if (rd_err != ESP_OK) {
             DEBUG_ERR(TAG, "SHA 计算: 分区读失败 @offset %u: %s",
                       (unsigned)offset, esp_err_to_name(rd_err));
-            free(read_buf);
             mbedtls_sha256_free(&ctx);
             return rd_err;
         }
-        mbedtls_sha256_update(&ctx, read_buf, to_read);
+        mbedtls_sha256_update(&ctx, s_sha_read_buf, to_read);
         offset += to_read;
     }
 
-    free(read_buf);
     mbedtls_sha256_finish(&ctx, m_sha256);
     mbedtls_sha256_free(&ctx);
     m_shaComputed = true;
