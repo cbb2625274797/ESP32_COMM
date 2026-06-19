@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "esp_ota_ops.h"
+#include "freertos/task.h"
 
 class BleOta {
 public:
@@ -47,6 +48,12 @@ public:
  */
     void signalRelay();
 
+    /** @brief 获取 BLE OTA 守护任务句柄。 */
+    TaskHandle_t getTaskHandle() const { return m_taskHandle; }
+
+    /** @brief 获取 BLE OTA 数据工作线程句柄。 */
+    TaskHandle_t getWorkerTaskHandle() const { return m_workerTaskHandle; }
+
     // 以下状态为 public，供 C 回调函数访问
     bool m_bleReady = false;
     bool m_bleConnected = false;
@@ -56,6 +63,8 @@ public:
     bool m_esp32RebootPending = false;   // 收尾任务去重标志
     uint8_t m_esp32LastCmd = 0;          // 最后一次数据包命令（用于补发 ACK）
     uint16_t m_esp32LastSeq = 0xFFFFU;   // 最后一次数据包序号（用于补发 ACK）
+    TaskHandle_t m_taskHandle = nullptr;
+    TaskHandle_t m_workerTaskHandle = nullptr;
 };
 
 #endif // BLE_OTA_H

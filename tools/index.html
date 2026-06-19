@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 OTA 中继控制台</title>
-<link rel="stylesheet" href="style.css?v=20260617a">
+<link rel="stylesheet" href="style.css?v=20260619c">
 </head>
 <body>
 <div class="container">
@@ -248,8 +248,8 @@
               <div class="k">连接状态</div>
             </div>
             <div class="badge-stat">
-              <div class="v warn" id="bOTAProgress">0%</div>
-              <div class="k">OTA 进度</div>
+              <div class="v" id="mHealth">--</div>
+              <div class="k">健康状态</div>
             </div>
             <div class="badge-stat">
               <div class="v err" id="connBadge">offline</div>
@@ -269,12 +269,56 @@
         <div class="card-body">
           <div class="metric-grid">
             <div class="metric"><div class="k">温度</div><div class="v" id="mTemp">--</div></div>
-            <div class="metric"><div class="k">空闲堆</div><div class="v" id="mHeap" style="font-size:16px;">--</div></div>
-            <div class="metric"><div class="k">最低空闲堆</div><div class="v" id="mMinHeap" style="font-size:16px;">--</div></div>
             <div class="metric"><div class="k">GD32 APP</div><div class="v" id="mGd32App" style="font-size:14px;">--</div></div>
             <div class="metric"><div class="k">GD32 BOOT</div><div class="v" id="mGd32Boot" style="font-size:14px;">--</div></div>
             <div class="metric"><div class="k">OTA 缓存</div><div class="v" id="mOtaCache" style="font-size:13px;">--</div></div>
           </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <span class="ico">🧾</span> 系统状态 (/system/status)
+          <button class="btn btn-ghost btn-sm card-head-btn" onclick="refreshSystemStatusNow(event)">刷新</button>
+        </div>
+        <div class="card-body">
+          <div class="status-kv-grid">
+            <div class="status-kv"><span class="k">OTA 状态</span><b id="sOtaState">--</b></div>
+            <div class="status-kv"><span class="k">Relay 状态</span><b id="sRelayState">--</b></div>
+            <div class="status-kv"><span class="k">缓存进度</span><b id="sOtaStored">--</b></div>
+            <div class="status-kv"><span class="k">刷新时间</span><b id="sStatusUpdated">--</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card collapsed">
+        <div class="card-head" onclick="toggleCollapse(this)">
+          <span class="ico">🧠</span> 堆与任务栈
+          <button class="btn btn-ghost btn-sm card-head-btn" onclick="refreshSystemStatusNow(event)">刷新</button>
+          <span class="collapse-arrow">▼</span>
+        </div>
+        <div class="card-body">
+          <div class="status-section-title">堆概况</div>
+          <div class="heap-group">
+            <div class="heap-group-title">内部 DRAM <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(数据堆)</span></div>
+            <div class="heap-bar-row">
+              <span class="heap-bar-text" id="memInternalUsage">--</span>
+              <span class="heap-bar-track"><span class="heap-bar-fill" id="memInternalFill"></span></span>
+              <span class="heap-bar-pct" id="memInternalPct">--</span>
+            </div>
+            <div class="heap-detail-row">
+              <span>空闲: <b id="mInternalHeap">--</b></span>
+              <span>最低空闲: <b id="mInternalMinHeap">--</b></span>
+              <span>最大块: <b id="mInternalLargestBlock">--</b></span>
+            </div>
+          </div>
+
+          <div class="status-section-title">任务栈水位</div>
+          <div class="status-task-list" id="taskStackList">
+            <div class="status-empty">等待状态刷新...</div>
+          </div>
+          <div class="status-section-title">原始 JSON</div>
+          <pre class="status-json" id="statusJson">--</pre>
         </div>
       </div>
 
@@ -369,7 +413,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260619c"></script>
+<script src="app.js?v=20260619e"></script>
 <script>
 window.connectionMode = window.connectionMode || 'wifi';
 window.flashTarget = window.flashTarget || 'esp32';

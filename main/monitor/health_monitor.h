@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "driver/temperature_sensor.h"
 #include "app_config.h"
 
@@ -70,6 +71,9 @@ public:
     /** @brief 获取最近一次 WiFi RSSI 及其年龄。 */
     bool getLastWifiRssi(int8_t *out_rssi, uint32_t *out_age_ms);
 
+    /** @brief 获取健康监控任务句柄。 */
+    TaskHandle_t getTaskHandle() const { return m_taskHandle; }
+
 private:
     /** @brief 加锁读取健康状态。 */
     health_state_t getState();
@@ -88,6 +92,7 @@ private:
     float m_lastTemperature = 0.0f;
     int8_t m_lastWifiRssi = -127;
     int64_t m_lastWifiRssiMs = 0;
+    TaskHandle_t m_taskHandle = NULL;
 
     static void tempMonitorCallback(void *arg);
 };

@@ -1289,7 +1289,7 @@
           // ★ 等待设备端 reorder buffer flush + ACK 回传。
           //   设备端可能正在 flush 缺口包（getReceived 跳跃增长），
           //   留足时间让最新的 ACK 到达，避免重发已 flush 的包。
-          await sleep(150);
+          await sleep(10);
 
           for (let seq = resumeSeq; seq <= endSeq; seq++) {
             const start = seq * payloadSize;

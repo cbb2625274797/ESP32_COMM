@@ -14,6 +14,7 @@ let pageVisible = !document.hidden;   // 页面可见性：切到后台/最小�
 let latestSystemStatus = null;
 let isEsp32Rebooting = false;
 let rebootStartTime = 0;
+let pollingPausedForUpload = false;
 
 // ==================== 折叠面板 ====================
 function toggleCollapse(headEl) {
@@ -172,6 +173,18 @@ function formatUptime(sec) {
   if (m > 0) return m + 'm ' + s + 's';
   return s + 's';
 }
+function escapeHtml(text) {
+  return String(text == null ? '' : text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+function formatPercent(value) {
+  if (!Number.isFinite(value)) return '--';
+  return value.toFixed(1).replace(/\.0$/, '') + '%';
+}
 function formatHttpErrorDetail(text) {
   var detail = (text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
   if (detail.length > 180) detail = detail.slice(0, 177) + '...';
@@ -299,6 +312,7 @@ function resetStageFlow() {
 function applyDisconnectedRuntimeState() {
   document.getElementById('pillIP').textContent = '--';
   document.getElementById('pillRSSI').textContent = '--';
+  if (isUploading || currentOtaTarget) return;
   resetProgress();
   resetStageFlow();
 }
@@ -354,7 +368,92 @@ function updateHealthUi(healthCode, freeHeap) {
     connStatusTxt.textContent = (latestSystemStatus.wifi.connected ? '设备在线' : '设备离线') + ' · 系统' + health;
   }
   if (freeHeap !== undefined) {
-    document.getElementById('mHeap').textContent = formatBytes(freeHeap);
+    var mHeapEl = document.getElementById('mHeap');
+    if (mHeapEl) mHeapEl.textContent = formatBytes(freeHeap);
+  }
+  var mh = document.getElementById('mHealth');
+  if (mh) {
+    mh.textContent = health;
+    mh.className = 'v ' + (healthCode === 0 ? 'ok' : healthCode === 1 ? 'warn' : 'err');
+  }
+}
+function updateHeapAndTaskStatusUi(data) {
+  if (!data) return;
+  var ota = data.ota || {};
+  var wifi = data.wifi || {};
+  var targetHost = getBaseUrl().replace(/^http:\/\//, '');
+  var setText = function (id, value) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+  // ---- 堆概况：已用 / 总计 + 占用条 ----
+  function setFill(id, pct) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    el.className = 'heap-bar-fill' + (pct >= 85 ? ' danger' : pct >= 70 ? ' warn' : '');
+  }
+  function setBar(usageId, fillId, pctId, free, total) {
+    if (free === undefined || total === undefined) {
+      setText(usageId, '--'); setFill(fillId, 0); setText(pctId, '--');
+      return;
+    }
+    var used = total - free;
+    var pct = total > 0 ? (used * 100 / total) : 0;
+    setText(usageId, '已用 ' + formatBytes(used) + ' / 总计 ' + formatBytes(total));
+    setFill(fillId, pct);
+    setText(pctId, pct.toFixed(1) + '%');
+  }
+  setText('mInternalHeap', data.internal_free_heap !== undefined ? formatBytes(data.internal_free_heap) : '--');
+  setText('mInternalMinHeap', data.internal_min_free_heap !== undefined ? formatBytes(data.internal_min_free_heap) : '--');
+  setText('mInternalLargestBlock', data.internal_largest_free_block !== undefined ? formatBytes(data.internal_largest_free_block) : '--');
+  setBar('memInternalUsage', 'memInternalFill', 'memInternalPct', data.internal_free_heap, data.internal_heap_total);
+
+  setText('mLargestBlock', data.largest_free_block !== undefined ? formatBytes(data.largest_free_block) : '--');
+
+  setText('sOtaState', (ota.sys_state || '--') + (Number.isFinite(ota.sys_state_code) ? ' (' + ota.sys_state_code + ')' : ''));
+  setText('sRelayState', Number.isFinite(ota.relay_state) ? String(ota.relay_state) : '--');
+  var storedText = '--';
+  if (ota.total_size || ota.stored_size) {
+    storedText = formatBytes(ota.stored_size || 0) + ' / ' + formatBytes(ota.total_size || 0);
+  }
+  setText('sOtaStored', storedText);
+  setText('sStatusUpdated', formatTime(new Date()));
+
+  var taskList = document.getElementById('taskStackList');
+  if (taskList) {
+    var taskStack = data.task_stack || {};
+    var names = Object.keys(taskStack);
+    if (!names.length) {
+      taskList.innerHTML = '<div class="status-empty">当前状态未包含任务栈信息</div>';
+    } else {
+      taskList.innerHTML = names.map(function (name) {
+        var item = taskStack[name] || {};
+        var stackSize = Number(item.stack_size_bytes) || 0;
+        var watermark = Number(item.high_watermark_bytes) || 0;
+        var peakUsed = Number(item.peak_used_bytes) || 0;
+        var usagePct = stackSize > 0 ? (peakUsed * 100 / stackSize) : 0;
+        var fillClass = usagePct >= 85 ? 'err' : usagePct >= 70 ? 'warn' : '';
+        return '' +
+          '<div class="status-task">' +
+            '<div class="status-task-head">' +
+              '<div class="status-task-name">' + escapeHtml(name) + '</div>' +
+              '<div class="status-task-ratio">' + escapeHtml(formatPercent(usagePct)) + '</div>' +
+            '</div>' +
+            '<div class="status-task-bar"><div class="status-task-bar-fill ' + fillClass + '" style="width:' + Math.max(0, Math.min(100, usagePct)) + '%"></div></div>' +
+            '<div class="status-task-meta">' +
+              '<div><span>栈大小</span><b>' + escapeHtml(formatBytes(stackSize)) + '</b></div>' +
+              '<div><span>剩余水位</span><b>' + escapeHtml(formatBytes(watermark)) + '</b></div>' +
+              '<div><span>峰值占用</span><b>' + escapeHtml(formatBytes(peakUsed)) + '</b></div>' +
+            '</div>' +
+          '</div>';
+      }).join('');
+    }
+  }
+
+  var statusJson = document.getElementById('statusJson');
+  if (statusJson) {
+    statusJson.textContent = JSON.stringify(data, null, 2);
   }
 }
 // ==================== OTA 阶段驱动 (真实状态) ====================
@@ -425,6 +524,7 @@ function updateStagesFromRelayState(rs) {
 function updateSystemStatusUi(data) {
   if (!data) return;
   latestSystemStatus = data;
+  updateHeapAndTaskStatusUi(data);
   var wifi = data.wifi || {};
   var ota = data.ota || {};
   var healthCode = data.health;
@@ -433,10 +533,12 @@ function updateSystemStatusUi(data) {
   var connText = connected ? (wifi.mode || 'STA') + ' 已连接' : (wifi.mode || 'STA') + ' 未连接';
   updateConnectionUi(connected, connText);
   updateHealthUi(healthCode, data.free_heap);
-  // version
   if (data.version) {
-    document.getElementById('pillVer').textContent = 'v' + data.version;
-    document.getElementById('pillVer').dataset.tooltip = data.build_time ? ('编译: ' + data.build_time) : '';
+    var pillVerEl = document.getElementById('pillVer');
+    if (pillVerEl) {
+      pillVerEl.textContent = 'v' + data.version;
+      pillVerEl.dataset.tooltip = data.build_time ? ("编译: " + data.build_time) : '';
+    }
     // GD32 版本
     var mGd32App = document.getElementById('mGd32App');
     var mGd32Boot = document.getElementById('mGd32Boot');
@@ -460,23 +562,20 @@ function updateSystemStatusUi(data) {
     }
   }
   // temperature
-  document.getElementById('mTemp').textContent =
+  var mTempEl = document.getElementById('mTemp');
+  if (mTempEl) mTempEl.textContent =
     Number.isFinite(data.temperature) ? data.temperature.toFixed(1) + '\u00B0C' : '--';
   // uptime
   var uptimeEl = document.getElementById('pillUptime');
   if (uptimeEl) uptimeEl.textContent = '\u23F1 ' + formatUptime(data.uptime_sec);
   // wifi / signal
-  document.getElementById('pillIP').textContent = wifi.ip || '--';
+  var pillIPEl = document.getElementById('pillIP');
+  if (pillIPEl) pillIPEl.textContent = wifi.ip || '--';
   var rssi = (wifi.rssi !== undefined && wifi.rssi !== -127) ? wifi.rssi + ' dBm' : '--';
-  document.getElementById('pillRSSI').textContent = rssi;
-  // heap
-  document.getElementById('mHeap').textContent =
-    data.free_heap !== undefined ? formatBytes(data.free_heap) : '--';
-  document.getElementById('mMinHeap').textContent =
-    data.min_free_heap !== undefined ? formatBytes(data.min_free_heap) : '--';
-  // ota cache
-  var otaStored = ota.stored_size || 0;
+  var pillRSSIEl = document.getElementById('pillRSSI');
+  if (pillRSSIEl) pillRSSIEl.textContent = rssi;
   var mOtaCache = document.getElementById('mOtaCache');
+  var otaStored = ota.stored_size || 0;
   if (mOtaCache) {
     if (otaStored > 0) {
       mOtaCache.textContent = formatBytes(otaStored) + ' / 216 KB';
@@ -501,14 +600,7 @@ function updateSystemStatusUi(data) {
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
   var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
-  var bp = document.getElementById('bOTAProgress');
-  function setOtaProgressBadge(pct) {
-    var safePct = Math.max(0, Math.min(100, Math.round(pct || 0)));
-    if (bp) {
-      bp.textContent = safePct + '%';
-      bp.className = 'v ' + (safePct >= 100 ? 'ok' : safePct > 0 ? 'warn' : '');
-    }
-  }
+  function setOtaProgressBadge() {}  // OTA 进度卡片已移除，保留空壳避免调用报错
   // GD32 relay forwarding progress
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
@@ -605,6 +697,32 @@ async function testConnection() {
     var diag = await diagnoseNetwork();
     addLog('W', '诊断', diag);
     showToast('无法连接: ' + diag, 'error');
+  }
+}
+async function refreshSystemStatusNow(event) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  if (pollingPausedForUpload) return;
+  try {
+    var resp = await fetch(getBaseUrl() + '/system/status', {
+      signal: AbortSignal.timeout(3000)
+    });
+    if (!resp.ok) {
+      addLog('E', '状态', '刷新失败: HTTP ' + resp.status);
+      showToast('状态刷新失败: HTTP ' + resp.status, 'error');
+      return;
+    }
+    var data = await resp.json();
+    latestSystemStatus = data;
+    updateSystemStatusUi(data);
+    consecutivePollFailures = 0;
+    if (pollSlowMode) restorePolling();
+    addLog('I', '状态', '已手动刷新 /system/status');
+  } catch (e) {
+    addLog('E', '状态', '刷新失败: ' + e.message);
+    showToast('状态刷新失败', 'error');
   }
 }
 // ==================== CAN 帧发送 ====================
@@ -984,6 +1102,7 @@ function clearFile(chip) {
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file || isUploading) return;
+  pausePollingForUpload();
   // ★ 必须先抢锁再 await：守卫同步设置，await 期间重复点击才能被拦下。
   //   旧实现把 isUploading 设在 await handle.getFile() 之后 → 用户在 BLE 期间
   //   狂点 WiFi 上传按钮时，多个 startUpload 都能通过守卫，最终并发 xhr.send，
@@ -1008,12 +1127,14 @@ async function startUpload(chip) {
         addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 ESP32 上传');
         showToast('设备正在 OTA 中，请等待结束后再试', 'error');
         isUploading = false;
+        resumePollingAfterUpload();
         return;
       }
       if (chip === 'gd32' && (esp32Busy || gd32Busy)) {
         addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 GD32 上传');
         showToast('设备正在 OTA 中，请等待结束后再试', 'error');
         isUploading = false;
+        resumePollingAfterUpload();
         return;
       }
     }
@@ -1054,6 +1175,7 @@ async function startUpload(chip) {
       showToast('文件已变更，请重新选择', 'error');
       clearFile(chip);
       isUploading = false;
+      resumePollingAfterUpload();
       return;
     }
   }
@@ -1135,17 +1257,14 @@ async function startUpload(chip) {
         if (chip === 'gd32') {
           var overallPct = Math.min(45, Math.round(pct * 0.45));
           setProgress(overallPct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
-          var el = document.getElementById('bOTAProgress');
-          if (el) el.textContent = overallPct + '%';
         } else {
           setProgress(pct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
-          var el = document.getElementById('bOTAProgress');
-          if (el) el.textContent = pct + '%';
         }
       }
     });
     xhr.addEventListener('load', function () {
       isUploading = false;
+      resumePollingAfterUpload();
       uploadBtn.disabled = false;
       uploadBtn.textContent = origText;
       updateUploadButtonLabel();
@@ -1177,6 +1296,7 @@ async function startUpload(chip) {
     });
     xhr.addEventListener('error', function () {
       isUploading = false;
+      resumePollingAfterUpload();
       uploadBtn.disabled = false;
       uploadBtn.textContent = origText;
       updateUploadButtonLabel();
@@ -1189,6 +1309,7 @@ async function startUpload(chip) {
     addLog('E', '上传', '上传失败: ' + e.message);
     showToast('上传失败', 'error');
     isUploading = false;
+    resumePollingAfterUpload();
     uploadBtn.disabled = false;
     uploadBtn.textContent = origText;
     updateUploadButtonLabel();
@@ -1253,7 +1374,7 @@ async function verifyEsp32Firmware() {
       addLog('E', 'OTA', '校验失败: ' + detail);
       showToast('校验失败: ' + detail, 'error');
       var resultEl = document.getElementById('sviResult');
-      if (resultEl) { resultEl.textContent = '❌ ' + detail; resultEl.className = 'svi-val err'; }
+      if (resultEl) { resultEl.textContent = '? ' + detail; resultEl.className = 'svi-val err'; }
       updateEsp32StagesError();
       showVerifyActions('retry');
     }
@@ -1462,7 +1583,31 @@ function restorePolling() {
     logsTimerId = setInterval(pollLogs, 1000);
   }
 }
+function pausePollingForUpload() {
+  if (pollingPausedForUpload) return;
+  pollingPausedForUpload = true;
+  consecutivePollFailures = 0;
+  if (statusTimerId) clearInterval(statusTimerId);
+  if (logsTimerId) clearInterval(logsTimerId);
+  statusTimerId = null;
+  logsTimerId = null;
+}
+function resumePollingAfterUpload() {
+  if (!pollingPausedForUpload) return;
+  pollingPausedForUpload = false;
+  consecutivePollFailures = 0;
+  if (pollSlowMode) {
+    statusTimerId = setInterval(pollStatus, 10000);
+    logsTimerId = setInterval(pollLogs, 10000);
+  } else {
+    statusTimerId = setInterval(pollStatus, 1000);
+    logsTimerId = setInterval(pollLogs, 1000);
+  }
+  pollStatus();
+  pollLogs();
+}
 async function pollStatus() {
+  if (pollingPausedForUpload) return;
   try {
     var resp = await fetch(getBaseUrl() + '/system/status', {
       signal: AbortSignal.timeout(3000)
@@ -1485,14 +1630,14 @@ async function pollStatus() {
         addLog('I', '系统', 'ESP32 已恢复在线');
         showToast('ESP32 已恢复在线', 'success');
       }
-      updateSystemStatusUi(data);
+      try { updateSystemStatusUi(data); } catch (e2) { console.warn('updateSystemStatusUi 异常:', e2); }
     }
   } catch (e) {
     // 后台期间 setInterval 会被 Chrome/Edge 节流到最低 1 分钟/次，
     // 因此后台累积的失败计数不应递增，避免切回前台瞬间误触发 5-fail 诊断。
     if (pageVisible) consecutivePollFailures++;
-    // 传输中屏蔽网关无响应的检测功能（上传期间设备忙，无法响应轮询是正常的）
-    if (pageVisible && consecutivePollFailures >= 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting) {
+    // OTA/传输/重启中屏蔽网关无响应的检测功能（设备忙或正在重启，无法响应轮询是正常的）
+    if (pageVisible && consecutivePollFailures >= 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting && !currentOtaTarget) {
       addLog('W', '诊断', '设备连续 5 次无响应，正在诊断网络...');
       var diag = await diagnoseNetwork();
       addLog('W', '诊断', diag);
@@ -1540,6 +1685,7 @@ document.addEventListener('visibilitychange', function () {
 // ==================== ESP32 实时日志拉取 (增量) ====================
 var lastLogTimestamp = 0;
 async function pollLogs() {
+  if (pollingPausedForUpload) return;
   try {
     var resp = await fetch(getBaseUrl() + '/logs', {
       signal: AbortSignal.timeout(2000)

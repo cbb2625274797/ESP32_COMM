@@ -95,7 +95,7 @@ extern "C" void app_main(void)
     xRet = xTaskCreatePinnedToCore(
         OtaRelay::taskEntry,
         "ota_relay",
-        12288,
+        6144,
         NULL,
         configMAX_PRIORITIES - 2,
         NULL,
@@ -127,7 +127,7 @@ extern "C" void app_main(void)
     xRet = xTaskCreatePinnedToCore(
         BleOta::taskEntry,
         "ble_ota",
-        8192,
+        4096,
         NULL,
         configMAX_PRIORITIES - 3,
         NULL,

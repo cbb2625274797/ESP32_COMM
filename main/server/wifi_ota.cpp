@@ -31,6 +31,7 @@
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
 #include "spi_master.h"
+#include "ble_ota.h"
 #include "cJSON.h"
 
 
@@ -1166,6 +1167,46 @@ static esp_err_t spi_send_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static constexpr uint32_t INTERNAL_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+
+struct TaskStackMetric {
+    const char* name;
+    TaskHandle_t handle;
+    size_t stack_size_bytes;
+};
+
+static size_t get_task_stack_high_watermark_bytes(TaskHandle_t handle)
+{
+    if (handle == NULL) return 0;
+    UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(handle);
+    return (size_t)highWaterMark;
+}
+
+static size_t get_task_stack_peak_used_bytes(TaskHandle_t handle, size_t stack_size_bytes)
+{
+    size_t high_watermark = get_task_stack_high_watermark_bytes(handle);
+    return (stack_size_bytes >= high_watermark) ? (stack_size_bytes - high_watermark) : 0;
+}
+
+/**
+ * @brief 追加 JSON 内容到响应缓冲区，自动处理 snprintf 截断。
+ */
+static int append_jsonf(char* buf, size_t cap, int offset, const char* fmt, ...)
+{
+    if (!buf || cap == 0 || offset < 0 || (size_t)offset >= cap) return offset;
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf + offset, cap - (size_t)offset, fmt, args);
+    va_end(args);
+    if (n < 0) return offset;
+    size_t written = (size_t)n;
+    if (offset + (int)written >= (int)cap) {
+        buf[cap - 1] = '\0';
+        return (int)(cap - 1);
+    }
+    return offset + (int)written;
+}
+
 /**
  * @brief HTTP GET /system/status 处理器
  * @param req
@@ -1236,12 +1277,45 @@ static esp_err_t system_status_handler(httpd_req_t *req)
     gd32_version_t snapVer2 = {};
     OtaRelay::getGd32Version(&snapVer2);
     ota_system_state_t sysState = OtaCoordinator::instance().getSystemState();
-    char resp[1280];
+    size_t free_heap = esp_get_free_heap_size();
+    size_t min_free_heap = esp_get_minimum_free_heap_size();
+    size_t largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    size_t internal_free_heap = heap_caps_get_free_size(INTERNAL_HEAP_CAPS);
+    size_t internal_min_free_heap = heap_caps_get_minimum_free_size(INTERNAL_HEAP_CAPS);
+    size_t internal_largest_free_block = heap_caps_get_largest_free_block(INTERNAL_HEAP_CAPS);
+    size_t internal_heap_total = heap_caps_get_total_size(INTERNAL_HEAP_CAPS);
+    size_t default_heap_total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    TaskStackMetric task_metrics[] = {
+        { "http_server", xTaskGetCurrentTaskHandle(), HTTP_SERVER_STACK_SIZE },
+        { "health_mon", HealthMonitor::instance().getTaskHandle(), 4096 },
+        { "ota_relay", OtaRelay::getTaskHandle(), 6144 },
+        { "wifi_ota", WifiOta::instance().getTaskHandle(), 8192 },
+        { "wifi_reconnect", WifiOta::instance().m_reconnectTask, 4096 },
+        { "ble_ota", BleOta::instance().getTaskHandle(), 4096 },
+        { "ble_ota_worker", BleOta::instance().getWorkerTaskHandle(), 4096 }
+    };
+
+    char resp[4096];
     int len = snprintf(resp, sizeof(resp),
-        "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, \"free_heap\": %lu, \"min_free_heap\": %lu, \"temperature\": %.1f, \"uptime_sec\": %lu, \"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, \"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, \"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, \"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}}",
+        "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, "
+        "\"free_heap\": %lu, \"min_free_heap\": %lu, \"largest_free_block\": %lu, "
+        "\"internal_free_heap\": %lu, \"internal_min_free_heap\": %lu, \"internal_largest_free_block\": %lu, "
+        "\"internal_heap_total\": %lu, \"default_heap_total\": %lu, "
+        "\"temperature\": %.1f, \"uptime_sec\": %lu, "
+        "\"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, "
+        "\"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, "
+        "\"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, "
+        "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}, "
+        "\"task_stack\": {",
         FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
-        (unsigned long)esp_get_free_heap_size(),
-        (unsigned long)esp_get_minimum_free_heap_size(),
+        (unsigned long)free_heap,
+        (unsigned long)min_free_heap,
+        (unsigned long)largest_free_block,
+        (unsigned long)internal_free_heap,
+        (unsigned long)internal_min_free_heap,
+        (unsigned long)internal_largest_free_block,
+        (unsigned long)internal_heap_total,
+        (unsigned long)default_heap_total,
         (double)HealthMonitor::instance().getLastTemperature(),
         (unsigned long)(esp_timer_get_time() / 1000000),
         WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_AP ? "AP" : "STA",
@@ -1261,6 +1335,17 @@ static esp_err_t system_status_handler(httpd_req_t *req)
         snapVer2.app_patch, snapVer2.app_build,
         snapVer2.boot_major, snapVer2.boot_minor,
         snapVer2.boot_patch, snapVer2.boot_build);
+
+    for (size_t i = 0; i < sizeof(task_metrics) / sizeof(task_metrics[0]); ++i) {
+        len = append_jsonf(resp, sizeof(resp), len,
+            "%s\"%s\":{\"stack_size_bytes\":%lu,\"high_watermark_bytes\":%lu,\"peak_used_bytes\":%lu}",
+            i == 0 ? "" : ",",
+            task_metrics[i].name,
+            (unsigned long)task_metrics[i].stack_size_bytes,
+            (unsigned long)get_task_stack_high_watermark_bytes(task_metrics[i].handle),
+            (unsigned long)get_task_stack_peak_used_bytes(task_metrics[i].handle, task_metrics[i].stack_size_bytes));
+    }
+    len = append_jsonf(resp, sizeof(resp), len, "}}");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
@@ -1648,6 +1733,7 @@ bool WifiOta::earlyInit()
 void WifiOta::taskEntry(void *pvParameters)
 {
     (void)pvParameters;
+    WifiOta::instance().m_taskHandle = xTaskGetCurrentTaskHandle();
 
     DEBUG_INFO("WIFI", "=== WiFi OTA 任务启动 ===");
 

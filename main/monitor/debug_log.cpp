@@ -60,74 +60,89 @@ int DebugLog::ringCount()
 }
 
 /**
-  * @brief 读取并清空环形日志缓冲区，返回 JSON 数组字符串。
- * @param out_len 输出参数，返回 JSON 字符串长度。
- * @return 指向 JSON 字符串的指针，需调用者 free。
+  * @brief 弹出一条最旧日志并从环形缓冲区移除。
+ * @param out 输出缓冲区。
+ * @param out_size 输出缓冲区大小。
+ * @param out_len 输出日志长度。
+ * @return true 表示成功弹出一条日志，false 表示缓冲区为空或参数无效。
  */
-char *DebugLog::ringDrainJson(int *out_len)
+bool DebugLog::ringPopOldest(char *out, size_t out_size, int *out_len)
 {
-    if (!m_logRingMutex) {
+    if (out_len) {
         *out_len = 0;
-        return NULL;
+    }
+    if (!m_logRingMutex || !out || out_size == 0) {
+        return false;
     }
 
     xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
 
-    int count = m_logRingCount;
-    if (count == 0) {
+    if (m_logRingCount <= 0) {
         xSemaphoreGive(m_logRingMutex);
-        *out_len = 0;
-        return NULL;
+        return false;
     }
 
-    // 估算 JSON 大小：每条 ~280 字节（转义 + JSON 包装）
-    size_t buf_size = (size_t)count * 280 + 16;
-    char *json = (char *)malloc(buf_size);
-    if (!json) {
-        xSemaphoreGive(m_logRingMutex);
-        *out_len = 0;
-        return NULL;
+    int idx = (m_logRingHead - m_logRingCount + LOG_RING_SLOTS) % LOG_RING_SLOTS;
+    int len = m_logRingLens[idx];
+    if (len < 0) {
+        len = 0;
     }
 
-    int pos = 0;
-    json[pos++] = '[';
-
-    // 从最旧的开始读
-    int start = (count < LOG_RING_SLOTS) ? 0 : m_logRingHead;
-    for (int i = 0; i < count && pos < (int)buf_size - 200; i++) {
-        int idx = (start + i) % LOG_RING_SLOTS;
-        int len = m_logRingLens[idx];
-        if (len <= 0) continue;
-
-        if (i > 0) json[pos++] = ',';
-
-        pos += snprintf(json + pos, buf_size - pos, "\"");
-        for (int j = 0; j < len && pos < (int)buf_size - 10; j++) {
-            char c = m_logRing[idx][j];
-            if (c == '"' || c == '\\') {
-                json[pos++] = '\\';
-                json[pos++] = c;
-            } else if (c == '\n') {
-                json[pos++] = '\\';
-                json[pos++] = 'n';
-            } else if (c >= 32) {
-                json[pos++] = c;
-            }
-        }
-        pos += snprintf(json + pos, buf_size - pos, "\"");
+    int copy_len = len;
+    if ((size_t)copy_len >= out_size) {
+        copy_len = (int)out_size - 1;
     }
 
-    json[pos++] = ']';
-    json[pos] = '\0';
+    if (copy_len > 0) {
+        memcpy(out, m_logRing[idx], (size_t)copy_len);
+    }
+    out[copy_len] = '\0';
+    if (out_len) {
+        *out_len = copy_len;
+    }
 
-    // 清空缓冲区
-    m_logRingHead = 0;
-    m_logRingCount = 0;
+    m_logRingLens[idx] = 0;
+    m_logRingCount--;
 
     xSemaphoreGive(m_logRingMutex);
+    return true;
+}
 
+char* DebugLog::ringDrainJson(int *out_len)
+{
+    if (!out_len) return NULL;
+    *out_len = 0;
+    int count = ringCount();
+    int capacity = count * (LOG_RING_SIZE * 2) + 16;
+    if (capacity < 16) capacity = 16;
+    char *buf = (char*)malloc(capacity);
+    if (!buf) return NULL;
+
+    int pos = 0;
+    buf[pos++] = '[';
+    bool first = true;
+    char entry[LOG_RING_SIZE];
+    int entryLen = 0;
+
+    while (ringPopOldest(entry, sizeof(entry), &entryLen) && entryLen > 0) {
+        if (!first) buf[pos++] = ',';
+        first = false;
+        buf[pos++] = '"';
+        for (int i = 0; i < entryLen && pos < capacity - 4; i++) {
+            char c = entry[i];
+            if (c == '"') { buf[pos++] = '\\'; buf[pos++] = '"'; }
+            else if (c == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+            else if (c == '\n') { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+            else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+            else if (c == '\t') { buf[pos++] = '\\'; buf[pos++] = 't'; }
+            else if ((unsigned char)c >= 0x20) { buf[pos++] = c; }
+        }
+        buf[pos++] = '"';
+    }
+    buf[pos++] = ']';
+    buf[pos] = '\0';
     *out_len = pos;
-    return json;
+    return buf;
 }
 
 /**

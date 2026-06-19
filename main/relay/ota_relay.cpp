@@ -41,6 +41,7 @@ gd32_version_t OtaRelay::gd32Version = {};
 QueueHandle_t OtaRelay::dispatchQueue = NULL;
 QueueHandle_t OtaRelay::resultQueue = NULL;
 SemaphoreHandle_t OtaRelay::s_stateMutex = NULL;
+TaskHandle_t OtaRelay::taskHandle = NULL;
 
 // ============================================================
 // 状态表：将每个 relay_state_t 映射到对应的 handler
@@ -132,6 +133,11 @@ void OtaRelay::setGd32Version(const gd32_version_t &ver)
 {
     StateLockGuard lock;
     gd32Version = ver;
+}
+
+TaskHandle_t OtaRelay::getTaskHandle()
+{
+    return taskHandle;
 }
 
 // ============================================================
@@ -1397,6 +1403,7 @@ ota_result_t OtaRelay::doFinishAndVerify()
 void OtaRelay::taskEntry(void *pvParameters)
 {
     (void)pvParameters;
+    taskHandle = xTaskGetCurrentTaskHandle();
     DEBUG_INFO("OTA", "OTA 中继任务启动");
 
     initMutex();

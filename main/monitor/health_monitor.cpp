@@ -16,7 +16,6 @@
 #include "esp_err.h"
 #include "driver/temperature_sensor.h"
 
-#include "esp_heap_caps.h"
 #include "health_monitor.h"
 #include "debug_log.h"
 #include "server/wifi_ota.h"
@@ -167,7 +166,9 @@ void HealthMonitor::tempMonitorCallback(void *arg)
  */
 void HealthMonitor::taskEntry(void *pvParameters)
 {
+    (void)pvParameters;
     auto& self = instance();
+    self.m_taskHandle = xTaskGetCurrentTaskHandle();
     DEBUG_INFO("MON", "=== 健康监控任务启动 ===");
 
     temperature_sensor_config_t temp_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 80);

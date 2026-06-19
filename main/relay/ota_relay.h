@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "transport/protocol.h"
 #include "transport/spi_master.h"
 #include "esp_partition.h"
@@ -137,6 +138,10 @@ public:
      * @brief 设置GD32固件版本.
      */
     static void setGd32Version(const gd32_version_t &ver);
+    /**
+     * @brief 获取 OTA 中继任务句柄。
+     */
+    static TaskHandle_t getTaskHandle();
 
     /**
      * @brief 重置状态机到 IDLE.
@@ -199,6 +204,7 @@ public:
     static gd32_version_t gd32Version;
     static QueueHandle_t dispatchQueue;
     static QueueHandle_t resultQueue;
+    static TaskHandle_t taskHandle;
 
     // ── 线程安全锁 ──
     static SemaphoreHandle_t s_stateMutex;

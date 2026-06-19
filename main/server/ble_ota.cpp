@@ -1205,6 +1205,7 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
 static void ble_ota_data_worker_task(void *pvParameters)
 {
     (void)pvParameters;
+    BleOta::instance().m_workerTaskHandle = xTaskGetCurrentTaskHandle();
     DEBUG_INFO(TAG, "OTA 数据工作线程已启动");
 
     while (1) {
@@ -1715,6 +1716,7 @@ void BleOta::signalRelay()
 void BleOta::taskEntry(void *pvParameters)
 {
     (void)pvParameters;
+    BleOta::instance().m_taskHandle = xTaskGetCurrentTaskHandle();
     DEBUG_INFO(TAG, "=== BLE OTA 任务启动 ===");
 
     // 创建 OTA 数据队列和工作线程（在 NimBLE 初始化之前完成）
@@ -1722,7 +1724,7 @@ void BleOta::taskEntry(void *pvParameters)
     if (s_otaDataQueue) {
         BaseType_t wk_ok = xTaskCreate(ble_ota_data_worker_task,
                                        "ble_ota_worker",
-                                       8192,   // 6KB→8KB，flash 操作需要足够栈空间
+                                       4096,   // 峰值仅 ~1.9KB，4KB 留有充足余量
                                        NULL,
                                        10,     // 中等优先级，避免被 NimBLE host task 过度抢占
                                        NULL);

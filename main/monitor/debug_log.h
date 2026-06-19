@@ -72,7 +72,8 @@ public:
     /** @brief 获取当前环形日志缓冲区中的日志条数。 */
     int ringCount();
 
-    /** @brief 读取并清空环形日志缓冲区，返回 JSON 数组字符串（需调用者 free）。 */
+    /** @brief 弹出一条最旧日志并从环形缓冲区移除。 */
+    bool ringPopOldest(char *out, size_t out_size, int *out_len);
     char* ringDrainJson(int *out_len);
 
     /** @brief 当前日志级别（运行时可改）。 */

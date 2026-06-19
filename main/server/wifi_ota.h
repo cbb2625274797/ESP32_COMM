@@ -11,6 +11,7 @@
 #include "esp_ota_ops.h"
 #include "esp_http_server.h"
 #include "esp_event.h"
+#include "freertos/task.h"
 #include <atomic>
 
 // SHA-256 验证所需类型前向声明
@@ -102,6 +103,9 @@ public:
     /** @brief BLE OTA 开始传输时调用，暂停 WiFi RSSI 轮询等射频活动。 */
     void setBleOtaActive(bool v) { m_bleOtaActive.store(v); }
 
+    /** @brief 获取 WiFi OTA 任务句柄。 */
+    TaskHandle_t getTaskHandle() const { return m_taskHandle; }
+
 private:
     // ── 跨任务共享状态（atomic + m_stateMutex 保护）──
     std::atomic<bool> m_staConnected{false};
@@ -110,6 +114,7 @@ private:
     std::atomic<bool> m_gd32StorageDone{false};
     std::atomic<bool> m_relayTriggered{false};
     SemaphoreHandle_t m_stateMutex = NULL;
+    TaskHandle_t m_taskHandle = nullptr;
 
     /**
       * @brief 初始化 SoftAP 模式，供局域网 OTA 使用。
