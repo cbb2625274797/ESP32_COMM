@@ -419,6 +419,7 @@
     bleLog('CFG', `目标切换为 ${cfg.label}: packetCmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, payload=${cfg.recommendedPayload}`);
   }
 
+  /** @description 连接 BLE 设备（扫描→连接→发现服务→使能通知）。 */
   async function connectBle() {
     if (!navigator.bluetooth) {
       bleLog('BLE', '当前浏览器不支持 Web Bluetooth', 'E');
@@ -494,6 +495,7 @@
     }
   }
 
+  /** @description 断开 BLE 连接并清理资源。 */
   async function disconnectBle() {
     // 用户主动断开：取消任何进行中的重连 / expectedReboot
     state.expectedReboot = false;
@@ -534,6 +536,7 @@
     }
   }
 
+  /** @description 处理 BLE Notify 事件（解析 ACK/ERROR/PROGRESS 等响应类型）。 */
   function handleNotify(event) {
     const view = event.target.value;
     const bytes = new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
@@ -1100,6 +1103,7 @@
     bleLog('FILE', '文件已清除');
   }
 
+  /** @description 构建 BLE OTA 数据包（seq + totalSize + payload + cmd + CRC）。 */
   function buildPacket(seq, totalSize, payload, cmd) {
     const packet = new Uint8Array(7 + payload.length);
     packet[0] = cmd;
@@ -1118,6 +1122,7 @@
   }
 
 
+  /** @description 分块上传固件到 ESP32（通过 BLE GATT 写入）。 */
   async function uploadFirmware() {
     // 每次刷写前尝试重新从本地读取文件
     if (state.selectedFileHandle) {
@@ -1454,6 +1459,7 @@
     }
   }
 
+  /** @description 自动刷写流程：上传 ESP32 固件 → SHA验证 → 触发 GD32 中继。 */
   async function autoFlash() {
     // 每次刷写前尝试重新从本地读取文件（支持热重载：用户重新编译后无需重新选择）
     if (state.selectedFileHandle) {
@@ -1507,6 +1513,7 @@
     }
   }
 
+  /** @description 中止当前 BLE OTA 任务并清理状态。 */
   function abortTask() {
     state.abortRequested = true;
     bleLog('OTA', '已请求中止，等待当前分包返回');

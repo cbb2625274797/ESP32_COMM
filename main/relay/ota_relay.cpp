@@ -16,19 +16,16 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_err.h"
-#include "esp_partition.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "aes/esp_aes.h"
-#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
-#include "mbedtls/private/sha256.h"
 
 #include "ota_relay.h"
+#include "storage/gd32_flash_store.h"
 #include "spi_master.h"
 #include "protocol.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
-#include "ota_coordinator.h"   // ★ 通知 OtaCoordinator 中继开始/完成
+// ★ H4 解耦：OtaRelay 不再直接 #include "ota_coordinator.h"，
+//   通过 IRelayListener 接口回调通知协调器，依赖方向变为单向。
 
 // ============================================================
 // 静态成员定义
@@ -42,6 +39,18 @@ QueueHandle_t OtaRelay::dispatchQueue = NULL;
 QueueHandle_t OtaRelay::resultQueue = NULL;
 SemaphoreHandle_t OtaRelay::s_stateMutex = NULL;
 TaskHandle_t OtaRelay::taskHandle = NULL;
+IRelayListener *OtaRelay::s_relayListener = nullptr;
+
+// ── 中继事件监听器（解决 H4 双向耦合）──
+void OtaRelay::setRelayListener(IRelayListener *listener)
+{
+    s_relayListener = listener;
+}
+
+IRelayListener* OtaRelay::getRelayListener()
+{
+    return s_relayListener;
+}
 
 // ============================================================
 // 状态表：将每个 relay_state_t 映射到对应的 handler
@@ -273,7 +282,7 @@ ota_result_t OtaRelay::handleSizeNeg(relay_event_t event, const uint8_t *payload
 
     // 加载元数据获取固件大小
     ota_meta_t meta;
-    if (OtaRelay::metaLoad(&meta) != ESP_OK || meta.total_size == 0) {
+    if (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK || meta.total_size == 0) {
         DEBUG_ERR("OTA", "SIZE_NEG: 元数据无效");
         setState(RELAY_ERROR);
         return OTA_RESULT_ERR_STORAGE;
@@ -409,7 +418,7 @@ ota_result_t OtaRelay::handleError(relay_event_t event, const uint8_t *payload, 
 ota_result_t OtaRelay::forwardFirmware()
 {
     ota_meta_t meta;
-    if (OtaRelay::metaLoad(&meta) != ESP_OK) {
+    if (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK) {
         return OTA_RESULT_ERR_STORAGE;
     }
 
@@ -417,7 +426,7 @@ ota_result_t OtaRelay::forwardFirmware()
 
     // 固件完整性校验
     {
-        esp_err_t verify_err = metaVerifyChecksum();
+        esp_err_t verify_err = Gd32FlashStore::instance().metaVerifyChecksum();
         if (verify_err != ESP_OK) {
             DEBUG_ERR("OTA", "固件完整性校验失败，中止转发");
             reset();
@@ -492,6 +501,13 @@ void OtaRelay::reset()
 // ============================================================
 // 内部工具函数（不变）
 // ============================================================
+/**
+ * @brief 检查缓冲区中所有字节是否为指定值。
+ * @param buf 数据缓冲区。
+ * @param len 缓冲区长度。
+ * @param value 目标字节值。
+ * @return true 所有字节均为指定值，false 否则。
+ */
 static bool bytesAllValue(const uint8_t *buf, size_t len, uint8_t value)
 {
     if (!buf || len == 0) return false;
@@ -501,6 +517,13 @@ static bool bytesAllValue(const uint8_t *buf, size_t len, uint8_t value)
     return true;
 }
 
+/**
+ * @brief 本地 AES-128-ECB 加密单块（16字节），使用硬件加速。
+ * @param key 16 字节密钥。
+ * @param in 16 字节明文输入。
+ * @param out 16 字节密文输出。
+ * @return 0 成功，-1 失败。
+ */
 int OtaRelay::aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
     esp_aes_context ctx;
@@ -511,6 +534,13 @@ int OtaRelay::aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, 
     return ret;
 }
 
+/**
+ * @brief 记录 GD32 SPI 响应的十六进制负载（调试用）。
+ * @param stage 当前阶段名称。
+ * @param resp_type 响应类型字节。
+ * @param payload 响应负载数据。
+ * @param len 负载长度。
+ */
 void OtaRelay::logRespPayload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len)
 {
     char hex[193] = {0};
@@ -522,6 +552,17 @@ void OtaRelay::logRespPayload(const char *stage, uint8_t resp_type, const uint8_
               n > 0 ? hex : "<empty>", len > n ? "..." : "");
 }
 
+/**
+ * @brief 循环轮询 SPI 直到响应不再是 WAIT 类型，超过最大轮询次数后放弃。
+ * @param stage 当前阶段名称（日志用）。
+ * @param resp_type 输入/输出响应类型（初始为 SPI_OTA_RSP_WAIT）。
+ * @param resp_payload 输出响应负载缓冲区。
+ * @param resp_max 响应负载缓冲区最大长度。
+ * @param resp_len 输出实际响应长度。
+ * @param timeout_ms 单次 SPI 轮询超时（毫秒）。
+ * @param max_wait_rounds 最大 WAIT 轮询次数。
+ * @return ESP_OK 成功，ESP_ERR_TIMEOUT 超时。
+ */
 esp_err_t OtaRelay::waitUntilNotWait(const char *stage, uint8_t *resp_type,
                                      uint8_t *resp_payload, size_t resp_max,
                                      size_t *resp_len, uint32_t timeout_ms, uint32_t max_wait_rounds)
@@ -539,6 +580,13 @@ esp_err_t OtaRelay::waitUntilNotWait(const char *stage, uint8_t *resp_type,
     return ESP_OK;
 }
 
+/**
+ * @brief 检查响应负载是否为带指定序号的结构化 ACK（0xBA 0xC0 + seq32）。
+ * @param payload 响应负载数据。
+ * @param len 负载长度。
+ * @param expected_seq 期望的序号。
+ * @return true 匹配，false 不匹配。
+ */
 bool OtaRelay::isStructuredAckWithSeq(const uint8_t *payload, size_t len, uint32_t expected_seq)
 {
     if (!payload || len < 6) return false;
@@ -548,6 +596,14 @@ bool OtaRelay::isStructuredAckWithSeq(const uint8_t *payload, size_t len, uint32
     return seq == expected_seq;
 }
 
+/**
+ * @brief 解析结构化错误响应（0xBA 0xC0 + seq32 + err_code）。
+ * @param payload 响应负载数据。
+ * @param len 负载长度。
+ * @param seq_out 输出序号（可为 nullptr）。
+ * @param err_out 输出错误码（可为 nullptr）。
+ * @return true 成功解析为结构化错误，false 不是。
+ */
 bool OtaRelay::parseStructuredError(const uint8_t *payload, size_t len, uint32_t *seq_out, uint8_t *err_out)
 {
     if (!payload || len < 7) return false;
@@ -558,18 +614,23 @@ bool OtaRelay::parseStructuredError(const uint8_t *payload, size_t len, uint32_t
     return true;
 }
 
+/** @brief 检查响应是否为握手回显 ACK（0x00 0xAC）。 */
 bool OtaRelay::isHandshakeEchoAck(const uint8_t *payload, size_t len)
 { return payload && len >= 2U && payload[0] == 0x00U && payload[1] == 0xACU; }
 
+/** @brief 检查响应是否为挑战认证 ACK（36字节挑战响应）。 */
 bool OtaRelay::isChallengePayloadAck(const uint8_t *payload, size_t len)
 { return payload && len == GD32_CHALLENGE_RESPONSE_LEN; }
 
+/** @brief 检查响应是否为确认明文 ACK（0xBA 0xC0）。 */
 bool OtaRelay::isConfirmPlainAck(const uint8_t *payload, size_t len)
 { return payload && len == 2U && payload[0] == 0xBAU && payload[1] == 0xC0U; }
 
+/** @brief 检查响应是否为固件大小 seq=0 的结构化 ACK。 */
 bool OtaRelay::isSizeSeq0Ack(const uint8_t *payload, size_t len)
 { return isStructuredAckWithSeq(payload, len, 0U); }
 
+/** @brief 检查响应是否为结束指令 ACK（0x0A 0xAC）。 */
 bool OtaRelay::isFinishPlainAck(const uint8_t *payload, size_t len)
 {
     if (!payload) return false;
@@ -577,6 +638,19 @@ bool OtaRelay::isFinishPlainAck(const uint8_t *payload, size_t len)
     return false;
 }
 
+/**
+ * @brief 轮询 SPI 直到匹配指定的 ACK 形状，处理 WAIT 和过期 ACK。
+ * @param stage 当前阶段名称。
+ * @param resp_type 输入/输出响应类型。
+ * @param resp_payload 输入/输出响应负载。
+ * @param resp_max 响应负载缓冲区最大长度。
+ * @param resp_len 输入/输出实际响应长度。
+ * @param poll_timeout_ms 单次 SPI 轮询超时。
+ * @param wait_rounds 最大 WAIT 轮询次数。
+ * @param maxExtraPolls 最大额外轮询次数。
+ * @param matcher ACK 形状匹配函数。
+ * @return ESP_OK 成功，其他错误码表示失败。
+ */
 esp_err_t OtaRelay::pollUntilExpectedAckShape(const char *stage,
                                                uint8_t *resp_type, uint8_t *resp_payload,
                                                size_t resp_max, size_t *resp_len,
@@ -609,6 +683,14 @@ esp_err_t OtaRelay::pollUntilExpectedAckShape(const char *stage,
     return ESP_OK;
 }
 
+/**
+ * @brief 解析挑战响应负载，验证 nonce、派生会话密钥和 UID。
+ * @param resp_payload GD32 响应负载（36字节）。
+ * @param resp_len 响应负载长度。
+ * @param out_k_session 输出 16 字节会话密钥。
+ * @param out_uid 输出 12 字节 GD32 UID。
+ * @return true 验证通过，false 失败。
+ */
 bool OtaRelay::parseAndVerifyChallengePayload(const uint8_t *resp_payload, size_t resp_len,
                                                uint8_t *out_k_session, uint8_t *out_uid)
 {
@@ -641,6 +723,13 @@ bool OtaRelay::parseAndVerifyChallengePayload(const uint8_t *resp_payload, size_
     return true;
 }
 
+/**
+ * @brief AES-128-ECB 加密 48 字节（分 3 个 16 字节块）。
+ * @param key 16 字节密钥。
+ * @param in 48 字节明文输入。
+ * @param out 48 字节密文输出。
+ * @return true 全部加密成功，false 任一块失败。
+ */
 bool OtaRelay::aes128EcbEncrypt48Bytes(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
     for (int i = 0; i < 3; ++i)
@@ -648,6 +737,12 @@ bool OtaRelay::aes128EcbEncrypt48Bytes(const uint8_t *key, const uint8_t *in, ui
     return true;
 }
 
+/**
+ * @brief 使用 CRC32（IEEE 多项式 0xEDB88320）对 key+data48 计算 4 字节校验值。
+ * @param key 16 字节密钥（混入 CRC）。
+ * @param data48 48 字节数据。
+ * @param output 输出 4 字节 CRC32 值（小端序）。
+ */
 void OtaRelay::calculateCrc32WithKey(const uint8_t *key, const uint8_t *data48, uint8_t *output)
 {
     uint32_t crc = 0xFFFFFFFFU;
@@ -659,300 +754,9 @@ void OtaRelay::calculateCrc32WithKey(const uint8_t *key, const uint8_t *data48, 
 }
 
 // ============================================================
-// Flash / NVS 操作（不变）
-// ============================================================
-esp_err_t OtaRelay::metaLoad(ota_meta_t *meta)
-{
-    if (!meta) return ESP_ERR_INVALID_ARG;
-    memset(meta, 0, sizeof(ota_meta_t));
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(OTA_META_NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        return ESP_OK;
-    }
-
-    uint32_t val = 0;
-    if (nvs_get_u32(handle, "total_size", &val) == ESP_OK) meta->total_size = val;
-    if (nvs_get_u32(handle, "stored_size", &val) == ESP_OK) meta->stored_size = val;
-    if (nvs_get_u32(handle, "last_seq", &val) == ESP_OK) meta->last_seq = val;
-
-    size_t sha_len = sizeof(meta->checksum);
-    if (nvs_get_blob(handle, "checksum", meta->checksum, &sha_len) == ESP_OK && sha_len == sizeof(meta->checksum)) {
-    } else {
-        memset(meta->checksum, 0, sizeof(meta->checksum));
-    }
-
-    nvs_close(handle);
-    return ESP_OK;
-}
-
-esp_err_t OtaRelay::metaSave(const ota_meta_t *meta)
-{
-    if (!meta) return ESP_ERR_INVALID_ARG;
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(OTA_META_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "无法打开 NVS 写入: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    nvs_set_u32(handle, "total_size", meta->total_size);
-    nvs_set_u32(handle, "stored_size", meta->stored_size);
-    nvs_set_u32(handle, "last_seq", meta->last_seq);
-    nvs_set_blob(handle, "checksum", meta->checksum, sizeof(meta->checksum));
-    err = nvs_commit(handle);
-    nvs_close(handle);
-
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "NVS commit 失败: %s", esp_err_to_name(err));
-    }
-    return err;
-}
-
-esp_err_t OtaRelay::metaUpdate(uint32_t stored_size, uint32_t last_seq)
-{
-    ota_meta_t meta;
-    esp_err_t err = OtaRelay::metaLoad(&meta);
-    if (err != ESP_OK) return err;
-
-    meta.stored_size = stored_size;
-    meta.last_seq = last_seq;
-
-    return OtaRelay::metaSave(&meta);
-}
-
-esp_err_t OtaRelay::metaClear()
-{
-    DEBUG_INFO("OTA", "清除 OTA 元数据");
-    ota_meta_t meta = {};
-    return OtaRelay::metaSave(&meta);
-}
-
-esp_err_t OtaRelay::computeFlashSha256(uint8_t out_sha256[32])
-{
-    if (!out_sha256) return ESP_ERR_INVALID_ARG;
-
-    ota_meta_t meta;
-    esp_err_t err = metaLoad(&meta);
-    if (err != ESP_OK || meta.total_size == 0) {
-        DEBUG_ERR("OTA", "computeSha256: 元数据无效");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    if (mbedtls_sha256_starts(&ctx, 0) != 0) {
-        mbedtls_sha256_free(&ctx);
-        return ESP_FAIL;
-    }
-
-    static constexpr size_t kChunkSize = 1024;
-    uint8_t *buf = (uint8_t *)malloc(kChunkSize);
-    if (!buf) {
-        mbedtls_sha256_free(&ctx);
-        return ESP_ERR_NO_MEM;
-    }
-
-    uint32_t remaining = meta.total_size;
-    uint32_t offset = 0;
-    while (remaining > 0) {
-        size_t to_read = (remaining > kChunkSize) ? kChunkSize : remaining;
-        err = flashReadChunk(offset, buf, to_read);
-        if (err != ESP_OK) {
-            DEBUG_ERR("OTA", "computeSha256: Flash 读取失败 offset=%" PRIu32, offset);
-            free(buf);
-            mbedtls_sha256_free(&ctx);
-            return err;
-        }
-        if (mbedtls_sha256_update(&ctx, buf, to_read) != 0) {
-            free(buf);
-            mbedtls_sha256_free(&ctx);
-            return ESP_FAIL;
-        }
-        offset += to_read;
-        remaining -= to_read;
-    }
-
-    free(buf);
-    int ret = mbedtls_sha256_finish(&ctx, out_sha256);
-    mbedtls_sha256_free(&ctx);
-    return (ret == 0) ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t OtaRelay::metaFinalizeChecksum()
-{
-    ota_meta_t meta;
-    esp_err_t err = metaLoad(&meta);
-    if (err != ESP_OK) return err;
-
-    if (meta.total_size == 0 || meta.stored_size < meta.total_size) {
-        DEBUG_ERR("OTA", "metaFinalize: 固件不完整 stored=%" PRIu32 " total=%" PRIu32,
-                  meta.stored_size, meta.total_size);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    err = computeFlashSha256(meta.checksum);
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "metaFinalize: SHA-256 计算失败");
-        return err;
-    }
-
-    char hex[65] = {0};
-    for (int i = 0; i < 32; ++i)
-        snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", meta.checksum[i]);
-    DEBUG_INFO("OTA", "固件 SHA-256: %s", hex);
-
-    return metaSave(&meta);
-}
-
-esp_err_t OtaRelay::metaVerifyChecksum()
-{
-    ota_meta_t meta;
-    esp_err_t err = metaLoad(&meta);
-    if (err != ESP_OK) return err;
-
-    if (bytesAllValue(meta.checksum, sizeof(meta.checksum), 0x00)) {
-        DEBUG_WARN("OTA", "metaVerify: checksum 未计算，跳过校验（旧数据兼容）");
-        return ESP_OK;
-    }
-
-    uint8_t computed[32] = {0};
-    err = computeFlashSha256(computed);
-    if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "metaVerify: SHA-256 计算失败");
-        return err;
-    }
-
-    if (memcmp(computed, meta.checksum, 32) != 0) {
-        char hex_stored[65] = {0}, hex_computed[65] = {0};
-        for (int i = 0; i < 32; ++i) {
-            snprintf(&hex_stored[i * 2], sizeof(hex_stored) - i * 2, "%02X", meta.checksum[i]);
-            snprintf(&hex_computed[i * 2], sizeof(hex_computed) - i * 2, "%02X", computed[i]);
-        }
-        DEBUG_ERR("OTA", "固件完整性校验失败!");
-        DEBUG_ERR("OTA", "  存储 SHA-256: %s", hex_stored);
-        DEBUG_ERR("OTA", "  计算 SHA-256: %s", hex_computed);
-        return ESP_ERR_INVALID_CRC;
-    }
-
-    DEBUG_INFO("OTA", "固件完整性校验通过 (SHA-256 匹配)");
-    return ESP_OK;
-}
-
-esp_err_t OtaRelay::verifyFrontendSha(const uint8_t frontend_sha32[32],
-                                      uint8_t out_device_sha[32])
-{
-    if (!frontend_sha32) return ESP_ERR_INVALID_ARG;
-
-    // 1) 计算设备端 SHA 并写入 meta.checksum（metaFinalizeChecksum 内部已校验固件完整性）
-    esp_err_t err = metaFinalizeChecksum();
-    if (err != ESP_OK) return err;
-
-    // 2) 读回 meta 拿到 checksum，回传给调用方
-    ota_meta_t meta;
-    err = metaLoad(&meta);
-    if (err != ESP_OK) return err;
-    if (out_device_sha) memcpy(out_device_sha, meta.checksum, 32);
-
-    // 3) 比对前端 SHA 与设备端 SHA
-    if (memcmp(meta.checksum, frontend_sha32, 32) != 0) {
-        return ESP_ERR_INVALID_CRC;
-    }
-    return ESP_OK;
-}
-
-esp_err_t OtaRelay::flashWriteChunk(uint32_t offset, const uint8_t *data, size_t len)
-{
-    if (!instance().m_gd32Partition) {
-        instance().m_gd32Partition = esp_partition_find_first(
-            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "gd32_ota");
-        if (!instance().m_gd32Partition) {
-            DEBUG_ERR("OTA", "找不到 gd32_ota 分区");
-            return ESP_ERR_NOT_FOUND;
-        }
-    }
-
-    const esp_partition_t *part = instance().m_gd32Partition;
-
-    // ★ 计算 head/tail padding，使写入地址和长度都对齐到 4 字节
-    //   WiFi HTTP chunk 边界不一定 4 对齐，flash 写入必须对齐。
-    size_t head_pad = offset % 4;
-    uint32_t aligned_offset = offset - head_pad;
-    size_t total = head_pad + len;
-    size_t aligned_len = (total + 3) & ~(size_t)3;
-
-    if (aligned_offset + aligned_len > part->size) {
-        DEBUG_ERR("OTA", "flashWriteChunk越界: offset=%" PRIu32 " len=%zu aligned_off=%" PRIu32 " aligned_len=%zu part=%" PRIu32,
-                  offset, len, aligned_offset, aligned_len, part->size);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    // 快速路径：offset 和 len 都对齐
-    if (head_pad == 0 && len % 4 == 0) {
-        return esp_partition_write(part, offset, data, len);
-    }
-
-    if (head_pad > 0 || len % 4 != 0) {
-        DEBUG_WARN("OTA", "flashWriteChunk 非对齐: offset=%" PRIu32 " len=%zu head=%zu aligned_len=%zu",
-                   offset, len, head_pad, aligned_len);
-    }
-
-    uint8_t *aligned_buf = (uint8_t *)malloc(aligned_len);
-    if (!aligned_buf) {
-        DEBUG_ERR("OTA", "flashWriteChunk malloc失败: %zu字节", aligned_len);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // 读回 head padding（offset 之前的字节，属于上一次写入的尾部）
-    if (head_pad > 0) {
-        esp_err_t err = esp_partition_read(part, aligned_offset, aligned_buf, head_pad);
-        if (err != ESP_OK) {
-            DEBUG_ERR("OTA", "flashWriteChunk读回head失败: offset=%" PRIu32 " head=%zu err=%s",
-                      aligned_offset, head_pad, esp_err_to_name(err));
-            free(aligned_buf);
-            return err;
-        }
-    }
-
-    // 拷贝实际数据
-    memcpy(aligned_buf + head_pad, data, len);
-
-    // 读回 tail padding（数据末尾到 4 字节边界的字节）
-    size_t tail_pad = aligned_len - total;
-    if (tail_pad > 0) {
-        esp_err_t err = esp_partition_read(part, aligned_offset + total, aligned_buf + total, tail_pad);
-        if (err != ESP_OK) {
-            DEBUG_ERR("OTA", "flashWriteChunk读回tail失败: offset=%" PRIu32 " tail=%zu err=%s",
-                      aligned_offset + total, tail_pad, esp_err_to_name(err));
-            free(aligned_buf);
-            return err;
-        }
-    }
-
-    esp_err_t err = esp_partition_write(part, aligned_offset, aligned_buf, aligned_len);
-    free(aligned_buf);
-    return err;
-}
-
-esp_err_t OtaRelay::flashReadChunk(uint32_t offset, uint8_t *data, size_t len)
-{
-    if (!instance().m_gd32Partition) {
-        instance().m_gd32Partition = esp_partition_find_first(
-            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "gd32_ota");
-        if (!instance().m_gd32Partition) {
-            DEBUG_ERR("OTA", "找不到 gd32_ota 分区");
-            return ESP_ERR_NOT_FOUND;
-        }
-    }
-
-    return esp_partition_read(instance().m_gd32Partition, offset, data, len);
-}
-
-// ============================================================
 // 协议子步骤实现
 // ============================================================
+/** @brief 协议子步骤：请求 GD32 APP 进入 Bootloader OTA 模式。 */
 esp_err_t OtaRelay::requestGd32AppEnterBootloader()
 {
     DEBUG_INFO("OTA", "尝试通知 GD32 APP 进入 Bootloader OTA 窗口");
@@ -966,6 +770,7 @@ esp_err_t OtaRelay::requestGd32AppEnterBootloader()
     return err;
 }
 
+/** @brief 协议子步骤：发送握手请求（0x00 0xAC）并等待 GD32 回显 ACK。 */
 ota_result_t OtaRelay::doHandshakeReq()
 {
     DEBUG_INFO("OTA", "--- 握手请求 ---");
@@ -1016,6 +821,7 @@ ota_result_t OtaRelay::doHandshakeReq()
     return OTA_RESULT_ERR_TIMEOUT;
 }
 
+/** @brief 协议子步骤：执行挑战认证（发送 nonce、验证响应、派生会话密钥、发送确认）。 */
 ota_result_t OtaRelay::doChallengeAndAuth()
 {
     uint8_t resp_type = 0;
@@ -1086,6 +892,7 @@ ota_result_t OtaRelay::doChallengeAndAuth()
     return OTA_RESULT_OK;
 }
 
+/** @brief 协议子步骤：发送固件总大小给 GD32 并等待 seq=0 的确认。 */
 ota_result_t OtaRelay::doSendFirmwareSize(uint32_t size)
 {
     uint8_t resp_type = 0;
@@ -1116,12 +923,17 @@ ota_result_t OtaRelay::doSendFirmwareSize(uint32_t size)
     return OTA_RESULT_OK;
 }
 
+/**
+ * @brief 协议子步骤：逐包转发固件数据给 GD32。
+ * 流程：从 Flash 读取 → AES 加密 → SPI 发送 → 等待 ACK → 失败则重发。
+ * 每 OTA_PACKET_HEALTH_CHECK_INTERVAL 包执行一次健康检查。
+ */
 ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
 {
     DEBUG_INFO("OTA", "开始转发 %" PRIu32 " 包", m_transferTotalPackets);
 
     ota_meta_t meta;
-    if (OtaRelay::metaLoad(&meta) != ESP_OK) {
+    if (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK) {
         DEBUG_ERR("OTA", "元数据加载失败");
         return OTA_RESULT_ERR_STORAGE;
     }
@@ -1154,7 +966,7 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
             chunk_size = meta.total_size - (seq * GD32_OTA_PACKET_SIZE);
         }
 
-        esp_err_t err = OtaRelay::flashReadChunk(m_transferFlashOffset, plain48, chunk_size);
+        esp_err_t err = Gd32FlashStore::instance().flashReadChunk(m_transferFlashOffset, plain48, chunk_size);
         if (err != ESP_OK) {
             DEBUG_ERR("OTA", "Flash 读取失败, offset=%" PRIu32 ", err=%d", m_transferFlashOffset, err);
             return OTA_RESULT_ERR_STORAGE;
@@ -1297,6 +1109,7 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
     return result;
 }
 
+/** @brief 协议子步骤：发送 FINISH_OTA 指令并验证 GD32 APP 存活。 */
 ota_result_t OtaRelay::doFinishAndVerify()
 {
     DEBUG_INFO("OTA", "发送 FINISH_OTA (0x0A 0xAC)，等待 GD32 确认即将跳转 APP");
@@ -1365,7 +1178,7 @@ ota_result_t OtaRelay::doFinishAndVerify()
 
     DEBUG_INFO("OTA", "=== OTA 完成，等待 GD32 APP 启动 ===");
 
-    OtaRelay::metaClear();
+    Gd32FlashStore::instance().metaClear();
 
     // ★ APP 存活验证
     gd32AppAlive = false;
@@ -1425,8 +1238,8 @@ void OtaRelay::taskEntry(void *pvParameters)
         }
 
         DEBUG_INFO("OTA", "收到 OTA 调度信号: %" PRIu32 "，开始转发...", msg);
-        // ★ 通知协调器中继已开始（确保协调器状态与实际中继一致）
-        OtaCoordinator::instance().notifyRelayStarted();
+        // ★ H4: 通过 IRelayListener 接口回调通知协调器（不再直接依赖 OtaCoordinator）
+        if (s_relayListener) s_relayListener->onRelayStarted();
         ota_result_t result = instance().forwardFirmware();
 
         uint32_t result_msg = (uint32_t)result;
@@ -1441,8 +1254,7 @@ void OtaRelay::taskEntry(void *pvParameters)
             DEBUG_ERR("OTA", "OTA 转发失败，错误码: %d", result);
         }
         instance().reset();
-        // ★ 通知协调器中继结束（成功→GD32_COMPLETE，失败→ERROR→IDLE）
-        //   避免 m_sysState 卡在 OTA_SYS_GD32_RELAYING，导致后续 beginGd32Storage() 全部被拒
-        OtaCoordinator::instance().notifyRelayComplete(result == OTA_RESULT_OK);
+        // ★ H4: 通过 IRelayListener 接口回调通知协调器中继结束
+        if (s_relayListener) s_relayListener->onRelayComplete(result == OTA_RESULT_OK);
     }
 }

@@ -18,8 +18,8 @@
 #define FRAME_OVERHEAD     (6)       // SOF + CMD + LEN(2) + CRC16(2)
 
 // 安全常量（定义在 app_config.h 中）
-inline constexpr size_t MASTER_KEY_HERE_LEN = 16;
-inline constexpr size_t CHIP_UID_LEN = 12;
+inline constexpr size_t MASTER_KEY_HERE_LEN = 16; ///< AES-128 主密钥长度（字节）
+inline constexpr size_t CHIP_UID_LEN = 12;        ///< GD32 芯片 UID 长度（字节）
 
 // AES 会话上下文
 typedef struct {

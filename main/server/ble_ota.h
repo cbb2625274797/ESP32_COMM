@@ -43,11 +43,6 @@ public:
  * @return 已连接返回 true，未连接返回 false。
  */
     bool isConnected();
-    /**
-  * @brief 触发中继模块向 GD32 转发固件。
- */
-    void signalRelay();
-
     /** @brief 获取 BLE OTA 守护任务句柄。 */
     TaskHandle_t getTaskHandle() const { return m_taskHandle; }
 
@@ -55,16 +50,16 @@ public:
     TaskHandle_t getWorkerTaskHandle() const { return m_workerTaskHandle; }
 
     // 以下状态为 public，供 C 回调函数访问
-    bool m_bleReady = false;
-    bool m_bleConnected = false;
-    uint16_t m_connHandle = 0xFFFF;
+    bool m_bleReady = false;            ///< BLE GATT 服务注册完成标志
+    bool m_bleConnected = false;        ///< BLE 客户端连接状态
+    uint16_t m_connHandle = 0xFFFF;     ///< BLE 连接句柄（0xFFFF=未连接）
 
     // BLE 传输相关（OTA 写入状态已移至 Esp32OtaCore）
-    bool m_esp32RebootPending = false;   // 收尾任务去重标志
-    uint8_t m_esp32LastCmd = 0;          // 最后一次数据包命令（用于补发 ACK）
-    uint16_t m_esp32LastSeq = 0xFFFFU;   // 最后一次数据包序号（用于补发 ACK）
-    TaskHandle_t m_taskHandle = nullptr;
-    TaskHandle_t m_workerTaskHandle = nullptr;
+    bool m_esp32RebootPending = false;   ///< 收尾任务去重标志
+    uint8_t m_esp32LastCmd = 0;          ///< 最后一次数据包命令（用于补发 ACK）
+    uint16_t m_esp32LastSeq = 0xFFFFU;   ///< 最后一次数据包序号（用于补发 ACK）
+    TaskHandle_t m_taskHandle = nullptr;           ///< BLE OTA 守护任务句柄
+    TaskHandle_t m_workerTaskHandle = nullptr;     ///< BLE OTA 数据工作线程句柄
 };
 
 #endif // BLE_OTA_H

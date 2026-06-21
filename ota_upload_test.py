@@ -1,6 +1,14 @@
-﻿import urllib.request, json, time, sys
+﻿#!/usr/bin/env python3
+"""
+ota_upload_test.py - ESP32 OTA 上传集成测试脚本
 
-ESP_IP = "192.168.31.127"
+用法: python ota_upload_test.py
+前提: 已编译 build/ESP32_COMM.bin，ESP32 已连接网络。
+步骤: 上传固件 → 触发更新 → 等待重启并验证版本。
+"""
+import urllib.request, json, time, sys
+
+ESP_IP = "192.168.31.127"  # 目标 ESP32 IP 地址（根据实际网络修改）
 
 # Step 1: Upload ESP32 firmware
 bin_path = r"G:\Robot_v2\DCU\ESP32_COMM\build\ESP32_COMM.bin"

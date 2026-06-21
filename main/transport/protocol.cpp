@@ -55,6 +55,10 @@ void Protocol::init()
 
 /**
  * @brief 根据时间戳、地址和随机种子生成 16 字节 nonce。
+ * @param timestamp 当前时间戳（tick）。
+ * @param mem_addr 内存地址（增加随机性）。
+ * @param rand_seed 随机种子。
+ * @param nonce_out 输出 16 字节 nonce 缓冲区。
  */
 void Protocol::scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
                                 uint32_t rand_seed, uint8_t *nonce_out)
@@ -84,7 +88,10 @@ void Protocol::scrambleGenerate(uint32_t timestamp, uint32_t mem_addr,
 }
 
 /**
- * @brief 会话密钥初始化
+ * @brief 会话密钥初始化。
+ * @param sess 会话上下文指针。
+ * @param k_session 16 字节会话密钥。
+ * @return 0 成功，-1 参数无效。
  */
 int Protocol::sessionKeyInit(session_ctx_t *sess, const uint8_t *k_session)
 {
@@ -100,6 +107,7 @@ int Protocol::sessionKeyInit(session_ctx_t *sess, const uint8_t *k_session)
 
 /**
  * @brief 清除会话上下文中的密钥和状态。
+ * @param sess 会话上下文指针。
  */
 void Protocol::sessionKeyClear(session_ctx_t *sess)
 {

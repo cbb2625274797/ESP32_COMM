@@ -108,6 +108,11 @@ bool DebugLog::ringPopOldest(char *out, size_t out_size, int *out_len)
     return true;
 }
 
+/**
+ * @brief 将环形缓冲区所有日志导出为 JSON 数组字符串。
+ * @param out_len 输出 JSON 字符串长度。
+ * @return 动态分配的 JSON 字符串，调用者须 free()。
+ */
 char* DebugLog::ringDrainJson(int *out_len)
 {
     if (!out_len) return NULL;

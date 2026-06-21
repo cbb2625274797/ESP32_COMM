@@ -16,8 +16,8 @@
 #define SPI_MASTER_CS_GPIO    (4)           // CS 片选引脚
 #define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 4MHz
 #define SPI_MODE              (0)           // CPOL=0, CPHA=0
-#define SPI_QUEUE_SIZE        (1)
-#define SPI_OTA_FRAME_MAX     (96)
+#define SPI_QUEUE_SIZE        (1)           ///< SPI 事务队列深度
+#define SPI_OTA_FRAME_MAX     (96)          ///< SPI OTA 单帧最大字节数
 
 // GD32 SPI OTA 帧类型
 #define SPI_OTA_SOF           (0xA5)

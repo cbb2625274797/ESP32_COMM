@@ -9,12 +9,14 @@
 #include "freertos/semphr.h"
 #include <cstdint>
 
-extern SemaphoreHandle_t g_esp32OtaMutex;
-extern volatile bool g_esp32OtaOccupied;
+extern SemaphoreHandle_t g_esp32OtaMutex;    ///< ESP32 OTA 全局互斥锁句柄（main.cpp 中创建）
+extern volatile bool g_esp32OtaOccupied;     ///< ESP32 OTA 分区占用标志（true=正在OTA）
 
-// 获取全局 OTA 占用标志（带超时），成功返回 true
-// 内部: Take Mutex → 检查标志 → 若空闲则置 true → Give Mutex
-/** @brief 获取全局 OTA 占用标志（带超时），成功返回 true。 */
+/**
+ * @brief 获取全局 OTA 占用标志（带超时）。
+ * @param timeout_ms 等待互斥锁的超时时间（毫秒）。
+ * @return true 成功获取并置占用标志，false 已占用或超时。
+ */
 static inline bool esp32_ota_mutex_acquire(uint32_t timeout_ms) {
     if (!g_esp32OtaMutex) return false;
     if (xSemaphoreTake(g_esp32OtaMutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
@@ -27,9 +29,10 @@ static inline bool esp32_ota_mutex_acquire(uint32_t timeout_ms) {
     return true;
 }
 
-// 释放全局 OTA 占用标志
-// 内部: Take Mutex → 清除标志 → Give Mutex
-/** @brief 释放全局 OTA 占用标志。 */
+/**
+ * @brief 释放全局 OTA 占用标志。
+ * @note 内部: Take Mutex → 清除标志 → Give Mutex。
+ */
 static inline void esp32_ota_mutex_release(void) {
     if (!g_esp32OtaMutex) return;
     xSemaphoreTake(g_esp32OtaMutex, portMAX_DELAY);

@@ -1,8 +1,14 @@
 # ESP32-C3FH4 OTA Relay - Partition Table (4MB Flash)
 # Name,     Type, SubType, Offset,   Size,     Label
+# NVS: 系统配置 + OTA 元数据 (24KB)
 nvs,        data, nvs,     0x9000,    0x6000,
+# OTA Data: AB 分区启动标志 (8KB)
 otadata,    data, ota,      0xF000,    0x2000,
+# GD32 OTA: GD32 固件缓存区 (252KB)，使用 spiffs 子类型以便 esp_partition API 直接读写
 gd32_ota,   data, spiffs,  0x11000,   0x3F000,
+# APP0: ESP32 固件主分区 (1.25MB)
 app0,       app,  ota_0,   0x50000,   0x140000,
+# APP1: ESP32 固件备份分区 (1.25MB)，支持 AB 分区回滚
 app1,       app,  ota_1,   0x190000,  0x140000,
+# SPIFFS: 用户数据文件系统 (1.06MB)
 spiffs,     data, spiffs,  0x2D0000,  0x110000,

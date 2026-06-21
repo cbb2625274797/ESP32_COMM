@@ -20,16 +20,17 @@ typedef enum {
     SYS_SAFE_SHUTDOWN = 3  // 安全关机
 } health_state_t;
 
+/** @brief 健康监控模块内部状态码，用于函数返回值。 */
 typedef enum {
-    HEALTH_MON_OK = 0,
-    HEALTH_MON_WARNING = 1,
-    HEALTH_MON_CRITICAL = 2,
-    HEALTH_MON_SHUTDOWN = 3
+    HEALTH_MON_OK = 0,       ///< 健康检查通过
+    HEALTH_MON_WARNING = 1,  ///< 健康检查警告（可继续）
+    HEALTH_MON_CRITICAL = 2, ///< 健康检查危险（建议中止）
+    HEALTH_MON_SHUTDOWN = 3  ///< 需要安全关机
 } health_status_t;
 
 // WiFi RSSI 阈值（来自 app_config.h）
-#define WIFI_RSSI_NORMAL   WIFI_RSSI_WARNING
-#define WIFI_RSSI_WEAK     WIFI_RSSI_CRITICAL
+#define WIFI_RSSI_NORMAL   WIFI_RSSI_WARNING  ///< WiFi 信号正常阈值（别名）
+#define WIFI_RSSI_WEAK     WIFI_RSSI_CRITICAL ///< WiFi 信号弱阈值（别名）
 
 /**
  * @brief 系统健康监控类（单例）

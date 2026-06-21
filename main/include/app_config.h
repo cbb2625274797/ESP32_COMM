@@ -13,9 +13,9 @@
 // ============================================================
 // 固件版本（由 version.h 自动生成，此处提供 C++ constexpr 访问）
 // ============================================================
-inline constexpr const char *FW_VERSION = FW_VERSION_STRING;
-inline constexpr const char *FW_BUILD_TIME = BUILD_TIME;
-inline constexpr const char *FW_GIT_HASH = GIT_HASH;
+inline constexpr const char *FW_VERSION = FW_VERSION_STRING;     ///< 固件版本字符串（自动生成）
+inline constexpr const char *FW_BUILD_TIME = BUILD_TIME;         ///< 编译时间字符串（自动生成）
+inline constexpr const char *FW_GIT_HASH = GIT_HASH;             ///< Git 提交哈希（自动生成）
 
 // ============================================================
 // WiFi 工作模式选择
@@ -27,9 +27,9 @@ inline constexpr uint8_t CONFIG_WIFI_MODE = 1;
 // ============================================================
 // WiFi STA 模式配置（连接路由器）
 // ============================================================
-inline constexpr const char* WIFI_STA_SSID = "004舰桥";
-inline constexpr const char* WIFI_STA_PASSWORD = "q13362875622";
-inline constexpr uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 30000;
+inline constexpr const char* WIFI_STA_SSID = "004舰桥";            ///< STA 模式目标 WiFi 名称
+inline constexpr const char* WIFI_STA_PASSWORD = "q13362875622";   ///< STA 模式 WiFi 密码
+inline constexpr uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 30000;     ///< STA 连接超时（毫秒）
 inline constexpr uint8_t  WIFI_STA_MAX_RETRY = 5;  // 最大重连次数，超过后切换 AP 模式
 
 // STA 静态 IP
@@ -44,16 +44,16 @@ inline constexpr const char* WIFI_STA_STATIC_DNS     = "192.168.31.1";
 // ============================================================
 // WiFi AP 模式配置（设备当热点）
 // ============================================================
-inline constexpr const char* WIFI_AP_SSID     = "ESP32_OTA_RELAY";
-inline constexpr const char* WIFI_AP_PASSWORD = "12345678";
-inline constexpr uint8_t     WIFI_AP_CHANNEL = 6;
-inline constexpr uint8_t     WIFI_AP_MAX_CONNECT = 4;
+inline constexpr const char* WIFI_AP_SSID     = "ESP32_OTA_RELAY"; ///< AP 模式热点名称
+inline constexpr const char* WIFI_AP_PASSWORD = "12345678";        ///< AP 模式热点密码
+inline constexpr uint8_t     WIFI_AP_CHANNEL = 6;                  ///< AP 模式工作信道
+inline constexpr uint8_t     WIFI_AP_MAX_CONNECT = 4;              ///< AP 模式最大连接数
 
 // ============================================================
 // HTTP 服务器配置
 // ============================================================
-inline constexpr uint16_t HTTP_SERVER_PORT      = 80;
-inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;
+inline constexpr uint16_t HTTP_SERVER_PORT      = 80;              ///< HTTP 服务器监听端口
+inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;           ///< HTTP 服务器任务栈大小（字节）
 
 // ============================================================
 // OTA 配置
@@ -68,40 +68,40 @@ inline constexpr uint32_t OTA_PACKET_DELAY_MS   = 5;            // 每包发送�
 // ============================================================
 // 健康监控阈值
 // ============================================================
-inline constexpr int32_t WIFI_RSSI_CRITICAL = -85;
-inline constexpr int32_t WIFI_RSSI_WARNING  = -75;
-inline constexpr int32_t OTA_WIFI_RSSI_CRITICAL = -88;
-inline constexpr uint32_t OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS = 15000;
-inline constexpr uint32_t OTA_PACKET_HEALTH_CHECK_INTERVAL = 32;
-inline constexpr int32_t TEMP_WARNING       = 80;
-inline constexpr int32_t TEMP_CRITICAL      = 100;
-inline constexpr size_t  HEAP_WARNING_MIN   = 10240;
+inline constexpr int32_t WIFI_RSSI_CRITICAL = -85;                 ///< WiFi 信号严重警告阈值（dBm）
+inline constexpr int32_t WIFI_RSSI_WARNING  = -75;                 ///< WiFi 信号一般警告阈值（dBm）
+inline constexpr int32_t OTA_WIFI_RSSI_CRITICAL = -88;             ///< OTA 传输期间 WiFi 信号临界阈值
+inline constexpr uint32_t OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS = 15000; ///< RSSI 采样最大有效期（毫秒）
+inline constexpr uint32_t OTA_PACKET_HEALTH_CHECK_INTERVAL = 32;   ///< 每 N 包执行一次健康检查
+inline constexpr int32_t TEMP_WARNING       = 80;                  ///< 芯片温度警告阈值（℃）
+inline constexpr int32_t TEMP_CRITICAL      = 100;                 ///< 芯片温度严重警告阈值（℃）
+inline constexpr size_t  HEAP_WARNING_MIN   = 10240;               ///< 堆内存警告阈值（字节）
 
 // ============================================================
 // 调试配置（UDP 日志）
 // ============================================================
-inline constexpr uint8_t  DEBUG_LOG_ENABLED = 1;
-inline constexpr const char* DEBUG_LOG_IP   = "192.168.31.3";
-inline constexpr uint16_t DEBUG_LOG_PORT   = 6666;
+inline constexpr uint8_t  DEBUG_LOG_ENABLED = 1;                   ///< UDP 调试日志开关（1=启用）
+inline constexpr const char* DEBUG_LOG_IP   = "192.168.31.3";      ///< UDP 日志目标 IP
+inline constexpr uint16_t DEBUG_LOG_PORT   = 6666;                 ///< UDP 日志目标端口
 
 // ============================================================
 // BLE OTA 配置
 // ============================================================
-inline constexpr const char* BLE_DEVICE_NAME    = "ESP32-OTA-RELAY";
-inline constexpr uint16_t    BLE_MTU_SIZE       = 512;
-inline constexpr uint16_t    BLE_OTA_SERVICE_UUID = 0xFFFF;
-inline constexpr uint16_t    BLE_OTA_CTRL_UUID   = 0x0001;
-inline constexpr uint16_t    BLE_OTA_DATA_IN_UUID  = 0x0002;
-inline constexpr uint16_t    BLE_OTA_DATA_OUT_UUID = 0x0003;
-inline constexpr uint16_t    BLE_OTA_VERSION_UUID  = 0x0004;
-inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_GD32  = 0xF7;
-inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_ESP32 = 0xF8;
-inline constexpr uint8_t BLE_OTA_CTRL_VERIFY_SHA256 = 0xF9;  // SHA-256哈希验证命令（仅从分区读回算 SHA-256，前端比对后再决定是否触发）
-inline constexpr uint8_t BLE_OTA_CTRL_RESTART_ESP32 = 0xFA;  // 重启 ESP32 命令（配套前端 expectedReboot 自动重连）
-inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;
-inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;
-inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;
-inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;
+inline constexpr const char* BLE_DEVICE_NAME    = "ESP32-OTA-RELAY"; ///< BLE 广播设备名
+inline constexpr uint16_t    BLE_MTU_SIZE       = 512;               ///< BLE MTU 协商大小
+inline constexpr uint16_t    BLE_OTA_SERVICE_UUID = 0xFFFF;          ///< OTA GATT 服务 UUID
+inline constexpr uint16_t    BLE_OTA_CTRL_UUID   = 0x0001;           ///< OTA 控制特征 UUID（写入命令）
+inline constexpr uint16_t    BLE_OTA_DATA_IN_UUID  = 0x0002;         ///< OTA 数据输入特征 UUID（写固件包）
+inline constexpr uint16_t    BLE_OTA_DATA_OUT_UUID = 0x0003;         ///< OTA 数据输出特征 UUID（通知/ACK）
+inline constexpr uint16_t    BLE_OTA_VERSION_UUID  = 0x0004;         ///< OTA 版本信息特征 UUID（只读）
+inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_GD32  = 0xF7;         ///< BLE 控制命令：触发 GD32 中继 OTA
+inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_ESP32 = 0xF8;         ///< BLE 控制命令：触发 ESP32 本机 OTA
+inline constexpr uint8_t BLE_OTA_CTRL_VERIFY_SHA256 = 0xF9;         ///< BLE 控制命令：SHA-256 哈希验证
+inline constexpr uint8_t BLE_OTA_CTRL_RESTART_ESP32 = 0xFA;         ///< BLE 控制命令：重启 ESP32
+inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;             ///< BLE 数据通道：GD32 固件包标识
+inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;             ///< BLE 数据通道：ESP32 固件包标识
+inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;            ///< BLE 单包数据载荷大小（字节）
+inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;           ///< BLE 包头+序号+校验开销（字节）
 // Reorder buffer 窗口大小（吸收 BLE 窗口内乱序到达的包，须 >= BLE_OTA_ACK_WINDOW）
 inline constexpr size_t      BLE_OTA_REORDER_WINDOW = 32;
 
@@ -118,9 +118,9 @@ inline constexpr uint8_t MASTER_KEY[] = {
 inline constexpr size_t SCRAMBLE_CONST_LEN = 16;
 
 // GD32_CHIP_UID 仅保留为默认占位，运行时以握手包解出的芯片地址 UID 为准。
-inline constexpr uint32_t DEVICE_SERIAL_ADDR_LSB = 0x1FFFF7E8U;
-inline constexpr uint32_t DEVICE_SERIAL_ADDR_MID = 0x1FFFF7ECU;
-inline constexpr uint32_t DEVICE_SERIAL_ADDR_MSB = 0x1FFFF7F0U;
+inline constexpr uint32_t DEVICE_SERIAL_ADDR_LSB = 0x1FFFF7E8U; ///< GD32 设备序列号低字 Flash 地址
+inline constexpr uint32_t DEVICE_SERIAL_ADDR_MID = 0x1FFFF7ECU; ///< GD32 设备序列号中字 Flash 地址
+inline constexpr uint32_t DEVICE_SERIAL_ADDR_MSB = 0x1FFFF7F0U; ///< GD32 设备序列号高字 Flash 地址
 
 inline constexpr uint8_t GD32_CHIP_UID[] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05,

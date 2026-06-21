@@ -44,6 +44,7 @@
 #include "esp32_ota_core.h"
 #include "ota_coordinator.h"
 #include "ota_relay.h"
+#include "storage/gd32_flash_store.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
 
@@ -633,11 +634,13 @@ static void sendFinishEvent(uint8_t stage, uint32_t value)
     }
 }
 
+/** @brief 将 session_id 和 code 打包为 32 位 BLE FINISH 事件值。 */
 static uint32_t packBleFinishValue(uint16_t session_id, uint16_t code)
 {
     return ((uint32_t)code << 16) | (uint32_t)session_id;
 }
 
+/** @brief 将 32 字节 SHA-256 转为大写十六进制字符串（65字节含'\0'）。 */
 static void shaBytesToHexUpper(const uint8_t sha[32], char out_hex[65])
 {
     if (!sha || !out_hex) return;
@@ -647,6 +650,7 @@ static void shaBytesToHexUpper(const uint8_t sha[32], char out_hex[65])
     out_hex[64] = '\0';
 }
 
+/** @brief 通过 BLE Notify 推送设备端 SHA-256 给前端（用于比对验证）。 */
 static void sendSha256Notify(const uint8_t sha[32], uint16_t session_id)
 {
     if (!sha) return;
@@ -659,6 +663,7 @@ static void sendSha256Notify(const uint8_t sha[32], uint16_t session_id)
     BleOta::instance().notifyResponse(sha_pkt, sizeof(sha_pkt));
 }
 
+/** @brief BLE 触发 GD32 中继后等待结果的 FreeRTOS 任务。 */
 static void ble_gd32_relay_wait_task(void *pvParameters)
 {
     BleGd32RelayWaitCtx *ctx = (BleGd32RelayWaitCtx *)pvParameters;
@@ -747,7 +752,7 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
 
         // 检查固件是否存储完毕 → 通过协调器触发 GD32 OTA 中继
         ota_meta_t meta = {};
-        esp_err_t err = OtaRelay::metaLoad(&meta);
+        esp_err_t err = OtaCoordinator::instance().loadGd32Meta(&meta);
         if (err == ESP_OK &&
             meta.total_size > 0 &&
             meta.stored_size >= meta.total_size) {
@@ -758,7 +763,7 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
 
             // ★ 统一走共享 helper：计算设备端 SHA → 比对前端 SHA
             uint8_t device_sha[32] = {0};
-            err = OtaRelay::verifyFrontendSha(frontend_sha, device_sha);
+            err = OtaCoordinator::instance().verifyGd32Firmware(frontend_sha, device_sha);
             shaBytesToHexUpper(device_sha, device_sha_hex);
             sendSha256Notify(device_sha, session_id);
             DEBUG_INFO(TAG, "GD32 前端 SHA-256: %s, session=%u", frontend_sha_hex, session_id);
@@ -1111,7 +1116,7 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
                 meta.stored_size = 0;
                 meta.last_seq    = 0;
 
-                esp_err_t err = OtaRelay::metaSave(&meta);
+                esp_err_t err = OtaCoordinator::instance().saveGd32Meta(&meta);
                 if (err != ESP_OK) {
                     DEBUG_ERR(TAG, "元数据保存失败");
                     OtaCoordinator::instance().abortCurrent();
@@ -1124,7 +1129,7 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
             }
 
             ota_meta_t meta = {};
-            if (OtaRelay::metaLoad(&meta) != ESP_OK || meta.total_size == 0) {
+            if (OtaCoordinator::instance().loadGd32Meta(&meta) != ESP_OK || meta.total_size == 0) {
                 DEBUG_ERR(TAG, "GD32 元数据无效，拒绝写入: seq=%u", seq);
                 return;
             }
@@ -1151,7 +1156,7 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
                 return;
             }
 
-            esp_err_t err = OtaRelay::flashWriteChunk(flash_offset, &buf[data_offset], data_len);
+            esp_err_t err = OtaCoordinator::instance().writeGd32Chunk(flash_offset, &buf[data_offset], data_len);
             if (err != ESP_OK) {
                 DEBUG_ERR(TAG, "Flash 写入失败: seq=%u offset=%" PRIu32 " err=%s",
                           seq, flash_offset, esp_err_to_name(err));
@@ -1159,7 +1164,7 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
             }
 
             uint32_t stored_size = flash_offset + (uint32_t)data_len;
-            err = OtaRelay::metaUpdate(stored_size, seq);
+            err = OtaCoordinator::instance().updateGd32Meta(stored_size, seq);
             if (err != ESP_OK) {
                 DEBUG_WARN(TAG, "元数据更新失败 (seq=%u)", seq);
             }
@@ -1174,14 +1179,14 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
                       seq, flash_offset, stored_size);
 
             // --- 检查 GD32 固件是否接收完毕 ---
-            if (OtaRelay::metaLoad(&meta) == ESP_OK &&
+            if (OtaCoordinator::instance().loadGd32Meta(&meta) == ESP_OK &&
                 meta.total_size > 0 &&
                 meta.stored_size >= meta.total_size) {
                 DEBUG_INFO(TAG, "★ GD32 固件接收完毕: %" PRIu32 " / %" PRIu32 " 字节 (共 %u 块)",
                            meta.stored_size, meta.total_size, seq + 1);
                 OtaCoordinator::instance().completeGd32Storage();
                 ble_ota_restore_wifi_ps();
-                esp_err_t sha_err = OtaRelay::metaFinalizeChecksum();
+                esp_err_t sha_err = OtaCoordinator::instance().finalizeGd32Checksum();
                 if (sha_err != ESP_OK) {
                     DEBUG_ERR(TAG, "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
                 }
@@ -1388,7 +1393,6 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
             }
         } else {
             DEBUG_WARN(TAG, "BLE 连接失败: status=%d", event->connect.status);
-            /** @brief BLE GATT 客户端连接状态。 */
             BleOta::instance().m_bleConnected = false;
         }
         return 0;
@@ -1554,7 +1558,6 @@ static void ble_ota_on_sync(void)
 static void ble_ota_on_reset(int reason)
 {
     DEBUG_WARN(TAG, "NimBLE 协议栈重置: reason=%d", reason);
-    /** @brief NimBLE 协议栈同步完成标志。 */
     BleOta::instance().m_bleReady = false;
 }
 
@@ -1678,28 +1681,7 @@ esp_err_t BleOta::notifyResponse(const uint8_t *data, size_t len)
  */
 bool BleOta::isConnected()
 {
-    /** @brief BLE GATT 客户端连接状态。 */
     return BleOta::instance().m_bleConnected;
-}
-
-/**
-  * @brief 通知中继模块开始向 GD32 转发固件。
- */
-void BleOta::signalRelay()
-{
-    if (OtaRelay::dispatchQueue == NULL) {
-        DEBUG_ERR(TAG, "OTA 调度队列未初始化");
-        return;
-    }
-
-    uint32_t msg = 1;
-    BaseType_t ret = xQueueSend(OtaRelay::dispatchQueue, &msg, pdMS_TO_TICKS(200));
-    if (ret != pdTRUE) {
-        DEBUG_ERR(TAG, "OTA 调度信号发送失败: 队列满");
-        return;
-    }
-
-    DEBUG_INFO(TAG, "OTA 调度信号已发送 → ota_relay_task");
 }
 
 // ============================================================

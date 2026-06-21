@@ -7,6 +7,7 @@
 #include "ota_coordinator.h"
 #include "esp32_ota_core.h"
 #include "relay/ota_relay.h"
+#include "storage/gd32_flash_store.h"
 #include "monitor/debug_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -102,10 +103,13 @@ void OtaCoordinator::init()
     m_gd32StorageDone = false;
     m_busySinceTick = 0;
 
+    // ★ H4 解耦：注册协调器为 OtaRelay 的中继事件监听器
+    OtaRelay::setRelayListener(this);
+
     // ★ 重启恢复：如果 NVS 里有完整固件元数据，开机时立即进入 STORED 状态，
     //   否则用户重启后看到的状态是 IDLE 但 NVS 里其实有未中继的固件，前后不一致。
     ota_meta_t boot_meta;
-    if (OtaRelay::metaLoad(&boot_meta) == ESP_OK &&
+    if (Gd32FlashStore::instance().metaLoad(&boot_meta) == ESP_OK &&
         boot_meta.total_size > 0 &&
         boot_meta.stored_size >= boot_meta.total_size) {
         m_sysState = OTA_SYS_GD32_STORED;
@@ -140,7 +144,7 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size)
     // 如果之前已有存储但未中继（STORED）或刚中继完（COMPLETE），先清理再开始新存储
     if (h && (m_sysState == OTA_SYS_GD32_STORED || m_sysState == OTA_SYS_GD32_COMPLETE)) {
         DEBUG_INFO(TAG, "清理旧 GD32 存储状态，开始新存储 (size=%" PRIu32 ")", total_size);
-        OtaRelay::metaClear();
+        Gd32FlashStore::instance().metaClear();
     }
 
     if (h) {
@@ -165,6 +169,50 @@ void OtaCoordinator::completeGd32Storage()
         DEBUG_WARN(TAG, "completeGd32Storage 在非预期状态: %d", (int)m_sysState);
     }
     unlock(h);
+}
+
+// ============================================================
+// GD32 存储操作（传输层统一入口，解决 H3 绕过协调器问题）
+// ============================================================
+esp_err_t OtaCoordinator::writeGd32Chunk(uint32_t offset, const uint8_t *data, size_t len)
+{
+    return Gd32FlashStore::instance().flashWriteChunk(offset, data, len);
+}
+
+esp_err_t OtaCoordinator::saveGd32Meta(const ota_meta_t *meta)
+{
+    return Gd32FlashStore::instance().metaSave(meta);
+}
+
+esp_err_t OtaCoordinator::loadGd32Meta(ota_meta_t *meta)
+{
+    return Gd32FlashStore::instance().metaLoad(meta);
+}
+
+esp_err_t OtaCoordinator::updateGd32Meta(uint32_t stored_size, uint32_t last_seq)
+{
+    return Gd32FlashStore::instance().metaUpdate(stored_size, last_seq);
+}
+
+esp_err_t OtaCoordinator::clearGd32Meta()
+{
+    return Gd32FlashStore::instance().metaClear();
+}
+
+esp_err_t OtaCoordinator::verifyGd32Firmware(const uint8_t frontend_sha32[32],
+                                              uint8_t out_device_sha[32])
+{
+    return Gd32FlashStore::instance().verifyFrontendSha(frontend_sha32, out_device_sha);
+}
+
+esp_err_t OtaCoordinator::finalizeGd32Checksum()
+{
+    return Gd32FlashStore::instance().metaFinalizeChecksum();
+}
+
+esp_err_t OtaCoordinator::eraseGd32Partition(uint32_t size)
+{
+    return Gd32FlashStore::instance().erasePartition(size);
 }
 
 // ============================================================
@@ -200,7 +248,7 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
 
     // 验证固件是否确实已存储（通过 NVS 元数据）
     ota_meta_t meta;
-    if (h && (OtaRelay::metaLoad(&meta) != ESP_OK ||
+    if (h && (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK ||
         meta.total_size == 0 ||
         meta.stored_size < meta.total_size)) {
         DEBUG_WARN(TAG, "GD32 固件未完整存储，拒绝触发中继");
@@ -247,6 +295,7 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
     return ESP_OK;
 }
 
+/** @brief 通知协调器：GD32 中继已开始，更新系统状态为 GD32_RELAYING。 */
 void OtaCoordinator::notifyRelayStarted()
 {
     bool h = lock();
@@ -258,6 +307,7 @@ void OtaCoordinator::notifyRelayStarted()
     unlock(h);
 }
 
+/** @brief 通知协调器：GD32 中继已完成，根据结果转为 COMPLETE 或 ERROR。 */
 void OtaCoordinator::notifyRelayComplete(bool success)
 {
     bool h = lock();
@@ -274,6 +324,21 @@ void OtaCoordinator::notifyRelayComplete(bool success)
         }
     }
     unlock(h);
+}
+
+// ============================================================
+// IRelayListener 接口实现（H4: OtaRelay 通过接口回调通知协调器）
+// ============================================================
+/** @brief IRelayListener 回调：中继已开始，委托给 notifyRelayStarted()。 */
+void OtaCoordinator::onRelayStarted()
+{
+    notifyRelayStarted();
+}
+
+/** @brief IRelayListener 回调：中继已完成，委托给 notifyRelayComplete()。 */
+void OtaCoordinator::onRelayComplete(bool success)
+{
+    notifyRelayComplete(success);
 }
 
 // ============================================================
@@ -342,6 +407,7 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size)
     return err;
 }
 
+/** @brief 通知协调器：ESP32 固件接收完毕，状态转为 FINALIZING。 */
 void OtaCoordinator::notifyEsp32ReceiveComplete()
 {
     bool h = lock();
@@ -352,6 +418,7 @@ void OtaCoordinator::notifyEsp32ReceiveComplete()
     unlock(h);
 }
 
+/** @brief 通知协调器：ESP32 OTA 收尾完成（SHA验证+标记启动），状态转为 REBOOTING。 */
 void OtaCoordinator::notifyEsp32FinalizeComplete()
 {
     bool h = lock();
@@ -362,6 +429,7 @@ void OtaCoordinator::notifyEsp32FinalizeComplete()
     unlock(h);
 }
 
+/** @brief 通知协调器：ESP32 即将重启。 */
 void OtaCoordinator::notifyEsp32Rebooting()
 {
     bool h = lock();
@@ -399,6 +467,11 @@ void OtaCoordinator::restartEsp32()
     // 不会返回
 }
 
+/**
+ * @brief 将 ESP32 OTA finalize 错误码分类。
+ * @param err finalize 返回的 esp_err_t。
+ * @return 0=成功，1=SHA不匹配，2=其他失败。
+ */
 int OtaCoordinator::esp32FinalizeErrCategory(esp_err_t err)
 {
     if (err == ESP_OK)                  return 0;  // 成功
@@ -416,7 +489,7 @@ void OtaCoordinator::abortCurrent()
         DEBUG_INFO(TAG, "中止当前 OTA 操作 (state=%d)", (int)m_sysState);
 
         if (m_sysState == OTA_SYS_GD32_STORING) {
-            OtaRelay::metaClear();
+            Gd32FlashStore::instance().metaClear();
         } else if (m_sysState == OTA_SYS_GD32_RELAYING) {
             OtaRelay::instance().reset();
         } else if (m_sysState == OTA_SYS_ESP32_RECEIVING ||
@@ -445,6 +518,7 @@ ota_system_state_t OtaCoordinator::getSystemState() const
     return s;
 }
 
+/** @brief 判断系统是否处于空闲状态（IDLE/STORED/COMPLETE）。 */
 bool OtaCoordinator::isIdle() const
 {
     return (getSystemState() == OTA_SYS_IDLE ||
@@ -452,6 +526,7 @@ bool OtaCoordinator::isIdle() const
             getSystemState() == OTA_SYS_GD32_COMPLETE);
 }
 
+/** @brief 判断 GD32 通道是否正忙（STORING 或 RELAYING）。 */
 bool OtaCoordinator::isGd32Busy() const
 {
     ota_system_state_t s = getSystemState();
@@ -459,6 +534,7 @@ bool OtaCoordinator::isGd32Busy() const
             s == OTA_SYS_GD32_RELAYING);
 }
 
+/** @brief 判断 ESP32 通道是否正忙（RECEIVING/FINALIZING/REBOOTING）。 */
 bool OtaCoordinator::isEsp32Busy() const
 {
     ota_system_state_t s = getSystemState();
@@ -467,6 +543,7 @@ bool OtaCoordinator::isEsp32Busy() const
             s == OTA_SYS_ESP32_REBOOTING);
 }
 
+/** @brief 获取系统状态的字符串名称（用于日志和前端显示）。 */
 const char* OtaCoordinator::getSystemStateString() const
 {
     switch (getSystemState()) {
@@ -483,11 +560,13 @@ const char* OtaCoordinator::getSystemStateString() const
     }
 }
 
+/** @brief 获取 GD32 APP 存活状态（委托 OtaRelay）。 */
 bool OtaCoordinator::getGd32AppAlive() const
 {
     return OtaRelay::getGd32AppAlive();
 }
 
+/** @brief 获取 GD32 固件是否已存储完成（线程安全）。 */
 bool OtaCoordinator::isGd32StorageDone() const
 {
     OtaCoordinator* self = const_cast<OtaCoordinator*>(this);

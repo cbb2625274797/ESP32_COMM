@@ -22,16 +22,8 @@
 #include "freertos/task.h"
 #include "transport/protocol.h"
 #include "transport/spi_master.h"
+#include "storage/gd32_flash_store.h"
 #include "esp_partition.h"
-
-#define OTA_META_NVS_NAMESPACE "ota_meta"
-
-typedef struct {
-    uint32_t total_size;
-    uint32_t stored_size;
-    uint32_t last_seq;
-    uint8_t  checksum[32];
-} ota_meta_t;
 
 // ============================================================
 // 阶段状态枚举（精简为 7 个状态，原 17 个"微状态"合并为阶段）
@@ -58,26 +50,49 @@ typedef enum {
     RELAY_EVT_ABORT          // 外部中止
 } relay_event_t;
 
+/** @brief OTA 中继操作结果码枚举。 */
 typedef enum {
-    OTA_RESULT_OK = 0,
-    OTA_RESULT_ERR_TIMEOUT = -1,
-    OTA_RESULT_ERR_CRC = -2,
-    OTA_RESULT_ERR_AUTH = -3,
-    OTA_RESULT_ERR_STORAGE = -4,
-    OTA_RESULT_ERR_GD32 = -5,
-    OTA_RESULT_ERR_HEALTH = -6,
-    OTA_RESULT_ERR_USER_ABORT = -7
+    OTA_RESULT_OK = 0,             ///< 操作成功
+    OTA_RESULT_ERR_TIMEOUT = -1,   ///< 等待 GD32 响应超时
+    OTA_RESULT_ERR_CRC = -2,       ///< 固件 CRC/SHA-256 校验失败
+    OTA_RESULT_ERR_AUTH = -3,      ///< 挑战认证失败
+    OTA_RESULT_ERR_STORAGE = -4,   ///< Flash 存储错误
+    OTA_RESULT_ERR_GD32 = -5,      ///< GD32 返回错误
+    OTA_RESULT_ERR_HEALTH = -6,    ///< 健康检查未通过
+    OTA_RESULT_ERR_USER_ABORT = -7 ///< 用户主动中止
 } ota_result_t;
+
+// ============================================================
+// IRelayListener - 中继事件监听接口（解决 H4 双向耦合）
+// ============================================================
+// OtaCoordinator 实现此接口并注册到 OtaRelay，
+// OtaRelay 通过接口回调通知协调器，不再直接 #include ota_coordinator.h。
+// 依赖方向变为单向：OtaCoordinator → OtaRelay（通过接口）。
+/**
+ * @brief 中继事件监听器接口。
+ *        OtaCoordinator 实现此接口，OtaRelay 通过回调通知状态变更，
+ *        消除 OtaRelay → OtaCoordinator 的直接依赖（解决 H4 双向耦合）。
+ */
+class IRelayListener {
+public:
+    virtual ~IRelayListener() = default;
+    /** @brief 中继已开始（forwardFirmware 被调用）。 */
+    virtual void onRelayStarted() = 0;
+    /** @brief 中继已完成。 @param success true=成功，false=失败。 */
+    virtual void onRelayComplete(bool success) = 0;
+};
 
 class OtaRelay {
 public:
     /**
      * @brief 获取OtaRelay单例引用.
+     * @return OtaRelay 单例引用。
      */
     static OtaRelay& instance();
 
     /**
      * @brief OTA中继FreeRTOS任务入口.
+     * @param pvParameters FreeRTOS 任务参数（未使用）。
      */
     static void taskEntry(void *pvParameters);
 
@@ -100,46 +115,57 @@ public:
     // ── 状态查询（线程安全）──
     /**
      * @brief 获取当前中继状态.
+     * @return 当前 relay_state_t 状态值。
      */
     static relay_state_t getState();
     /**
      * @brief 获取中继当前序号.
+     * @return 当前中继序号。
      */
     static uint32_t getRelaySeq();
     /**
      * @brief 获取中继总包数.
+     * @return 本次中继的总包数。
      */
     static uint32_t getRelayTotalPackets();
     /**
      * @brief 获取GD32 APP存活标志位.
+     * @return true 表示 GD32 APP 存活。
      */
     static bool getGd32AppAlive();
     /**
      * @brief 获取GD32固件版本.
+     * @param out 输出版本信息结构体指针。
      */
     static void getGd32Version(gd32_version_t *out);
     /**
      * @brief 设置中继状态.
+     * @param s 目标状态。
      */
     static void setState(relay_state_t s);
     /**
      * @brief 设置中继当前序号.
+     * @param seq 序号值。
      */
     static void setRelaySeq(uint32_t seq);
     /**
      * @brief 设置中继总包数.
+     * @param total 总包数。
      */
     static void setRelayTotalPackets(uint32_t total);
     /**
      * @brief 设置GD32 APP存活标志位.
+     * @param alive true 表示存活。
      */
     static void setGd32AppAlive(bool alive);
     /**
      * @brief 设置GD32固件版本.
+     * @param ver 版本信息结构体引用。
      */
     static void setGd32Version(const gd32_version_t &ver);
     /**
      * @brief 获取 OTA 中继任务句柄。
+     * @return FreeRTOS 任务句柄。
      */
     static TaskHandle_t getTaskHandle();
 
@@ -148,69 +174,37 @@ public:
      */
     void reset();
 
-    // ── Flash 操作 ──
+    // ── 中继事件监听器（解决 H4 双向耦合）──
     /**
-     * @brief Flash写入接口（支持非4字节对齐写入）.
+     * @brief 注册中继事件监听器（由 OtaCoordinator 在 init 时调用）。
+     * @param listener 监听器指针，传 nullptr 取消注册。
      */
-    static esp_err_t flashWriteChunk(uint32_t offset, const uint8_t *data, size_t len);
+    static void setRelayListener(IRelayListener *listener);
     /**
-     * @brief 从OTA缓存分区读取数据块.
+     * @brief 获取当前注册的监听器。
+     * @return 监听器指针，未注册时为 nullptr。
      */
-    static esp_err_t flashReadChunk(uint32_t offset, uint8_t *data, size_t len);
-    /**
-     * @brief 从Flash加载元数据.
-     */
-    static esp_err_t metaLoad(ota_meta_t *meta);
-    /**
-     * @brief 保存元数据到Flash.
-     */
-    static esp_err_t metaSave(const ota_meta_t *meta);
-    /**
-     * @brief 传输过程中更新元数据.
-     */
-    static esp_err_t metaUpdate(uint32_t stored_size, uint32_t last_seq);
-    /**
-     * @brief OTA完成或中止时清除元数据.
-     */
-    static esp_err_t metaClear();
-    /**
-     * @brief 计算gd32_ota分区中已存储固件的SHA-256.
-     */
-    static esp_err_t computeFlashSha256(uint8_t out_sha256[32]);
-    /**
-     * @brief 固件接收完毕后计算SHA-256并写入元数据.
-     */
-    static esp_err_t metaFinalizeChecksum();
-    /**
-     * @brief 校验固件完整性（SHA-256）.
-     */
-    static esp_err_t metaVerifyChecksum();
-    /**
-     * @brief 校验前端提供的 SHA-256 是否与设备端计算的一致。
-     *        BLE/WiFi 传输层共用：内部完成 metaFinalizeChecksum → metaLoad → memcmp。
-     *        无论是否匹配，都会通过 out_device_sha 回传设备端 SHA（便于前端核对）。
-     * @param frontend_sha32  前端 32 字节原始 SHA（非 hex）。
-     * @param out_device_sha  可为 nullptr；非空时输出设备端 32 字节 SHA。
-     * @return ESP_OK 匹配；ESP_ERR_INVALID_CRC 不匹配；其他 = 元数据/计算失败。
-     */
-    static esp_err_t verifyFrontendSha(const uint8_t frontend_sha32[32],
-                                       uint8_t out_device_sha[32]);
+    static IRelayListener* getRelayListener();
+
+    // ── Flash 操作已迁移至 Gd32FlashStore（storage/gd32_flash_store.h）──
 
     // ── 公开状态成员 ──
-    static relay_state_t relayState;
-    static uint32_t relaySeq;
-    static uint32_t relayTotalPackets;
-    static volatile bool gd32AppAlive;
-    static gd32_version_t gd32Version;
-    static QueueHandle_t dispatchQueue;
-    static QueueHandle_t resultQueue;
-    static TaskHandle_t taskHandle;
+    static relay_state_t relayState;          ///< 当前状态机状态
+    static uint32_t relaySeq;                 ///< 当前中继会话序号
+    static uint32_t relayTotalPackets;        ///< 本次中继总包数
+    static volatile bool gd32AppAlive;        ///< GD32 APP 存活标志
+    static gd32_version_t gd32Version;        ///< GD32 固件版本信息
+    static QueueHandle_t dispatchQueue;       ///< 事件分发队列
+    static QueueHandle_t resultQueue;         ///< 结果回传队列
+    static TaskHandle_t taskHandle;           ///< OTA 中继任务句柄
+    static IRelayListener *s_relayListener;   ///< 中继事件监听器（解决 H4）
 
     // ── 线程安全锁 ──
-    static SemaphoreHandle_t s_stateMutex;
-    static void initMutex();
-    static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(50);
+    static SemaphoreHandle_t s_stateMutex;    ///< 状态成员互斥锁
+    static void initMutex();                  ///< 初始化状态互斥锁（app_main 中调用）
+    static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(50); ///< 锁获取超时时间
 
+    /** @brief RAII 状态锁守护类，自动获取/释放 s_stateMutex。 */
     class StateLockGuard {
     public:
         explicit StateLockGuard(TickType_t timeout = kLockTimeout) {
@@ -227,11 +221,10 @@ public:
     };
 
     // ── 实例状态 ──
-    const esp_partition_t *m_gd32Partition = NULL;
-    session_ctx_t m_sessionCtx;
-    uint8_t m_nonceServer[16] = {0};
-    uint8_t m_kSession[16] = {0};
-    uint8_t m_gd32UidRuntime[12] = {0};
+    session_ctx_t m_sessionCtx;                     ///< AES 会话上下文
+    uint8_t m_nonceServer[16] = {0};                ///< 服务端随机数
+    uint8_t m_kSession[16] = {0};                   ///< 会话密钥（挑战认证后生成）
+    uint8_t m_gd32UidRuntime[12] = {0};             ///< GD32 芯片 UID（运行时握手获取）
 
     static constexpr size_t GD32_UID_LEN = 12;
     static constexpr size_t GD32_CHALLENGE_RESPONSE_LEN = 36;
@@ -271,26 +264,34 @@ private:
     // ── 协议子步骤（由状态 handler 内部调用）──
     /**
      * @brief 请求GD32 APP进入Bootloader.
+     * @return ESP_OK 成功，SPI 通信失败返回错误码。
      */
     esp_err_t requestGd32AppEnterBootloader();
     /**
      * @brief 执行握手请求（发送 HANDSHAKE_REQ）.
+     * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_TIMEOUT 超时。
      */
     ota_result_t doHandshakeReq();
     /**
      * @brief 执行挑战认证.
+     * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_AUTH 认证失败。
      */
     ota_result_t doChallengeAndAuth();
     /**
      * @brief 发送固件总大小.
+     * @param size 固件总大小（字节）。
+     * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_TIMEOUT 超时。
      */
     ota_result_t doSendFirmwareSize(uint32_t size);
     /**
      * @brief 转发下一批数据包（由 TRANSFERRING 状态循环调用）.
+     * @param deadline_tick 全局超时时刻（0=不限时）。
+     * @return OTA_RESULT_OK 成功，负值表示错误。
      */
     ota_result_t doRelayPackets(TickType_t deadline_tick);
     /**
      * @brief 发送结束指令并验证 APP 存活.
+     * @return OTA_RESULT_OK 成功，负值表示错误。
      */
     ota_result_t doFinishAndVerify();
 

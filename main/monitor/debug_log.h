@@ -26,9 +26,9 @@
 // 调试日志配置（DEBUG_LOG_IP/PORT/ENABLED 已在 app_config.h 中定义）
 
 // UART0 调试配置
-#define UART_DEBUG_TX_GPIO   21
-#define UART_DEBUG_RX_GPIO   20
-#define UART_DEBUG_BAUD_RATE 115200
+#define UART_DEBUG_TX_GPIO   21     ///< UART0 TX GPIO 引脚号
+#define UART_DEBUG_RX_GPIO   20     ///< UART0 RX GPIO 引脚号
+#define UART_DEBUG_BAUD_RATE 115200 ///< UART0 波特率
 
 // 日志级别
 typedef enum {
@@ -74,6 +74,12 @@ public:
 
     /** @brief 弹出一条最旧日志并从环形缓冲区移除。 */
     bool ringPopOldest(char *out, size_t out_size, int *out_len);
+
+    /**
+     * @brief 将环形缓冲区所有日志导出为 JSON 数组字符串。
+     * @param out_len 输出 JSON 字符串长度。
+     * @return 动态分配的 JSON 字符串，调用者须 free()。
+     */
     char* ringDrainJson(int *out_len);
 
     /** @brief 当前日志级别（运行时可改）。 */
@@ -103,9 +109,9 @@ private:
 };
 
 // 便捷宏 — 直接调用单例方法
-#define DEBUG_ERR(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_ERR,   tag, fmt, ##__VA_ARGS__)
-#define DEBUG_WARN(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_WARN,  tag, fmt, ##__VA_ARGS__)
-#define DEBUG_INFO(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_INFO,  tag, fmt, ##__VA_ARGS__)
-#define DEBUG_DBG(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_DBG,   tag, fmt, ##__VA_ARGS__)
+#define DEBUG_ERR(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_ERR,   tag, fmt, ##__VA_ARGS__) ///< 错误级别日志宏
+#define DEBUG_WARN(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_WARN,  tag, fmt, ##__VA_ARGS__) ///< 警告级别日志宏
+#define DEBUG_INFO(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_INFO,  tag, fmt, ##__VA_ARGS__) ///< 信息级别日志宏
+#define DEBUG_DBG(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_DBG,   tag, fmt, ##__VA_ARGS__) ///< 调试级别日志宏
 
 #endif // DEBUG_LOG_H

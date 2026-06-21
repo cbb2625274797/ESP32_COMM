@@ -1,4 +1,16 @@
-﻿// ==================== 全局状态 ====================
+﻿/**
+ * app.js - ESP32 OTA 中继控制台主脚本（WiFi OTA 通道）
+ *
+ * 职责：
+ * - 固件文件选择 / HEX→BIN 转换 / SHA-256 计算
+ * - WiFi OTA 上传流程（ESP32 本机 + GD32 中继）
+ * - 系统状态轮询（/status + /logs）
+ * - CAN/SPI 调试工具
+ * - UI 状态管理（进度条、阶段流程、Toast、日志）
+ *
+ * 依赖：index.html 中定义的 DOM 元素、style.css 样式
+ */
+// ==================== 全局状态 ====================
 let esp32File = null;
 let gd32File = null;
 let esp32FileHandle = null;  // FileSystemFileHandle for hot reload
@@ -104,6 +116,7 @@ function showVerifyActions(type) {
   void type;
 }
 
+/** @description 设置当前活跃 OTA 阶段并更新 UI 步骤指示器。 */
 function setActivePhase(phase) {
   if (phase === 'gd32Upload' || phase === 'gd32Relay') phase = 'gd32Ota';
   activePhase = phase;
@@ -118,6 +131,7 @@ function setActivePhase(phase) {
   var fill = document.getElementById('progressFill');
   if (fill) fill.classList.remove('done');
 }
+/** @description 标记指定阶段为完成，更新进度条颜色。 */
 function markPhaseDone(phase) {
   if (phase === 'gd32Upload' || phase === 'gd32Relay') phase = 'gd32Ota';
   var stepMap = { esp32Ota: 'ppEsp32', gd32Ota: 'ppGd32Ota' };
@@ -129,6 +143,7 @@ function markPhaseDone(phase) {
     if (fill) fill.classList.add('done');
   }
 }
+/** @description 更新进度条百分比和文本显示。 */
 function setProgress(pct, text) {
   var fillEl = document.getElementById('progressFill');
   var txtEl = document.getElementById('progressTxt');
@@ -137,6 +152,7 @@ function setProgress(pct, text) {
   if (txtEl) txtEl.textContent = text;
   if (pctEl) pctEl.textContent = pct + '%';
 }
+/** @description 重置进度条和阶段状态到初始值。 */
 function resetProgress() {
   setProgress(0, '等待操作...');
   activePhase = null;
@@ -150,11 +166,13 @@ function resetProgress() {
   if (fill) fill.classList.remove('done');
 }
 // ==================== 工具函数 ====================
+/** @description 格式化字节大小为人类可读字符串（B/KB/MB）。 */
 function formatBytes(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
 }
+/** @description 格式化 Date 对象为 HH:MM:SS.mmm 时间字符串。 */
 function formatTime(date) {
   var h = String(date.getHours()).padStart(2, '0');
   var m = String(date.getMinutes()).padStart(2, '0');
@@ -162,6 +180,7 @@ function formatTime(date) {
   var ms = String(date.getMilliseconds()).padStart(3, '0');
   return h + ':' + m + ':' + s + '.' + ms;
 }
+/** @description 格式化秒数为人类可读运行时间（d/h/m/s）。 */
 function formatUptime(sec) {
   if (!Number.isFinite(sec) || sec < 0) return '--';
   const d = Math.floor(sec / 86400);
@@ -173,6 +192,7 @@ function formatUptime(sec) {
   if (m > 0) return m + 'm ' + s + 's';
   return s + 's';
 }
+/** @description 转义 HTML 特殊字符，防止 XSS 注入。 */
 function escapeHtml(text) {
   return String(text == null ? '' : text)
     .replace(/&/g, '&amp;')
@@ -190,6 +210,7 @@ function formatHttpErrorDetail(text) {
   if (detail.length > 180) detail = detail.slice(0, 177) + '...';
   return detail;
 }
+/** @description 显示 Toast 提示消息，支持 info/success/warning/error 类型。 */
 function showToast(message, type) {
   type = type || 'success';
   const toast = document.getElementById('toast');
@@ -210,6 +231,7 @@ function getBaseUrl() {
 function makeLogHash(level, tag, message) {
   return level + '|' + tag + '|' + message;
 }
+/** @description 添加一条日志条目到环形缓冲区和日志面板。 */
 function addLog(level, tag, message) {
   var scroll = document.getElementById('logScroll');
   var time = formatTime(new Date());
@@ -666,6 +688,7 @@ function updateSystemStatusUi(data) {
     setOtaProgressBadge(storageProgress);
   }
 }
+/** @description 测试与 ESP32 的连接（GET /status）。 */
 async function testConnection() {
   // 如果在降速模式，先恢复正常轮询
   if (pollSlowMode) {
@@ -1016,6 +1039,7 @@ async function convertHexFileToBin(file) {
   return { file: binFile, converted: true, baseAddr: result.baseAddr, endAddr: result.endAddr };
 }
 // ==================== 文件处理 ====================
+/** @description 处理用户选择的固件文件（HEX→BIN 转换、SHA-256 计算、文件校验）。 */
 function processFile(file, chip) {
   var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
   var isHexByName = file.name.toLowerCase().endsWith('.hex');
@@ -1083,6 +1107,7 @@ function processFile(file, chip) {
     }
   }
 }
+/** @description 清除已选固件文件并重置对应 UI 状态。 */
 function clearFile(chip) {
   var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
   if (chip === 'esp32') { esp32File = null; esp32FileHandle = null; window._esp32FileSha256 = null; }
@@ -1099,6 +1124,7 @@ function clearFile(chip) {
 //   但前端只用一个 `isUploading` bool 锁同一通道。这里在每次 startUpload
 //   入口主动查询 /system/status，若发现另一通道已经进入 OTA 活跃态
 //   （ESP32 三个状态或 GD32 存储/中继），直接拒绝并提示用户。
+/** @description 启动 ESP32 本机 OTA 上传流程（互斥获取→分块上传→SHA验证→重启）。 */
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file || isUploading) return;
@@ -1317,6 +1343,7 @@ async function startUpload(chip) {
 }
 // ==================== ESP32 OTA 完成升级 ====================
 // 一次调用完成：校验 SHA-256 → 设置启动分区 → 自动重启（无需确认按钮）
+/** @description 验证 ESP32 固件 SHA-256 是否与设备端计算值一致。 */
 async function verifyEsp32Firmware() {
   updateEsp32StagesFromPhase(3);  // 校验中
   var sha256 = window._esp32FileSha256;
@@ -1463,6 +1490,7 @@ async function restartEsp32() {
   }
 }
 // ==================== GD32 OTA 触发（带 SHA-256 校验，对齐 BLE 0xF7）====================
+/** @description 触发 GD32 中继 OTA 流程（通过 HTTP 接口）。 */
 async function triggerGd32Relay() {
   var sha256 = window._gd32FileSha256;
   if (!sha256) {
@@ -1507,6 +1535,7 @@ async function triggerGd32Relay() {
 }
 
 // ==================== 手动触发 GD32 OTA (调试/旧页面兜底) ====================
+/** @description 触发 GD32 OTA 中继（封装函数，调用实际 API）。 */
 async function triggerRelay() {
   // 转发到统一入口：自动使用最近一次上传的 GD32 文件 SHA
   await triggerGd32Relay();
@@ -1558,6 +1587,7 @@ async function diagnoseNetwork() {
   diagResult = result.join('；');
   return diagResult;
 }
+/** @description 启动定时轮询（状态 + 日志）。 */
 function startPolling() {
   consecutivePollFailures = 0;
   pollSlowMode = false;
@@ -1606,6 +1636,7 @@ function resumePollingAfterUpload() {
   pollStatus();
   pollLogs();
 }
+/** @description 轮询 ESP32 系统状态（GET /status）并更新 UI。 */
 async function pollStatus() {
   if (pollingPausedForUpload) return;
   try {
@@ -1684,6 +1715,7 @@ document.addEventListener('visibilitychange', function () {
 });
 // ==================== ESP32 实时日志拉取 (增量) ====================
 var lastLogTimestamp = 0;
+/** @description 轮询 ESP32 日志（GET /logs）并追加到日志面板。 */
 async function pollLogs() {
   if (pollingPausedForUpload) return;
   try {

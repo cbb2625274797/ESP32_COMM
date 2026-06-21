@@ -19,6 +19,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_err.h"
+#include "storage/gd32_flash_store.h"
+#include "relay/ota_relay.h"   // IRelayListener 接口定义（H4 解耦）
 
 // ============================================================
 // 系统级 OTA 状态枚举
@@ -51,10 +53,11 @@ typedef struct {
  * 传输层（WiFi/BLE）通过本协调器发起所有 OTA 操作，
  * 不再直接调用 OtaRelay / Esp32OtaCore 的底层接口。
  */
-class OtaCoordinator {
+class OtaCoordinator : public IRelayListener {
 public:
     /**
      * @brief 获取 OtaCoordinator 单例实例。
+     * @return OtaCoordinator 单例引用。
      */
     static OtaCoordinator& instance();
 
@@ -79,6 +82,67 @@ public:
      *        更新系统状态为 OTA_SYS_GD32_STORED。
      */
     void completeGd32Storage();
+
+    // ── GD32 存储操作（传输层通过协调器操作 Flash，解决 H3 绕过问题）──
+    /**
+     * @brief 向 GD32 Flash 分区写入固件数据块。
+     *        传输层（WiFi/BLE）通过此接口写入，不再直接调用 Gd32FlashStore。
+     * @param offset 写入偏移。
+     * @param data 数据缓冲区。
+     * @param len 数据长度。
+     * @return ESP_OK 成功。
+     */
+    esp_err_t writeGd32Chunk(uint32_t offset, const uint8_t *data, size_t len);
+
+    /**
+     * @brief 保存 GD32 OTA 元数据。
+     * @param meta 元数据结构体。
+     * @return ESP_OK 成功。
+     */
+    esp_err_t saveGd32Meta(const ota_meta_t *meta);
+
+    /**
+     * @brief 加载 GD32 OTA 元数据。
+     * @param meta 输出元数据结构体。
+     * @return ESP_OK 成功。
+     */
+    esp_err_t loadGd32Meta(ota_meta_t *meta);
+
+    /**
+     * @brief 更新 GD32 OTA 元数据的进度。
+     * @param stored_size 已存储大小。
+     * @param last_seq 最后包序号。
+     * @return ESP_OK 成功。
+     */
+    esp_err_t updateGd32Meta(uint32_t stored_size, uint32_t last_seq);
+
+    /**
+     * @brief 清除 GD32 OTA 元数据。
+     * @return ESP_OK 成功。
+     */
+    esp_err_t clearGd32Meta();
+
+    /**
+     * @brief 校验前端 SHA-256 与设备端固件是否一致。
+     * @param frontend_sha32 前端 32 字节 SHA。
+     * @param out_device_sha 输出设备端 32 字节 SHA（可为 nullptr）。
+     * @return ESP_OK 匹配，ESP_ERR_INVALID_CRC 不匹配。
+     */
+    esp_err_t verifyGd32Firmware(const uint8_t frontend_sha32[32],
+                                  uint8_t out_device_sha[32]);
+
+    /**
+     * @brief 计算 GD32 固件 SHA-256 并写入元数据。
+     * @return ESP_OK 成功。
+     */
+    esp_err_t finalizeGd32Checksum();
+
+    /**
+     * @brief 擦除 GD32 OTA 分区。
+     * @param size 擦除大小。
+     * @return ESP_OK 成功。
+     */
+    esp_err_t eraseGd32Partition(uint32_t size);
 
     // ── GD32 中继阶段 ──
     /**
@@ -161,37 +225,44 @@ public:
     // ── 状态查询 ──
     /**
      * @brief 获取当前系统级 OTA 状态。
+     * @return 当前 ota_system_state_t 状态值。
      */
     ota_system_state_t getSystemState() const;
 
     /**
      * @brief 检查系统是否空闲（可接受新的 OTA 请求）。
+     * @return true 系统空闲（IDLE/STORED/COMPLETE）。
      */
     bool isIdle() const;
 
     /**
      * @brief 检查是否有 GD32 相关操作正在进行。
+     * @return true 表示 STORING 或 RELAYING。
      */
     bool isGd32Busy() const;
 
     /**
      * @brief 检查是否有 ESP32 OTA 正在进行。
+     * @return true 表示 RECEIVING/FINALIZING/REBOOTING。
      */
     bool isEsp32Busy() const;
 
     /**
      * @brief 获取系统状态的可读字符串描述。
+     * @return 状态名称字符串（如 "IDLE"、"GD32_STORING" 等）。
      */
     const char* getSystemStateString() const;
 
     // ── GD32 状态（供 status API 使用，委托给 OtaRelay 查询）──
     /**
      * @brief 获取 GD32 APP 存活状态。
+     * @return true 表示 GD32 APP 存活。
      */
     bool getGd32AppAlive() const;
 
     /**
      * @brief GD32 固件存储完成标志（供状态查询）。
+     * @return true 表示固件已完整存储。
      */
     bool isGd32StorageDone() const;
 
@@ -205,9 +276,24 @@ public:
     /**
      * @brief 把 finalize 返回的 esp_err_t 映射为前端可读的事件码。
      *        统一 BLE/WiFi 两端语义，便于日志/状态一致。
+     * @param err finalize 返回的 esp_err_t。
      * @return 0=成功；1=SHA 不匹配；2=其他失败。
      */
     static int esp32FinalizeErrCategory(esp_err_t err);
+
+    // ── IRelayListener 接口实现（H4: OtaRelay 通过接口回调通知协调器）──
+    /**
+     * @brief IRelayListener 回调：中继已开始。
+     *        由 OtaRelay task 在 forwardFirmware() 前通过 s_relayListener 调用。
+     */
+    void onRelayStarted() override;
+
+    /**
+     * @brief IRelayListener 回调：中继已完成。
+     *        由 OtaRelay task 在 forwardFirmware() 返回后通过 s_relayListener 调用。
+     * @param success true 成功，false 失败。
+     */
+    void onRelayComplete(bool success) override;
 
 private:
     OtaCoordinator() = default;

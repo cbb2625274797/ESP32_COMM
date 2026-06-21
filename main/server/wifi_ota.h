@@ -14,10 +14,10 @@
 #include "freertos/task.h"
 #include <atomic>
 
-// SHA-256 验证所需类型前向声明
+/** @brief WiFi 工作模式枚举，区分 AP（设备热点）和 STA（连接路由器）模式。 */
 typedef enum {
-    OTA_WIFI_MODE_AP,
-    OTA_WIFI_MODE_STA
+    OTA_WIFI_MODE_AP,   ///< AP 模式：设备作为热点供局域网设备连接
+    OTA_WIFI_MODE_STA   ///< STA 模式：设备连接上级路由器
 } ota_wifi_mode_t;
 
 class WifiOta {
@@ -38,11 +38,6 @@ public:
      * @param pvParameters FreeRTOS 任务参数。
      */
     static void taskEntry(void *pvParameters);
-    /**
-      * @brief 通知 OTA 中继开始向 GD32 转发固件。
-     */
-    void signalRelay();
-
     /**
       * @brief 获取当前 WiFi 工作模式。
      * @return 当前 WiFi 模式（AP 或 STA）。
@@ -76,11 +71,6 @@ public:
     bool getGd32StorageDone() const       { return m_gd32StorageDone.load(); }
     /** @brief 设置 GD32 固件存储完成标志。 */
     void setGd32StorageDone(bool v)       { m_gd32StorageDone.store(v); }
-    /** @brief 获取中继触发标志。 */
-    bool getRelayTriggered() const        { return m_relayTriggered.load(); }
-    /** @brief 设置中继触发标志。 */
-    void setRelayTriggered(bool v)        { m_relayTriggered.store(v); }
-
     // ── 状态互斥锁（保护复合读-改-写操作）──
     /** @brief 获取状态互斥锁句柄。 */
     SemaphoreHandle_t getStateMutex() const { return m_stateMutex; }
@@ -90,13 +80,13 @@ public:
     void stateUnlock() { if (m_stateMutex) xSemaphoreGive(m_stateMutex); }
 
     // ── 初始化/运行时状态（仅 OTA 任务访问，无需额外锁）──
-    ota_wifi_mode_t m_wifiMode = OTA_WIFI_MODE_AP;
-    bool m_coldBoot = false;
-    SemaphoreHandle_t m_staConnectedSem = NULL;
-    SemaphoreHandle_t m_staGotIpSem = NULL;
-    TaskHandle_t m_reconnectTask = nullptr;
+    ota_wifi_mode_t m_wifiMode = OTA_WIFI_MODE_AP; ///< 当前 WiFi 工作模式
+    bool m_coldBoot = false;                        ///< 是否为冷启动（首次上电）
+    SemaphoreHandle_t m_staConnectedSem = NULL;      ///< STA 连接成功信号量
+    SemaphoreHandle_t m_staGotIpSem = NULL;           ///< STA 获取 IP 信号量
+    TaskHandle_t m_reconnectTask = nullptr;           ///< STA 后台重连任务句柄
 
-    httpd_handle_t m_httpServer = NULL;
+    httpd_handle_t m_httpServer = NULL;               ///< HTTP OTA 服务器句柄
 
     // ★ BLE OTA 传输期间暂停 WiFi 射频活动（减少共存干扰）
     std::atomic<bool> m_bleOtaActive{false};
@@ -112,7 +102,6 @@ private:
     std::atomic<int>  m_staRetryCount{0};
     std::atomic<bool> m_staRetryExhausted{false};
     std::atomic<bool> m_gd32StorageDone{false};
-    std::atomic<bool> m_relayTriggered{false};
     SemaphoreHandle_t m_stateMutex = NULL;
     TaskHandle_t m_taskHandle = nullptr;
 
