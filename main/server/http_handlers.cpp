@@ -24,6 +24,7 @@
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
 #include "spi_master.h"
+#include "canfd_bridge.h"
 #include "ble_ota.h"
 
 static constexpr uint32_t GD32_OTA_FLASH_SECTOR_SIZE = 4096U;
@@ -180,7 +181,8 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     DEBUG_INFO("WIFI", "收到固件上传请求, 内容长度: %d 字节", req->content_len);
 
     esp_wifi_set_ps(WIFI_PS_NONE);
-    WifiOta::instance().setBleOtaActive(false);
+    // ★ L1: WiFi OTA 开始时恢复 BLE 共存状态（通过协调器）
+    OtaCoordinator::instance().notifyBleCoexEnd();
 
     char peek;
     int peek_ret = httpd_req_recv(req, &peek, 1);
@@ -563,7 +565,7 @@ esp_err_t can_send_handler(httpd_req_t *req)
     cJSON_Delete(root);
 
     uint8_t resp_data[CAN_MAX_DLC] = {0};
-    int resp_len = SpiMaster::instance().canSend(ch, ext_id, tx_data, tx_dlc,
+    int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
                                    resp_data, sizeof(resp_data), 1000);
 
     char resp[512];

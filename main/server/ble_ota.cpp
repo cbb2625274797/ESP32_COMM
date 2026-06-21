@@ -38,9 +38,7 @@
 // SHA-256 计算已抽离到 Esp32OtaCore，本文件不再直接引用 mbedtls
 
 #include "app_config.h"
-#include "ota_mutex.h"
 #include "ble_ota.h"
-#include "wifi_ota.h"
 #include "esp32_ota_core.h"
 #include "ota_coordinator.h"
 #include "ota_relay.h"
@@ -234,7 +232,8 @@ static void ble_ota_boost_wifi_ps()
 {
     if (s_wifi_ps_boosted) return;
     s_wifi_ps_boosted = true;
-    WifiOta::instance().setBleOtaActive(true);  // ★ 暂停 WiFi RSSI 轮询
+    // ★ L1: 通过协调器通知 WiFi 层（替代直接调用 WifiOta）
+    OtaCoordinator::instance().notifyBleCoexStart();
     DEBUG_INFO(TAG, "BLE OTA 进行中：暂停 WiFi RSSI 轮询（保持 WIFI_PS_NONE，STA 仍可响应 HTTP）");
 }
 
@@ -245,7 +244,8 @@ static void ble_ota_restore_wifi_ps()
 {
     if (!s_wifi_ps_boosted) return;
     s_wifi_ps_boosted = false;
-    WifiOta::instance().setBleOtaActive(false);  // ★ 恢复 WiFi RSSI 轮询
+    // ★ L1: 通过协调器通知 WiFi 层（替代直接调用 WifiOta）
+    OtaCoordinator::instance().notifyBleCoexEnd();
     DEBUG_INFO(TAG, "BLE OTA 结束：恢复 WiFi RSSI 轮询");
 }
 
@@ -571,12 +571,10 @@ static esp_err_t ble_esp32_ota_begin(size_t total_size)
  */
 static void ble_esp32_ota_abort()
 {
-    // ★ 通知协调器释放 ESP32 通道占用（m_sysState → IDLE），
-    //   否则后续 begin() 会因协调器仍记为 ESP32_RECEIVING 而假拒绝。
-    ota_system_state_t cur = OtaCoordinator::instance().getSystemState();
-    if (cur == OTA_SYS_ESP32_RECEIVING || cur == OTA_SYS_ESP32_FINALIZING) {
-        OtaCoordinator::instance().abortCurrent();
-    }
+    // ★ 无条件通知协调器释放通道占用（m_sysState → IDLE）。
+    //   abortCurrent() 对 IDLE 状态是空操作，对其他状态均复位到 IDLE，
+    //   确保后续 begin() 不会被残留的 ESP32_RECEIVING / ERROR 等状态假拒绝。
+    OtaCoordinator::instance().abortCurrent();
     Esp32OtaCore::instance().abort();
     BleOta::instance().m_esp32RebootPending = false;
     // ★ 释放 reorder buffer
@@ -672,8 +670,9 @@ static void ble_gd32_relay_wait_task(void *pvParameters)
 
     uint32_t result_msg = (uint32_t)OTA_RESULT_ERR_TIMEOUT;
     bool got_result = false;
-    if (OtaRelay::resultQueue) {
-        got_result = (xQueueReceive(OtaRelay::resultQueue, &result_msg, pdMS_TO_TICKS(120000)) == pdTRUE);
+    QueueHandle_t rq = OtaRelay::getResultQueue();
+    if (rq) {
+        got_result = (xQueueReceive(rq, &result_msg, pdMS_TO_TICKS(120000)) == pdTRUE);
     }
 
     if (!got_result) {
@@ -783,9 +782,9 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
 
             DEBUG_INFO(TAG, "GD32 固件就绪且 SHA-256 匹配 (%" PRIu32 " / %" PRIu32 " 字节)，通过协调器触发中继",
                        meta.stored_size, meta.total_size);
-            if (OtaRelay::resultQueue) {
+            if (OtaRelay::getResultQueue()) {
                 uint32_t stale = 0;
-                while (xQueueReceive(OtaRelay::resultQueue, &stale, 0) == pdTRUE) {
+                while (xQueueReceive(OtaRelay::getResultQueue(), &stale, 0) == pdTRUE) {
                     DEBUG_WARN(TAG, "清理旧 GD32 中继结果: %" PRIu32, stale);
                 }
             }
@@ -1020,13 +1019,28 @@ static void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
                     DEBUG_ERR(TAG, "ESP32 固件大小非法: %" PRIu32, total_size);
                     return;
                 }
-                // ★ 幂等保护：若已有活跃 ESP32 OTA 会话，说明这是客户端因 ACK 超时
-                //   重传的 seq=0（同一会话续传）。若再次走 begin，会被协调器以
-                //   "OTA 已 ESP32_RECEIVING" 拒绝 → 误报"被其他通道占用"并中止整条
-                //   OTA 流程。此处跳过 begin 复用现有会话，后续 reorder buffer 会
-                //   按 seq 去重（seq=0 < expected 时作为重复包丢弃）。
+                // ★ 会话判定：若已有活跃 ESP32 OTA 会话，根据已接收字节数区分两种情况：
+                //   ① m_received == 0：seq=0 尚未写入 flash，说明是客户端 ACK 超时后
+                //     重传的 seq=0（同一会话续传），跳过 begin。
+                //   ② m_received > 0：seq=0 已写入且有后续数据，说明这是新的上传会话
+                //     （前端 abort 后 BLE 断开未完成就发起了新传输），需 abort 旧会话
+                //     再 begin，否则 reorder buffer 以旧 expected 去重导致全部丢弃。
                 if (Esp32OtaCore::instance().isActive()) {
-                    DEBUG_INFO(TAG, "ESP32 OTA 会话已激活，seq=0 视为重传，跳过 begin");
+                    if (Esp32OtaCore::instance().getReceived() > 0) {
+                        DEBUG_WARN(TAG, "ESP32 OTA 新会话检测: received=%u > 0, "
+                                   "中止旧会话并重新开始",
+                                   (unsigned)Esp32OtaCore::instance().getReceived());
+                        ble_esp32_ota_abort();
+                        esp_err_t err = ble_esp32_ota_begin(total_size);
+                        if (err != ESP_OK) {
+                            if (err == ESP_ERR_INVALID_STATE) {
+                                sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
+                            }
+                            return;
+                        }
+                    } else {
+                        DEBUG_INFO(TAG, "ESP32 OTA 会话已激活，seq=0 视为重传，跳过 begin");
+                    }
                 } else {
                     // 分区选择/大小校验/互斥由 Esp32OtaCore::begin 内部完成
                     esp_err_t err = ble_esp32_ota_begin(total_size);

@@ -27,6 +27,9 @@ let latestSystemStatus = null;
 let isEsp32Rebooting = false;
 let rebootStartTime = 0;
 let pollingPausedForUpload = false;
+let activeXhr = null;           // 当前上传 XHR，用于 abort
+let uploadBtnOrigText = '';     // 上传按钮原始文字
+let activeUploadChip = null;    // 当前上传目标芯片 ('esp32' | 'gd32' | null)
 
 // ==================== 折叠面板 ====================
 function toggleCollapse(headEl) {
@@ -109,6 +112,67 @@ function updateEsp32StagesError() {
   var statusText = document.getElementById('stageStatusText');
   if (statusBar) statusBar.className = 'stage-status-bar err';
   if (statusText) statusText.textContent = '校验/应用失败';
+}
+
+/**
+ * @description OTA 失败后的统一清理函数。
+ * 所有上传失败、校验失败、中继触发失败等异常路径都应调用此函数，
+ * 确保 UI 状态完整重置，不会残留"上传中"或中间态。
+ * @param {string} reason 失败原因描述
+ */
+function cleanupAfterOtaFailure(reason) {
+  // 1. 重置上传锁
+  isUploading = false;
+
+  // 2. 中止正在进行的 XHR（如有）
+  if (activeXhr) {
+    try { activeXhr.abort(); } catch (_) {}
+    activeXhr = null;
+  }
+
+  // 3. 标记阶段指示器为错误态
+  if (currentOtaTarget === 'esp32') {
+    updateEsp32StagesError();
+  } else if (currentOtaTarget === 'gd32') {
+    updateStagesFromRelayState(255);
+  }
+
+  // 4. 状态栏标红
+  var sb = document.getElementById('stageStatusBar');
+  var st = document.getElementById('stageStatusText');
+  if (sb) sb.className = 'stage-status-bar err';
+  if (st) st.textContent = reason || '失败';
+
+  // 5. 进度条显示失败信息
+  setProgress(0, reason || '刷写失败');
+
+  // 6. 重置活跃阶段
+  setActivePhase(null);
+
+  // 7. 清除 OTA 目标（下次操作时重新设置）
+  currentOtaTarget = null;
+
+  // 8. 隐藏校验面板
+  var verifyInfo = document.getElementById('stageVerifyInfo');
+  if (verifyInfo) verifyInfo.style.display = 'none';
+
+  // 9. 恢复上传按钮（基于实际上传的芯片，而非当前 UI 选中的标签）
+  var chip = activeUploadChip || window.flashTarget || 'esp32';
+  var btnId = (chip === 'gd32') ? 'uploadGd32Btn' : 'uploadEsp32Btn';
+  var btn = document.getElementById(btnId);
+  if (btn && uploadBtnOrigText) {
+    btn.disabled = false;
+    btn.textContent = uploadBtnOrigText;
+  }
+  activeUploadChip = null;
+
+  updateUploadButtonLabel();
+
+  // 10. 恢复轮询
+  resumePollingAfterUpload();
+
+  // 11. 日志
+  addLog('E', 'OTA', '刷写流程已中止: ' + (reason || '未知原因'));
 }
 
 function showVerifyActions(type) {
@@ -631,10 +695,15 @@ function updateSystemStatusUi(data) {
   var displayRelayState = isGd32Complete ? 5 : (isGd32Relaying && rs === 0 ? 1 : rs);
   if (currentOtaTarget !== 'esp32') { updateStagesFromRelayState(displayRelayState); }
 
-  if (isGd32Error) {
-    setActivePhase('gd32Ota');
-    setOtaProgressBadge(0);
-    setProgress(0, 'GD32 OTA 失败');
+  if (isGd32Error && currentOtaTarget === 'gd32') {
+    cleanupAfterOtaFailure('GD32 OTA 失败');
+  } else if (isGd32Error) {
+    // 非当前 OTA 会话的错误：仅标记阶段指示器，不触发完整清理
+    updateStagesFromRelayState(255);
+    var sbErr = document.getElementById('stageStatusBar');
+    var stErr = document.getElementById('stageStatusText');
+    if (sbErr) sbErr.className = 'stage-status-bar err';
+    if (stErr) stErr.textContent = 'GD32 错误（待机）';
   } else if (isGd32Complete || rs === 5 || (gd32AppAlive && sysState === 'GD32_COMPLETE')) {
     markPhaseDone('gd32Ota');
     setOtaProgressBadge(100);
@@ -1134,39 +1203,46 @@ async function startUpload(chip) {
   //   狂点 WiFi 上传按钮时，多个 startUpload 都能通过守卫，最终并发 xhr.send，
   //   设备端互斥被绕过、403 路径走漏。
   isUploading = true;
-  // 跨通道互斥前置检查
-  try {
-    var probe = await fetch(getBaseUrl() + '/system/status', {
-      signal: AbortSignal.timeout(2000)
-    });
-    if (probe.ok) {
-      var st = await probe.json();
-      var ota = st.ota || {};
-      var ssc = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
-      // ESP32 三种活跃态（5=RECEIVING, 6=FINALIZING, 7=REBOOTING）
-      var esp32Busy = (ssc === 5 || ssc === 6 || ssc === 7);
-      // GD32 存储/中继（1=STORING, 3=RELAYING）→ 阻止新上传，避免 NVS 与 Flash 互踩
-      var gd32Busy = (ssc === 1 || ssc === 3);
-      // 同通道（chip=esp32）已在进行中：本通道会重入；不做阻拦
-      // 另一通道活跃：拒绝
-      if (chip === 'esp32' && (esp32Busy || gd32Busy)) {
-        addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 ESP32 上传');
-        showToast('设备正在 OTA 中，请等待结束后再试', 'error');
-        isUploading = false;
-        resumePollingAfterUpload();
-        return;
-      }
-      if (chip === 'gd32' && (esp32Busy || gd32Busy)) {
-        addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 GD32 上传');
-        showToast('设备正在 OTA 中，请等待结束后再试', 'error');
-        isUploading = false;
-        resumePollingAfterUpload();
-        return;
-      }
+  activeUploadChip = chip;
+  // 跨通道互斥前置检查（含 BLE 取消后的瞬态重试）
+  var _probeReady = false;
+  for (var _pi = 0; _pi < 4; _pi++) {
+    if (_pi > 0) {
+      var _pd = [1500, 3000, 3000][_pi - 1];
+      addLog('I', '上传', '等待设备清理 OTA 状态 (' + _pd + 'ms)...');
+      await new Promise(function(r) { setTimeout(r, _pd); });
     }
-  } catch (e) {
-    // 探测失败：可能是设备瞬时忙或网络问题。保守继续走，由后端 403 兜底。
-    addLog('W', '上传', '跨通道互斥状态探测失败: ' + e.message + '（继续尝试，由设备端兜底）');
+    try {
+      var probe = await fetch(getBaseUrl() + '/system/status', {
+        signal: AbortSignal.timeout(2000)
+      });
+      if (probe.ok) {
+        var st = await probe.json();
+        var ota = st.ota || {};
+        var ssc = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
+        // ★ RECEIVING (5) 可能是刚取消的 BLE OTA 残留态（设备端 GAP disconnect
+        //   处理需 3-4 秒），等它清理完；FINALIZING(6)/REBOOTING(7) 是真实忙，直接拒绝。
+        if (ssc === 5 && _pi < 3) continue;
+        // ESP32 活跃态（5=RECEIVING, 6=FINALIZING, 7=REBOOTING）
+        var esp32Busy = (ssc === 5 || ssc === 6 || ssc === 7);
+        // GD32 存储/中继（1=STORING, 3=RELAYING）→ 阻止新上传，避免 NVS 与 Flash 互踩
+        var gd32Busy = (ssc === 1 || ssc === 3);
+        if ((esp32Busy || gd32Busy)) {
+          addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 ' + chip.toUpperCase() + ' 上传');
+          showToast('设备正在 OTA 中，请等待结束后再试', 'error');
+          isUploading = false;
+          resumePollingAfterUpload();
+          return;
+        }
+      }
+      _probeReady = true;
+      break;
+    } catch (e) {
+      // 探测失败：可能是设备瞬时忙或网络问题。保守继续走，由后端 403 兜底。
+      addLog('W', '上传', '跨通道互斥状态探测失败: ' + e.message + '（继续尝试，由设备端兜底）');
+      _probeReady = true;
+      break;
+    }
   }
   // 每次上传前尝试重新从本地读取文件
   var handle = chip === 'esp32' ? esp32FileHandle : gd32FileHandle;
@@ -1206,7 +1282,7 @@ async function startUpload(chip) {
     }
   }
   var uploadBtn = document.getElementById(chip === 'esp32' ? 'uploadEsp32Btn' : 'uploadGd32Btn');
-  var origText = uploadBtn.textContent;
+  uploadBtnOrigText = uploadBtn.textContent;
   uploadBtn.disabled = true;
   uploadBtn.textContent = '上传中...';
   switchStageFlow(chip);
@@ -1275,7 +1351,8 @@ async function startUpload(chip) {
       combined.set(new Uint8Array(payload), headerBytes.length);
       body = combined.buffer;
     }
-    var xhr = new XMLHttpRequest();
+    activeXhr = new XMLHttpRequest();
+    var xhr = activeXhr;
     xhr.upload.addEventListener('progress', function (e) {
       if (e.lengthComputable) {
         var pct = Math.round((e.loaded / e.total) * 100);
@@ -1290,9 +1367,10 @@ async function startUpload(chip) {
     });
     xhr.addEventListener('load', function () {
       isUploading = false;
+      activeXhr = null;
       resumePollingAfterUpload();
       uploadBtn.disabled = false;
-      uploadBtn.textContent = origText;
+      uploadBtn.textContent = uploadBtnOrigText;
       updateUploadButtonLabel();
       if (xhr.status === 200) {
         addLog('I', '上传', '固件上传完成！');
@@ -1312,33 +1390,33 @@ async function startUpload(chip) {
       } else if (xhr.status === 403) {
         addLog('E', '上传', 'ESP32 OTA 被其他通道占用（BLE/WiFi 互斥），请稍后重试');
         showToast('ESP32 OTA 被其他通道占用，请稍后重试', 'error');
-        setProgress(0, 'OTA 被其他通道占用');
+        cleanupAfterOtaFailure('通道被占用');
       } else {
         var detail = formatHttpErrorDetail(xhr.responseText);
         var message = '上传失败: HTTP ' + xhr.status + (detail ? ' - ' + detail : '');
         addLog('E', '上传', message);
         showToast(detail ? ('上传失败: ' + detail) : '上传失败', 'error');
+        cleanupAfterOtaFailure('HTTP ' + xhr.status);
       }
     });
     xhr.addEventListener('error', function () {
-      isUploading = false;
-      resumePollingAfterUpload();
-      uploadBtn.disabled = false;
-      uploadBtn.textContent = origText;
-      updateUploadButtonLabel();
-      addLog('E', '上传', '上传过程发生错误');
-      showToast('上传出错', 'error');
+      if (activeXhr) {
+        cleanupAfterOtaFailure('网络错误');
+        showToast('上传过程发生网络错误', 'error');
+      }
+    });
+    xhr.addEventListener('abort', function () {
+      if (activeXhr) {
+        cleanupAfterOtaFailure('已中止');
+        showToast('上传已中止', 'error');
+      }
     });
     xhr.open('POST', url);
     xhr.send(body);
   } catch (e) {
     addLog('E', '上传', '上传失败: ' + e.message);
-    showToast('上传失败', 'error');
-    isUploading = false;
-    resumePollingAfterUpload();
-    uploadBtn.disabled = false;
-    uploadBtn.textContent = origText;
-    updateUploadButtonLabel();
+    showToast('上传失败: ' + e.message, 'error');
+    cleanupAfterOtaFailure('上传异常');
   }
 }
 // ==================== ESP32 OTA 完成升级 ====================
@@ -1401,9 +1479,9 @@ async function verifyEsp32Firmware() {
       addLog('E', 'OTA', '校验失败: ' + detail);
       showToast('校验失败: ' + detail, 'error');
       var resultEl = document.getElementById('sviResult');
-      if (resultEl) { resultEl.textContent = '? ' + detail; resultEl.className = 'svi-val err'; }
-      updateEsp32StagesError();
+      if (resultEl) { resultEl.textContent = '✗ ' + detail; resultEl.className = 'svi-val err'; }
       showVerifyActions('retry');
+      cleanupAfterOtaFailure('校验失败');
     }
   } catch (e) {
     addLog('W', 'OTA', '应用请求出现异常（设备可能已重启）: ' + e.message);
@@ -1430,10 +1508,15 @@ async function retryEsp32Upload() {
 }
 
 async function cancelEsp32Ota() {
-  addLog('I', 'OTA', '已取消 OTA 刷写');
+  addLog('I', 'OTA', '用户取消 OTA 刷写');
   showToast('已取消 OTA', 'error');
   showVerifyActions('none');
-  resetProgress();
+  var xhr = activeXhr;
+  activeXhr = null;
+  if (xhr) {
+    try { xhr.abort(); } catch (_) {}
+  }
+  cleanupAfterOtaFailure('用户取消');
 }
 
 async function applyEsp32Firmware() {
@@ -1496,6 +1579,7 @@ async function triggerGd32Relay() {
   if (!sha256) {
     addLog('E', 'OTA', '缺少 GD32 文件 SHA-256，请先上传文件');
     showToast('SHA-256 缺失', 'error');
+    cleanupAfterOtaFailure('SHA-256 缺失');
     return;
   }
   addLog('I', 'OTA', 'GD32 SHA-256: ' + sha256 + ' → 触发中继...');
@@ -1522,15 +1606,18 @@ async function triggerGd32Relay() {
         if (err.device) {
           addLog('E', 'OTA', 'GD32 SHA-256 不匹配: 设备=' + err.device + ' 前端=' + sha256);
           showToast('SHA-256 不匹配', 'error');
+          cleanupAfterOtaFailure('SHA-256 不匹配');
           return;
         }
       } catch (_) {}
       addLog('E', 'OTA', 'GD32 触发失败: HTTP ' + resp.status + ' ' + text);
       showToast('GD32 触发失败', 'error');
+      cleanupAfterOtaFailure('触发失败 HTTP ' + resp.status);
     }
   } catch (e) {
     addLog('E', 'OTA', 'GD32 触发失败: ' + e.message);
     showToast('GD32 触发失败', 'error');
+    cleanupAfterOtaFailure('触发异常');
   }
 }
 

@@ -27,7 +27,7 @@ OtaCoordinator& OtaCoordinator::instance()
 // ============================================================
 // 线程安全辅助
 // ============================================================
-bool OtaCoordinator::lock()
+bool OtaCoordinator::lock() const
 {
     // ★ 修复: 返回 take 结果，由调用方传回 unlock()。
     //   旧实现用成员 bool m_locked 记录 take 结果，多任务并发 lock() 时
@@ -42,7 +42,7 @@ bool OtaCoordinator::lock()
     return ok;
 }
 
-void OtaCoordinator::unlock(bool handle)
+void OtaCoordinator::unlock(bool handle) const
 {
     // ★ 修复: 仅在对应的 lock() 成功 take 时才 give。
     if (handle && m_mutex) {
@@ -266,7 +266,8 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
     }
 
     // 向 OtaRelay task 发送启动消息
-    if (h && !OtaRelay::dispatchQueue) {
+    QueueHandle_t dq = OtaRelay::getDispatchQueue();
+    if (h && !dq) {
         DEBUG_ERR(TAG, "OtaRelay dispatchQueue 未就绪");
         unlock(h);
         return ESP_ERR_INVALID_STATE;
@@ -282,7 +283,7 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
     DEBUG_INFO(TAG, "触发 GD32 中继, 系统状态 → GD32_RELAYING");
 
     uint32_t cmd = 1;
-    BaseType_t ret = xQueueSend(OtaRelay::dispatchQueue, &cmd, pdMS_TO_TICKS(200));
+    BaseType_t ret = xQueueSend(dq, &cmd, pdMS_TO_TICKS(200));
     if (ret != pdTRUE) {
         DEBUG_ERR(TAG, "向 OtaRelay 发送启动消息失败");
         m_sysState = OTA_SYS_GD32_STORED;
@@ -339,6 +340,28 @@ void OtaCoordinator::onRelayStarted()
 void OtaCoordinator::onRelayComplete(bool success)
 {
     notifyRelayComplete(success);
+}
+
+// ============================================================
+// BLE 射频共存管理（L1: 消除 ble_ota → wifi_ota 直接依赖）
+// ============================================================
+void OtaCoordinator::setBleCoexListener(IBleCoexListener *listener)
+{
+    m_bleCoexListener = listener;
+}
+
+void OtaCoordinator::notifyBleCoexStart()
+{
+    if (m_bleCoexListener) {
+        m_bleCoexListener->onBleOtaStart();
+    }
+}
+
+void OtaCoordinator::notifyBleCoexEnd()
+{
+    if (m_bleCoexListener) {
+        m_bleCoexListener->onBleOtaEnd();
+    }
 }
 
 // ============================================================
@@ -511,10 +534,10 @@ void OtaCoordinator::abortCurrent()
 ota_system_state_t OtaCoordinator::getSystemState() const
 {
     // 对于纯读取，短暂加锁保证一致性
-    OtaCoordinator* self = const_cast<OtaCoordinator*>(this);
-    bool h = self->lock();
+    // ★ M1/L3: m_mutex 为 mutable + lock()/unlock() 为 const，无需 const_cast
+    bool h = lock();
     ota_system_state_t s = m_sysState;
-    self->unlock(h);
+    unlock(h);
     return s;
 }
 
@@ -569,10 +592,10 @@ bool OtaCoordinator::getGd32AppAlive() const
 /** @brief 获取 GD32 固件是否已存储完成（线程安全）。 */
 bool OtaCoordinator::isGd32StorageDone() const
 {
-    OtaCoordinator* self = const_cast<OtaCoordinator*>(this);
-    bool h = self->lock();
+    // ★ M1/L3: m_mutex 为 mutable + lock()/unlock() 为 const，无需 const_cast
+    bool h = lock();
     bool done = m_gd32StorageDone;
-    self->unlock(h);
+    unlock(h);
     return done;
 }
 

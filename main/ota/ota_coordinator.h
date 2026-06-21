@@ -37,6 +37,25 @@ typedef enum {
     OTA_SYS_ERROR               // 错误状态
 } ota_system_state_t;
 
+// ============================================================
+// IBleCoexListener - BLE 射频共存通知接口（解决 L1 横向耦合）
+// ============================================================
+// WifiOta 实现此接口并注册到 OtaCoordinator，
+// BLE OTA 开始/结束时通过协调器通知 WiFi 层，
+// 消除 ble_ota → wifi_ota 的直接依赖。
+/**
+ * @brief BLE 射频共存监听器接口。
+ *        BLE OTA 开始/结束时，协调器通过此接口通知 WiFi 层暂停/恢复射频活动。
+ */
+class IBleCoexListener {
+public:
+    virtual ~IBleCoexListener() = default;
+    /** @brief BLE OTA 开始，暂停 WiFi RSSI 轮询等射频活动。 */
+    virtual void onBleOtaStart() = 0;
+    /** @brief BLE OTA 结束，恢复 WiFi 射频活动。 */
+    virtual void onBleOtaEnd() = 0;
+};
+
 /**
  * @brief ESP32 OTA 收尾结果（由 finalizeForReboot 返回）。
  *        err 为 ESP_OK 时 device_sha_hex 有效；SHA 不匹配时也填充 device_sha_hex 供前端核对。
@@ -295,6 +314,23 @@ public:
      */
     void onRelayComplete(bool success) override;
 
+    // ── BLE 射频共存管理（L1: 替代 ble_ota → wifi_ota 直接调用）──
+    /**
+     * @brief 注册 BLE 共存监听器（由 main 在初始化时调用）。
+     * @param listener WifiOta 实现的监听器指针，nullptr 取消注册。
+     */
+    void setBleCoexListener(IBleCoexListener *listener);
+
+    /**
+     * @brief BLE OTA 开始时调用，通知 WiFi 层暂停 RSSI 轮询。
+     */
+    void notifyBleCoexStart();
+
+    /**
+     * @brief BLE OTA 结束时调用，通知 WiFi 层恢复射频活动。
+     */
+    void notifyBleCoexEnd();
+
 private:
     OtaCoordinator() = default;
     ~OtaCoordinator() = default;
@@ -306,8 +342,8 @@ private:
     //   旧实现用共享 bool m_locked 记录 take 结果，多任务并发 lock() 时
     //   超时方会把 m_locked 置 false，覆盖持锁方的 true，导致 unlock() 跳过 give，
     //   mutex 永久死锁 → 后续 take 超时触发 vTaskPriorityDisinherit assert → PANIC。
-    bool lock();
-    void unlock(bool handle);
+    bool lock() const;
+    void unlock(bool handle) const;
 
     // ★ 卡死自愈检查：若忙状态停留超过 watchdog 超时，强制转为 ERROR。
     //   用于在中继 task 因任何原因（崩溃/SPI 死锁/看门狗复位残留）未能回调
@@ -324,8 +360,11 @@ private:
     // GD32 存储跟踪
     bool m_gd32StorageDone = false;
 
-    // 互斥锁
-    SemaphoreHandle_t m_mutex = nullptr;
+    // 互斥锁（M1/L3: mutable 允许在 const 方法中加锁，消除 const_cast）
+    mutable SemaphoreHandle_t m_mutex = nullptr;
+
+    // BLE 共存监听器（L1: 由 WifiOta 实现并注册）
+    IBleCoexListener *m_bleCoexListener = nullptr;
     static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(100);
 
     // ★ 忙状态 watchdog 超时。GD32 中继理论最大耗时 ≈ 60s(全局超时) + 15s(APP存活轮询) + 1s(bootloader) ≈ 76s，

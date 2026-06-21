@@ -75,6 +75,14 @@ public:
     /** @brief 获取健康监控任务句柄。 */
     TaskHandle_t getTaskHandle() const { return m_taskHandle; }
 
+    /**
+     * @brief 由 WiFi 事件回调推送连接状态（解耦 HealthMonitor → WifiOta 依赖）。
+     *        WiFi 连接/断开时由 wifi_ota 事件处理器主动调用，
+     *        HealthMonitor 不再主动查询 WifiOta::isConnected()。
+     * @param connected true=已连接，false=断开。
+     */
+    void setWifiConnected(bool connected);
+
 private:
     /** @brief 加锁读取健康状态。 */
     health_state_t getState();
@@ -94,6 +102,7 @@ private:
     int8_t m_lastWifiRssi = -127;
     int64_t m_lastWifiRssiMs = 0;
     TaskHandle_t m_taskHandle = NULL;
+    volatile bool m_wifiConnected = false;   ///< WiFi 连接状态（由 WiFi 事件推送）
 
     static void tempMonitorCallback(void *arg);
 };

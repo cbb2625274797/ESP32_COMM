@@ -52,6 +52,17 @@ IRelayListener* OtaRelay::getRelayListener()
     return s_relayListener;
 }
 
+// ── 队列访问器（M3: 封装 public static 成员）──
+QueueHandle_t OtaRelay::getDispatchQueue()
+{
+    return dispatchQueue;
+}
+
+QueueHandle_t OtaRelay::getResultQueue()
+{
+    return resultQueue;
+}
+
 // ============================================================
 // 状态表：将每个 relay_state_t 映射到对应的 handler
 // ============================================================

@@ -22,7 +22,6 @@
 #include "esp_mac.h"
 
 #include "app_config.h"
-#include "ota_mutex.h"
 #include "wifi_ota.h"
 #include "esp32_ota_core.h"
 #include "ota_coordinator.h"
@@ -149,6 +148,8 @@ void WifiOta::wifiEventHandler(void* arg, esp_event_base_t event_base,
             inst.setStaRetryCount(0);
             inst.setStaRetryExhausted(false);  // ★ 连接成功，重置耗尽标志
             inst.stateUnlock();
+            // ★ M2: 推送 WiFi 连接状态给 HealthMonitor（解耦监控层主动查询）
+            HealthMonitor::instance().setWifiConnected(true);
             if (inst.m_staConnectedSem) {
                 xSemaphoreGive(inst.m_staConnectedSem);
             }
@@ -161,6 +162,8 @@ void WifiOta::wifiEventHandler(void* arg, esp_event_base_t event_base,
             bool exhausted = inst.getStaRetryExhausted();
             int retryCount = inst.getStaRetryCount();
             inst.stateUnlock();
+            // ★ M2: 推送 WiFi 断开状态给 HealthMonitor
+            HealthMonitor::instance().setWifiConnected(false);
 
             if (!exhausted) {
                 DEBUG_WARN("WIFI", "STA 断开, reason=%d, retry=%d",
@@ -600,6 +603,19 @@ int8_t WifiOta::getRssi()
 bool WifiOta::isConnected()
 {
     return WifiOta::instance().getStaConnected();
+}
+
+// ============================================================
+// IBleCoexListener 接口实现（L1: 通过协调器接收 BLE 共存通知）
+// ============================================================
+void WifiOta::onBleOtaStart()
+{
+    setBleOtaActive(true);
+}
+
+void WifiOta::onBleOtaEnd()
+{
+    setBleOtaActive(false);
 }
 
 // ----------------------------------------

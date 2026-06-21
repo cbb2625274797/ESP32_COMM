@@ -30,30 +30,7 @@
 #define SPI_OTA_RSP_WAIT      (0x81)
 #define SPI_OTA_RSP_ERROR     (0x82)
 
-// ============================================================
-// CANFD 帧格式（3通道）
-// [通道编号: 1B] [扩展帧ID: 4B BE] [数据: 1~64B]
-// 长度自动识别，无需发送 DLC
-// ============================================================
-#define CAN_EXTENDED_ID_BITS   (29)          // CAN 扩展帧 ID 位数
-#define CAN_MAX_DLC            (64)            // 最大数据长度
-#define CAN_CHANNEL_MASK        (0x03)         // 通道号掩码 (0~2)
-
-// 通道定义
-typedef enum {
-    CAN_CHANNEL_0 = 0,
-    CAN_CHANNEL_1 = 1,
-    CAN_CHANNEL_2 = 2,
-    CAN_CHANNEL_MAX = 3,
-} can_channel_t;
-
-// CANFD 帧结构
-typedef struct {
-    can_channel_t channel;      // CAN 通道 (0~2)
-    uint32_t      ext_id;      // 扩展帧 ID (29bit, Big-Endian 存储)
-    uint8_t       data[CAN_MAX_DLC];  // CAN 数据负载 (最大 64 字节)
-    uint8_t       dlc;         // 数据长度 (1~64)
-} can_frame_t;
+// CANFD 类型已迁移至 transport/canfd_bridge.h（M4 解耦）
 
 // GD32 版本信息（从 APP PING 响应解析）
 typedef struct {
@@ -122,19 +99,7 @@ public:
                                 size_t payload_len, uint8_t *recv_buf,
                                 size_t recv_len, int max_retries);
 
-    // ============================================================
-    // CANFD 接口
-    // ============================================================
-
-    /** @brief 发送一帧 CANFD 数据，可选等待并读取响应内容。 */
-    int canSend(can_channel_t channel, uint32_t ext_id,
-                const uint8_t *data, uint8_t dlc,
-                uint8_t *recv_buf, uint8_t recv_max,
-                uint32_t timeout_ms);
-
-    /** @brief 发送一帧无需响应的 CANFD 数据。 */
-    int canSendNoReply(can_channel_t channel, uint32_t ext_id,
-                       const uint8_t *data, uint8_t dlc);
+    // ── CANFD 接口已迁移至 transport/canfd_bridge.h（M4 解耦）──
 
     /** @brief 获取 SPI 设备句柄（供外部状态查询）。 */
     spi_device_handle_t deviceHandle() const { return m_spiDevice; }

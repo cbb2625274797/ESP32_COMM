@@ -19,6 +19,8 @@
 #include "esp_err.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 class Esp32OtaCore {
 public:
@@ -99,8 +101,21 @@ public:
     bool   isActive() const  { return m_active; }
     /** @brief 获取已接收的字节数。 */
     size_t getReceived() const { return m_received; }
+
+    // ── 分区互斥锁管理（M1: 从 ota_mutex.h 全局变量内聚到此类）──
+    /**
+     * @brief 初始化 ESP32 OTA 分区互斥锁（在 app_main 中调用）。
+     *        替代旧的全局 g_esp32OtaMutex / g_esp32OtaOccupied。
+     */
+    static void initMutex();
 private:
     Esp32OtaCore() = default;
+
+    // ── 分区互斥锁（M1: 内聚自 ota_mutex.h）──
+    static SemaphoreHandle_t s_mutex;      ///< ESP32 OTA 分区互斥锁
+    static volatile bool     s_occupied;   ///< 分区占用标志
+    static bool acquireMutex(uint32_t timeout_ms);
+    static void releaseMutex();
 
     // 从 OTA 分区读回计算 SHA-256（WiFi 风格），结果写入 m_sha256，置 m_shaComputed=true
     /**

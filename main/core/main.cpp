@@ -22,23 +22,18 @@
 #include "transport/protocol.h"
 #include "monitor/debug_log.h"
 #include "app_config.h"
-#include "ota_mutex.h"
+#include "ota/esp32_ota_core.h"
 
 /**
  * @brief 程序主入口，初始化系统组件并创建各 FreeRTOS 任务。
  */
-// 全局 ESP32 OTA 互斥变量（声明在 ota_mutex.h）
-SemaphoreHandle_t g_esp32OtaMutex = NULL;
-volatile bool g_esp32OtaOccupied = false;
-
 extern "C" void app_main(void)
 {
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
 
-    // 创建 ESP32 OTA 全局互斥 Mutex
-    g_esp32OtaMutex = xSemaphoreCreateMutex();
-    g_esp32OtaOccupied = false;
+    // ★ M1: ESP32 OTA 分区互斥锁内聚到 Esp32OtaCore（替代旧的全局变量）
+    Esp32OtaCore::initMutex();
 
     // 初始化网络接口 + 事件循环（必须最早）
     ESP_ERROR_CHECK(esp_netif_init());
@@ -82,6 +77,8 @@ extern "C" void app_main(void)
 
     // ★ 全局 OTA 协调器初始化（在 OTA task 创建前，确保 mutex 就绪）
     OtaCoordinator::instance().init();
+    // ★ L1: 注册 BLE 射频共存监听器（WifiOta 实现 IBleCoexListener）
+    OtaCoordinator::instance().setBleCoexListener(&WifiOta::instance());
     DEBUG_INFO("MAIN", "OTA 全局协调器已初始化");
 
     esp_err_t ret = SpiMaster::instance().init();

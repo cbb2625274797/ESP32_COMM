@@ -186,6 +186,20 @@ public:
      */
     static IRelayListener* getRelayListener();
 
+    // ── 队列访问器（解决 M3: 封装 public static 成员）──
+    /**
+     * @brief 获取事件分发队列句柄。
+     *        外部模块（OtaCoordinator / BLE）通过 getter 访问，不再直接引用静态成员。
+     * @return dispatchQueue 句柄，未初始化时为 NULL。
+     */
+    static QueueHandle_t getDispatchQueue();
+
+    /**
+     * @brief 获取结果回传队列句柄。
+     * @return resultQueue 句柄，未初始化时为 NULL。
+     */
+    static QueueHandle_t getResultQueue();
+
     // ── Flash 操作已迁移至 Gd32FlashStore（storage/gd32_flash_store.h）──
 
     // ── 公开状态成员 ──
@@ -194,8 +208,6 @@ public:
     static uint32_t relayTotalPackets;        ///< 本次中继总包数
     static volatile bool gd32AppAlive;        ///< GD32 APP 存活标志
     static gd32_version_t gd32Version;        ///< GD32 固件版本信息
-    static QueueHandle_t dispatchQueue;       ///< 事件分发队列
-    static QueueHandle_t resultQueue;         ///< 结果回传队列
     static TaskHandle_t taskHandle;           ///< OTA 中继任务句柄
     static IRelayListener *s_relayListener;   ///< 中继事件监听器（解决 H4）
 
@@ -230,6 +242,10 @@ public:
     static constexpr size_t GD32_CHALLENGE_RESPONSE_LEN = 36;
 
 private:
+    // ── 队列（M3: 由 getter 访问，外部不再直接引用）──
+    static QueueHandle_t dispatchQueue;       ///< 事件分发队列
+    static QueueHandle_t resultQueue;         ///< 结果回传队列
+
     OtaRelay() = default;
     ~OtaRelay() = default;
     OtaRelay(const OtaRelay&) = delete;

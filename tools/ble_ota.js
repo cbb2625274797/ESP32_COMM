@@ -1444,6 +1444,23 @@
       bleLog('OTA', `写入失败: ${err.message}`, 'E');
       setProgress(0, `写入失败: ${err.message}`);
       setBleStageError(err.message);
+      // ★ BLE OTA 失败/中止后强制断开 BLE 连接，并等待实际断连完成：
+      //   触发 ESP32 后端的 GAP disconnect 处理器 → ble_esp32_ota_abort()，
+      //   清理 OTA 会话（Esp32OtaCore::abort + reorder buffer 释放 + 协调器状态复位）。
+      //   等待 gattserverdisconnected 事件确保断连真正生效，避免用户快速重试时
+      //   旧会话尚未清理导致 seq=0 被误判为重传。
+      if (state.server && state.device && state.device.gatt && state.device.gatt.connected) {
+        bleLog('OTA', '刷写失败，断开 BLE 以清理 ESP32 OTA 会话...', 'W');
+        try {
+          await new Promise((resolve) => {
+            let done = false;
+            const finish = () => { if (!done) { done = true; resolve(); } };
+            state.device.addEventListener('gattserverdisconnected', finish, { once: true });
+            setTimeout(finish, 1000);  // 1 秒兜底超时
+            state.device.gatt.disconnect();
+          });
+        } catch (_) {}
+      }
       return false;
     } finally {
       if (state.ackWaiter) {
@@ -1495,6 +1512,12 @@
       const ok = await uploadFirmware();
       if (!ok || state.abortRequested) {
         bleLog('AUTO', '一键刷写中止', 'W');
+        // ★ 确保 BLE 已断开（触发 ESP32 OTA 会话清理）
+        //   uploadFirmware catch 块已尝试断开，这里做安全网兜底
+        if (state.device && state.device.gatt && state.device.gatt.connected) {
+          bleLog('AUTO', '断开 BLE 以清理 ESP32 OTA 会话...', 'W');
+          try { state.device.gatt.disconnect(); } catch (_) {}
+        }
         return;
       }
       if (cfg.label === 'ESP32') {

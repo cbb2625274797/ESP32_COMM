@@ -14,9 +14,11 @@
 #include "driver/spi_master.h"
 #include "soc/spi_struct.h"
 #include "esp_err.h"
+#include "esp_log.h"
 
 #include "spi_master.h"
 #include "monitor/debug_log.h"
+
 
 static constexpr size_t kSpiTransferMaxBytes = 256U;
 
@@ -724,83 +726,7 @@ esp_err_t SpiMaster::transferWithRetry(uint8_t cmd, const uint8_t *payload,
     return ESP_ERR_TIMEOUT;
 }
 
-// ============================================================
-// CANFD 接口
-// ============================================================
-/**
- * @brief 发送一帧 CANFD 数据，可选等待并读取响应内容。
- * @param channel CAN 通道编号（0~2）。
- * @param ext_id 扩展帧 ID（29 位）。
- * @param data CAN 数据负载。
- * @param dlc 数据长度。
- * @param recv_buf 接收数据缓冲区。
- * @param recv_max 接收缓冲区最大长度。
- * @param timeout_ms 超时时间（毫秒）。
- * @return 成功时返回接收数据长度，失败返回 -1。
- */
-int SpiMaster::canSend(can_channel_t channel, uint32_t ext_id,
-                       const uint8_t *data, uint8_t dlc,
-                       uint8_t *recv_buf, uint8_t recv_max,
-                       uint32_t timeout_ms)
-{
-    LockGuard lock(m_mutex);
-    if (channel >= CAN_CHANNEL_MAX || dlc > CAN_MAX_DLC || !data) {
-        return -1;
-    }
-
-    uint8_t tx_buf[72];
-    size_t tx_len = 0;
-
-    tx_buf[tx_len++] = (uint8_t)(channel & CAN_CHANNEL_MASK);
-    tx_buf[tx_len++] = (uint8_t)((ext_id >> 24) & 0xFF);
-    tx_buf[tx_len++] = (uint8_t)((ext_id >> 16) & 0xFF);
-    tx_buf[tx_len++] = (uint8_t)((ext_id >> 8) & 0xFF);
-    tx_buf[tx_len++] = (uint8_t)(ext_id & 0xFF);
-    memcpy(&tx_buf[tx_len], data, dlc);
-    tx_len += dlc;
-
-    esp_err_t ret = syncTransferUnlocked(0, tx_buf, tx_len, recv_buf, recv_max, timeout_ms);
-    if (ret != ESP_OK) {
-        return -1;
-    }
-
-    return (int)recv_max;
-}
-
-/**
- * @brief 发送一帧无需响应的 CANFD 数据。
- * @param channel CAN 通道编号（0~2）。
- * @param ext_id 扩展帧 ID（29 位）。
- * @param data CAN 数据负载。
- * @param dlc 数据长度。
- * @return 成功返回 0，失败返回 -1。
- */
-int SpiMaster::canSendNoReply(can_channel_t channel, uint32_t ext_id,
-                              const uint8_t *data, uint8_t dlc)
-{
-    LockGuard lock(m_mutex);
-    if (channel >= CAN_CHANNEL_MAX || dlc > CAN_MAX_DLC || !data) {
-        return -1;
-    }
-
-    uint8_t tx_buf[72];
-    size_t tx_len = 0;
-
-    tx_buf[tx_len++] = (uint8_t)(channel & CAN_CHANNEL_MASK);
-    tx_buf[tx_len++] = (uint8_t)((ext_id >> 24) & 0xFF);
-    tx_buf[tx_len++] = (uint8_t)((ext_id >> 16) & 0xFF);
-    tx_buf[tx_len++] = (uint8_t)((ext_id >> 8) & 0xFF);
-    tx_buf[tx_len++] = (uint8_t)(ext_id & 0xFF);
-    memcpy(&tx_buf[tx_len], data, dlc);
-    tx_len += dlc;
-
-    esp_err_t ret = sendUnlocked(0, tx_buf, tx_len);
-    if (ret != ESP_OK) {
-        return -1;
-    }
-
-    return 0;
-}
+// CANFD 接口已迁移至 transport/canfd_bridge.cpp（M4 解耦）
 
 // ============================================================
 // 无锁内部版本实现

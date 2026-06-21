@@ -14,13 +14,15 @@
 #include "freertos/task.h"
 #include <atomic>
 
+#include "ota/ota_coordinator.h"  // IBleCoexListener 接口定义
+
 /** @brief WiFi 工作模式枚举，区分 AP（设备热点）和 STA（连接路由器）模式。 */
 typedef enum {
     OTA_WIFI_MODE_AP,   ///< AP 模式：设备作为热点供局域网设备连接
     OTA_WIFI_MODE_STA   ///< STA 模式：设备连接上级路由器
 } ota_wifi_mode_t;
 
-class WifiOta {
+class WifiOta : public IBleCoexListener {
 public:
     /**
       * @brief 获取 WifiOta 单例实例。
@@ -92,6 +94,12 @@ public:
     std::atomic<bool> m_bleOtaActive{false};
     /** @brief BLE OTA 开始传输时调用，暂停 WiFi RSSI 轮询等射频活动。 */
     void setBleOtaActive(bool v) { m_bleOtaActive.store(v); }
+
+    // ── IBleCoexListener 接口实现（L1: 通过协调器接收 BLE 共存通知）──
+    /** @brief BLE OTA 开始，暂停 WiFi RSSI 轮询。 */
+    void onBleOtaStart() override;
+    /** @brief BLE OTA 结束，恢复 WiFi 射频活动。 */
+    void onBleOtaEnd() override;
 
     /** @brief 获取 WiFi OTA 任务句柄。 */
     TaskHandle_t getTaskHandle() const { return m_taskHandle; }

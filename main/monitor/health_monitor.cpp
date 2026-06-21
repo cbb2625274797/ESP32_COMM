@@ -18,7 +18,6 @@
 
 #include "health_monitor.h"
 #include "debug_log.h"
-#include "server/wifi_ota.h"
 
 // ============================================================
 // 单例
@@ -247,7 +246,7 @@ health_status_t HealthMonitor::checkBeforeOta()
         DEBUG_WARN("HEALTH", "OTA 前检查: SYS_WARNING，继续传输但需注意");
     }
 
-    if (!WifiOta::isConnected()) {
+    if (!m_wifiConnected) {
         DEBUG_WARN("HEALTH", "OTA 前检查: WiFi 未连接");
         return HEALTH_MON_CRITICAL;
     }
@@ -310,6 +309,18 @@ health_status_t HealthMonitor::checkBeforeOtaRelay()
     }
 
     return status;
+}
+
+// ============================================================
+// WiFi 连接状态推送（由 WiFi 事件回调调用）
+// ============================================================
+/**
+  * @brief 由 WiFi 事件回调推送连接状态。
+ * @param connected true=已连接，false=断开。
+ */
+void HealthMonitor::setWifiConnected(bool connected)
+{
+    m_wifiConnected = connected;
 }
 
 // ============================================================

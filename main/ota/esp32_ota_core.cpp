@@ -17,11 +17,45 @@
 #include "mbedtls/private/sha256.h"
 
 #include "esp32_ota_core.h"
-#include "ota_mutex.h"
 #include "app_config.h"
 #include "monitor/debug_log.h"
 
 #define TAG "OTA_CORE"
+
+// ============================================================
+// 分区互斥锁（M1: 内聚自 ota_mutex.h 全局变量）
+// ============================================================
+SemaphoreHandle_t Esp32OtaCore::s_mutex = NULL;
+volatile bool Esp32OtaCore::s_occupied = false;
+
+void Esp32OtaCore::initMutex()
+{
+    if (!s_mutex) {
+        s_mutex = xSemaphoreCreateMutex();
+        s_occupied = false;
+    }
+}
+
+bool Esp32OtaCore::acquireMutex(uint32_t timeout_ms)
+{
+    if (!s_mutex) return false;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
+    if (s_occupied) {
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+    s_occupied = true;
+    xSemaphoreGive(s_mutex);
+    return true;
+}
+
+void Esp32OtaCore::releaseMutex()
+{
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_occupied = false;
+    xSemaphoreGive(s_mutex);
+}
 
 /**
   * @brief 获取 Esp32OtaCore 单例实例。
@@ -56,7 +90,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
 {
     // ★ 全局互斥：必须在清理旧会话之前检查，
     //   否则 WiFi 的 begin() 会先释放 BLE 持有的锁，再自己获取，导致互斥失效
-    if (!esp32_ota_mutex_acquire(1000)) {
+    if (!acquireMutex(1000)) {
         DEBUG_ERR(TAG, "ESP32 OTA 被其他通道占用，拒绝 begin");
         return ESP_ERR_INVALID_STATE;
     }
@@ -67,10 +101,10 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         if (!m_ended) {
             esp_ota_abort(m_handle);
         }
-        esp32_ota_mutex_release();
+        releaseMutex();
         resetState();
         // 重新获取全局互斥（刚刚释放了）
-        if (!esp32_ota_mutex_acquire(1000)) {
+        if (!acquireMutex(1000)) {
             DEBUG_ERR(TAG, "ESP32 OTA 重新获取互斥失败");
             return ESP_ERR_INVALID_STATE;
         }
@@ -91,7 +125,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
 
     if (m_partition == NULL) {
         DEBUG_ERR(TAG, "找不到可用的 OTA 分区");
-        esp32_ota_mutex_release();
+        releaseMutex();
         return ESP_FAIL;
     }
 
@@ -102,7 +136,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         DEBUG_ERR(TAG, "固件太大: %u > 分区大小: %u",
                   (unsigned)total_size, (unsigned)m_partition->size);
         m_partition = nullptr;
-        esp32_ota_mutex_release();
+        releaseMutex();
         return ESP_FAIL;
     }
 
@@ -119,7 +153,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         DEBUG_ERR(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(err));
         m_partition = nullptr;
         m_handle = 0;
-        esp32_ota_mutex_release();
+        releaseMutex();
         return err;
     }
 
@@ -248,7 +282,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
             DEBUG_ERR(TAG, "SHA 计算失败: %s，中止", esp_err_to_name(sha_err));
             esp_ota_abort(m_handle);
             m_ended = false;
-            esp32_ota_mutex_release();
+            releaseMutex();
             resetState();
             return sha_err;
         }
@@ -279,7 +313,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
                       frontend_sha_hex, device_hex);
             esp_ota_abort(m_handle);
             m_ended = false;
-            esp32_ota_mutex_release();
+            releaseMutex();
             resetState();
             return ESP_ERR_INVALID_VERSION;
         }
@@ -300,7 +334,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         // end 失败时仍可 abort（未真正 end）
         esp_ota_abort(m_handle);
         m_ended = false;
-        esp32_ota_mutex_release();
+        releaseMutex();
         resetState();
         return err;
     }
@@ -310,12 +344,12 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
     err = esp_ota_set_boot_partition(m_partition);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
-        esp32_ota_mutex_release();
+        releaseMutex();
         resetState();
         return err;
     }
 
-    esp32_ota_mutex_release();
+    releaseMutex();
     DEBUG_INFO(TAG, "ESP32 OTA 收尾完成，共 %u 字节", (unsigned)m_received);
 
     // 保持 m_active 直到重启或下次 begin；resetState 由 begin/abort 处理
@@ -341,7 +375,7 @@ void Esp32OtaCore::abort()
     if (!m_ended) {
         esp_ota_abort(m_handle);
     }
-    esp32_ota_mutex_release();
+    releaseMutex();
     resetState();
     DEBUG_INFO(TAG, "ESP32 OTA 已中止并清理");
 }
@@ -351,7 +385,7 @@ void Esp32OtaCore::abort()
   *
   * 用于新通道（WiFi/BLE）发现锁被残留占用时，主动走完整的状态机退出流程：
   *   1. 若会话活跃（m_active）→ 走 abort() 完整清理（esp_ota_abort + 释放锁 + 复位状态）
-  *   2. 若会话不活跃但锁被占（g_esp32OtaOccupied）→ 仅释放残留锁
+  *   2. 若会话不活跃但锁被占（s_occupied）→ 仅释放残留锁
   *   3. 否则无需操作
   *
   * @return true 执行了清理（调用方可重试 begin），false 无需清理。
@@ -366,16 +400,16 @@ bool Esp32OtaCore::forceCleanup()
     }
 
     // 会话不活跃，但锁可能被残留占用
-    if (!g_esp32OtaMutex) return false;
+    if (!s_mutex) return false;
 
-    // 在互斥保护下检查 g_esp32OtaOccupied
-    if (xSemaphoreTake(g_esp32OtaMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    // 在互斥保护下检查 s_occupied
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
 
-    bool was_occupied = g_esp32OtaOccupied;
+    bool was_occupied = s_occupied;
     if (was_occupied) {
-        g_esp32OtaOccupied = false;
+        s_occupied = false;
     }
-    xSemaphoreGive(g_esp32OtaMutex);
+    xSemaphoreGive(s_mutex);
 
     if (was_occupied) {
         DEBUG_WARN(TAG, "强制清理: 释放残留 OTA 锁（无活跃会话）");

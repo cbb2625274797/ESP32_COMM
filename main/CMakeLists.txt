@@ -6,8 +6,6 @@ idf_component_register(
         "ota/ota_coordinator.cpp"      # OTA 多通道协调器（状态机/互斥）
         "relay/ota_relay.cpp"          # GD32 SPI OTA 中继状态机
         "storage/gd32_flash_store.cpp" # GD32 Flash 存储抽象层（H1 提取）
-        "transport/spi_master.cpp"     # SPI 总线驱动 + CANFD 接口
-        "transport/protocol.cpp"       # 帧协议 + AES 加密 + CRC
         "server/wifi_ota.cpp"          # WiFi HTTP OTA 服务器
         "server/http_handlers.cpp"     # HTTP 路由处理（H2 从 wifi_ota 提取）
         "server/ble_ota.cpp"           # BLE GATT OTA 服务器
@@ -19,14 +17,13 @@ idf_component_register(
         "ota"
         "relay"
         "storage"                     # GD32 Flash 存储抽象层头文件
-        "transport"
         "server"
         "monitor"
-        "include"                     # 公共头文件（app_config.h, version.h, ota_mutex.h）
+        "include"                     # 公共头文件（app_config.h, version.h）
     REQUIRES
+        transport                     # M5: 传输层组件（SPI/CANFD/协议）
         app_update                    # ESP32 OTA API
         cjson                         # JSON 解析/生成
-        esp_driver_spi                # SPI 主设备驱动
         esp_driver_tsens              # 温度传感器驱动
         esp_driver_uart               # UART 驱动（调试日志）
         esp_wifi                      # WiFi STA/AP 模式
