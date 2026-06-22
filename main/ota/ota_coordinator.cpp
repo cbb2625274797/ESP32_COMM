@@ -8,10 +8,12 @@
 #include "esp32_ota_core.h"
 #include "relay/ota_relay.h"
 #include "storage/gd32_flash_store.h"
+#include "transport/spi_master.h"
 #include "monitor/debug_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <inttypes.h>
 
 #define TAG "OTA_COORD"
 
@@ -597,6 +599,55 @@ bool OtaCoordinator::isGd32StorageDone() const
     bool done = m_gd32StorageDone;
     unlock(h);
     return done;
+}
+
+// ============================================================
+// OTA 状态快照（PR1: 收口状态读取）
+// ============================================================
+OtaSnapshot OtaCoordinator::getSnapshot() const
+{
+    OtaSnapshot snap{};
+
+    // ── coordinator 自身状态（一次 mutex）──
+    bool h = lock();
+    if (h) {
+        snap.sys_state = m_sysState;
+        snap.storage_done = m_gd32StorageDone;
+        unlock(h);
+    }
+    snap.sys_state_str = getSystemStateString();
+
+    // ── GD32 NVS 元数据 ──
+    Gd32FlashStore::instance().metaLoad(&snap.meta);
+
+    // ── relay 进度（一次 relay mutex）──
+    snap.relay = OtaRelay::getSnapshot();
+
+    return snap;
+}
+
+// ============================================================
+// GD32 APP 探测（PR2: 从 /system/status 移出）
+// ============================================================
+esp_err_t OtaCoordinator::probeGd32AppOnce(gd32_version_t *out_version, uint32_t *out_uptime)
+{
+    uint32_t uptime = 0;
+    gd32_version_t ver = {};
+
+    esp_err_t err = SpiMaster::instance().appPing(500, &uptime, &ver);
+    if (err == ESP_OK) {
+        OtaRelay::setGd32AppAlive(true);
+        OtaRelay::setGd32Version(ver);
+        if (out_version) *out_version = ver;
+        if (out_uptime)  *out_uptime  = uptime;
+        DEBUG_INFO(TAG, "GD32 APP 探测成功: alive, uptime=%" PRIu32 "s", uptime);
+    } else {
+        OtaRelay::setGd32AppAlive(false);
+        if (out_version) *out_version = ver;
+        if (out_uptime)  *out_uptime  = 0;
+        DEBUG_WARN(TAG, "GD32 APP 探测失败: %s", esp_err_to_name(err));
+    }
+    return err;
 }
 
 // ============================================================

@@ -20,7 +20,7 @@
 #include "freertos/semphr.h"
 #include "esp_err.h"
 #include "storage/gd32_flash_store.h"
-#include "relay/ota_relay.h"   // IRelayListener 接口定义（H4 解耦）
+#include "relay/ota_relay.h"   // IRelayListener 接口定义 + RelaySnapshot（H4 解耦）
 
 // ============================================================
 // 系统级 OTA 状态枚举
@@ -36,6 +36,22 @@ typedef enum {
     OTA_SYS_ESP32_REBOOTING,    // 即将重启 ESP32
     OTA_SYS_ERROR               // 错误状态
 } ota_system_state_t;
+
+// ============================================================
+// OTA 系统全量只读快照（PR1: 收口状态读取）
+// ============================================================
+/**
+ * @brief OTA 系统全量只读快照。
+ *        由 OtaCoordinator::getSnapshot() 一次性填充，
+ *        供 /system/status 等只读接口消费，避免散读各模块状态。
+ */
+struct OtaSnapshot {
+    ota_system_state_t sys_state = OTA_SYS_IDLE;  ///< 系统级 OTA 状态
+    const char *sys_state_str = "IDLE";            ///< 状态字符串
+    bool storage_done = false;                     ///< GD32 固件存储完成标志
+    ota_meta_t meta = {};                          ///< GD32 NVS 元数据
+    RelaySnapshot relay;                           ///< 中继进度快照
+};
 
 // ============================================================
 // IBleCoexListener - BLE 射频共存通知接口（解决 L1 横向耦合）
@@ -242,6 +258,24 @@ public:
     void abortCurrent();
 
     // ── 状态查询 ──
+    /**
+     * @brief 一次性读取系统 OTA 全量状态快照（PR1: 收口状态读取）。
+     *        coordinator mutex + relay mutex 各取一次，
+     *        供 /system/status 等只读接口消费。
+     * @return 包含 sys_state、meta、relay 进度的完整快照。
+     */
+    OtaSnapshot getSnapshot() const;
+
+    /**
+     * @brief 单次 SPI 探测 GD32 APP 是否存活（PR2: 从 status 移出）。
+     *        成功时更新 OtaRelay 缓存的 alive/version，
+     *        失败时清除 alive 标志。
+     * @param out_version 输出版本信息，可为 nullptr。
+     * @param out_uptime  输出 GD32 运行时间（秒），可为 nullptr。
+     * @return ESP_OK 存活，其他失败。
+     */
+    esp_err_t probeGd32AppOnce(gd32_version_t *out_version, uint32_t *out_uptime);
+
     /**
      * @brief 获取当前系统级 OTA 状态。
      * @return 当前 ota_system_state_t 状态值。

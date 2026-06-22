@@ -82,6 +82,22 @@ public:
     virtual void onRelayComplete(bool success) = 0;
 };
 
+// ============================================================
+// 中继进度快照（一次锁保护读取，消除逐 getter 不一致）
+// ============================================================
+/**
+ * @brief GD32 中继进度只读快照。
+ *        由 OtaRelay::getSnapshot() 在单次 StateLockGuard 下填充，
+ *        供 OtaCoordinator::getSnapshot() 组装完整系统快照。
+ */
+struct RelaySnapshot {
+    relay_state_t   state = RELAY_IDLE;     ///< 当前中继状态机状态
+    uint32_t        seq = 0;                ///< 当前中继包序号
+    uint32_t        total_packets = 0;      ///< 本次中继总包数
+    bool            gd32_app_alive = false; ///< GD32 APP 存活标志
+    gd32_version_t  version = {};           ///< GD32 固件版本
+};
+
 class OtaRelay {
 public:
     /**
@@ -138,6 +154,12 @@ public:
      * @param out 输出版本信息结构体指针。
      */
     static void getGd32Version(gd32_version_t *out);
+    /**
+     * @brief 一次性读取所有中继状态字段（单次锁保护）。
+     *        消除逐 getter 调用之间 relay task 更新状态导致的不一致。
+     * @return 中继进度快照。
+     */
+    static RelaySnapshot getSnapshot();
     /**
      * @brief 设置中继状态.
      * @param s 目标状态。

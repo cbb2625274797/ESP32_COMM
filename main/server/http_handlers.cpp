@@ -4,6 +4,7 @@
  */
 #include <string.h>
 #include <stdarg.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_http_server.h"
@@ -20,6 +21,7 @@
 #include "esp32_ota_core.h"
 #include "ota_coordinator.h"
 #include "ota_relay.h"
+#include "ota_snapshot.h"
 #include "storage/gd32_flash_store.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
@@ -721,47 +723,10 @@ esp_err_t system_status_handler(httpd_req_t *req)
         }
         connected = true;
     }
-    gd32_version_t pingVer = {};
-    OtaRelay::getGd32Version(&pingVer);
 
-    ota_system_state_t curSysState = OtaCoordinator::instance().getSystemState();
-    bool ota_busy = (curSysState == OTA_SYS_GD32_STORING ||
-                     curSysState == OTA_SYS_GD32_RELAYING ||
-                     curSysState == OTA_SYS_ESP32_RECEIVING ||
-                     curSysState == OTA_SYS_ESP32_FINALIZING ||
-                     curSysState == OTA_SYS_ESP32_REBOOTING);
-    if (!ota_busy &&
-        pingVer.app_major == 0 &&
-        pingVer.boot_major == 0 &&
-        OtaRelay::getState() == RELAY_IDLE) {
-        static uint32_t last_ping_ms = 0;
-        static uint8_t  ping_attempts = 0;
-        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        if (ping_attempts < 5 && now_ms - last_ping_ms > 5000) {
-            last_ping_ms = now_ms;
-            ++ping_attempts;
-            uint32_t uptime = 0;
-            gd32_version_t ver = {};
-            if (SpiMaster::instance().appPing(500, &uptime, &ver) == ESP_OK) {
-                OtaRelay::setGd32AppAlive(true);
-                OtaRelay::setGd32Version(ver);
-                ping_attempts = 0;
-            } else {
-                OtaRelay::setGd32AppAlive(false);
-                if (ping_attempts >= 5) {
-                    DEBUG_WARN("STATUS", "GD32 版本号读取失败，已达最大重试次数 (5)，停止尝试");
-                }
-            }
-        }
-    }
+    // ★ PR1: 一次性快照，替代散读 OtaCoordinator / OtaRelay 多个 getter
+    OtaSnapshot snap = OtaCoordinator::instance().getSnapshot();
 
-    ota_meta_t meta;
-    memset(&meta, 0, sizeof(meta));
-    OtaCoordinator::instance().loadGd32Meta(&meta);
-
-    gd32_version_t snapVer2 = {};
-    OtaRelay::getGd32Version(&snapVer2);
-    ota_system_state_t sysState = OtaCoordinator::instance().getSystemState();
     size_t free_heap = esp_get_free_heap_size();
     size_t min_free_heap = esp_get_minimum_free_heap_size();
     size_t largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
@@ -807,19 +772,19 @@ esp_err_t system_status_handler(httpd_req_t *req)
         ip_str,
         rssi,
         connected ? "true" : "false",
-        OtaCoordinator::instance().getSystemStateString(),
-        (int)sysState,
-        (unsigned long)meta.total_size,
-        (unsigned long)meta.stored_size,
-        OtaCoordinator::instance().isGd32StorageDone() ? "true" : "false",
-        OtaRelay::getState(),
-        (unsigned long)OtaRelay::getRelaySeq(),
-        (unsigned long)OtaRelay::getRelayTotalPackets(),
-        OtaRelay::getGd32AppAlive() ? "true" : "false",
-        snapVer2.app_major, snapVer2.app_minor,
-        snapVer2.app_patch, snapVer2.app_build,
-        snapVer2.boot_major, snapVer2.boot_minor,
-        snapVer2.boot_patch, snapVer2.boot_build);
+        snap.sys_state_str,
+        (int)snap.sys_state,
+        (unsigned long)snap.meta.total_size,
+        (unsigned long)snap.meta.stored_size,
+        snap.storage_done ? "true" : "false",
+        snap.relay.state,
+        (unsigned long)snap.relay.seq,
+        (unsigned long)snap.relay.total_packets,
+        snap.relay.gd32_app_alive ? "true" : "false",
+        snap.relay.version.app_major, snap.relay.version.app_minor,
+        snap.relay.version.app_patch, snap.relay.version.app_build,
+        snap.relay.version.boot_major, snap.relay.version.boot_minor,
+        snap.relay.version.boot_patch, snap.relay.version.boot_build);
 
     for (size_t i = 0; i < sizeof(task_metrics) / sizeof(task_metrics[0]); ++i) {
         len = append_jsonf(resp, sizeof(resp), len,
@@ -831,6 +796,36 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)get_task_stack_peak_used_bytes(task_metrics[i].handle, task_metrics[i].stack_size_bytes));
     }
     len = append_jsonf(resp, sizeof(resp), len, "}}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, len);
+    return ESP_OK;
+}
+
+// ============================================================
+// GET /system/probe — GD32 APP 单次 SPI 探测（PR2）
+// ============================================================
+/**
+ * @brief 显式触发一次 GD32 APP 存活探测。
+ *        从 system_status_handler 移出的副作用，改为独立端点。
+ *        成功时更新 OtaRelay 缓存的 alive/version 并返回版本信息。
+ */
+esp_err_t system_probe_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    gd32_version_t ver = {};
+    uint32_t uptime = 0;
+    esp_err_t err = OtaCoordinator::instance().probeGd32AppOnce(&ver, &uptime);
+
+    char resp[256];
+    int len = snprintf(resp, sizeof(resp),
+        "{\"alive\": %s, \"uptime_sec\": %" PRIu32 ", "
+        "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}",
+        (err == ESP_OK) ? "true" : "false",
+        uptime,
+        ver.app_major, ver.app_minor, ver.app_patch, ver.app_build,
+        ver.boot_major, ver.boot_minor, ver.boot_patch, ver.boot_build);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);

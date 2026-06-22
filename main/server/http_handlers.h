@@ -18,5 +18,6 @@ esp_err_t logs_handler(httpd_req_t *req);
 esp_err_t can_send_handler(httpd_req_t *req);
 esp_err_t spi_send_handler(httpd_req_t *req);
 esp_err_t system_status_handler(httpd_req_t *req);
+esp_err_t system_probe_handler(httpd_req_t *req);
 
 #endif // HTTP_HANDLERS_H

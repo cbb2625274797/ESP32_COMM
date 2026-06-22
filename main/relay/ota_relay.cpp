@@ -123,6 +123,18 @@ void OtaRelay::getGd32Version(gd32_version_t *out)
     *out = gd32Version;
 }
 
+RelaySnapshot OtaRelay::getSnapshot()
+{
+    StateLockGuard lock;
+    RelaySnapshot s;
+    s.state = relayState;
+    s.seq = relaySeq;
+    s.total_packets = relayTotalPackets;
+    s.gd32_app_alive = gd32AppAlive;
+    s.version = gd32Version;
+    return s;
+}
+
 void OtaRelay::setState(relay_state_t s)
 {
     StateLockGuard lock;
@@ -1239,6 +1251,31 @@ void OtaRelay::taskEntry(void *pvParameters)
         DEBUG_ERR("OTA", "OTA 队列创建失败");
         vTaskDelete(NULL);
         return;
+    }
+
+    // ★ 启动时初始 GD32 探测：读取 GD32 APP 版本号与存活状态
+    //   GD32 APP 启动需要一定时间，给其 3 秒准备窗口后发起探测
+    {
+        DEBUG_INFO("OTA", "启动初始 GD32 探测...");
+        vTaskDelay(pdMS_TO_TICKS(3000));  // 等待 GD32 APP 就绪
+        uint32_t uptime = 0;
+        gd32_version_t ping_ver = {};
+        esp_err_t ping_err = SpiMaster::instance().appPing(2000, &uptime, &ping_ver);
+        if (ping_err == ESP_OK) {
+            StateLockGuard lock;
+            gd32AppAlive = true;
+            gd32Version  = ping_ver;
+            DEBUG_INFO("OTA", "启动 GD32 探测成功: uptime=%" PRIu32 "s, "
+                       "APP=v%d.%d.%d.%d, BOOT=v%d.%d.%d.%d",
+                       uptime,
+                       ping_ver.app_major, ping_ver.app_minor,
+                       ping_ver.app_patch, ping_ver.app_build,
+                       ping_ver.boot_major, ping_ver.boot_minor,
+                       ping_ver.boot_patch, ping_ver.boot_build);
+        } else {
+            DEBUG_WARN("OTA", "启动 GD32 探测失败: %s (GD32 可能未就绪)",
+                       esp_err_to_name(ping_err));
+        }
     }
 
     while (1) {

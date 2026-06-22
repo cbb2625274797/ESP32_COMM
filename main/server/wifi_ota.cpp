@@ -517,20 +517,37 @@ esp_err_t WifiOta::httpServerStart()
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &logs_options_uri);
 
-    httpd_uri_t system_status_uri = {
+    // 系统状态查询端点
+    httpd_uri_t status_uri = {
         .uri = "/system/status",
         .method = HTTP_GET,
         .handler = system_status_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_status_uri);
-    httpd_uri_t system_status_options_uri = {
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_uri);
+    httpd_uri_t status_options_uri = {
         .uri = "/system/status",
         .method = HTTP_OPTIONS,
         .handler = http_options_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_status_options_uri);
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_options_uri);
+
+    // PR2: GD32 APP 探测端点
+    httpd_uri_t system_probe_uri = {
+        .uri = "/system/probe",
+        .method = HTTP_GET,
+        .handler = system_probe_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_probe_uri);
+    httpd_uri_t system_probe_options_uri = {
+        .uri = "/system/probe",
+        .method = HTTP_OPTIONS,
+        .handler = http_options_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_probe_options_uri);
 
     // CAN 帧转发
     httpd_uri_t can_send_uri = {
@@ -564,7 +581,7 @@ esp_err_t WifiOta::httpServerStart()
     };
     httpd_register_uri_handler(WifiOta::instance().m_httpServer, &spi_send_options_uri);
 
-    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /restart, /logs, /system/status, /can/send, /spi/send");
+    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /restart, /logs, /system/status, /system/probe, /can/send, /spi/send");
 
     return ESP_OK;
 }
