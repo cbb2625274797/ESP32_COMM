@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 CAN 通信控制台</title>
+<link rel="stylesheet" href="style.css?v=20260624b">
+</head>
+<body class="can-page">
+<div class="container can-container">
+
+  <header class="header-bar can-header">
+    <div class="header-brand">
+      <span class="dot-mark"></span>
+      <strong>ESP32 CAN 通信控制台</strong>
+    </div>
+    <div class="header-status">
+      <span class="pill offline" id="canConnPill"><span class="indicator"></span><span id="canConnTxt">未连接</span></span>
+      <span class="pill" id="canVersionPill">v--</span>
+      <span class="pill" id="canChannelPill">CH0</span>
+      <span class="pill" id="dbcSummaryPill">未导入 DBC</span>
+      <span class="pill" id="messageSummaryPill">0 报文</span>
+    </div>
+    <div class="header-sub can-header-actions">
+      <a class="pill can-link-pill" href="index.html">返回 OTA 控制台</a>
+    </div>
+  </header>
+
+  <section class="card can-toolbar-card">
+    <div class="card-head"><span class="ico">🧰</span> 工作台设置</div>
+    <div class="card-body">
+      <div class="can-toolbar-grid">
+        <div class="can-toolbar-block">
+          <label class="form-label" for="toolIp">ESP32 IP</label>
+          <div class="input-group">
+            <input class="input" type="text" id="toolIp" value="192.168.31.127" placeholder="输入 IP 地址">
+            <button class="btn btn-outline" id="testConnBtn" type="button">测试</button>
+          </div>
+        </div>
+
+        <div class="can-toolbar-block can-toolbar-channel">
+          <label class="form-label" for="defaultChannel">默认通道</label>
+          <select class="input" id="defaultChannel">
+            <option value="0">CH0</option>
+            <option value="1">CH1</option>
+            <option value="2">CH2</option>
+          </select>
+        </div>
+
+        <div class="can-toolbar-block can-toolbar-upload">
+          <label class="form-label">DBC 文件</label>
+          <div class="upload-zone upload-zone-sm dbc-dropzone" id="dbcDropZone">
+            <div class="upload-ico">📥</div>
+            <h4>导入 DBC</h4>
+            <p>点击或拖拽 .dbc 文件</p>
+          </div>
+          <input type="file" id="dbcFileInput" accept=".dbc,text/plain" style="display:none;">
+        </div>
+
+        <div class="can-toolbar-block can-toolbar-search">
+          <label class="form-label" for="dbcSearch">报文搜索</label>
+          <input class="input" type="text" id="dbcSearch" placeholder="按报文名、ID、节点或信号名过滤">
+        </div>
+      </div>
+
+      <div class="file-info can-file-info-inline" id="dbcFileInfo">
+        <div class="file-info-row">
+          <span class="can-file-name">📄 <span id="dbcFileName">-</span></span>
+          <button class="btn btn-ghost btn-sm" id="clearDbcBtn" type="button">清除</button>
+        </div>
+        <div class="file-info-grid">
+          <div class="file-meta-item"><span>报文</span><b id="dbcMessageCount">0</b></div>
+          <div class="file-meta-item"><span>信号</span><b id="dbcSignalCount">0</b></div>
+          <div class="file-meta-item"><span>节点</span><b id="dbcNodeCount">0</b></div>
+          <div class="file-meta-item"><span>大小</span><b id="dbcFileSize">0 B</b></div>
+        </div>
+      </div>
+
+      <div class="can-toolbar-foot">
+        <div class="conn-indicator err" id="connIndicator">
+          <span class="light"></span>
+          <span id="connIndicatorTxt">等待连接测试</span>
+        </div>
+        <div class="helper-note" id="connectionNote">
+          当前页面会直接调用 <code>/system/status</code> 和 <code>/can/send</code>。
+        </div>
+        <div class="helper-note" id="dbcHint">
+          当前解析器会自动识别常见 DBC 的 <code>BO_</code>、<code>SG_</code>、<code>VAL_</code>、
+          <code>CM_</code> 和 <code>SIG_VALTYPE_</code>。
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card can-table-card">
+    <div class="card-head"><span class="ico">📚</span> 报文列表</div>
+    <div class="card-body can-table-card-body">
+      <div class="message-list" id="messageList">
+        <div class="status-empty">等待导入 DBC...</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="can-editor-layout">
+    <section class="card can-signal-card">
+      <div class="card-head"><span class="ico">🎚️</span> 信号编辑</div>
+      <div class="card-body">
+        <div class="can-empty-state" id="emptyMessageState">
+          <div class="can-empty-icon">📡</div>
+          <h3>先导入 DBC，再选择一条 CAN 报文</h3>
+          <p>上方按表格选报文，下方按信号名直接编辑，右侧查看编码结果并发送。</p>
+        </div>
+
+        <div id="messageWorkspace" style="display:none;">
+          <div class="can-selection-bar">
+            <div class="can-selection-copy">
+              <div class="can-title" id="selectedMessageTitle">-</div>
+              <div class="can-subtitle" id="selectedMessageSubtitle">-</div>
+            </div>
+            <div class="can-selection-actions">
+              <button class="btn btn-outline" id="loadPreviewToRawBtn" type="button">载入原始帧</button>
+              <button class="btn btn-primary" id="sendSelectedBtn" type="button">发送当前报文</button>
+            </div>
+          </div>
+
+          <div class="can-meta-grid" id="selectedMessageMeta"></div>
+          <div class="helper-note can-comment-note" id="selectedMessageComment">暂无报文注释。</div>
+
+          <div class="signal-grid signal-table-host" id="signalGrid"></div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="can-sidepanel">
+      <section class="card">
+        <div class="card-head"><span class="ico">🛰️</span> 帧预览</div>
+        <div class="card-body">
+          <div class="can-frame-panel can-frame-panel-compact">
+            <div class="can-panel-kicker">编码结果</div>
+            <div class="can-frame-hex" id="generatedHex">--</div>
+            <div class="can-byte-strip" id="generatedBytes"></div>
+            <div class="helper-note" id="encodeHint">选择报文后，信号值会实时编码为 CAN 数据。</div>
+            <div class="can-response" id="dbcResp" style="display:none;">
+              <div class="can-response-label">设备响应</div>
+              <div id="dbcRespText"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><span class="ico">✍️</span> 原始帧发送</div>
+        <div class="card-body">
+          <div class="row-2 can-raw-grid">
+            <div class="form-row" style="margin:0;">
+              <label class="form-label" for="manualChannel">通道</label>
+              <select class="input" id="manualChannel">
+                <option value="0">CH0</option>
+                <option value="1">CH1</option>
+                <option value="2">CH2</option>
+              </select>
+            </div>
+            <div class="form-row" style="margin:0;">
+              <label class="form-label" for="manualId">CAN ID</label>
+              <input class="input" type="text" id="manualId" value="0x18DA00F1" placeholder="支持 0x 或十进制">
+            </div>
+          </div>
+          <div class="form-row" style="margin-top:10px;">
+            <label class="form-label" for="manualDlc">DLC</label>
+            <input class="input" type="number" id="manualDlc" value="8" min="0" max="64">
+          </div>
+          <div class="form-row" style="margin-top:10px;">
+            <label class="form-label" for="manualData">HEX 数据</label>
+            <input class="input" type="text" id="manualData" value="0102030405060708" placeholder="01020304...">
+          </div>
+          <div class="helper-note" id="manualHint">
+            原始帧模式适合绕过 DBC 直接发 HEX，或发送当前预览帧后二次微调。
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="sendManualBtn" type="button">发送原始帧</button>
+            <button class="btn btn-outline" id="resetManualBtn" type="button">重置</button>
+          </div>
+          <div class="can-response" id="manualResp" style="display:none;">
+            <div class="can-response-label">设备响应</div>
+            <div id="manualRespText"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><span class="ico">🕘</span> 最近发送</div>
+        <div class="card-body">
+          <div class="history-list history-list-compact" id="historyList">
+            <div class="status-empty">尚未发送任何 CAN 帧。</div>
+          </div>
+        </div>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<div class="toast" id="toast">
+  <span class="toast-ico" id="toastIco">✓</span>
+  <span id="toastMsg">操作成功</span>
+</div>
+
+<script src="can.js?v=20260624b"></script>
+</body>
+</html>

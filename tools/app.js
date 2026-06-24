@@ -360,8 +360,12 @@ function setHelper(id, text, type) {
   el.innerHTML = text;
 }
 function updateCanHint() {
-  var dlc = parseInt(document.getElementById('canDlc').value) || 0;
-  var dataHex = document.getElementById('canData').value.trim().replace(/\s/g, '');
+  var dlcEl = document.getElementById('canDlc');
+  var dataEl = document.getElementById('canData');
+  var hintEl = document.getElementById('canHint');
+  if (!dlcEl || !dataEl || !hintEl) return;
+  var dlc = parseInt(dlcEl.value) || 0;
+  var dataHex = dataEl.value.trim().replace(/\s/g, '');
   if (!dataHex) {
     setHelper('canHint', '输入十六进制数据后会自动检查字节数是否与 DLC 一致。', '');
     return;
@@ -490,6 +494,78 @@ function updateHeapAndTaskStatusUi(data) {
     setFill(fillId, pct);
     setText(pctId, pct.toFixed(1) + '%');
   }
+  function setCpuFill(pct) {
+    var el = document.getElementById('cpuUsageFill');
+    if (!el) return;
+    var safePct = Math.max(0, Math.min(100, Number(pct) || 0));
+    el.style.width = safePct + '%';
+    el.className = 'heap-bar-fill cpu-fill' + (safePct >= 85 ? ' danger' : safePct >= 70 ? ' warn' : '');
+  }
+  function updateCpuUsageUi(cpu) {
+    cpu = cpu || {};
+    var taskList = document.getElementById('cpuTaskList');
+    if (!cpu.available) {
+      setText('cpuUsageText', '未启用 FreeRTOS 统计');
+      setText('cpuUsagePct', '--');
+      setText('cpuIdlePct', '--');
+      setText('cpuSampleMs', '--');
+      setText('cpuTaskCount', '--');
+      setCpuFill(0);
+      if (taskList) taskList.innerHTML = '<div class="status-empty">固件未启用 CPU runtime stats</div>';
+      return;
+    }
+    if (!cpu.valid) {
+      setText('cpuUsageText', '等待下一次采样...');
+      setText('cpuUsagePct', '--');
+      setText('cpuIdlePct', '--');
+      setText('cpuSampleMs', '--');
+      setText('cpuTaskCount', '--');
+      setCpuFill(0);
+      if (taskList) taskList.innerHTML = '<div class="status-empty">首次刷新只建立基线，下一次刷新后显示 CPU 占用</div>';
+      return;
+    }
+    var usagePct = Number(cpu.usage_pct) || 0;
+    var idlePct = Number(cpu.idle_pct) || 0;
+    var sampleMs = Number(cpu.sample_ms) || 0;
+    var tasks = Array.isArray(cpu.tasks) ? cpu.tasks.slice() : [];
+    tasks.sort(function (a, b) {
+      return (Number(b.usage_pct) || 0) - (Number(a.usage_pct) || 0);
+    });
+
+    setText('cpuUsageText', 'CPU 已用 ' + formatPercent(usagePct));
+    setText('cpuUsagePct', formatPercent(usagePct));
+    setText('cpuIdlePct', formatPercent(idlePct));
+    setText('cpuSampleMs', sampleMs > 0 ? sampleMs + ' ms' : '--');
+    setText('cpuTaskCount', String(tasks.length));
+    setCpuFill(usagePct);
+
+    if (taskList) {
+      var visibleTasks = tasks.slice(0, 8);
+      if (!visibleTasks.length) {
+        taskList.innerHTML = '<div class="status-empty">当前采样没有任务增量</div>';
+      } else {
+        taskList.innerHTML = visibleTasks.map(function (task) {
+          var pct = Number(task.usage_pct) || 0;
+          var delta = Number(task.runtime_delta) || 0;
+          var fillClass = pct >= 85 ? 'err' : pct >= 70 ? 'warn' : '';
+          return '' +
+            '<div class="status-task cpu-task">' +
+              '<div class="status-task-head">' +
+                '<div class="status-task-name">' + escapeHtml(task.name || 'task') + '</div>' +
+                '<div class="status-task-ratio">' + escapeHtml(formatPercent(pct)) + '</div>' +
+              '</div>' +
+              '<div class="status-task-bar"><div class="status-task-bar-fill ' + fillClass + '" style="width:' + Math.max(0, Math.min(100, pct)) + '%"></div></div>' +
+              '<div class="status-task-meta">' +
+                '<div><span>任务号</span><b>' + escapeHtml(task.task_number) + '</b></div>' +
+                '<div><span>增量</span><b>' + escapeHtml(delta) + '</b></div>' +
+                '<div><span>占比</span><b>' + escapeHtml(formatPercent(pct)) + '</b></div>' +
+              '</div>' +
+            '</div>';
+        }).join('');
+      }
+    }
+  }
+  updateCpuUsageUi(data.cpu);
   setText('mInternalHeap', data.internal_free_heap !== undefined ? formatBytes(data.internal_free_heap) : '--');
   setText('mInternalMinHeap', data.internal_min_free_heap !== undefined ? formatBytes(data.internal_min_free_heap) : '--');
   setText('mInternalLargestBlock', data.internal_largest_free_block !== undefined ? formatBytes(data.internal_largest_free_block) : '--');
@@ -819,10 +895,18 @@ async function refreshSystemStatusNow(event) {
 }
 // ==================== CAN 帧发送 ====================
 async function sendCanFrame() {
-  var ch = parseInt(document.getElementById('canChannel').value);
-  var idStr = document.getElementById('canId').value.trim();
-  var dlc = parseInt(document.getElementById('canDlc').value) || 8;
-  var dataStr = document.getElementById('canData').value.trim();
+  var chEl = document.getElementById('canChannel');
+  var idEl = document.getElementById('canId');
+  var dlcEl = document.getElementById('canDlc');
+  var dataEl = document.getElementById('canData');
+  if (!chEl || !idEl || !dlcEl || !dataEl) {
+    showToast('请在独立 CAN 页面中发送帧', 'warning');
+    return;
+  }
+  var ch = parseInt(chEl.value);
+  var idStr = idEl.value.trim();
+  var dlc = parseInt(dlcEl.value) || 8;
+  var dataStr = dataEl.value.trim();
   var extId = 0;
   if (idStr.toLowerCase().indexOf('0x') === 0) extId = parseInt(idStr, 16);
   else { extId = parseInt(idStr, 10); if (isNaN(extId)) extId = parseInt(idStr, 16); }
@@ -854,10 +938,15 @@ async function sendCanFrame() {
   }
 }
 function clearCanFields() {
-  document.getElementById('canId').value = '0x18DA00F1';
-  document.getElementById('canDlc').value = '8';
-  document.getElementById('canData').value = '0102030405060708';
-  document.getElementById('canResp').style.display = 'none';
+  var idEl = document.getElementById('canId');
+  var dlcEl = document.getElementById('canDlc');
+  var dataEl = document.getElementById('canData');
+  var respEl = document.getElementById('canResp');
+  if (!idEl || !dlcEl || !dataEl) return;
+  idEl.value = '0x18DA00F1';
+  dlcEl.value = '8';
+  dataEl.value = '0102030405060708';
+  if (respEl) respEl.style.display = 'none';
   updateCanHint();
 }
 // ==================== SPI 发送 ====================
@@ -1001,10 +1090,14 @@ function setupDropZone(zoneId, chip) {
 }
 setupDropZone('uploadZoneEsp32', 'esp32');
 setupDropZone('uploadZoneGd32', 'gd32');
-document.getElementById('canData').addEventListener('input', updateCanHint);
-document.getElementById('canDlc').addEventListener('input', updateCanHint);
-document.getElementById('spiType').addEventListener('input', updateSpiHint);
-document.getElementById('spiData').addEventListener('input', updateSpiHint);
+var canDataEl = document.getElementById('canData');
+var canDlcEl = document.getElementById('canDlc');
+if (canDataEl) canDataEl.addEventListener('input', updateCanHint);
+if (canDlcEl) canDlcEl.addEventListener('input', updateCanHint);
+var spiTypeEl = document.getElementById('spiType');
+var spiDataEl = document.getElementById('spiData');
+if (spiTypeEl) spiTypeEl.addEventListener('input', updateSpiHint);
+if (spiDataEl) spiDataEl.addEventListener('input', updateSpiHint);
 // ==================== Intel HEX → BIN 转换 ====================
 /**
  * 将 Intel HEX 字符串解析为原始 BIN 字节数组。

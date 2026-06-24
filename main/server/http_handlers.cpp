@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <algorithm>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_http_server.h"
@@ -667,12 +668,154 @@ esp_err_t spi_send_handler(httpd_req_t *req)
 }
 
 static constexpr uint32_t INTERNAL_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+static constexpr size_t SYSTEM_STATUS_JSON_CAP = 8192;
+static constexpr size_t CPU_TASK_SNAPSHOT_MAX = 24;
 
 struct TaskStackMetric {
     const char* name;
     TaskHandle_t handle;
     size_t stack_size_bytes;
 };
+
+struct CpuTaskSample {
+    UBaseType_t task_number;
+    configRUN_TIME_COUNTER_TYPE runtime;
+};
+
+struct CpuTaskMetric {
+    const char* name;
+    UBaseType_t task_number;
+    uint64_t runtime_delta;
+    double usage_pct;
+};
+
+struct CpuUsageSnapshot {
+    bool available;
+    bool valid;
+    uint32_t sample_ms;
+    double usage_pct;
+    double idle_pct;
+    CpuTaskMetric tasks[CPU_TASK_SNAPSHOT_MAX];
+    size_t task_count;
+};
+
+static portMUX_TYPE s_cpu_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+static CpuTaskSample s_cpu_last_samples[CPU_TASK_SNAPSHOT_MAX];
+static size_t s_cpu_last_count = 0;
+static configRUN_TIME_COUNTER_TYPE s_cpu_last_total = 0;
+static int64_t s_cpu_last_time_us = 0;
+static bool s_cpu_has_last = false;
+
+static uint64_t runtime_delta(configRUN_TIME_COUNTER_TYPE current, configRUN_TIME_COUNTER_TYPE previous)
+{
+    return current >= previous ? (uint64_t)(current - previous) : 0U;
+}
+
+static bool task_name_is_idle(const char* name)
+{
+    return name && strncmp(name, "IDLE", 4) == 0;
+}
+
+static void reset_cpu_usage_baseline_locked(const TaskStatus_t* tasks, size_t task_count,
+                                            configRUN_TIME_COUNTER_TYPE total_runtime,
+                                            int64_t now_us)
+{
+    size_t copy_count = std::min(task_count, CPU_TASK_SNAPSHOT_MAX);
+    for (size_t i = 0; i < copy_count; ++i) {
+        s_cpu_last_samples[i].task_number = tasks[i].xTaskNumber;
+        s_cpu_last_samples[i].runtime = tasks[i].ulRunTimeCounter;
+    }
+    s_cpu_last_count = copy_count;
+    s_cpu_last_total = total_runtime;
+    s_cpu_last_time_us = now_us;
+    s_cpu_has_last = true;
+}
+
+static CpuUsageSnapshot sample_cpu_usage()
+{
+    CpuUsageSnapshot result = {};
+#if defined(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)
+    result.available = true;
+
+    UBaseType_t task_count = uxTaskGetNumberOfTasks();
+    if (task_count == 0) {
+        return result;
+    }
+    task_count = std::min<UBaseType_t>(task_count + 2U, CPU_TASK_SNAPSHOT_MAX);
+
+    TaskStatus_t* tasks = (TaskStatus_t*)calloc(task_count, sizeof(TaskStatus_t));
+    if (!tasks) {
+        return result;
+    }
+
+    configRUN_TIME_COUNTER_TYPE total_runtime = 0;
+    UBaseType_t captured_count = uxTaskGetSystemState(tasks, task_count, &total_runtime);
+    int64_t now_us = esp_timer_get_time();
+    if (captured_count == 0 || captured_count > task_count) {
+        free(tasks);
+        return result;
+    }
+
+    CpuTaskSample previous_samples[CPU_TASK_SNAPSHOT_MAX] = {};
+    size_t previous_count = 0;
+    configRUN_TIME_COUNTER_TYPE previous_total = 0;
+    int64_t previous_time_us = 0;
+    bool had_previous = false;
+
+    portENTER_CRITICAL(&s_cpu_stats_mux);
+    previous_count = s_cpu_last_count;
+    previous_total = s_cpu_last_total;
+    previous_time_us = s_cpu_last_time_us;
+    had_previous = s_cpu_has_last;
+    for (size_t i = 0; i < previous_count; ++i) {
+        previous_samples[i] = s_cpu_last_samples[i];
+    }
+    reset_cpu_usage_baseline_locked(tasks, captured_count, total_runtime, now_us);
+    portEXIT_CRITICAL(&s_cpu_stats_mux);
+
+    bool can_compute = had_previous && total_runtime >= previous_total && now_us > previous_time_us;
+    uint64_t total_delta = can_compute ? runtime_delta(total_runtime, previous_total) : 0U;
+    uint64_t idle_delta = 0U;
+    if (can_compute && total_delta > 0U) {
+        for (UBaseType_t i = 0; i < captured_count; ++i) {
+            configRUN_TIME_COUNTER_TYPE last_runtime = 0;
+            bool found_previous = false;
+            for (size_t j = 0; j < previous_count; ++j) {
+                if (previous_samples[j].task_number == tasks[i].xTaskNumber) {
+                    last_runtime = previous_samples[j].runtime;
+                    found_previous = true;
+                    break;
+                }
+            }
+            if (!found_previous) {
+                continue;
+            }
+            uint64_t delta = runtime_delta(tasks[i].ulRunTimeCounter, last_runtime);
+            double pct = (double)delta * 100.0 / (double)total_delta;
+            if (task_name_is_idle(tasks[i].pcTaskName)) {
+                idle_delta += delta;
+            }
+            if (result.task_count < CPU_TASK_SNAPSHOT_MAX) {
+                CpuTaskMetric& metric = result.tasks[result.task_count++];
+                metric.name = tasks[i].pcTaskName ? tasks[i].pcTaskName : "";
+                metric.task_number = tasks[i].xTaskNumber;
+                metric.runtime_delta = delta;
+                metric.usage_pct = pct;
+            }
+        }
+
+        result.valid = true;
+        result.sample_ms = (uint32_t)((now_us - previous_time_us) / 1000);
+        result.idle_pct = std::min(100.0, (double)idle_delta * 100.0 / (double)total_delta);
+        result.usage_pct = std::max(0.0, 100.0 - result.idle_pct);
+    }
+
+    free(tasks);
+#else
+    result.available = false;
+#endif
+    return result;
+}
 
 static size_t get_task_stack_high_watermark_bytes(TaskHandle_t handle)
 {
@@ -701,6 +844,30 @@ static int append_jsonf(char* buf, size_t cap, int offset, const char* fmt, ...)
         return (int)(cap - 1);
     }
     return offset + (int)written;
+}
+
+static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUsageSnapshot& cpu)
+{
+    offset = append_jsonf(buf, cap, offset,
+        "\"cpu\":{\"available\":%s,\"valid\":%s,\"usage_pct\":%.2f,\"idle_pct\":%.2f,\"sample_ms\":%lu,\"tasks\":[",
+        cpu.available ? "true" : "false",
+        cpu.valid ? "true" : "false",
+        cpu.valid ? cpu.usage_pct : 0.0,
+        cpu.valid ? cpu.idle_pct : 0.0,
+        (unsigned long)(cpu.valid ? cpu.sample_ms : 0U));
+
+    for (size_t i = 0; i < cpu.task_count; ++i) {
+        const CpuTaskMetric& task = cpu.tasks[i];
+        offset = append_jsonf(buf, cap, offset,
+            "%s{\"name\":\"%s\",\"task_number\":%lu,\"runtime_delta\":%" PRIu64 ",\"usage_pct\":%.2f}",
+            i == 0 ? "" : ",",
+            task.name,
+            (unsigned long)task.task_number,
+            task.runtime_delta,
+            task.usage_pct);
+    }
+
+    return append_jsonf(buf, cap, offset, "]},");
 }
 
 esp_err_t system_status_handler(httpd_req_t *req)
@@ -744,9 +911,15 @@ esp_err_t system_status_handler(httpd_req_t *req)
         { "ble_ota", BleOta::instance().getTaskHandle(), 4096 },
         { "ble_ota_worker", BleOta::instance().getWorkerTaskHandle(), 4096 }
     };
+    CpuUsageSnapshot cpu = sample_cpu_usage();
 
-    char resp[4096];
-    int len = snprintf(resp, sizeof(resp),
+    char* resp = (char*)calloc(1, SYSTEM_STATUS_JSON_CAP);
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+        return ESP_FAIL;
+    }
+
+    int len = snprintf(resp, SYSTEM_STATUS_JSON_CAP,
         "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, "
         "\"free_heap\": %lu, \"min_free_heap\": %lu, \"largest_free_block\": %lu, "
         "\"internal_free_heap\": %lu, \"internal_min_free_heap\": %lu, \"internal_largest_free_block\": %lu, "
@@ -755,8 +928,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
         "\"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, "
         "\"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, "
         "\"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, "
-        "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}, "
-        "\"task_stack\": {",
+        "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}, ",
         FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
         (unsigned long)free_heap,
         (unsigned long)min_free_heap,
@@ -786,8 +958,10 @@ esp_err_t system_status_handler(httpd_req_t *req)
         snap.relay.version.boot_major, snap.relay.version.boot_minor,
         snap.relay.version.boot_patch, snap.relay.version.boot_build);
 
+    len = append_cpu_status_json(resp, SYSTEM_STATUS_JSON_CAP, len, cpu);
+    len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len, "\"task_stack\": {");
     for (size_t i = 0; i < sizeof(task_metrics) / sizeof(task_metrics[0]); ++i) {
-        len = append_jsonf(resp, sizeof(resp), len,
+        len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len,
             "%s\"%s\":{\"stack_size_bytes\":%lu,\"high_watermark_bytes\":%lu,\"peak_used_bytes\":%lu}",
             i == 0 ? "" : ",",
             task_metrics[i].name,
@@ -795,10 +969,11 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)get_task_stack_high_watermark_bytes(task_metrics[i].handle),
             (unsigned long)get_task_stack_peak_used_bytes(task_metrics[i].handle, task_metrics[i].stack_size_bytes));
     }
-    len = append_jsonf(resp, sizeof(resp), len, "}}");
+    len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len, "}}");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
+    free(resp);
     return ESP_OK;
 }
 

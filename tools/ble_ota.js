@@ -93,8 +93,6 @@
     abortBtn: $('abortBtn'),
     uploadZone: $('uploadZone'),
     firmwareFile: $('firmwareFile'),
-    payloadSize: $('payloadSize'),
-    ctrlHex: $('ctrlHex'),
     connStatus: $('connStatus'),          // 共享连接指示器
     connStatusTxt: $('connStatusTxt'),    // 共享连接指示器文本
     connState: $('connState'),
@@ -118,6 +116,11 @@
 
   function currentTarget() {
     return TARGETS[window.flashTarget] || TARGETS.esp32;
+  }
+
+  function currentPayloadSize() {
+    const cfg = currentTarget();
+    return Math.max(32, Math.min(498, Number(cfg.recommendedPayload) || 480));
   }
 
   function flowTarget() {
@@ -324,7 +327,7 @@
     if (!Number.isFinite(totalSize) || totalSize <= 0) return;
     const safeBytes = Math.max(0, Math.min(totalSize, ackBytes >>> 0));
     const percent = (safeBytes / totalSize) * 100;
-    const payloadSize = Math.max(1, Number(els.payloadSize.value) || 480);
+    const payloadSize = Math.max(1, currentPayloadSize());
     const ackedPackets = Math.min(packetTotal, Math.ceil(safeBytes / payloadSize));
     const cfg = currentTarget();
     setProgress(percent, `[${cfg.label}] 已确认 ${ackedPackets}/${packetTotal} 包`);
@@ -363,8 +366,6 @@
       els.connectBtn.disabled = false;
     }
     els.disconnectBtn.disabled = !connected;
-    els.payloadSize.disabled = state.uploading;
-    els.ctrlHex.disabled = state.uploading;
     els.autoFlashBtn.disabled = !idle;
     els.abortBtn.disabled = !state.uploading;
 
@@ -373,7 +374,7 @@
     } else if (!state.notificationsEnabled) {
       setReadyHint('设备已连接，正在自动准备刷写通道。若长时间无响应，请断开后重连。');
     } else if (!state.selectedFile) {
-      setReadyHint('设备已连接。下一步请选择固件文件，并确认目标芯片与 Payload。');
+      setReadyHint('设备已连接。下一步请选择目标芯片与固件文件。');
     } else {
       setReadyHint('设备与文件都已就绪，可以直接开始刷写或执行一键刷写。');
     }
@@ -406,8 +407,6 @@
   function refreshTargetUi() {
     const cfg = currentTarget();
     updateBleStageLabels(cfg);
-    els.ctrlHex.value = cfg.ctrlHex;
-    els.payloadSize.value = String(cfg.recommendedPayload);
     if (state.selectedFile) updateFileInfo(state.selectedFile);
     setConnectionState(!!state.server);
     // 同步目标胶囊标签
@@ -552,7 +551,7 @@
       //   不再用 ackMinSeenSeq 作下界 —— 因为本 run 第一个窗口的 seq 本身就是 0..31，
       //   下界过严会把正常 ACK 也误判为越界（导致 ackBytes 永远 0）。
       if (state.uploading && state.activeTotalSize > 0) {
-        const payloadSize = Math.max(1, Number(els.payloadSize.value) || 480);
+        const payloadSize = Math.max(1, currentPayloadSize());
         const maxExpectedSeq = Math.ceil(state.activeTotalSize / payloadSize) - 1;
         if (ackSeq > maxExpectedSeq + BLE_OTA_ACK_WINDOW) {
           bleLog('ACK', `忽略越界 ACK: seq=${ackSeq} (run 范围 0..${maxExpectedSeq})`, 'W');
@@ -954,7 +953,7 @@
     els.fileName.textContent = file ? file.name : '-';
     els.fileType.textContent = file ? (file.name.toLowerCase().includes('.hex') ? 'Intel HEX' : 'Binary') : '-';
     els.fileSize.textContent = file ? formatBytes(file.size) : '0 B';
-    const payloadSize = Number(els.payloadSize.value) || 480;
+    const payloadSize = currentPayloadSize();
     const packets = file ? Math.ceil(file.size / payloadSize) : 0;
     els.packetCount.textContent = String(packets);
     els.sentCount.textContent = '0';
@@ -1141,7 +1140,7 @@
 
     const cfg = currentTarget();
     state.uploadTargetKey = window.flashTarget || 'esp32';
-    const payloadSize = Math.max(32, Math.min(498, Number(els.payloadSize.value) || 480));
+    const payloadSize = Math.max(32, Math.min(498, currentPayloadSize()));
     const file = state.selectedFile;
 
     state.abortRequested = false;
@@ -1401,7 +1400,7 @@
       setBleStageText('发送 0xF7 + SHA-256，等待设备端缓存校验...');
       showBleVerifyInfo(frontSha, '等待设备端比对...', { text: '已发送文件 SHA-256，等待 GD32 缓存校验' });
       await sleep(30);
-      const cmdHex = els.ctrlHex.value || cfg.ctrlHex;
+      const cmdHex = cfg.ctrlHex;
       const cmdBase = hexToBytes(cmdHex);
       const cmd = new Uint8Array(cmdBase.length + 32 + 2);
       cmd.set(cmdBase, 0);
@@ -1554,7 +1553,6 @@
     els.firmwareFile.addEventListener('change', syncSelectedFileFromInput);
     els.firmwareFile.addEventListener('input', syncSelectedFileFromInput);
     window.addEventListener('focus', () => setTimeout(syncSelectedFileFromInput, 0));
-    els.payloadSize.addEventListener('change', () => updateFileInfo(state.selectedFile));
   }
 
   // 暴露到 window，方便外部模式切换/集成时调用（默认 API：init / disconnect）

@@ -1,4 +1,4 @@
-﻿<!--
+<!--
   index.html - ESP32 OTA 中继控制台主页面
   支持 WiFi OTA（ESP32 本机 + GD32 中继）和 BLE OTA 双通道固件升级。
   配套脚本：app.js (WiFi OTA), ble_ota.js (BLE OTA), style.css (UI 样式)
@@ -58,18 +58,6 @@
             <div class="input-group">
               <input class="input" type="text" id="espIp" value="192.168.31.127" placeholder="输入 IP 地址">
               <button class="btn btn-outline" onclick="testConnection()">测试</button>
-            </div>
-          </div>
-          </div>
-          <div id="bleModeCards" style="display:none;">
-          <div class="row-2" id="bleParamRow" style="margin-top:0;">
-            <div class="form-row" style="margin:0;">
-              <label class="form-label" for="payloadSize">每包 Payload</label>
-              <input id="payloadSize" class="input" type="number" min="32" max="498" value="480">
-            </div>
-            <div class="form-row" style="margin:0;">
-              <label class="form-label" for="ctrlHex">触发命令（HEX）</label>
-              <input id="ctrlHex" class="input" type="text" value="F7" maxlength="8">
             </div>
           </div>
           </div>
@@ -157,7 +145,7 @@
               <b id="fileSha256" style="font-size:10px;word-break:break-all;font-family:var(--font-mono);">-</b>
             </div>
           </div>
-          <div class="footer-note">建议使用 Chrome / Edge。若首包失败，可将 Payload 从 480 降为 240 再试。</div>
+          <div class="footer-note">建议使用 Chrome / Edge。每包 Payload 与触发命令由系统按目标自动设置。</div>
           </div>
           <div style="height:12px"></div>
           <div id="wifiEsp32ActionPane">
@@ -302,7 +290,25 @@
           <button class="btn btn-ghost btn-sm card-head-btn" onclick="refreshSystemStatusNow(event)">刷新</button>
           <span class="collapse-arrow">▼</span>
         </div>
-        <div class="card-body">
+          <div class="card-body">
+          <div class="status-section-title">CPU 占用</div>
+          <div class="heap-group cpu-group">
+            <div class="heap-group-title">ESP32 Runtime <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(FreeRTOS)</span></div>
+            <div class="heap-bar-row">
+              <span class="heap-bar-text" id="cpuUsageText">等待采样...</span>
+              <span class="heap-bar-track"><span class="heap-bar-fill cpu-fill" id="cpuUsageFill"></span></span>
+              <span class="heap-bar-pct" id="cpuUsagePct">--</span>
+            </div>
+            <div class="heap-detail-row">
+              <span>空闲: <b id="cpuIdlePct">--</b></span>
+              <span>窗口: <b id="cpuSampleMs">--</b></span>
+              <span>任务数: <b id="cpuTaskCount">--</b></span>
+            </div>
+          </div>
+          <div class="status-task-list cpu-task-list" id="cpuTaskList">
+            <div class="status-empty">等待下一次状态刷新...</div>
+          </div>
+
           <div class="status-section-title">堆概况</div>
           <div class="heap-group">
             <div class="heap-group-title">内部 DRAM <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(数据堆)</span></div>
@@ -327,35 +333,37 @@
         </div>
       </div>
 
-      <!-- CAN panel -->
+      <!-- CAN workspace entry -->
       <div class="card collapsed">
         <div class="card-head" onclick="toggleCollapse(this)">
-          <span class="ico">📨</span> CAN 帧发送
+          <span class="ico">📨</span> CAN 通信页
           <span class="collapse-arrow">▼</span>
         </div>
         <div class="card-body">
-          <div class="can-grid">
-            <div class="form-row" style="margin:0"><label class="form-label">通道</label>
-              <select class="input" id="canChannel"><option value="0">CH0</option><option value="1">CH1</option><option value="2">CH2</option></select>
+          <div class="can-launch-card">
+            <div class="can-launch-copy">
+              <div class="can-launch-top">
+                <div>
+                  <div class="can-launch-kicker">CAN Workspace</div>
+                  <h3>独立 CAN 通信工作台</h3>
+                </div>
+                <span class="can-launch-badge">DBC / HEX</span>
+              </div>
+              <p class="can-launch-desc">导入 DBC 后自动读取报文和信号，按物理值实时组帧，并复用现有 <code>/can/send</code> 接口直接发送。</p>
+              <div class="can-launch-points">
+                <span class="can-launch-point">自动解析 DBC</span>
+                <span class="can-launch-point">信号实时组帧</span>
+                <span class="can-launch-point">保留原始 HEX 发送</span>
+              </div>
             </div>
-            <div class="form-row" style="margin:0"><label class="form-label">扩展帧 ID</label>
-              <input class="input" type="text" id="canId" value="0x18DA00F1">
+            <div class="can-launch-actions">
+              <a class="btn btn-primary can-launch-primary" href="can.html">进入 CAN 页面</a>
+              <button class="btn btn-outline can-launch-secondary" type="button" onclick="window.open('can.html','_blank','noopener')">新窗口打开</button>
             </div>
-            <div class="form-row" style="margin:0"><label class="form-label">DLC</label>
-              <input class="input" type="number" id="canDlc" value="8" min="1" max="64">
+            <div class="can-launch-foot">
+              <span class="can-launch-foot-label">说明</span>
+              <span>手工 CAN 表单已迁到独立页面，避免和 OTA 控制流混在一起；SPI 调试仍保留在当前页。</span>
             </div>
-            <div class="form-row" style="margin:0"><label class="form-label">数据 (HEX)</label>
-              <input class="input" type="text" id="canData" value="0102030405060708" placeholder="01020304...">
-            </div>
-          </div>
-          <div class="helper-note" id="canHint">输入十六进制数据后会自动检查字节数是否与 DLC 一致。</div>
-          <div class="btn-row">
-            <button class="btn btn-primary" onclick="sendCanFrame()">发送</button>
-            <button class="btn btn-outline" onclick="clearCanFields()">清空</button>
-          </div>
-          <div id="canResp" style="display:none;margin-top:12px;padding:12px;background:var(--bg-elevated);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;">
-            <div style="color:var(--text-label);margin-bottom:4px;">响应</div>
-            <div id="canRespText" style="color:var(--accent);"></div>
           </div>
         </div>
       </div>
@@ -418,7 +426,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260619e"></script>
+<script src="app.js?v=20260623a"></script>
 <script>
 window.connectionMode = window.connectionMode || 'wifi';
 window.flashTarget = window.flashTarget || 'esp32';
@@ -670,6 +678,6 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   applySharedModeUi();
 })();
 </script>
-<script src="ble_ota.js?v=20260617b"></script>
+<script src="ble_ota.js?v=20260625a"></script>
 </body>
 </html>
