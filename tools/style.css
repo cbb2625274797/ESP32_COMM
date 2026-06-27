@@ -1504,3 +1504,207 @@ code { color: #d3f9ff; font-family: var(--font-mono); }
   }
 }
 
+
+
+/* ===== ENHANCED ANIMATIONS (v20260625b) ===== */
+
+/* Global keyframes */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes popIn {
+  0%   { opacity: 0; transform: scale(.85); }
+  60%  { opacity: 1; transform: scale(1.04); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes ringPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(34,211,238,.55); }
+  70%  { box-shadow: 0 0 0 10px rgba(34,211,238,0); }
+  100% { box-shadow: 0 0 0 0 rgba(34,211,238,0); }
+}
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%      { transform: translateX(-4px); }
+  40%      { transform: translateX(4px); }
+  60%      { transform: translateX(-3px); }
+  80%      { transform: translateX(3px); }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes floatY {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-4px); }
+}
+@keyframes glowBreath {
+  0%, 100% { box-shadow: 0 0 8px var(--accent-dim); }
+  50%      { box-shadow: 0 0 18px rgba(34,211,238,.45); }
+}
+@keyframes flowDash {
+  to { background-position: 200% 0; }
+}
+
+/* Page entrance — header + cards staggered */
+.header-bar { animation: fadeInUp .45s ease both; }
+.main-layout > div > .card { animation: fadeInUp .5s ease both; }
+.main-layout > div:nth-child(1) > .card:nth-child(1) { animation-delay: .05s; }
+.main-layout > div:nth-child(1) > .card:nth-child(2) { animation-delay: .12s; }
+.main-layout > div:nth-child(1) > .card:nth-child(3) { animation-delay: .19s; }
+.main-layout > div:nth-child(1) > .card:nth-child(4) { animation-delay: .26s; }
+.main-layout > div:nth-child(2) > .card:nth-child(1) { animation-delay: .08s; }
+.main-layout > div:nth-child(2) > .card:nth-child(2) { animation-delay: .15s; }
+.main-layout > div:nth-child(2) > .card:nth-child(3) { animation-delay: .22s; }
+.main-layout > div:nth-child(2) > .card:nth-child(4) { animation-delay: .29s; }
+
+/* Card hover — lift + glow */
+.card {
+  transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease;
+}
+.card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(34,211,238,.28);
+  box-shadow: 0 10px 28px rgba(0,0,0,.35), 0 0 0 1px rgba(34,211,238,.08);
+}
+
+/* Brand dot — gentle ring pulse */
+.header-brand .dot-mark {
+  animation: ringPulse 2.2s ease-out infinite, glowBreath 3.6s ease-in-out infinite;
+}
+
+/* Pills — subtle hover */
+.pill { transition: transform .2s ease, border-color .2s ease, background .2s ease; }
+.pill:hover { transform: translateY(-1px); border-color: rgba(34,211,238,.3); }
+
+/* Button — press + sheen on hover for primary */
+.btn { position: relative; overflow: hidden; }
+.btn:active:not(:disabled) { transform: translateY(0) scale(.97); transition: transform .08s ease; }
+.btn-primary::before,
+.btn-success::before,
+.btn-danger::before {
+  content: "";
+  position: absolute; top: 0; left: -120%;
+  width: 60%; height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.35), transparent);
+  transform: skewX(-20deg);
+  transition: left .55s ease;
+  pointer-events: none;
+}
+.btn-primary:hover:not(:disabled)::before,
+.btn-success:hover:not(:disabled)::before,
+.btn-danger:hover:not(:disabled)::before {
+  left: 130%;
+}
+
+/* Upload zone — drag pulse + icon float */
+.upload-zone { transition: border-color .2s, background .2s, transform .2s; }
+.upload-zone:hover { transform: translateY(-1px); }
+.upload-zone .upload-ico {
+  display: inline-block;
+  transition: transform .25s ease;
+}
+.upload-zone:hover .upload-ico { animation: floatY 1.6s ease-in-out infinite; }
+.upload-zone.dragover { animation: ringPulse 1.2s ease-out infinite; }
+
+/* File info appearance */
+.file-info.show { animation: fadeInUp .3s ease both; }
+
+/* Progress bar — striped flow on active */
+.progress-fill {
+  background-image:
+    linear-gradient(90deg, #22d3ee, #06b6d4),
+    repeating-linear-gradient(45deg,
+      rgba(255,255,255,.18) 0 10px,
+      rgba(255,255,255,0) 10px 20px);
+  background-size: 100% 100%, 200% 100%;
+  background-blend-mode: normal, overlay;
+  animation: flowDash 1.4s linear infinite;
+}
+.progress-fill.done { animation: none; }
+
+/* Phase step capsule — pop when becoming active/done */
+.pp-step.active,
+.pp-step.done { animation: popIn .35s cubic-bezier(.4,1.4,.5,1) both; }
+
+/* Stage flow — connector grow + dot pop */
+.stage-node:not(:last-child)::after {
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent) 50%, var(--border) 50%, var(--border) 100%);
+  background-size: 200% 100%;
+  background-position: 100% 0;
+  transition: background-position .5s ease;
+}
+.stage-node.done:not(:last-child)::after,
+.stage-node.live:not(:last-child)::after {
+  background-position: 0% 0;
+}
+.stage-dot { transition: transform .3s ease, background .3s, border-color .3s, color .3s, box-shadow .3s; }
+.stage-node.live .stage-dot {
+  animation: ringPulse 1.6s ease-out infinite;
+}
+.stage-node.done .stage-dot { animation: popIn .35s cubic-bezier(.4,1.4,.5,1) both; }
+.stage-node.err  .stage-dot { animation: shake .4s ease both; }
+
+/* Stage status bar — slide in when state changes */
+.stage-status-bar.active,
+.stage-status-bar.ok,
+.stage-status-bar.err { animation: fadeInUp .3s ease both; }
+
+/* Stage result panel */
+.stage-result { animation: popIn .4s cubic-bezier(.4,1.4,.5,1) both; }
+
+/* Metric / badge values — number tick highlight */
+.metric .v,
+.badge-stat .v {
+  transition: color .3s ease, transform .3s ease;
+}
+.metric:hover,
+.badge-stat:hover {
+  border-color: rgba(34,211,238,.25);
+  transition: border-color .25s ease;
+}
+
+/* Conn indicator — light ring pulse when warn */
+.conn-indicator { transition: background .25s ease, border-color .25s ease; }
+.conn-indicator.warn .light { animation: ringPulse 1.4s ease-out infinite; }
+.conn-indicator.ok   .light { animation: glowBreath 3s ease-in-out infinite; }
+
+/* Heap / task bars — sheen */
+.heap-bar-track,
+.status-task-bar { position: relative; overflow: hidden; }
+.heap-bar-track::after,
+.status-task-bar::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.12) 50%, transparent 100%);
+  transform: translateX(-100%);
+  animation: shimmer 2.6s linear infinite;
+  background-size: 200% 100%;
+  pointer-events: none;
+}
+.heap-bar-fill,
+.status-task-bar-fill { transition: width .6s cubic-bezier(.4,0,.2,1); }
+
+/* Log lines — fresh entry fade-in */
+.log-line { animation: fadeIn .25s ease both; }
+
+/* Toast — pop and float */
+.toast.show { animation: popIn .35s cubic-bezier(.4,1.4,.5,1) both; }
+
+/* Reduced motion — respect user preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}

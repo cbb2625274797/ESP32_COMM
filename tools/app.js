@@ -274,6 +274,19 @@ function formatHttpErrorDetail(text) {
   if (detail.length > 180) detail = detail.slice(0, 177) + '...';
   return detail;
 }
+function isOtaBusyError(status, detail) {
+  var text = (detail || '').toLowerCase();
+  return status === 403 ||
+    status === 409 ||
+    status === 423 ||
+    text.indexOf('busy') >= 0 ||
+    text.indexOf('occupied') >= 0 ||
+    text.indexOf('another ota') >= 0 ||
+    text.indexOf('invalid state') >= 0 ||
+    text.indexOf('占用') >= 0 ||
+    text.indexOf('互斥') >= 0 ||
+    text.indexOf('系统忙') >= 0;
+}
 /** @description 显示 Toast 提示消息，支持 info/success/warning/error 类型。 */
 function showToast(message, type) {
   type = type || 'success';
@@ -1289,7 +1302,13 @@ function clearFile(chip) {
 /** @description 启动 ESP32 本机 OTA 上传流程（互斥获取→分块上传→SHA验证→重启）。 */
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
-  if (!file || isUploading) return;
+  if (!file) return;
+  if (isUploading) {
+    var busyChip = (activeUploadChip || window.flashTarget || chip || 'ota').toUpperCase();
+    addLog('W', '上传', '已有 ' + busyChip + ' OTA 正在进行，拒绝新的 ' + chip.toUpperCase() + ' 上传');
+    showToast('OTA 通道正在占用，请等待当前刷写结束', 'error');
+    return;
+  }
   pausePollingForUpload();
   // ★ 必须先抢锁再 await：守卫同步设置，await 期间重复点击才能被拦下。
   //   旧实现把 isUploading 设在 await handle.getFile() 之后 → 用户在 BLE 期间
@@ -1480,9 +1499,10 @@ async function startUpload(chip) {
           setProgress(45, '上传完成，校验并触发 GD32 OTA...');
           triggerGd32Relay();
         }
-      } else if (xhr.status === 403) {
-        addLog('E', '上传', 'ESP32 OTA 被其他通道占用（BLE/WiFi 互斥），请稍后重试');
-        showToast('ESP32 OTA 被其他通道占用，请稍后重试', 'error');
+      } else if (isOtaBusyError(xhr.status, formatHttpErrorDetail(xhr.responseText))) {
+        var busyDetail = formatHttpErrorDetail(xhr.responseText);
+        addLog('E', '上传', chip.toUpperCase() + ' OTA 被其他通道占用（BLE/WiFi 互斥）' + (busyDetail ? ': ' + busyDetail : ''));
+        showToast('OTA 通道被占用，请稍后重试', 'error');
         cleanupAfterOtaFailure('通道被占用');
       } else {
         var detail = formatHttpErrorDetail(xhr.responseText);

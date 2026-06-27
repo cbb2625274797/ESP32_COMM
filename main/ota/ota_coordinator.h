@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_err.h"
+#include "app_config.h"        // OTA_MAX_FIRMWARE_SIZE / GD32_OTA_PACKET_SIZE（validateGd32Size 用）
 #include "storage/gd32_flash_store.h"
 #include "relay/ota_relay.h"   // IRelayListener 接口定义 + RelaySnapshot（H4 解耦）
 
@@ -36,6 +37,14 @@ typedef enum {
     OTA_SYS_ESP32_REBOOTING,    // 即将重启 ESP32
     OTA_SYS_ERROR               // 错误状态
 } ota_system_state_t;
+
+// ============================================================
+// OTA 传输通道标识（用于同类型重启时区分同通道/跨通道）
+// ============================================================
+typedef enum {
+    OTA_CHANNEL_WIFI = 0,
+    OTA_CHANNEL_BLE = 1,
+} ota_channel_t;
 
 // ============================================================
 // OTA 系统全量只读快照（PR1: 收口状态读取）
@@ -108,9 +117,21 @@ public:
      * @brief 传输层开始接收 GD32 固件前调用。
      *        若系统正忙（ESP32 OTA 进行中或 GD32 中继中），返回失败。
      * @param total_size 固件总字节数。
+     * @param channel 发起通道（WiFi/BLE），用于同类型重启时区分同通道/跨通道。
      * @return ESP_OK 成功，ESP_ERR_INVALID_STATE 系统忙。
      */
-    esp_err_t beginGd32Storage(uint32_t total_size);
+    esp_err_t beginGd32Storage(uint32_t total_size, ota_channel_t channel);
+
+    /**
+     * @brief 统一 GD32 OTA 写入前的准备工作：校验大小 + begin + 擦除分区 + 清空 meta + 写入初始 meta。
+     *        供 BLE seq=0 首包 / HTTP GD32 upload（非 prepared 复用路径）调用，
+     *        消除两路径对"擦除/meta 初始化"序列的隐式差异（原 BLE 路径未擦除分区）。
+     *        任意步骤失败时内部调 abortCurrent 清理，调用方无需再清理。
+     * @param total_size 固件总字节数。
+     * @param channel 发起通道（WiFi/BLE）。
+     * @return ESP_OK 成功；ESP_ERR_INVALID_SIZE 大小非法；ESP_ERR_INVALID_STATE 系统忙；其他擦除/写入错误。
+     */
+    esp_err_t prepareGd32Storage(uint32_t total_size, ota_channel_t channel);
 
     /**
      * @brief GD32 固件接收完毕时调用。
@@ -127,21 +148,30 @@ public:
      * @param len 数据长度。
      * @return ESP_OK 成功。
      */
-    esp_err_t writeGd32Chunk(uint32_t offset, const uint8_t *data, size_t len);
+    inline esp_err_t writeGd32Chunk(uint32_t offset, const uint8_t *data, size_t len)
+    {
+        return Gd32FlashStore::instance().flashWriteChunk(offset, data, len);
+    }
 
     /**
      * @brief 保存 GD32 OTA 元数据。
      * @param meta 元数据结构体。
      * @return ESP_OK 成功。
      */
-    esp_err_t saveGd32Meta(const ota_meta_t *meta);
+    inline esp_err_t saveGd32Meta(const ota_meta_t *meta)
+    {
+        return Gd32FlashStore::instance().metaSave(meta);
+    }
 
     /**
      * @brief 加载 GD32 OTA 元数据。
      * @param meta 输出元数据结构体。
      * @return ESP_OK 成功。
      */
-    esp_err_t loadGd32Meta(ota_meta_t *meta);
+    inline esp_err_t loadGd32Meta(ota_meta_t *meta)
+    {
+        return Gd32FlashStore::instance().metaLoad(meta);
+    }
 
     /**
      * @brief 更新 GD32 OTA 元数据的进度。
@@ -149,13 +179,19 @@ public:
      * @param last_seq 最后包序号。
      * @return ESP_OK 成功。
      */
-    esp_err_t updateGd32Meta(uint32_t stored_size, uint32_t last_seq);
+    inline esp_err_t updateGd32Meta(uint32_t stored_size, uint32_t last_seq)
+    {
+        return Gd32FlashStore::instance().metaUpdate(stored_size, last_seq);
+    }
 
     /**
      * @brief 清除 GD32 OTA 元数据。
      * @return ESP_OK 成功。
      */
-    esp_err_t clearGd32Meta();
+    inline esp_err_t clearGd32Meta()
+    {
+        return Gd32FlashStore::instance().metaClear();
+    }
 
     /**
      * @brief 校验前端 SHA-256 与设备端固件是否一致。
@@ -163,21 +199,52 @@ public:
      * @param out_device_sha 输出设备端 32 字节 SHA（可为 nullptr）。
      * @return ESP_OK 匹配，ESP_ERR_INVALID_CRC 不匹配。
      */
-    esp_err_t verifyGd32Firmware(const uint8_t frontend_sha32[32],
-                                  uint8_t out_device_sha[32]);
+    inline esp_err_t verifyGd32Firmware(const uint8_t frontend_sha32[32],
+                                         uint8_t out_device_sha[32])
+    {
+        return Gd32FlashStore::instance().verifyFrontendSha(frontend_sha32, out_device_sha);
+    }
 
     /**
      * @brief 计算 GD32 固件 SHA-256 并写入元数据。
      * @return ESP_OK 成功。
      */
-    esp_err_t finalizeGd32Checksum();
+    inline esp_err_t finalizeGd32Checksum()
+    {
+        return Gd32FlashStore::instance().metaFinalizeChecksum();
+    }
 
     /**
      * @brief 擦除 GD32 OTA 分区。
      * @param size 擦除大小。
      * @return ESP_OK 成功。
      */
-    esp_err_t eraseGd32Partition(uint32_t size);
+    inline esp_err_t eraseGd32Partition(uint32_t size)
+    {
+        return Gd32FlashStore::instance().erasePartition(size);
+    }
+
+    /**
+     * @brief 校验 GD32 固件大小是否合法（BLE/HTTP 双通道共用）。
+     *
+     * 统一规则：raw==0 或 raw>MAX 拒绝；按 GD32_OTA_PACKET_SIZE 向上取整后仍>MAX 拒绝。
+     * 调用方各自翻译为通道特定错误码（BLE: BLE_OTA_FINISH_ERR_GD32_SIZE；HTTP: HTTPD_500）。
+     *
+     * @param raw_size 固件原始字节数。
+     * @return ESP_OK 合法；ESP_ERR_INVALID_SIZE 非法。
+     */
+    inline esp_err_t validateGd32Size(uint32_t raw_size) const
+    {
+        if (raw_size == 0U || raw_size > (uint32_t)OTA_MAX_FIRMWARE_SIZE) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        const uint32_t packet_size = (uint32_t)GD32_OTA_PACKET_SIZE;
+        const uint32_t rounded = ((raw_size + packet_size - 1U) / packet_size) * packet_size;
+        if (rounded > (uint32_t)OTA_MAX_FIRMWARE_SIZE) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        return ESP_OK;
+    }
 
     // ── GD32 中继阶段 ──
     /**
@@ -205,17 +272,19 @@ public:
      * @brief ESP32 OTA 开始接收固件。
      *        内部委托 Esp32OtaCore::begin()。
      * @param total_size 固件总字节数。
+     * @param channel 发起通道（WiFi/BLE），用于同类型重启时区分同通道/跨通道。
      * @return ESP_OK 成功，ESP_ERR_INVALID_STATE 系统忙或通道被占用。
      */
-    esp_err_t beginEsp32Ota(uint32_t total_size);
+    esp_err_t beginEsp32Ota(uint32_t total_size, ota_channel_t channel);
 
     /**
      * @brief 发起 ESP32 OTA，若被 ESP_ERR_INVALID_STATE 拒绝则 forceCleanup 后重试一次。
      *        封装 BLE/WiFi 两端完全相同的重试模式，调用方只需调一次。
      * @param total_size 固件总字节数。
+     * @param channel 发起通道（WiFi/BLE）。
      * @return ESP_OK 成功；其他 = 协调器拒绝或 Esp32OtaCore::begin 失败。
      */
-    esp_err_t beginEsp32OtaWithRetry(uint32_t total_size);
+    esp_err_t beginEsp32OtaWithRetry(uint32_t total_size, ota_channel_t channel);
 
     /**
      * @brief ESP32 OTA 固件接收完毕，准备收尾。
@@ -257,6 +326,25 @@ public:
      */
     void abortCurrent();
 
+    /**
+     * @brief 获取当前 OTA 会话的 epoch（代次）。
+     *        每次 beginEsp32Ota/beginGd32Storage 成功时递增。
+     *        传输层 handler 在 begin 成功后捕获 epoch，
+     *        在失败清理时通过 abortCurrentIfEpoch() 检查是否仍为当前会话，
+     *        避免旧 handler 的清理代码误中止新会话（同类型重启场景）。
+     * @return 当前 epoch 值。
+     */
+    uint32_t getOtaEpoch() const;
+
+    /**
+     * @brief 仅当 epoch 匹配当前会话时才中止 OTA。
+     *        用于旧 handler 的失败清理路径：若新请求已经接管（epoch 不匹配），
+     *        旧 handler 不应调 abortCurrent，否则会误中止新会话。
+     * @param epoch 调用方在 begin 成功时捕获的 epoch。
+     * @return true 已中止（epoch 匹配），false 未中止（新会话已接管）。
+     */
+    bool abortCurrentIfEpoch(uint32_t epoch);
+
     // ── 状态查询 ──
     /**
      * @brief 一次性读取系统 OTA 全量状态快照（PR1: 收口状态读取）。
@@ -283,25 +371,67 @@ public:
     ota_system_state_t getSystemState() const;
 
     /**
+     * @brief 获取当前 OTA 会话的发起通道（WiFi/BLE）。
+     *        仅在活跃状态（ESP32_RECEIVING / GD32_STORING）下有意义；
+     *        IDLE 等非活跃状态返回值未定义（默认 OTA_CHANNEL_WIFI）。
+     * @return 当前会话通道枚举值。
+     */
+    ota_channel_t getOtaChannel() const;
+
+    /**
+     * @brief 把状态枚举转成可读字符串（不加锁，纯函数）。
+     *        供持锁代码路径和已取一次状态值的调用方复用，避免二次加锁。
+     * @param s 状态枚举值。
+     * @return 状态名称字符串（如 "IDLE"、"GD32_STORING" 等）。
+     */
+    static const char* stateToString(ota_system_state_t s);
+
+    /**
+     * @brief 检查给定状态值是否属于空闲态（不加锁，纯判断）。
+     *        调用方先 getSystemState() 取一次再传入，避免连续加锁。
+     * @param s 状态枚举值。
+     * @return true 表示 IDLE/STORED/COMPLETE。
+     */
+    bool isIdleState(ota_system_state_t s) const;
+
+    /**
+     * @brief 检查给定状态值是否属于 GD32 忙态（不加锁，纯判断）。
+     * @param s 状态枚举值。
+     * @return true 表示 STORING 或 RELAYING。
+     */
+    bool isGd32BusyState(ota_system_state_t s) const;
+
+    /**
+     * @brief 检查给定状态值是否属于 ESP32 忙态（不加锁，纯判断）。
+     * @param s 状态枚举值。
+     * @return true 表示 RECEIVING/FINALIZING/REBOOTING。
+     */
+    bool isEsp32BusyState(ota_system_state_t s) const;
+
+    /**
      * @brief 检查系统是否空闲（可接受新的 OTA 请求）。
+     *        内部仍加锁取一次状态后调 isIdleState()。
      * @return true 系统空闲（IDLE/STORED/COMPLETE）。
      */
     bool isIdle() const;
 
     /**
      * @brief 检查是否有 GD32 相关操作正在进行。
+     *        内部仍加锁取一次状态后调 isGd32BusyState()。
      * @return true 表示 STORING 或 RELAYING。
      */
     bool isGd32Busy() const;
 
     /**
      * @brief 检查是否有 ESP32 OTA 正在进行。
+     *        内部仍加锁取一次状态后调 isEsp32BusyState()。
      * @return true 表示 RECEIVING/FINALIZING/REBOOTING。
      */
     bool isEsp32Busy() const;
 
     /**
      * @brief 获取系统状态的可读字符串描述。
+     *        内部委托 stateToString(getSystemState())，保持向后兼容。
      * @return 状态名称字符串（如 "IDLE"、"GD32_STORING" 等）。
      */
     const char* getSystemStateString() const;
@@ -385,6 +515,10 @@ private:
     //   必须在已持锁状态下调用。
     void watchdogCheckLocked();
 
+    // ★ 已持锁版本的中止序列：根据当前 m_sysState 调用对应子模块的清理，
+    //   并把状态机复位为 IDLE。abortCurrent / abortCurrentIfEpoch 共享此实现。
+    void doAbortLocked();
+
     // 系统状态
     ota_system_state_t m_sysState = OTA_SYS_IDLE;
 
@@ -393,6 +527,15 @@ private:
 
     // GD32 存储跟踪
     bool m_gd32StorageDone = false;
+
+    // OTA 会话代次：每次 beginEsp32Ota/beginGd32Storage 成功时递增。
+    // 传输层 handler 在 begin 后捕获 epoch，失败清理时通过 abortCurrentIfEpoch
+    // 检查 epoch 是否仍匹配，避免旧 handler 误中止同类型重启后的新会话。
+    uint32_t m_otaEpoch = 0;
+
+    // 当前 OTA 会话的发起通道（WiFi/BLE），用于同类型重启时区分同通道/跨通道。
+    // 仅在同类型活跃状态（ESP32_RECEIVING / GD32_STORING）下有意义。
+    ota_channel_t m_otaChannel = OTA_CHANNEL_WIFI;
 
     // 互斥锁（M1/L3: mutable 允许在 const 方法中加锁，消除 const_cast）
     mutable SemaphoreHandle_t m_mutex = nullptr;

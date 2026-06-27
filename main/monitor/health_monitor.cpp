@@ -1,4 +1,4 @@
-﻿/*
+/*
  * health_monitor.cpp - 系统健康监控
  * 包含：健康状态管理 + WiFi RSSI 监控 + 温度监控
  *
@@ -46,6 +46,21 @@ void HealthMonitor::init()
     }
 }
 
+/**
+  * @brief 反初始化：停止并删除温度监控定时器，回收 esp_timer 资源。
+  *        当前 HealthMonitor 任务为无限循环，无显式删除路径，
+  *        本方法预留给未来停用场景（如安全关机后停止监控）使用。
+  */
+void HealthMonitor::deinit()
+{
+    if (m_tempTimer != nullptr) {
+        esp_timer_stop(m_tempTimer);
+        esp_timer_delete(m_tempTimer);
+        m_tempTimer = nullptr;
+        DEBUG_INFO("HEALTH", "温度监控定时器已停止并删除");
+    }
+}
+
 // ============================================================
 // 线程安全的健康状态读写
 // ============================================================
@@ -55,10 +70,8 @@ void HealthMonitor::init()
  */
 health_state_t HealthMonitor::getState()
 {
-    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
-    health_state_t s = m_healthState;
-    if (m_mutex) xSemaphoreGive(m_mutex);
-    return s;
+    LockGuard lock(m_mutex);
+    return m_healthState;
 }
 
 /**
@@ -67,9 +80,8 @@ health_state_t HealthMonitor::getState()
  */
 void HealthMonitor::setState(health_state_t newState)
 {
-    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
+    LockGuard lock(m_mutex);
     m_healthState = newState;
-    if (m_mutex) xSemaphoreGive(m_mutex);
 }
 
 // ============================================================
@@ -90,10 +102,8 @@ health_state_t HealthMonitor::getCurrent()
  */
 float HealthMonitor::getLastTemperature()
 {
-    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
-    float t = m_lastTemperature;
-    if (m_mutex) xSemaphoreGive(m_mutex);
-    return t;
+    LockGuard lock(m_mutex);
+    return m_lastTemperature;
 }
 
 /**
@@ -104,10 +114,13 @@ float HealthMonitor::getLastTemperature()
  */
 bool HealthMonitor::getLastWifiRssi(int8_t *out_rssi, uint32_t *out_age_ms)
 {
-    if (m_mutex) xSemaphoreTake(m_mutex, portMAX_DELAY);
-    int64_t lastMs = m_lastWifiRssiMs;
-    int8_t  rssi   = m_lastWifiRssi;
-    if (m_mutex) xSemaphoreGive(m_mutex);
+    int64_t lastMs;
+    int8_t  rssi;
+    {
+        LockGuard lock(m_mutex);
+        lastMs = m_lastWifiRssiMs;
+        rssi   = m_lastWifiRssi;
+    }
 
     if (lastMs <= 0) {
         return false;
@@ -138,9 +151,10 @@ void HealthMonitor::tempMonitorCallback(void *arg)
         return;
     }
 
-    if (self.m_mutex) xSemaphoreTake(self.m_mutex, portMAX_DELAY);
-    self.m_lastTemperature = temp;
-    if (self.m_mutex) xSemaphoreGive(self.m_mutex);
+    {
+        LockGuard lock(self.m_mutex);
+        self.m_lastTemperature = temp;
+    }
 
     if (temp >= TEMP_CRITICAL) {
         self.setState(SYS_SAFE_SHUTDOWN);
@@ -180,17 +194,17 @@ void HealthMonitor::taskEntry(void *pvParameters)
     }
 
     // 定时器，每1秒读取一次温度
-    esp_timer_handle_t temp_timer;
     esp_timer_create_args_t timer_args = {};
     timer_args.callback = &tempMonitorCallback;
     timer_args.arg = nullptr;
     timer_args.name = "temp_monitor";
     timer_args.dispatch_method = ESP_TIMER_TASK;
 
-    if (esp_timer_create(&timer_args, &temp_timer) == ESP_OK) {
-        esp_timer_start_periodic(temp_timer, 1000000);  // 1秒
+    if (esp_timer_create(&timer_args, &self.m_tempTimer) == ESP_OK) {
+        esp_timer_start_periodic(self.m_tempTimer, 1000000);  // 1秒
         DEBUG_INFO("MON", "温度监控定时器已启动 (1秒间隔)");
     } else {
+        self.m_tempTimer = nullptr;
         DEBUG_ERR("MON", "创建温度监控定时器失败");
     }
 
@@ -246,7 +260,12 @@ health_status_t HealthMonitor::checkBeforeOta()
         DEBUG_WARN("HEALTH", "OTA 前检查: SYS_WARNING，继续传输但需注意");
     }
 
-    if (!m_wifiConnected) {
+    bool wifi_connected;
+    {
+        LockGuard lock(m_mutex);
+        wifi_connected = m_wifiConnected;
+    }
+    if (!wifi_connected) {
         DEBUG_WARN("HEALTH", "OTA 前检查: WiFi 未连接");
         return HEALTH_MON_CRITICAL;
     }
@@ -320,6 +339,7 @@ health_status_t HealthMonitor::checkBeforeOtaRelay()
  */
 void HealthMonitor::setWifiConnected(bool connected)
 {
+    LockGuard lock(m_mutex);
     m_wifiConnected = connected;
 }
 
@@ -348,10 +368,13 @@ health_status_t HealthMonitor::updateFromWifiRssi(int8_t rssi)
         return HEALTH_MON_WARNING;
     }
 
+    // RSSI 已恢复正常（>= WIFI_RSSI_NORMAL）：从 WARNING 或 CRITICAL 任一状态降级到 NORMAL。
+    // 历史缺陷：原仅当 cur == SYS_WARNING 时降级，导致 CRITICAL 状态下 RSSI 恢复正常无法降级。
+    // 注意：SAFE_SHUTDOWN 不应被 RSSI 恢复降级，仅处理 WARNING/CRITICAL。
     health_state_t cur = getState();
-    if (cur == SYS_WARNING && rssi >= WIFI_RSSI_NORMAL) {
+    if ((cur == SYS_WARNING || cur == SYS_CRITICAL) && rssi >= WIFI_RSSI_NORMAL) {
         setState(SYS_NORMAL);
-        DEBUG_INFO("HEALTH", "WiFi RSSI 恢复: %d dBm >= %d dBm", rssi, WIFI_RSSI_NORMAL);
+        DEBUG_INFO("HEALTH", "WiFi RSSI 恢复: %d dBm >= %d dBm (从 %d 降级)", rssi, WIFI_RSSI_NORMAL, (int)cur);
         logEvent("WIFI恢复", rssi);
     }
 

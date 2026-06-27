@@ -1,4 +1,4 @@
-﻿/*
+/*
  * spi_master.cpp - SPI Master 驱动实现
  * T1.1 - T1.4
  * ESP-IDF 6.0 适配版本
@@ -707,7 +707,7 @@ esp_err_t SpiMaster::transferWithRetry(uint8_t cmd, const uint8_t *payload,
     DEBUG_INFO("SPI", "SPI 传输 (带重试): cmd=0x%02X, 最大重试=%d", cmd, max_retries);
 
     while (retry_count < max_retries) {
-        ret = syncTransferUnlocked(cmd, payload, payload_len,
+        ret = transferRequestResponse(cmd, payload, payload_len,
                            recv_buf, recv_len, 3000);
         if (ret == ESP_OK) {
             if (retry_count > 0) {
@@ -728,34 +728,3 @@ esp_err_t SpiMaster::transferWithRetry(uint8_t cmd, const uint8_t *payload,
 
 // CANFD 接口已迁移至 transport/canfd_bridge.cpp（M4 解耦）
 
-// ============================================================
-// 无锁内部版本实现
-// ============================================================
-/**
- * @brief 无锁版本的同步 SPI 传输实现。
- * @param cmd 命令字节。
- * @param payload 负载数据缓冲区。
- * @param payload_len 负载数据长度。
- * @param recv_buf 接收数据缓冲区。
- * @param recv_len 接收数据长度。
- * @param timeout_ms 超时时间（毫秒）。
- * @return ESP_OK 表示成功，否则返回错误码。
- */
-esp_err_t SpiMaster::syncTransferUnlocked(uint8_t cmd, const uint8_t *payload,
-                                          size_t payload_len, uint8_t *recv_buf,
-                                          size_t recv_len, uint32_t timeout_ms)
-{
-    return transferRequestResponse(cmd, payload, payload_len, recv_buf, recv_len, timeout_ms);
-}
-
-/**
- * @brief 无锁版本的 SPI 发送实现。
- * @param cmd 命令字节。
- * @param payload 负载数据缓冲区。
- * @param len 负载数据长度。
- * @return ESP_OK 表示成功，否则返回错误码。
- */
-esp_err_t SpiMaster::sendUnlocked(uint8_t cmd, const uint8_t *payload, size_t len)
-{
-    return transferRequestResponse(cmd, payload, len, NULL, 0, 0U);
-}

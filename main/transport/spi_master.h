@@ -1,4 +1,4 @@
-﻿/*
+/*
  * spi_master.h - SPI Master 驱动头文件
  * CANFD 3通道发送接口 + 底层 SPI 总线
  *
@@ -182,27 +182,6 @@ private:
 
 
     // 无锁内部版本（供已持锁的公共方法调用，避免递归死锁）
-    /**
-     * @brief 无锁版本的同步 SPI 传输（调用者须已持有锁）。
-     * @param cmd 命令字节。
-     * @param payload 负载数据缓冲区。
-     * @param payload_len 负载数据长度。
-     * @param recv_buf 接收数据缓冲区。
-     * @param recv_len 接收数据长度。
-     * @param timeout_ms 超时时间（毫秒）。
-     * @return ESP_OK 表示成功，否则返回错误码。
-     */
-    esp_err_t syncTransferUnlocked(uint8_t cmd, const uint8_t *payload,
-                                   size_t payload_len, uint8_t *recv_buf,
-                                   size_t recv_len, uint32_t timeout_ms);
-    /**
-     * @brief 无锁版本的 SPI 发送（调用者须已持有锁）。
-     * @param cmd 命令字节。
-     * @param payload 负载数据缓冲区。
-     * @param len 负载数据长度。
-     * @return ESP_OK 表示成功，否则返回错误码。
-     */
-    esp_err_t sendUnlocked(uint8_t cmd, const uint8_t *payload, size_t len);
     /**
      * @brief 无锁版本的 OTA 响应轮询（调用者须已持有锁）。
      * @param resp_type 输出响应类型。

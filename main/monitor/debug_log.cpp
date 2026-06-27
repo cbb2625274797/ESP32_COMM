@@ -1,4 +1,4 @@
-﻿/*
+/*
  * debug_log.cpp - 调试日志输出实现
  *
  * 日志会同时写入三处：
@@ -120,6 +120,8 @@ char* DebugLog::ringDrainJson(int *out_len)
     int count = ringCount();
     int capacity = count * (LOG_RING_SIZE * 2) + 16;
     if (capacity < 16) capacity = 16;
+    // 当 count 较大（如 64）时 capacity 可能达 32KB+，单次 malloc 有风险。
+    //   当前为简化实现保留单次 malloc；若后续日志量增大，可改为按 8KB 分块 realloc。
     char *buf = (char*)malloc(capacity);
     if (!buf) return NULL;
 
@@ -130,10 +132,22 @@ char* DebugLog::ringDrainJson(int *out_len)
     int entryLen = 0;
 
     while (ringPopOldest(entry, sizeof(entry), &entryLen) && entryLen > 0) {
-        if (!first) buf[pos++] = ',';
+        // 逗号写入前做边界检查，预留 4 字节给 ']' + '\0' 及末尾余量
+        if (!first) {
+            if (pos + 1 >= capacity - 4) break;
+            buf[pos++] = ',';
+        }
         first = false;
         buf[pos++] = '"';
+
+        // 单条日志转义后超过 LOG_RING_SIZE * 2 时截断，标记 "..." 后缀
+        int content_start = pos;
+        bool truncated = false;
         for (int i = 0; i < entryLen && pos < capacity - 4; i++) {
+            if (pos - content_start >= LOG_RING_SIZE * 2) {
+                truncated = true;
+                break;
+            }
             char c = entry[i];
             if (c == '"') { buf[pos++] = '\\'; buf[pos++] = '"'; }
             else if (c == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
@@ -141,6 +155,14 @@ char* DebugLog::ringDrainJson(int *out_len)
             else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r'; }
             else if (c == '\t') { buf[pos++] = '\\'; buf[pos++] = 't'; }
             else if ((unsigned char)c >= 0x20) { buf[pos++] = c; }
+        }
+        if (truncated) {
+            // 确保 "..." + '"' + ']' + '\0' (共 6 字节) 有空间才写入标记
+            if (pos + 6 <= capacity) {
+                buf[pos++] = '.';
+                buf[pos++] = '.';
+                buf[pos++] = '.';
+            }
         }
         buf[pos++] = '"';
     }
@@ -216,6 +238,8 @@ esp_err_t DebugLog::uartInit()
     }
 
     m_uartInitialized = true;
+    // 标记 UART 真正可用，send() 依据此标志决定是否调用 uart_write_bytes
+    m_uartAvailable = true;
     ESP_LOGD(TAG, "UART0 调试输出已初始化 (TX=GPIO%d, RX=GPIO%d, %d baud)",
              UART_DEBUG_TX_GPIO, UART_DEBUG_RX_GPIO, UART_DEBUG_BAUD_RATE);
 
@@ -255,7 +279,13 @@ esp_err_t DebugLog::init()
         return ESP_OK;
     }
 
-    uartInit();
+    // 检查 uartInit 返回值；失败时仍让 ring buffer 模式工作，
+    //   但记录"UART 不可用"日志，并在 send() 中跳过 uart_write_bytes 调用。
+    esp_err_t uart_ret = uartInit();
+    if (uart_ret != ESP_OK) {
+        ESP_LOGW(TAG, "UART 不可用，仅 ring buffer 模式 (err=%s)", esp_err_to_name(uart_ret));
+        m_uartAvailable = false;
+    }
 
     m_logRingMutex = xSemaphoreCreateMutex();
 
@@ -302,8 +332,8 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
     esp_err_t udp_ret = ESP_FAIL;
     esp_err_t uart_ret = ESP_FAIL;
 
-    // UART 通道
-    if (m_uartInitialized) {
+    // UART 通道（UART 不可用时跳过 uart_write_bytes 调用）
+    if (m_uartAvailable) {
         uart_ret = uartSend(data, len);
     }
 

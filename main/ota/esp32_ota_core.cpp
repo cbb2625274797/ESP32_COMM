@@ -69,7 +69,7 @@ Esp32OtaCore& Esp32OtaCore::instance()
 
 /**
   * @brief 复位所有状态变量。
- */
+  */
 void Esp32OtaCore::resetState()
 {
     m_active = false;
@@ -79,6 +79,39 @@ void Esp32OtaCore::resetState()
     m_shaComputed = false;
     memset(m_sha256, 0, sizeof(m_sha256));
     m_ended = false;
+}
+
+/**
+  * @brief begin() 失败后的统一清理。
+  *        仅释放 mutex + 复位状态（不调 esp_ota_abort，
+  *        begin 失败时 m_handle 未成功创建，无需也不能 abort）。
+  * @param code 返回给调用方的错误码。
+  * @return 透传 code。
+  */
+esp_err_t Esp32OtaCore::beginCleanupAndReturn(esp_err_t code)
+{
+    releaseMutex();
+    resetState();
+    return code;
+}
+
+/**
+  * @brief finalize() 失败后的统一清理。
+  *        若 esp_ota_end 未成功（m_ended=false），调 esp_ota_abort 释放 handle；
+  *        然后复位 m_ended、释放 mutex、复位状态，返回 code。
+  *        与现有 abort() 的 m_ended 守卫语义一致，避免 end 成功后误调 abort。
+  * @param code 返回给调用方的错误码。
+  * @return 透传 code。
+  */
+esp_err_t Esp32OtaCore::finalizeCleanupAndReturn(esp_err_t code)
+{
+    if (!m_ended) {
+        esp_ota_abort(m_handle);
+    }
+    m_ended = false;
+    releaseMutex();
+    resetState();
+    return code;
 }
 
 /**
@@ -125,8 +158,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
 
     if (m_partition == NULL) {
         DEBUG_ERR(TAG, "找不到可用的 OTA 分区");
-        releaseMutex();
-        return ESP_FAIL;
+        return beginCleanupAndReturn(ESP_FAIL);
     }
 
     DEBUG_INFO(TAG, "OTA 目标分区: %s, size=%u, address=0x%lx",
@@ -135,9 +167,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     if (total_size > m_partition->size) {
         DEBUG_ERR(TAG, "固件太大: %u > 分区大小: %u",
                   (unsigned)total_size, (unsigned)m_partition->size);
-        m_partition = nullptr;
-        releaseMutex();
-        return ESP_FAIL;
+        return beginCleanupAndReturn(ESP_FAIL);
     }
 
     // BLE OTA 修复：传固件实际大小而非分区全尺寸，避免全分区擦除导致
@@ -151,10 +181,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     esp_err_t err = esp_ota_begin(m_partition, erase_size, &m_handle);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(err));
-        m_partition = nullptr;
-        m_handle = 0;
-        releaseMutex();
-        return err;
+        return beginCleanupAndReturn(err);
     }
 
     m_received = 0;
@@ -280,11 +307,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         esp_err_t sha_err = computeShaFromPartition();
         if (sha_err != ESP_OK) {
             DEBUG_ERR(TAG, "SHA 计算失败: %s，中止", esp_err_to_name(sha_err));
-            esp_ota_abort(m_handle);
-            m_ended = false;
-            releaseMutex();
-            resetState();
-            return sha_err;
+            return finalizeCleanupAndReturn(sha_err);
         }
 
         char device_hex[65] = {0};
@@ -311,11 +334,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         } else {
             DEBUG_ERR(TAG, "SHA-256 不匹配: frontend=%s device=%s",
                       frontend_sha_hex, device_hex);
-            esp_ota_abort(m_handle);
-            m_ended = false;
-            releaseMutex();
-            resetState();
-            return ESP_ERR_INVALID_VERSION;
+            return finalizeCleanupAndReturn(ESP_ERR_INVALID_VERSION);
         }
     } else if (out_device_sha_hex) {
         // 未提供前端 SHA，但仍计算设备端 SHA 供输出
@@ -332,11 +351,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_end 失败: %s (0x%x)", esp_err_to_name(err), (unsigned)err);
         // end 失败时仍可 abort（未真正 end）
-        esp_ota_abort(m_handle);
-        m_ended = false;
-        releaseMutex();
-        resetState();
-        return err;
+        return finalizeCleanupAndReturn(err);
     }
     m_ended = true;  // ★ end 成功，后续不得再 abort
 

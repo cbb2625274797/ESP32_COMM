@@ -67,7 +67,10 @@ extern "C" void app_main(void)
         0
     );
     if (xRet != pdPASS) {
+        // 关键任务：负责温度与 WiFi RSSI 上报，缺失会让运维陷入盲区，
+        // 无法及时发现硬件异常，必须重启恢复
         DEBUG_ERR("MAIN", "创建 health_monitor_task 失败");
+        ESP_ERROR_CHECK(ESP_FAIL);  // 关键任务失败：终止启动并触发看门狗重启
     } else {
         DEBUG_INFO("MAIN", "健康监控任务已创建");
     }
@@ -99,7 +102,10 @@ extern "C" void app_main(void)
         0  // 核0
     );
     if (xRet != pdPASS) {
+        // 关键任务：OTA 中继是本设备核心职责（经 SPI 派发固件分片到目标 MCU），
+        // 缺失则 OTA 刷写主流程彻底瘫痪，必须重启恢复
         DEBUG_ERR("MAIN", "创建 ota_relay_task 失败");
+        ESP_ERROR_CHECK(ESP_FAIL);  // 关键任务失败：终止启动并触发看门狗重启
     } else {
         DEBUG_INFO("MAIN", "OTA 中继任务已创建");
     }
@@ -115,7 +121,10 @@ extern "C" void app_main(void)
         0
     );
     if (xRet != pdPASS) {
+        // 关键任务：WiFi OTA 是 OTA 刷写主通道之一，缺失则 WiFi 侧固件升级不可用，
+        // 系统失去主要刷写路径，必须重启恢复
         DEBUG_ERR("MAIN", "创建 wifi_ota_task 失败");
+        ESP_ERROR_CHECK(ESP_FAIL);  // 关键任务失败：终止启动并触发看门狗重启
     } else {
         DEBUG_INFO("MAIN", "WiFi OTA 任务已创建");
     }
@@ -131,7 +140,12 @@ extern "C" void app_main(void)
         0  // ESP32-C3 单核，固定核0
     );
     if (xRet != pdPASS) {
+        // 关键任务：BLE OTA 是 OTA 刷写主通道之一（与 WiFi OTA 互为冗余），
+        // 缺失则 BLE 侧固件升级完全不可用，必须重启恢复
+        // 注：此处为 BLE OTA 主服务任务，区别于 ble_ota.cpp 内部的
+        // ble_ota_data_worker 子任务（后者可降级，不在本文件创建）
         DEBUG_ERR("MAIN", "创建 ble_ota_task 失败");
+        ESP_ERROR_CHECK(ESP_FAIL);  // 关键任务失败：终止启动并触发看门狗重启
     } else {
         DEBUG_INFO("MAIN", "BLE OTA 任务已创建");
     }

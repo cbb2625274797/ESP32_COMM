@@ -1,4 +1,4 @@
-﻿/*
+/*
  * protocol.cpp - 协议层实现
  * T2.1, T2.2, T1.3
  * ESP-IDF 6.0 适配版本 - 使用硬件 AES-128-CBC + 硬件 RNG
@@ -99,21 +99,17 @@ int Protocol::sessionKeyInit(session_ctx_t *sess, const uint8_t *k_session)
 
     memset(sess, 0, sizeof(session_ctx_t));
     memcpy(sess->key, k_session, 16);
-    memset(sess->iv, 0, 16);
-    sess->used = 0;
 
     return 0;
 }
 
 /**
- * @brief 清除会话上下文中的密钥和状态。
+ * @brief 清除会话上下文中的密钥数据。
  * @param sess 会话上下文指针。
  */
 void Protocol::sessionKeyClear(session_ctx_t *sess)
 {
     if (sess) {
         memset(sess->key, 0, 16);
-        memset(sess->iv, 0, 16);
-        sess->used = 0;
     }
 }

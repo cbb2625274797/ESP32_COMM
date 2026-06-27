@@ -1,4 +1,4 @@
-﻿/*
+/*
  * app_config.h - 统一配置文件（C++ 版本）
  * ESP32-C3 OTA 中继项目
  *
@@ -59,7 +59,7 @@ inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;           ///< HTTP 服
 // OTA 配置
 // ============================================================
 inline constexpr size_t  OTA_BLOCK_SIZE         = 8192;
-inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB，对齐 GD32 APP_MAX_SIZE (0x36000)
+inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB = 221184B = 0x35F90，固件大小上限
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
 inline constexpr uint32_t OTA_POLL_RETRIES      = 40;          // 每包 ACK 轮询次数
 inline constexpr uint32_t OTA_RESEND_RETRIES    = 10;           // 每包重发次数上限
@@ -98,6 +98,7 @@ inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_GD32  = 0xF7;         ///< BLE 控
 inline constexpr uint8_t BLE_OTA_CTRL_TRIGGER_ESP32 = 0xF8;         ///< BLE 控制命令：触发 ESP32 本机 OTA
 inline constexpr uint8_t BLE_OTA_CTRL_VERIFY_SHA256 = 0xF9;         ///< BLE 控制命令：SHA-256 哈希验证
 inline constexpr uint8_t BLE_OTA_CTRL_RESTART_ESP32 = 0xFA;         ///< BLE 控制命令：重启 ESP32
+inline constexpr uint8_t BLE_OTA_CTRL_ABORT_OTA     = 0xFB;         ///< BLE 控制命令：中止当前 OTA（不断开 BLE）
 inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;             ///< BLE 数据通道：GD32 固件包标识
 inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;             ///< BLE 数据通道：ESP32 固件包标识
 inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;            ///< BLE 单包数据载荷大小（字节）

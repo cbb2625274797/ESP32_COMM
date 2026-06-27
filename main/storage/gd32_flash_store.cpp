@@ -14,6 +14,8 @@
 
 #include "gd32_flash_store.h"
 #include "monitor/debug_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 // ============================================================
 // 单例
@@ -22,6 +24,34 @@ Gd32FlashStore& Gd32FlashStore::instance()
 {
     static Gd32FlashStore inst;
     return inst;
+}
+
+// 构造时创建 NVS 互斥锁。
+//   单例静态局部变量在首次 instance() 调用时构造，此时 FreeRTOS 已就绪。
+Gd32FlashStore::Gd32FlashStore()
+{
+    m_nvsMutex = xSemaphoreCreateMutex();
+    if (!m_nvsMutex) {
+        DEBUG_ERR("OTA", "Gd32FlashStore NVS mutex 创建失败");
+    }
+}
+
+// ============================================================
+// NVS 互斥锁辅助
+// ============================================================
+bool Gd32FlashStore::lockNvs(uint32_t timeout_ms)
+{
+    // 参考 OtaCoordinator::lock：返回 take 结果，由调用方传回 unlockNvs 决定是否 give。
+    if (!m_nvsMutex) return false;
+    return xSemaphoreTake(m_nvsMutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void Gd32FlashStore::unlockNvs(bool handle)
+{
+    // 仅在对应 lockNvs 成功 take 时才 give，避免误释放。
+    if (handle && m_nvsMutex) {
+        xSemaphoreGive(m_nvsMutex);
+    }
 }
 
 // ============================================================
@@ -132,8 +162,8 @@ esp_err_t Gd32FlashStore::erasePartition(uint32_t size)
 // NVS 元数据持久化
 // ============================================================
 
-/** @brief 从 NVS 加载 OTA 元数据，命名空间不存在时返回全零结构。 */
-esp_err_t Gd32FlashStore::metaLoad(ota_meta_t *meta)
+/** @brief 已持锁版本：从 NVS 加载 OTA 元数据，命名空间不存在时返回全零结构。 */
+esp_err_t Gd32FlashStore::metaLoadLocked(ota_meta_t *meta)
 {
     if (!meta) return ESP_ERR_INVALID_ARG;
     memset(meta, 0, sizeof(ota_meta_t));
@@ -141,7 +171,15 @@ esp_err_t Gd32FlashStore::metaLoad(ota_meta_t *meta)
     nvs_handle_t handle;
     esp_err_t err = nvs_open(OTA_META_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        return ESP_OK;
+        // 区分 nvs_open 失败原因，不再一律当 OK。
+        //   ESP_ERR_NVS_NOT_FOUND = 命名空间不存在（首次使用/被擦除），视为空元数据，保持兼容。
+        //   其他错误（NVS 未初始化/分区丢失/损坏等）返回真实错误码，
+        //   避免掩盖底层故障导致调用方误判为"空元数据"继续执行。
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            return ESP_OK;
+        }
+        DEBUG_WARN("OTA", "metaLoad nvs_open 失败（非 NOT_FOUND）: %s", esp_err_to_name(err));
+        return err;
     }
 
     uint32_t val = 0;
@@ -159,8 +197,24 @@ esp_err_t Gd32FlashStore::metaLoad(ota_meta_t *meta)
     return ESP_OK;
 }
 
-/** @brief 将 OTA 元数据写入 NVS。 */
-esp_err_t Gd32FlashStore::metaSave(const ota_meta_t *meta)
+/** @brief 从 NVS 加载 OTA 元数据（加锁包装）。 */
+esp_err_t Gd32FlashStore::metaLoad(ota_meta_t *meta)
+{
+    if (!meta) return ESP_ERR_INVALID_ARG;
+    bool locked = lockNvs(kNvsLockTimeoutMs);
+    if (!locked) {
+        // 加锁失败不能跳过锁直接访问 NVS，清零输出并返回超时
+        memset(meta, 0, sizeof(ota_meta_t));
+        DEBUG_WARN("OTA", "metaLoad 加锁超时");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = metaLoadLocked(meta);
+    unlockNvs(true);
+    return err;
+}
+
+/** @brief 已持锁版本：将 OTA 元数据写入 NVS。 */
+esp_err_t Gd32FlashStore::metaSaveLocked(const ota_meta_t *meta)
 {
     if (!meta) return ESP_ERR_INVALID_ARG;
 
@@ -184,25 +238,57 @@ esp_err_t Gd32FlashStore::metaSave(const ota_meta_t *meta)
     return err;
 }
 
-/** @brief 传输过程中更新元数据的 stored_size 和 last_seq 字段。 */
+/** @brief 将 OTA 元数据写入 NVS（加锁包装）。 */
+esp_err_t Gd32FlashStore::metaSave(const ota_meta_t *meta)
+{
+    if (!meta) return ESP_ERR_INVALID_ARG;
+    bool locked = lockNvs(kNvsLockTimeoutMs);
+    if (!locked) {
+        DEBUG_WARN("OTA", "metaSave 加锁超时");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = metaSaveLocked(meta);
+    unlockNvs(true);
+    return err;
+}
+
+/**
+ * @brief 传输过程中更新元数据的 stored_size 和 last_seq 字段。
+ *        整个读-改-写过程持锁，避免并发 metaUpdate 丢失更新。
+ *        内部调用已持锁的 metaLoadLocked/metaSaveLocked，不再经公开方法重复加锁。
+ */
 esp_err_t Gd32FlashStore::metaUpdate(uint32_t stored_size, uint32_t last_seq)
 {
+    bool locked = lockNvs(kNvsLockTimeoutMs);
+    if (!locked) {
+        DEBUG_WARN("OTA", "metaUpdate 加锁超时");
+        return ESP_ERR_TIMEOUT;
+    }
+
     ota_meta_t meta;
-    esp_err_t err = metaLoad(&meta);
-    if (err != ESP_OK) return err;
-
-    meta.stored_size = stored_size;
-    meta.last_seq = last_seq;
-
-    return metaSave(&meta);
+    esp_err_t err = metaLoadLocked(&meta);
+    if (err == ESP_OK) {
+        meta.stored_size = stored_size;
+        meta.last_seq = last_seq;
+        err = metaSaveLocked(&meta);
+    }
+    unlockNvs(true);
+    return err;
 }
 
 /** @brief OTA 完成或中止时清除元数据（全零写入）。 */
 esp_err_t Gd32FlashStore::metaClear()
 {
     DEBUG_INFO("OTA", "清除 OTA 元数据");
+    bool locked = lockNvs(kNvsLockTimeoutMs);
+    if (!locked) {
+        DEBUG_WARN("OTA", "metaClear 加锁超时");
+        return ESP_ERR_TIMEOUT;
+    }
     ota_meta_t meta = {};
-    return metaSave(&meta);
+    esp_err_t err = metaSaveLocked(&meta);
+    unlockNvs(true);
+    return err;
 }
 
 // ============================================================
@@ -296,13 +382,12 @@ esp_err_t Gd32FlashStore::metaVerifyChecksum()
     if (err != ESP_OK) return err;
 
     // 检查 checksum 是否全零（未计算过）
-    bool all_zero = true;
-    for (size_t i = 0; i < sizeof(meta.checksum); ++i) {
-        if (meta.checksum[i] != 0x00) { all_zero = false; break; }
-    }
-    if (all_zero) {
-        DEBUG_WARN("OTA", "metaVerify: checksum 未计算，跳过校验（旧数据兼容）");
-        return ESP_OK;
+    // 注意：返回 INVALID_STATE 而非 ESP_OK，由调用方决定是否容忍。
+    // 历史上这里直接返回 OK 跳过校验，但 meta 被意外清零时会掩盖固件损坏。
+    static const uint8_t kZeroSha[32] = {0};
+    if (memcmp(meta.checksum, kZeroSha, sizeof(meta.checksum)) == 0) {
+        DEBUG_WARN("OTA", "metaVerify: checksum 未计算，返回 INVALID_STATE（调用方决定容忍或失败）");
+        return ESP_ERR_INVALID_STATE;
     }
 
     uint8_t computed[32] = {0};

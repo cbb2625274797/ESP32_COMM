@@ -1,4 +1,4 @@
-﻿/*
+/*
  * debug_log.h - 调试日志输出
  *
  * 当前日志会并行写入：
@@ -95,6 +95,9 @@ private:
     struct sockaddr_in m_debugAddr;
     bool m_initialized = false;
     bool m_uartInitialized = false;
+    // 记录 UART 是否真正可用（uartInit 失败时为 false，跳过 uart_write_bytes）。
+    //   m_uartInitialized 仅表示曾尝试初始化，m_uartAvailable 才是写日志的判据。
+    bool m_uartAvailable = false;
 
     static constexpr int LOG_RING_SLOTS = 64;
     static constexpr int LOG_RING_SIZE  = 256;

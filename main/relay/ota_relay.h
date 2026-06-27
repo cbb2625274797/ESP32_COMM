@@ -224,21 +224,12 @@ public:
 
     // ── Flash 操作已迁移至 Gd32FlashStore（storage/gd32_flash_store.h）──
 
-    // ── 公开状态成员 ──
-    static relay_state_t relayState;          ///< 当前状态机状态
-    static uint32_t relaySeq;                 ///< 当前中继会话序号
-    static uint32_t relayTotalPackets;        ///< 本次中继总包数
-    static volatile bool gd32AppAlive;        ///< GD32 APP 存活标志
-    static gd32_version_t gd32Version;        ///< GD32 固件版本信息
-    static TaskHandle_t taskHandle;           ///< OTA 中继任务句柄
-    static IRelayListener *s_relayListener;   ///< 中继事件监听器（解决 H4）
-
     // ── 线程安全锁 ──
-    static SemaphoreHandle_t s_stateMutex;    ///< 状态成员互斥锁
-    static void initMutex();                  ///< 初始化状态互斥锁（app_main 中调用）
+    static void initMutex();                  ///< 初始化状态互斥锁（taskEntry 首行调用）
     static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(50); ///< 锁获取超时时间
 
-    /** @brief RAII 状态锁守护类，自动获取/释放 s_stateMutex。 */
+    /** @brief RAII 状态锁守护类，自动获取/释放 s_stateMutex。
+     *         作为 public 嵌套类保留，内部代码在持锁块内可直接访问 private 状态成员。 */
     class StateLockGuard {
     public:
         explicit StateLockGuard(TickType_t timeout = kLockTimeout) {
@@ -267,6 +258,23 @@ private:
     // ── 队列（M3: 由 getter 访问，外部不再直接引用）──
     static QueueHandle_t dispatchQueue;       ///< 事件分发队列
     static QueueHandle_t resultQueue;         ///< 结果回传队列
+
+    // ── 状态成员（全部改 private，统一通过 public setter/getter 访问）──
+    //   外部代码使用 getState()/getRelaySeq()/... 读取，setState()/setRelaySeq()/... 写入。
+    //   内部代码：若已在 StateLockGuard 块内（reset/getSnapshot/启动探测），可直接访问；
+    //             否则必须使用 setter/getter，禁止裸读写（消除数据竞争）。
+    static relay_state_t relayState;          ///< 当前状态机状态
+    static uint32_t relaySeq;                 ///< 当前中继会话序号
+    static uint32_t relayTotalPackets;        ///< 本次中继总包数
+    static volatile bool gd32AppAlive;        ///< GD32 APP 存活标志
+    static gd32_version_t gd32Version;        ///< GD32 固件版本信息
+    static IRelayListener *s_relayListener;   ///< 中继事件监听器（解决 H4）
+    static SemaphoreHandle_t s_stateMutex;    ///< 状态成员互斥锁（由 StateLockGuard 使用）
+
+    // taskHandle 为 write-once-at-init 字段：仅 taskEntry 启动首行写入一次，
+    // 之后只读。getTaskHandle() 无锁返回，因写入发生在任务创建后、任务循环开始前，
+    // 与任何外部读取者构成 happens-before（任务创建同步），无数据竞争。
+    static TaskHandle_t taskHandle;           ///< OTA 中继任务句柄
 
     OtaRelay() = default;
     ~OtaRelay() = default;
@@ -328,10 +336,44 @@ private:
      */
     ota_result_t doRelayPackets(TickType_t deadline_tick);
     /**
-     * @brief 发送结束指令并验证 APP 存活.
+     * @brief 准备单包：读 Flash + 组装 tx_buf + 加密 + CRC（doRelayPackets 子步骤）。
+     * @param seq 当前包序号。
+     * @param meta 固件元数据（用于计算末包 chunk_size）。
+     * @param tx_buf 输出缓冲区（64 字节）。
+     * @param out_chunk_size 输出本包有效字节数（用于 sendRelayPacketWithRetry 推进 offset）。
+     * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_STORAGE 读 Flash 失败，OTA_RESULT_ERR_AUTH 加密失败。
+     */
+    ota_result_t prepareRelayPacket(uint32_t seq, const ota_meta_t &meta, uint8_t tx_buf[64], size_t *out_chunk_size);
+    /**
+     * @brief 发送单包并等待 ACK（doRelayPackets 子步骤）。
+     *
+     * 内含重试循环，使用以下命名常量（与历史阈值保持一致）：
+     *   kMaxResendOnNack=10（ACK 失败/轮询耗尽重发上限）
+     *   kMaxResendOnStructError=3（结构化错误重发上限）
+     *
+     * @param seq 当前包序号。
+     * @param tx_buf 已组装好的 64 字节发送缓冲区。
+     * @param chunk_size 本包有效字节数（成功时用于推进 m_transferFlashOffset）。
+     * @param[out] out_result 失败时写入错误码（OK 时不修改）。
+     * @return true 应中止外层循环（result 已设）；false 继续下一包。
+     */
+    bool sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], size_t chunk_size, ota_result_t *out_result);
+    /**
+     * @brief 发送结束指令并验证 APP 存活（顺序调用 doSendFinishOta + doWaitForAppAlive）.
      * @return OTA_RESULT_OK 成功，负值表示错误。
      */
     ota_result_t doFinishAndVerify();
+    /**
+     * @brief 发送 FINISH_OTA 指令并等待 GD32 ACK（10 次重试）.
+     * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_GD32 失败。
+     */
+    ota_result_t doSendFinishOta();
+    /**
+     * @brief 轮询等待 GD32 APP 存活（30 次重试）.
+     * @param timeout_ms 单次 appPing 超时（毫秒）。
+     * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_GD32 超时失败。
+     */
+    ota_result_t doWaitForAppAlive(uint32_t timeout_ms);
 
     // ── 传输进度跟踪（状态机内部）──
     uint32_t m_transferTotalPackets = 0;
@@ -343,6 +385,14 @@ private:
     // ── 加密/工具方法（不变）──
     static int aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, uint8_t *out);
     static void logRespPayload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len);
+    /**
+     * @brief 探测 GD32 APP 存活并缓存版本（统一 OtaRelay 内部探测逻辑）.
+     *        成功打印版本号，失败打印 warning。
+     * @param timeout_ms appPing 超时（毫秒）。
+     * @param out_uptime 可选，输出 GD32 uptime（秒）。
+     * @return true 探测成功，false 失败。
+     */
+    static bool probeAndCacheAppAlive(uint32_t timeout_ms, uint32_t *out_uptime = nullptr);
     esp_err_t waitUntilNotWait(const char *stage, uint8_t *resp_type,
                                uint8_t *resp_payload, size_t resp_max,
                                size_t *resp_len, uint32_t timeout_ms,

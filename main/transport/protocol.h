@@ -1,4 +1,4 @@
-﻿/*
+/*
  * protocol.h - 帧格式、CRC16、AES 加密解密
  * T2.2, T1.3
  * ESP-IDF 6.0 适配版本 - 使用硬件 AES-128-CBC + 硬件 RNG
@@ -12,11 +12,6 @@
 #include <stdbool.h>
 #include "app_config.h"
 
-// 帧格式: SOF(1B) + CMD(1B) + LEN(2B LE) + PAYLOAD(LEN) + CRC16(2B LE)
-#define FRAME_SOF          (0xEB)    // 帧起始标记
-#define FRAME_MAX_PAYLOAD  (64)      // 安全最大 payload
-#define FRAME_OVERHEAD     (6)       // SOF + CMD + LEN(2) + CRC16(2)
-
 // 安全常量（定义在 app_config.h 中）
 inline constexpr size_t MASTER_KEY_HERE_LEN = 16; ///< AES-128 主密钥长度（字节）
 inline constexpr size_t CHIP_UID_LEN = 12;        ///< GD32 芯片 UID 长度（字节）
@@ -24,8 +19,6 @@ inline constexpr size_t CHIP_UID_LEN = 12;        ///< GD32 芯片 UID 长度（
 // AES 会话上下文
 typedef struct {
     uint8_t key[16];          // 会话密钥 K_session
-    uint8_t iv[16];           // CBC 模式 IV
-    int used;               // 会话是否已初始化标志
 } session_ctx_t;
 
 /**
@@ -64,7 +57,7 @@ public:
      */
     static int sessionKeyInit(session_ctx_t *sess, const uint8_t *k_session);
     /**
-      * @brief 清除会话上下文的密钥和 IV 数据。
+      * @brief 清除会话上下文中的密钥数据。
      * @param sess 会话上下文指针。
      */
     static void sessionKeyClear(session_ctx_t *sess);

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * health_monitor.h - 系统健康监控头文件
  *
  * HealthMonitor 类封装健康状态管理、温度监控和 WiFi RSSI 监控。
@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/temperature_sensor.h"
+#include "esp_timer.h"
 #include "app_config.h"
 
 // T9.3: 健康状态等级
@@ -47,6 +48,13 @@ public:
 
     /** @brief 初始化健康监控模块，创建内部互斥锁与基础状态。 */
     void init();
+
+    /**
+      * @brief 反初始化：停止并删除温度监控定时器，回收 esp_timer 资源。
+      *        在任务删除路径中调用；当前 HealthMonitor 任务为无限循环，
+      *        无显式删除路径，本方法预留给未来停用场景使用。
+      */
+    void deinit();
 
     /** @brief 健康监控 FreeRTOS 任务入口。 */
     static void taskEntry(void *pvParameters);
@@ -97,12 +105,32 @@ private:
 
     SemaphoreHandle_t m_mutex = NULL;
     temperature_sensor_handle_t m_tempHandle = NULL;
+    // 温度监控 esp_timer 句柄存为成员，便于 deinit() 时停止并删除定时器，
+    //   避免任务被删除后定时器仍在运行、回调继续访问 instance() 成员。
+    esp_timer_handle_t m_tempTimer = nullptr;
     health_state_t m_healthState = SYS_NORMAL;
     float m_lastTemperature = 0.0f;
     int8_t m_lastWifiRssi = -127;
     int64_t m_lastWifiRssiMs = 0;
     TaskHandle_t m_taskHandle = NULL;
+    // m_wifiConnected 由 m_mutex 保护（setWifiConnected 写 / checkBeforeOta 读）。
+    //   volatile 保留为历史兼容，实际同步由 LockGuard 提供。
     volatile bool m_wifiConnected = false;   ///< WiFi 连接状态（由 WiFi 事件推送）
 
     static void tempMonitorCallback(void *arg);
+
+    // RAII 锁守卫（与 SpiMaster::LockGuard 风格一致）
+    class LockGuard {
+    public:
+        explicit LockGuard(SemaphoreHandle_t mutex) : m_lock(mutex) {
+            if (m_lock) { xSemaphoreTake(m_lock, portMAX_DELAY); }
+        }
+        ~LockGuard() {
+            if (m_lock) { xSemaphoreGive(m_lock); }
+        }
+        LockGuard(const LockGuard&) = delete;
+        LockGuard& operator=(const LockGuard&) = delete;
+    private:
+        SemaphoreHandle_t m_lock;
+    };
 };

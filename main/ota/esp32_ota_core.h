@@ -130,6 +130,24 @@ private:
      */
     void resetState();
 
+    // begin() 失败后的统一清理：释放 mutex + resetState() + 返回 code
+    //   不调 esp_ota_abort（begin 失败时 m_handle 未成功创建）
+    /**
+      * @brief begin() 失败后的统一清理。
+     * @param code 返回给调用方的错误码。
+     * @return 透传 code。
+     */
+    esp_err_t beginCleanupAndReturn(esp_err_t code);
+
+    // finalize() 失败后的统一清理：若 m_ended=false 调 esp_ota_abort 释放 handle；
+    //   再复位 m_ended + 释放 mutex + resetState() + 返回 code
+    /**
+      * @brief finalize() 失败后的统一清理。
+     * @param code 返回给调用方的错误码。
+     * @return 透传 code。
+     */
+    esp_err_t finalizeCleanupAndReturn(esp_err_t code);
+
     bool                 m_active = false;
     esp_ota_handle_t     m_handle = 0;
     const esp_partition_t *m_partition = nullptr;

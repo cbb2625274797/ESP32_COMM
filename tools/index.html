@@ -1,4 +1,4 @@
-<!--
+﻿<!--
   index.html - ESP32 OTA 中继控制台主页面
   支持 WiFi OTA（ESP32 本机 + GD32 中继）和 BLE OTA 双通道固件升级。
   配套脚本：app.js (WiFi OTA), ble_ota.js (BLE OTA), style.css (UI 样式)
@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 OTA 中继控制台</title>
-<link rel="stylesheet" href="style.css?v=20260619c">
+<link rel="stylesheet" href="style.css?v=20260625b">
 </head>
 <body>
 <div class="container">
@@ -426,7 +426,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260623a"></script>
+<script src="app.js?v=20260626a"></script>
 <script>
 window.connectionMode = window.connectionMode || 'wifi';
 window.flashTarget = window.flashTarget || 'esp32';
@@ -678,6 +678,6 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   applySharedModeUi();
 })();
 </script>
-<script src="ble_ota.js?v=20260625a"></script>
+<script src="ble_ota.js?v=20260626a"></script>
 </body>
 </html>

@@ -30,15 +30,14 @@
 #include "canfd_bridge.h"
 #include "ble_ota.h"
 
-static constexpr uint32_t GD32_OTA_FLASH_SECTOR_SIZE = 4096U;
-
-// OTA 接收共享缓冲区
-static uint8_t s_ota_recv_buf[OTA_BLOCK_SIZE];
-
-static uint32_t align_up_u32(uint32_t value, uint32_t alignment)
-{
-    return ((value + alignment - 1U) / alignment) * alignment;
-}
+// OTA 准备状态：/ota/prepare 完成后设置，/ota/upload 消费后清除
+// ★ 同时记录 prepare 时的 epoch，clear 时仅在同一会话才中止，避免误清新会话
+static bool s_esp32_prepared = false;
+static uint32_t s_esp32_prepare_size = 0;
+static uint32_t s_esp32_prepare_epoch = 0;
+static bool s_gd32_prepared = false;
+static uint32_t s_gd32_prepare_size = 0;
+static uint32_t s_gd32_prepare_epoch = 0;
 
 void http_set_cors_headers(httpd_req_t *req)
 {
@@ -46,6 +45,27 @@ void http_set_cors_headers(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
     httpd_resp_set_hdr(req, "Access-Control-Max-Age", "600");
+}
+
+static void clear_esp32_prepare()
+{
+    if (s_esp32_prepared) {
+        // ★ 仅在 prepare 仍属当前会话时中止；同类型重启已发生时跳过，避免误清新会话
+        OtaCoordinator::instance().abortCurrentIfEpoch(s_esp32_prepare_epoch);
+        s_esp32_prepared = false;
+        s_esp32_prepare_size = 0;
+        s_esp32_prepare_epoch = 0;
+    }
+}
+
+static void clear_gd32_prepare()
+{
+    if (s_gd32_prepared) {
+        OtaCoordinator::instance().abortCurrentIfEpoch(s_gd32_prepare_epoch);
+        s_gd32_prepared = false;
+        s_gd32_prepare_size = 0;
+        s_gd32_prepare_epoch = 0;
+    }
 }
 
 esp_err_t http_options_handler(httpd_req_t *req)
@@ -126,7 +146,8 @@ esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, strlen(resp));
 
-        DEBUG_INFO("OTA", "响应已发送，重启...");
+        DEBUG_INFO("OTA", "响应已发送，等待 TCP 刷新...");
+        vTaskDelay(pdMS_TO_TICKS(500));
         OtaCoordinator::instance().restartEsp32();
         return ESP_OK;
     }
@@ -177,9 +198,122 @@ static int recv_json_header(httpd_req_t *req, char *buf, int buf_size)
     return total;
 }
 
+esp_err_t ota_prepare_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+    DEBUG_INFO("WIFI", "=== HTTP: POST /ota/prepare ===");
+
+    char buf[256] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON parse failed");
+        return ESP_FAIL;
+    }
+
+    cJSON *type_item = cJSON_GetObjectItem(root, "type");
+    cJSON *size_item = cJSON_GetObjectItem(root, "total_size");
+    if (!type_item || !cJSON_IsString(type_item) ||
+        !size_item || !cJSON_IsNumber(size_item)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing type or total_size");
+        return ESP_FAIL;
+    }
+
+    const char *type = cJSON_GetStringValue(type_item);
+    uint32_t total_size = (uint32_t)cJSON_GetNumberValue(size_item);
+    cJSON_Delete(root);
+
+    if (type && strcmp(type, "esp32") == 0) {
+        clear_esp32_prepare();
+
+        esp_err_t err = OtaCoordinator::instance().beginEsp32OtaWithRetry(total_size, OTA_CHANNEL_WIFI);
+        if (err != ESP_OK) {
+            if (err == ESP_ERR_INVALID_STATE) {
+                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                    "ESP32 OTA occupied by another channel");
+            } else {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+            }
+            return ESP_FAIL;
+        }
+
+        s_esp32_prepared = true;
+        s_esp32_prepare_size = total_size;
+        s_esp32_prepare_epoch = OtaCoordinator::instance().getOtaEpoch();
+        const char resp[] = "{\"status\": \"ok\", \"target\": \"esp32\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, strlen(resp));
+        DEBUG_INFO("WIFI", "ESP32 OTA 准备完成: %u 字节", total_size);
+        return ESP_OK;
+    }
+
+    if (type && strcmp(type, "gd32") == 0) {
+        clear_gd32_prepare();
+
+        if (OtaRelay::getState() != RELAY_IDLE) {
+            DEBUG_WARN("WIFI", "GD32 prepare 前复位中继状态: %d", OtaRelay::getState());
+            OtaRelay::instance().reset();
+        }
+
+        // ★ 统一调用 prepareGd32Storage 完成：validate + begin + erase + clearMeta + saveMeta
+        //   与 BLE 路径 / ota_upload_handler 共享同一序列，消除手写重复
+        esp_err_t prep_err = OtaCoordinator::instance().prepareGd32Storage(total_size, OTA_CHANNEL_WIFI);
+        if (prep_err == ESP_ERR_INVALID_SIZE) {
+            DEBUG_ERR("WIFI", "prepare: firmware size invalid: %u", total_size);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "firmware size invalid");
+            return ESP_FAIL;
+        } else if (prep_err == ESP_ERR_INVALID_STATE) {
+            DEBUG_ERR("WIFI", "GD32 prepare 协调器拒绝（系统忙）");
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                "system busy with another OTA operation");
+            return ESP_FAIL;
+        } else if (prep_err != ESP_OK) {
+            DEBUG_ERR("WIFI", "GD32 prepare 失败: %s", esp_err_to_name(prep_err));
+            char err_msg[96];
+            snprintf(err_msg, sizeof(err_msg), "prepare gd32_ota failed: %s",
+                     esp_err_to_name(prep_err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, err_msg);
+            return ESP_FAIL;
+        }
+
+        WifiOta::instance().stateLock();
+        WifiOta::instance().setGd32StorageDone(false);
+        WifiOta::instance().stateUnlock();
+
+        s_gd32_prepared = true;
+        s_gd32_prepare_size = total_size;
+        s_gd32_prepare_epoch = OtaCoordinator::instance().getOtaEpoch();
+        const char resp[] = "{\"status\": \"ok\", \"target\": \"gd32\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, strlen(resp));
+        DEBUG_INFO("WIFI", "GD32 OTA 准备完成: %u 字节", total_size);
+        return ESP_OK;
+    }
+
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown type");
+    return ESP_FAIL;
+}
+
 esp_err_t ota_upload_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
+
+    // 每请求分配 OTA 接收缓冲区：OTA_BLOCK_SIZE=8KB > 4KB 不适合栈分配，
+    // 改为 per-request malloc 避免 ESP32/GD32 两条路径共享全局 buffer，
+    // max_open_sockets=4 时多连接并发也互不干扰。
+    uint8_t *recv_buf = (uint8_t *)malloc(OTA_BLOCK_SIZE);
+    if (!recv_buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc failed");
+        return ESP_FAIL;
+    }
+
     DEBUG_WARN("WIFI", "=== HTTP: POST /ota/upload === content_len=%d", req->content_len);
     DEBUG_INFO("WIFI", "收到固件上传请求, 内容长度: %d 字节", req->content_len);
 
@@ -191,6 +325,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     int peek_ret = httpd_req_recv(req, &peek, 1);
     if (peek_ret <= 0) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "接收失败");
+        free(recv_buf);
         return ESP_FAIL;
     }
 
@@ -231,22 +366,49 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
 
     if (is_esp32_ota) {
         if (total_size == 0) {
+            clear_esp32_prepare();
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing total_size");
+            free(recv_buf);
             return ESP_FAIL;
         }
 
-        esp_err_t err = OtaCoordinator::instance().beginEsp32OtaWithRetry(total_size);
-        if (err != ESP_OK) {
-            if (err == ESP_ERR_INVALID_STATE) {
-                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "ESP32 OTA occupied by another channel");
+        // ★ 若前端已通过 /ota/prepare 完成擦除，直接复用 prepared 状态，
+        //   避免在大量数据传输前再次长时间阻塞 HTTP worker。
+        bool used_prepare = false;
+        if (s_esp32_prepared) {
+            if (total_size == s_esp32_prepare_size) {
+                used_prepare = true;
+                s_esp32_prepared = false;
+                s_esp32_prepare_size = 0;
+                DEBUG_INFO("WIFI", "ESP32 OTA 使用已 prepared 状态，跳过擦除");
             } else {
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+                DEBUG_WARN("WIFI", "ESP32 prepared size mismatch (prepared=%u, upload=%u)，重新初始化",
+                           s_esp32_prepare_size, total_size);
+                clear_esp32_prepare();
             }
-            return ESP_FAIL;
+        }
+
+        esp_err_t err;
+        if (!used_prepare) {
+            err = OtaCoordinator::instance().beginEsp32OtaWithRetry(total_size, OTA_CHANNEL_WIFI);
+            if (err != ESP_OK) {
+                clear_esp32_prepare();
+                if (err == ESP_ERR_INVALID_STATE) {
+                    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "ESP32 OTA occupied by another channel");
+                } else {
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+                }
+                free(recv_buf);
+                return ESP_FAIL;
+            }
         }
 
         Esp32OtaCore &core = Esp32OtaCore::instance();
-        uint8_t *fw_buf = s_ota_recv_buf;
+        uint8_t *fw_buf = recv_buf;
+
+        // ★ 捕获当前 epoch，用于失败清理时检查会话是否仍属于本 handler
+        //   若同类型重启已发生（新请求接管），旧 handler 的 abortCurrentIfEpoch 不会中止新会话
+        uint32_t my_epoch = OtaCoordinator::instance().getOtaEpoch();
 
         size_t total_firmware_written = 0;
         size_t total_received = json_header_len;
@@ -259,16 +421,23 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
             int ret = httpd_req_recv(req, (char *)fw_buf, to_read);
             if (ret <= 0) {
                 DEBUG_ERR("WIFI", "HTTP recv failed (ret=%d), aborting OTA", ret);
-                core.abort();
+                // ★ 客户端断开/接收失败：用 abortCurrentIfEpoch 复位协调器状态机
+                //   若 epoch 不匹配（新请求已接管），跳过中止，避免误清新会话
+                OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
+                clear_esp32_prepare();
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTP recv failed");
+                free(recv_buf);
                 return ESP_FAIL;
             }
 
             err = core.write(fw_buf, (size_t)ret);
             if (err != ESP_OK) {
                 DEBUG_ERR("WIFI", "OTA write failed: %s", esp_err_to_name(err));
-                core.abort();
+                // ★ 同上：写入失败也用 abortCurrentIfEpoch，避免误中止新会话
+                OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
+                clear_esp32_prepare();
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+                free(recv_buf);
                 return ESP_FAIL;
             }
 
@@ -289,6 +458,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         const char resp[] = "{\"status\": \"ok\", \"message\": \"stored, call POST /ota/update to finish\", \"target\": \"esp32\"}";
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, strlen(resp));
+        free(recv_buf);
         return ESP_OK;
     }
 
@@ -299,53 +469,70 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     } else {
         gd32_valid_size = gd32_fw_size;
     }
-    const uint32_t gd32_rounded_size = (uint32_t)(((gd32_valid_size + (uint32_t)GD32_OTA_PACKET_SIZE - 1U) / (uint32_t)GD32_OTA_PACKET_SIZE) * (uint32_t)GD32_OTA_PACKET_SIZE);
-    if (gd32_valid_size == 0U || gd32_valid_size > OTA_MAX_FIRMWARE_SIZE || gd32_rounded_size > OTA_MAX_FIRMWARE_SIZE) {
-        DEBUG_ERR("WIFI", "firmware size invalid: valid=%u rounded48=%u max=%u",
-                  (unsigned)gd32_valid_size, (unsigned)gd32_rounded_size, (unsigned)OTA_MAX_FIRMWARE_SIZE);
+    if (OtaCoordinator::instance().validateGd32Size(gd32_valid_size) != ESP_OK) {
+        DEBUG_ERR("WIFI", "firmware size invalid: valid=%u max=%u",
+                  (unsigned)gd32_valid_size, (unsigned)OTA_MAX_FIRMWARE_SIZE);
+        clear_gd32_prepare();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "firmware too large or alignment overflow");
-        return ESP_FAIL;
-    }
-    if (OtaRelay::getState() != RELAY_IDLE) {
-        DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", OtaRelay::getState());
-        OtaRelay::instance().reset();
-    }
-
-    if (OtaCoordinator::instance().beginGd32Storage(gd32_valid_size) != ESP_OK) {
-        DEBUG_ERR("WIFI", "GD32 OTA 协调器拒绝存储（系统忙）");
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "system busy with another OTA operation");
+        free(recv_buf);
         return ESP_FAIL;
     }
 
-    WifiOta::instance().stateLock();
-    WifiOta::instance().setGd32StorageDone(false);
-    WifiOta::instance().stateUnlock();
-
-    const uint32_t gd32_erase_size = align_up_u32(gd32_valid_size, GD32_OTA_FLASH_SECTOR_SIZE);
-    DEBUG_INFO("WIFI", "擦除 gd32_ota 分区: %u bytes (fw=%u)",
-               (unsigned)gd32_erase_size, (unsigned)gd32_valid_size);
-    esp_err_t erase_err = OtaCoordinator::instance().eraseGd32Partition(gd32_erase_size);
-    if (erase_err != ESP_OK) {
-        DEBUG_ERR("WIFI", "擦除 gd32_ota 分区失败: %s", esp_err_to_name(erase_err));
-        char err_msg[96];
-        snprintf(err_msg, sizeof(err_msg), "erase gd32_ota failed: %s", esp_err_to_name(erase_err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, err_msg);
-        return ESP_FAIL;
+    // ★ 若前端已通过 /ota/prepare 完成擦除，直接复用 prepared 状态
+    bool used_gd32_prepare = false;
+    if (s_gd32_prepared) {
+        if (gd32_valid_size == s_gd32_prepare_size) {
+            used_gd32_prepare = true;
+            s_gd32_prepared = false;
+            s_gd32_prepare_size = 0;
+            DEBUG_INFO("WIFI", "GD32 OTA 使用已 prepared 状态，跳过擦除");
+        } else {
+            DEBUG_WARN("WIFI", "GD32 prepared size mismatch (prepared=%u, upload=%u)，重新初始化",
+                       s_gd32_prepare_size, gd32_valid_size);
+            clear_gd32_prepare();
+        }
     }
-    OtaCoordinator::instance().clearGd32Meta();
 
-    uint8_t *buf = s_ota_recv_buf;
+    if (!used_gd32_prepare) {
+        if (OtaRelay::getState() != RELAY_IDLE) {
+            DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", OtaRelay::getState());
+            OtaRelay::instance().reset();
+        }
+
+        // ★ 统一调用 prepareGd32Storage 完成：begin + erase + clearMeta + saveMeta
+        //   与 BLE 路径（process_gd32_packet seq=0）共用同一序列，消除隐式差异。
+        esp_err_t prep_err = OtaCoordinator::instance().prepareGd32Storage(gd32_valid_size, OTA_CHANNEL_WIFI);
+        if (prep_err == ESP_ERR_INVALID_STATE) {
+            DEBUG_ERR("WIFI", "GD32 OTA 协调器拒绝存储（系统忙）");
+            clear_gd32_prepare();
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "system busy with another OTA operation");
+            free(recv_buf);
+            return ESP_FAIL;
+        } else if (prep_err != ESP_OK) {
+            DEBUG_ERR("WIFI", "GD32 OTA 准备失败: %s", esp_err_to_name(prep_err));
+            clear_gd32_prepare();
+            char err_msg[96];
+            snprintf(err_msg, sizeof(err_msg), "prepare gd32_ota failed: %s", esp_err_to_name(prep_err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, err_msg);
+            free(recv_buf);
+            return ESP_FAIL;
+        }
+
+        WifiOta::instance().stateLock();
+        WifiOta::instance().setGd32StorageDone(false);
+        WifiOta::instance().stateUnlock();
+    }
+
+    // ★ 捕获当前 epoch，用于失败清理时检查会话是否仍属于本 handler
+    uint32_t my_epoch = OtaCoordinator::instance().getOtaEpoch();
+
+    uint8_t *buf = recv_buf;
 
     int received = 0;
 
+    // expected_fw_size_raw 仅用于后续日志输出；meta 已由 prepareGd32Storage
+    // （非 prepared 路径）或 /ota/prepare（prepared 路径）写入，此处不再重复保存。
     uint32_t expected_fw_size_raw = gd32_valid_size;
-    ota_meta_t meta_raw = {
-        .total_size = expected_fw_size_raw,
-        .stored_size = 0,
-        .last_seq = 0,
-        .checksum = {0}
-    };
-    OtaCoordinator::instance().saveGd32Meta(&meta_raw);
     uint32_t gd32_offset = 0;
 
     DEBUG_INFO("WIFI", "GD32 raw upload start: %u bytes", expected_fw_size_raw);
@@ -359,7 +546,10 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
             if (err != ESP_OK) {
                 DEBUG_ERR("WIFI", "GD32 first chunk write failed: len=%d err=%s",
                           first_chunk_len, esp_err_to_name(err));
+                // ★ 首块写入失败：用 abortCurrentIfEpoch 避免误中止新会话
+                OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
+                free(recv_buf);
                 return ESP_FAIL;
             }
             received = first_chunk_len;
@@ -378,7 +568,10 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         if (ret <= 0) {
             DEBUG_ERR("WIFI", "GD32 upload interrupted: received=%d expected=%d",
                       received, req->content_len);
+            // ★ 客户端断开（刷新网页/关浏览器/网络掉）：用 abortCurrentIfEpoch 避免误中止新会话
+            OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "upload interrupted");
+            free(recv_buf);
             return ESP_FAIL;
         }
 
@@ -386,7 +579,10 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         if (err != ESP_OK) {
             DEBUG_ERR("WIFI", "GD32 write failed: offset=%u len=%d err=%s",
                       (unsigned)gd32_offset, ret, esp_err_to_name(err));
+            // ★ 写入失败：同上，用 abortCurrentIfEpoch
+            OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
+            free(recv_buf);
             return ESP_FAIL;
         }
 
@@ -416,6 +612,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                        "\"message\": \"stored, call POST /ota/relay with sha256 to trigger\"}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
+    free(recv_buf);
     return ESP_OK;
 }
 

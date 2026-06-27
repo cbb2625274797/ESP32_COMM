@@ -19,6 +19,8 @@
   const BLE_OTA_FINISH_REBOOT_NOW = 0x07;
   const BLE_OTA_FINISH_GD32_RELAY_START = 0x10;
   const BLE_OTA_FINISH_GD32_RELAY_DONE = 0x11;
+  const BLE_OTA_FINISH_ABORTED = 0x20;           // 用户主动中止（BLE 不断开）
+  const BLE_OTA_CTRL_ABORT_OTA = 0xFB;           // 中止当前 OTA（不断开 BLE）
   const BLE_OTA_FINISH_ERR_FINALIZE = 0x81;
   const BLE_OTA_FINISH_ERR_MUTEX = 0x83;
   const BLE_OTA_FINISH_ERR_GD32_SIZE = 0x84;
@@ -240,6 +242,10 @@
 
   function finishSessionId(value) {
     return value & 0xFFFF;
+  }
+
+  function isSessionlessFinish(value) {
+    return finishSessionId(value) === 0;
   }
 
   function hasCurrentWaiter(targetKey) {
@@ -612,6 +618,7 @@
         [BLE_OTA_FINISH_REBOOT_NOW]: '[FINISH] ESP32 即将重启',
         [BLE_OTA_FINISH_GD32_RELAY_START]: '[FINISH] GD32 OTA 转发已开始',
         [BLE_OTA_FINISH_GD32_RELAY_DONE]: '[FINISH] GD32 OTA 转发完成',
+        [BLE_OTA_FINISH_ABORTED]: '[FINISH] OTA 已中止（BLE 保持连接）',
         [BLE_OTA_FINISH_ERR_FINALIZE]: `[FINISH] ESP32 OTA 收尾失败: err=${value}`,
         [BLE_OTA_FINISH_ERR_MUTEX]: '[FINISH] OTA 被其他通道占用，互斥拒绝',
         [BLE_OTA_FINISH_ERR_GD32_SIZE]: `[FINISH] GD32 固件超出分区大小: ${formatBytes(value)} (上限 216KB)`,
@@ -647,6 +654,29 @@
         state.lastUploadStatus = 'success';
         showToast('GD32 OTA 刷写完成', 'success');
         resolveOtaResult('success', { stage: stage, value: value });
+        return;
+      }
+
+      // ── 0x20 ABORTED：ESP32 已中止 OTA（BLE 保持连接）──
+      // 中止可由用户主动点"中止"按钮（abortTask 发 0xFB）触发，
+      // 也可能是设备端因错误自动中止。两种情况都走同一清理路径。
+      if (stage === BLE_OTA_FINISH_ABORTED) {
+        state.abortRequested = true;
+        state.expectedReboot = false;
+        state.reconnecting = false;
+        state.reconnectAttempts = 0;
+        state.lastUploadStatus = 'aborted';
+        setProgress(0, 'OTA 已中止');
+        setBleStageError('OTA 已中止');
+        showToast('OTA 已中止（BLE 保持连接）', 'warning');
+        // 解除任何等待 ACK / OTA 结果的 Promise
+        if (state.ackWaiter) {
+          const waiter = state.ackWaiter;
+          state.ackWaiter = null;
+          clearTimeout(waiter.timer);
+          waiter.reject(new Error('OTA 已中止'));
+        }
+        rejectOtaResult('OTA 已中止', { stage: stage, value: value });
         return;
       }
 
@@ -687,9 +717,12 @@
 
       // OTA 结果 toast 提示（用户可见，不只是在日志里）
       if (stage === BLE_OTA_FINISH_ERR_MUTEX) {
-        if (hasCurrentWaiter('esp32') && !finishBelongsToWaiter('esp32', value)) return;
-        if (hasCurrentWaiter('gd32') && !finishBelongsToWaiter('gd32', value)) return;
+        if (!isSessionlessFinish(value)) {
+          if (hasCurrentWaiter('esp32') && !finishBelongsToWaiter('esp32', value)) return;
+          if (hasCurrentWaiter('gd32') && !finishBelongsToWaiter('gd32', value)) return;
+        }
         showToast('OTA 被其他通道占用，请稍后重试', 'error');
+        state.abortRequested = true;
         setProgress(0, 'OTA 被其他通道占用');
         state.lastUploadStatus = 'failed';
         setBleStageError('OTA 被其他通道占用');
@@ -884,6 +917,11 @@
   }
 
   function waitForAck(cmd, expectedSeq, timeoutMs = 8000, opts = {}) {
+    // ★ 中止快速退出：若 0x20 ABORTED 已先于本调用到达（ackWaiter 当时为 null），
+    //   这里立即 reject，避免在已中止的会话上盲等超时。
+    if (state.abortRequested) {
+      return Promise.reject(new Error('OTA 已中止'));
+    }
     const gen = state.ackGeneration;
     // ★ 提前返回：只要 cmd 匹配 + generation 匹配 + 字节数足够，即可 resolve
     // 不再要求 lastAckSeq >= expectedSeq（与 handleNotify 保持一致）
@@ -1227,6 +1265,9 @@
         // 流水线发送：不逐包 await，减少 BLE 栈 per-packet 开销
         // ★ 不再在循环内 setProgress：进度完全由设备 ACK 后的 state.lastAckBytes 驱动
         for (let seq = windowStart; seq <= endSeq; seq++) {
+          // ★ 中止检查放在循环内：abortTask 可能在本窗口发送过程中触发
+          //   （windowStart 处的检查无法覆盖窗口中途的 abort）
+          if (state.abortRequested) throw new Error('用户中止');
           const start = seq * payloadSize;
           const end = Math.min(start + payloadSize, totalSize);
           const payload = fileBytes.slice(start, end);
@@ -1271,6 +1312,9 @@
         let prevAckBytes = state.lastAckBytes;  // ★ 进度跟踪：检测重试是否有效
         // ★ 仅以字节数判断是否完成，不依赖 ackOk（generation 不匹配时 ackOk 不可靠）
         while (state.lastAckBytes < expectedBytes && retryCount < MAX_WINDOW_RETRIES) {
+          // ★ 中止检查：0x20 ABORTED 可能在上一轮 waitForAck 超时期间到达，
+          //   或在 sleep/续发过程中到达。立即抛出，避免无谓重试已中止的会话。
+          if (state.abortRequested) throw new Error('用户中止');
           // 如果 ESP32 已确认所有数据（ACK 延迟到达），直接跳出
           if (state.lastAckBytes >= expectedBytes) break;
 
@@ -1296,6 +1340,8 @@
           await sleep(10);
 
           for (let seq = resumeSeq; seq <= endSeq; seq++) {
+            // ★ 中止检查：续发过程中可能收到 0x20 ABORTED
+            if (state.abortRequested) throw new Error('用户中止');
             const start = seq * payloadSize;
             const end = Math.min(start + payloadSize, totalSize);
             const payload = fileBytes.slice(start, end);
@@ -1436,6 +1482,12 @@
       bleLog('OTA', `📊 文件 SHA-256: ${fileSha256.toUpperCase()}`);
       return true;
     } catch (err) {
+      // ★ 中止不算失败：0x20 ABORTED handler 已更新 UI（progress/stage/toast），
+      //   这里只记录日志并返回 false，避免把"用户中止"误报为写入失败。
+      if (state.abortRequested || state.lastUploadStatus === 'aborted') {
+        bleLog('OTA', `写入已中止: ${err.message}`, 'W');
+        return false;
+      }
       state.lastUploadStatus = 'failed';
       state.expectedReboot = false;   // ★ 刷写失败，取消重连退避
       state.reconnecting = false;
@@ -1443,23 +1495,9 @@
       bleLog('OTA', `写入失败: ${err.message}`, 'E');
       setProgress(0, `写入失败: ${err.message}`);
       setBleStageError(err.message);
-      // ★ BLE OTA 失败/中止后强制断开 BLE 连接，并等待实际断连完成：
-      //   触发 ESP32 后端的 GAP disconnect 处理器 → ble_esp32_ota_abort()，
-      //   清理 OTA 会话（Esp32OtaCore::abort + reorder buffer 释放 + 协调器状态复位）。
-      //   等待 gattserverdisconnected 事件确保断连真正生效，避免用户快速重试时
-      //   旧会话尚未清理导致 seq=0 被误判为重传。
-      if (state.server && state.device && state.device.gatt && state.device.gatt.connected) {
-        bleLog('OTA', '刷写失败，断开 BLE 以清理 ESP32 OTA 会话...', 'W');
-        try {
-          await new Promise((resolve) => {
-            let done = false;
-            const finish = () => { if (!done) { done = true; resolve(); } };
-            state.device.addEventListener('gattserverdisconnected', finish, { once: true });
-            setTimeout(finish, 1000);  // 1 秒兜底超时
-            state.device.gatt.disconnect();
-          });
-        } catch (_) {}
-      }
+      // ★ BLE OTA 失败后不再强制断开 BLE：错误 FINISH 已通过 0xFB 路径或设备端
+      //   自动 abort 清理了 ESP32 OTA 会话。保留连接让用户可以快速重试或查看日志。
+      //   仅当连接已半死（gatt.connected=false）时由 onDisconnected 走重连路径。
       return false;
     } finally {
       if (state.ackWaiter) {
@@ -1511,12 +1549,8 @@
       const ok = await uploadFirmware();
       if (!ok || state.abortRequested) {
         bleLog('AUTO', '一键刷写中止', 'W');
-        // ★ 确保 BLE 已断开（触发 ESP32 OTA 会话清理）
-        //   uploadFirmware catch 块已尝试断开，这里做安全网兜底
-        if (state.device && state.device.gatt && state.device.gatt.connected) {
-          bleLog('AUTO', '断开 BLE 以清理 ESP32 OTA 会话...', 'W');
-          try { state.device.gatt.disconnect(); } catch (_) {}
-        }
+        // ★ 中止/失败后不再断开 BLE：0xFB 已让设备端清理 OTA 会话，保留连接方便重试。
+        //   若连接已半死，onDisconnected 会自动走重连路径。
         return;
       }
       if (cfg.label === 'ESP32') {
@@ -1535,10 +1569,40 @@
     }
   }
 
-  /** @description 中止当前 BLE OTA 任务并清理状态。 */
-  function abortTask() {
-    state.abortRequested = true;
-    bleLog('OTA', '已请求中止，等待当前分包返回');
+  /**
+   * @description 中止当前 BLE OTA 任务并清理状态。
+   *   改进：发 0xFB 控制命令让 ESP32 主动清理 OTA 会话，BLE 保持连接。
+   *   旧做法是直接断开 BLE 触发 GAP disconnect 清理，导致用户需重连。
+   *   若 0xFB 发送失败（如 CTRL 特征不可用），回退到设置标志等待发包循环自然退出。
+   */
+  async function abortTask() {
+    state.abortRequested = true;  // 立即停止发送循环
+    bleLog('OTA', '已请求中止，发送 0xFB 让设备端清理（BLE 保持连接）');
+
+    if (state.ctrlChar && state.server && state.device.gatt.connected) {
+      try {
+        const session = state.sessionId || 0;
+        const abortCmd = new Uint8Array([BLE_OTA_CTRL_ABORT_OTA, session & 0xFF, (session >> 8) & 0xFF]);
+        await state.ctrlChar.writeValue(abortCmd);
+        bleLog('OTA', '0xFB 已发送，等待设备端回复 ABORTED (stage=0x20)');
+      } catch (e) {
+        bleLog('OTA', '0xFB 发送失败: ' + e.message + '，回退到本地中止', 'E');
+        // CTRL 写入失败时回退：本地立即标记失败，不再等设备端 ABORTED 回复
+        state.lastUploadStatus = 'failed';
+        if (state.ackWaiter) {
+          const waiter = state.ackWaiter;
+          state.ackWaiter = null;
+          clearTimeout(waiter.timer);
+          waiter.reject(new Error('中止失败: ' + e.message));
+        }
+        rejectOtaResult('中止失败: ' + e.message, { stage: 0xFB, value: 0 });
+      }
+    } else {
+      // CTRL 特征未就绪（连接已断或未完成握手），仅本地清理
+      bleLog('OTA', 'CTRL 特征不可用，仅本地中止', 'W');
+      state.lastUploadStatus = 'failed';
+      rejectOtaResult('CTRL 特征不可用', { stage: 0xFB, value: 0 });
+    }
   }
 
   // showToast 使用 app.js 中的全局版本

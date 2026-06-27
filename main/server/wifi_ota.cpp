@@ -1,4 +1,4 @@
-﻿/*
+/*
  * wifi_ota.cpp - WiFi OTA 服务器实现
  * WifiOta 类封装 WiFi 初始化、HTTP OTA 服务器和网络状态查询。
  * T4.1 - T4.5
@@ -442,144 +442,38 @@ esp_err_t WifiOta::httpServerStart()
         }
     }
 
-    httpd_uri_t upload_uri = {
-        .uri = "/ota/upload",
-        .method = HTTP_POST,
-        .handler = ota_upload_handler,
-        .user_ctx = NULL
+    struct UriEntry {
+        const char *uri;
+        httpd_method_t method;
+        esp_err_t (*handler)(httpd_req_t *);
     };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &upload_uri);
-    httpd_uri_t upload_options_uri = {
-        .uri = "/ota/upload",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
+    static const UriEntry kHttpRoutes[] = {
+        {"/ota/upload",    HTTP_POST, ota_upload_handler},
+        {"/ota/relay",     HTTP_POST, ota_relay_trigger_handler},
+        {"/ota/update",    HTTP_POST, esp32_ota_update_handler},
+        {"/restart",       HTTP_POST, restart_handler},
+        {"/logs",          HTTP_GET,  logs_handler},
+        {"/system/status", HTTP_GET,  system_status_handler},
+        {"/system/probe",  HTTP_GET,  system_probe_handler},
+        {"/can/send",      HTTP_POST, can_send_handler},
+        {"/spi/send",      HTTP_POST, spi_send_handler},
     };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &upload_options_uri);
 
-    httpd_uri_t relay_uri = {
-        .uri = "/ota/relay",
-        .method = HTTP_POST,
-        .handler = ota_relay_trigger_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &relay_uri);
-    httpd_uri_t relay_options_uri = {
-        .uri = "/ota/relay",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &relay_options_uri);
+    for (const auto &r : kHttpRoutes) {
+        httpd_uri_t main_uri = {};
+        main_uri.uri = r.uri;
+        main_uri.method = r.method;
+        main_uri.handler = r.handler;
+        main_uri.user_ctx = NULL;
+        httpd_register_uri_handler(WifiOta::instance().m_httpServer, &main_uri);
 
-    httpd_uri_t esp32_update_uri = {
-        .uri = "/ota/update",
-        .method = HTTP_POST,
-        .handler = esp32_ota_update_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_update_uri);
-    httpd_uri_t esp32_update_options_uri = {
-        .uri = "/ota/update",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &esp32_update_options_uri);
-
-    httpd_uri_t restart_uri = {
-        .uri = "/restart",
-        .method = HTTP_POST,
-        .handler = restart_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &restart_uri);
-    httpd_uri_t restart_options_uri = {
-        .uri = "/restart",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &restart_options_uri);
-
-    httpd_uri_t logs_uri = {
-        .uri = "/logs",
-        .method = HTTP_GET,
-        .handler = logs_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &logs_uri);
-    httpd_uri_t logs_options_uri = {
-        .uri = "/logs",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &logs_options_uri);
-
-    // 系统状态查询端点
-    httpd_uri_t status_uri = {
-        .uri = "/system/status",
-        .method = HTTP_GET,
-        .handler = system_status_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_uri);
-    httpd_uri_t status_options_uri = {
-        .uri = "/system/status",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &status_options_uri);
-
-    // PR2: GD32 APP 探测端点
-    httpd_uri_t system_probe_uri = {
-        .uri = "/system/probe",
-        .method = HTTP_GET,
-        .handler = system_probe_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_probe_uri);
-    httpd_uri_t system_probe_options_uri = {
-        .uri = "/system/probe",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &system_probe_options_uri);
-
-    // CAN 帧转发
-    httpd_uri_t can_send_uri = {
-        .uri = "/can/send",
-        .method = HTTP_POST,
-        .handler = can_send_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_send_uri);
-    httpd_uri_t can_send_options_uri = {
-        .uri = "/can/send",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &can_send_options_uri);
-
-    // SPI 直接发送
-    httpd_uri_t spi_send_uri = {
-        .uri = "/spi/send",
-        .method = HTTP_POST,
-        .handler = spi_send_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &spi_send_uri);
-    httpd_uri_t spi_send_options_uri = {
-        .uri = "/spi/send",
-        .method = HTTP_OPTIONS,
-        .handler = http_options_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(WifiOta::instance().m_httpServer, &spi_send_options_uri);
+        httpd_uri_t opts_uri = {};
+        opts_uri.uri = r.uri;
+        opts_uri.method = HTTP_OPTIONS;
+        opts_uri.handler = http_options_handler;
+        opts_uri.user_ctx = NULL;
+        httpd_register_uri_handler(WifiOta::instance().m_httpServer, &opts_uri);
+    }
 
     DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /restart, /logs, /system/status, /system/probe, /can/send, /spi/send");
 

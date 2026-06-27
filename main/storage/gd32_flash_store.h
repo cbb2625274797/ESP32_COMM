@@ -6,7 +6,8 @@
  * 不再由 OtaRelay 承担存储职责（解决 H1 职责超载）。
  *
  * 线程模型：
- *   - 所有方法均为 static，由调用方（协调器/OtaRelay/传输层）保证串行化
+ *   - 通过 instance() 单例访问，NVS 元数据读写由内部 mutex 保护
+ *   - metaLoad/metaSave/metaUpdate/metaClear 串行化，读-改-写原子
  *   - 分区指针懒初始化，首次使用时查找并缓存
  */
 #ifndef GD32_FLASH_STORE_H
@@ -15,6 +16,8 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "esp_partition.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define OTA_META_NVS_NAMESPACE "ota_meta" ///< OTA 元数据 NVS 命名空间
 
@@ -71,9 +74,11 @@ public:
     // ── NVS 元数据持久化 ──
 
     /**
-     * @brief 从 NVS 加载 OTA 元数据（命名空间不存在时返回全零结构）。
-     * @param meta 输出元数据结构体指针。
-     * @return ESP_OK 成功。
+     * @brief 从 NVS 加载 OTA 元数据。
+     * @param meta 输出元数据结构体指针（任何错误路径下都会被清零）。
+     * @return ESP_OK 成功（含命名空间不存在的兼容路径，返回全零结构）；
+     *         ESP_ERR_TIMEOUT 加锁超时；
+     *         其他错误码 = nvs_open 真实失败（如 NVS 未初始化/损坏），不再一律当 OK。
      */
     esp_err_t metaLoad(ota_meta_t *meta);
 
@@ -135,12 +140,24 @@ public:
     const esp_partition_t* getPartition();
 
 private:
-    Gd32FlashStore() = default;
+    Gd32FlashStore();
     ~Gd32FlashStore() = default;
     Gd32FlashStore(const Gd32FlashStore&) = delete;
     Gd32FlashStore& operator=(const Gd32FlashStore&) = delete;
 
     const esp_partition_t *m_partition = nullptr; ///< gd32_ota 分区指针（懒初始化）
+
+    // ── NVS 互斥锁（保护元数据读-改-写原子性）──
+    //   lockNvs 返回是否成功 take；unlockNvs(handle) 据此决定是否 give，
+    //   参考 OtaCoordinator::lock/unlock 模式（避免共享 bool 被并发覆盖导致死锁）。
+    SemaphoreHandle_t m_nvsMutex = nullptr;
+    bool lockNvs(uint32_t timeout_ms);
+    void unlockNvs(bool handle);
+    static constexpr uint32_t kNvsLockTimeoutMs = 100; ///< NVS 加锁超时（ms）
+
+    // 已持锁版本：由持锁的公开方法或 metaUpdate 调用，不再自行加锁，避免递归 take 死锁
+    esp_err_t metaLoadLocked(ota_meta_t *meta);
+    esp_err_t metaSaveLocked(const ota_meta_t *meta);
 };
 
 #endif // GD32_FLASH_STORE_H
