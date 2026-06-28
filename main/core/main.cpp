@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ESP32-C3FH4 OTA 中继 - 程序入口
  * 四个 FreeRTOS 任务：健康监控 / OTA Relay / WiFi Server / BLE GATT
  *
@@ -23,6 +23,7 @@
 #include "monitor/debug_log.h"
 #include "app_config.h"
 #include "ota/esp32_ota_core.h"
+#include "monitor/can_feedback_task.h"
 
 /**
  * @brief 程序主入口，初始化系统组件并创建各 FreeRTOS 任务。
@@ -148,6 +149,13 @@ extern "C" void app_main(void)
         ESP_ERROR_CHECK(ESP_FAIL);  // 关键任务失败：终止启动并触发看门狗重启
     } else {
         DEBUG_INFO("MAIN", "BLE OTA 任务已创建");
+    }
+
+    // CAN 1Hz 反馈轮询任务（依赖 SPI 已初始化）
+    if (startCanFeedbackTask()) {
+        DEBUG_INFO("MAIN", "CAN 反馈轮询任务已创建");
+    } else {
+        DEBUG_WARN("MAIN", "CAN 反馈轮询任务创建失败（非致命，OTA 不受影响）");
     }
 
     // ★ OTA 回滚保护：标记当前固件有效

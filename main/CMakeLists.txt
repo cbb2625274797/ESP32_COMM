@@ -10,6 +10,7 @@ idf_component_register(
         "server/http_handlers.cpp"     # HTTP 路由处理（H2 从 wifi_ota 提取）
         "server/ble_ota.cpp"           # BLE GATT OTA 服务器
         "monitor/health_monitor.cpp"   # 系统健康监控（温度/RSSI/堆内存）
+        "monitor/can_feedback_task.cpp" # CAN 1Hz 反馈轮询任务（0xC1）
         "monitor/debug_log.cpp"        # 三路调试日志（UART/UDP/环形缓冲）
     INCLUDE_DIRS
         "."

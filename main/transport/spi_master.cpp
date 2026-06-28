@@ -452,7 +452,7 @@ esp_err_t SpiMaster::otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
 esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_payload,
                                              size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
 {
-    constexpr size_t kPollBytes = 96U;
+    constexpr size_t kPollBytes = 160U;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
 
     while (xTaskGetTickCount() <= deadline) {

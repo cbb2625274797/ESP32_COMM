@@ -5,6 +5,7 @@
  * 传输层（WiFi/BLE）通过本协调器发起所有 OTA 操作。
  */
 #include "ota_coordinator.h"
+#include "monitor/can_feedback_task.h"
 #include "esp32_ota_core.h"
 #include "relay/ota_relay.h"
 #include "storage/gd32_flash_store.h"
@@ -313,6 +314,7 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
 
     m_sysState = OTA_SYS_GD32_RELAYING;
     m_busySinceTick = xTaskGetTickCount();  // ★ 记录忙状态起始时刻
+    pauseCanFeedbackTask(true);
     DEBUG_INFO(TAG, "触发 GD32 中继, 系统状态 → GD32_RELAYING");
 
     uint32_t cmd = 1;
@@ -336,6 +338,7 @@ void OtaCoordinator::notifyRelayStarted()
     if (h && m_sysState != OTA_SYS_GD32_RELAYING) {
         m_sysState = OTA_SYS_GD32_RELAYING;
         m_busySinceTick = xTaskGetTickCount();  // ★ 记录起始时刻
+        pauseCanFeedbackTask(true);
         DEBUG_INFO(TAG, "中继已开始, 系统状态 → GD32_RELAYING");
     }
     unlock(h);
@@ -350,10 +353,12 @@ void OtaCoordinator::notifyRelayComplete(bool success)
             m_sysState = OTA_SYS_GD32_COMPLETE;
             m_gd32StorageDone = false;
             m_busySinceTick = 0;  // ★ COMPLETE 非忙
+            pauseCanFeedbackTask(false);
             DEBUG_INFO(TAG, "GD32 中继完成, 系统状态 → GD32_COMPLETE");
         } else {
             m_sysState = OTA_SYS_ERROR;
             m_busySinceTick = 0;  // ★ ERROR 非忙（可被后续请求恢复）
+            pauseCanFeedbackTask(false);
             DEBUG_ERR(TAG, "GD32 中继失败, 系统状态 → ERROR");
         }
     }

@@ -10,6 +10,7 @@
  * 协议子步骤与加密/Flash 工具方法保持不变。
  */
 #include <string.h>
+#include "monitor/can_feedback_task.h"
 #include <stdlib.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
@@ -1335,6 +1336,7 @@ void OtaRelay::taskEntry(void *pvParameters)
         DEBUG_INFO("OTA", "收到 OTA 调度信号: %" PRIu32 "，开始转发...", msg);
         // ★ H4: 通过 IRelayListener 接口回调通知协调器（不再直接依赖 OtaCoordinator）
         IRelayListener *listener = getRelayListener();
+        pauseCanFeedbackTask(true);
         if (listener) listener->onRelayStarted();
         ota_result_t result = instance().forwardFirmware();
 
@@ -1353,5 +1355,6 @@ void OtaRelay::taskEntry(void *pvParameters)
         // ★ H4: 通过 IRelayListener 接口回调通知协调器中继结束
         listener = getRelayListener();
         if (listener) listener->onRelayComplete(result == OTA_RESULT_OK);
+        pauseCanFeedbackTask(false);
     }
 }

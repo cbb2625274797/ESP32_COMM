@@ -1708,3 +1708,68 @@ code { color: #d3f9ff; font-family: var(--font-mono); }
     transition-duration: .001ms !important;
   }
 }
+
+/* === CAN 1Hz FEEDBACK === */
+.can-feedback-card { margin-top: 18px; }
+.can-feedback-card .card-head {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+}
+.feedback-controls { display: flex; align-items: center; gap: 8px; }
+.feedback-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+}
+.feedback-channel {
+  background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.07);
+  border-radius: 10px; padding: 14px 16px;
+}
+.feedback-ch-head {
+  font-weight: 700; font-size: 15px; margin-bottom: 10px;
+  display: flex; align-items: center; gap: 8px;
+}
+.ch-dot {
+  width: 10px; height: 10px; border-radius: 50%; display: inline-block;
+}
+.ch-dot.ch0 { background: #22d3ee; }
+.ch-dot.ch1 { background: #a78bfa; }
+.ch-dot.ch2 { background: #f59e0b; }
+.feedback-row {
+  display: flex; justify-content: space-between; padding: 3px 0;
+  font-size: 13px; border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.feedback-row:last-child { border-bottom: none; }
+.fb-label { color: var(--muted, #8892a4); }
+.fb-val { font-weight: 600; font-variant-numeric: tabular-nums; }
+.fb-val.mono { font-family: monospace; }
+.fb-val.ok  { color: #34d399; }
+.fb-val.warn { color: #f59e0b; }
+.fb-val.err  { color: #f87171; }
+.fb-val.zero { color: #64748b; }
+@media (max-width: 900px) {
+  .feedback-grid { grid-template-columns: 1fr; }
+}
+
+/* === ID SNAPSHOT TABLE === */
+.idsnap-table-wrap { overflow-x: auto; }
+.idsnap-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.idsnap-table th {
+  text-align: left; padding: 6px 10px; font-weight: 600;
+  border-bottom: 2px solid rgba(255,255,255,.12); color: var(--muted, #8892a4);
+  white-space: nowrap;
+}
+.idsnap-table td {
+  padding: 5px 10px; border-bottom: 1px solid rgba(255,255,255,.05);
+  white-space: nowrap;
+}
+.idsnap-table td.mono { font-family: monospace; }
+.idsnap-table tr:hover td { background: rgba(255,255,255,.03); }
+.idsnap-table .flag-on  { color: #34d399; font-weight: 600; }
+.idsnap-table .flag-off { color: #475569; }
+.idsnap-data { font-family: monospace; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+
+.fb-data-cell {
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis;
+  font-size: 11px; word-break: break-all; line-height: 1.4;
+}

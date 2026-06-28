@@ -1,4 +1,4 @@
-/*
+﻿/*
  * http_handlers.cpp - HTTP 请求处理器实现
  * 从 wifi_ota.cpp 提取的 HTTP handler 函数
  */
@@ -28,6 +28,7 @@
 #include "monitor/debug_log.h"
 #include "spi_master.h"
 #include "canfd_bridge.h"
+#include "monitor/can_feedback_task.h"
 #include "ble_ota.h"
 
 // OTA 准备状态：/ota/prepare 完成后设置，/ota/upload 消费后清除
@@ -714,6 +715,140 @@ esp_err_t logs_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+
+// ============================================================
+// GET /can/feedback — 三路 CAN 1Hz 反馈快照
+// ============================================================
+esp_err_t can_feedback_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    can_feedback_result_t results[CAN_CHANNEL_MAX] = {};
+    bool valid[CAN_CHANNEL_MAX] = {};
+    for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
+        valid[i] = getLatestCanFeedback(i, &results[i]);
+    }
+
+    /* 估算缓冲大小：每通道 ~2KB (统计+ID条目) */
+    char *resp = (char *)calloc(1, 8192);
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+        return ESP_FAIL;
+    }
+
+    char *p = resp;
+    p += sprintf(p, "{\"channels\":[");
+    for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
+        const can_feedback_result_t &r = results[i];
+        if (i > 0) p += sprintf(p, ",");
+        p += sprintf(p, "{\"ch\":%u,\"valid\":%s", (unsigned)i,
+                     valid[i] ? "true" : "false");
+        if (valid[i]) {
+            p += sprintf(p,
+                ",\"mode\":%u,\"seq\":%lu,\"rx\":%lu,\"tx\":%lu,"
+                "\"drop\":%lu,\"err\":%lu,\"count\":%u,\"entries\":[",
+                (unsigned)r.stats.mode,
+                (unsigned long)r.stats.snapshot_seq,
+                (unsigned long)r.stats.rx_count,
+                (unsigned long)r.stats.tx_count,
+                (unsigned long)r.stats.rx_drop_count,
+                (unsigned long)r.stats.error_count,
+                (unsigned)r.total_count);
+            for (uint8_t j = 0; j < r.total_count && j < CANFD_ID_SNAPSHOT_MAX; ++j) {
+                const id_snapshot_entry_t &e = r.entries[j];
+                if (j > 0) p += sprintf(p, ",");
+                p += sprintf(p,
+                    "{\"id\":\"0x%08lX\",\"dlc\":%u,\"fd\":%u,"
+                    "\"brs\":%u,\"esi\":%u,\"data\":\"",
+                    (unsigned long)e.id,
+                    (unsigned)e.dlc,
+                    (unsigned)e.fd_flag,
+                    (unsigned)e.brs,
+                    (unsigned)e.esi);
+                const uint8_t dataLen = (e.dlc < CANFD_ID_SNAPSHOT_DATA_MAX)
+                                        ? e.dlc : CANFD_ID_SNAPSHOT_DATA_MAX;
+                for (uint8_t d = 0; d < dataLen; ++d) {
+                    p += sprintf(p, "%02X", e.data[d]);
+                }
+                p += sprintf(p, "\"}");
+            }
+            p += sprintf(p, "]");
+        }
+        p += sprintf(p, "}");
+    }
+    p += sprintf(p, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, (int)(p - resp));
+    free(resp);
+    return ESP_OK;
+}
+
+// ============================================================
+// GET/POST /can/mode — 查询或切换三路 CAN 接收模式
+// ============================================================
+esp_err_t can_mode_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    if (req->method == HTTP_GET) {
+        can_feedback_result_t fb{};
+        if (getLatestCanFeedback(0, &fb)) {
+            char resp[64];
+            int len = snprintf(resp, sizeof(resp),
+                "{\"mode\":%u}", (unsigned)fb.stats.mode);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, resp, len);
+        } else {
+            can_rx_mode_t actual = CAN_RX_MODE_ALL_PASS;
+            int rc = canFdSetRxMode(CAN_RX_MODE_ALL_PASS, &actual, 500);
+            char resp[64];
+            int len = snprintf(resp, sizeof(resp),
+                "{\"mode\":%u,\"source\":\"spi\",\"ok\":%s}",
+                (unsigned)actual, rc == 0 ? "true" : "false");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, resp, len);
+        }
+        return ESP_OK;
+    }
+
+    char buf[128] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "接收数据失败");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON 解析失败");
+        return ESP_FAIL;
+    }
+
+    cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
+    if (!mode_item || !cJSON_IsNumber(mode_item)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 mode 字段");
+        return ESP_FAIL;
+    }
+
+    int requested = (int)cJSON_GetNumberValue(mode_item);
+    cJSON_Delete(root);
+
+    can_rx_mode_t target = (requested == 1) ? CAN_RX_MODE_FILTER_ID
+                                            : CAN_RX_MODE_ALL_PASS;
+    can_rx_mode_t actual = CAN_RX_MODE_ALL_PASS;
+    int rc = canFdSetRxMode(target, &actual, 500);
+
+    char resp[96];
+    int len = snprintf(resp, sizeof(resp),
+        "{\"ok\":%s,\"requested\":%d,\"actual\":%u}",
+        rc == 0 ? "true" : "false", requested, (unsigned)actual);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, len);
+    return ESP_OK;
+}
 esp_err_t can_send_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
