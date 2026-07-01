@@ -1332,15 +1332,17 @@ async function startUpload(chip) {
         var st = await probe.json();
         var ota = st.ota || {};
         var ssc = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
-        // ★ RECEIVING (5) 可能是刚取消的 BLE OTA 残留态（设备端 GAP disconnect
-        //   处理需 3-4 秒），等它清理完；FINALIZING(6)/REBOOTING(7) 是真实忙，直接拒绝。
-        if (ssc === 5 && _pi < 3) continue;
-        // ESP32 活跃态（5=RECEIVING, 6=FINALIZING, 7=REBOOTING）
-        var esp32Busy = (ssc === 5 || ssc === 6 || ssc === 7);
-        // GD32 存储/中继（1=STORING, 3=RELAYING）→ 阻止新上传，避免 NVS 与 Flash 互踩
-        var gd32Busy = (ssc === 1 || ssc === 3);
+        var otaChannel = Number.isFinite(ota.channel) ? ota.channel : -1;
+        var otaChannelName = ota.channel_name || (otaChannel === 1 ? 'BLE' : 'WIFI');
+        // ESP32 RECEIVING(5) 可由同一 WiFi 通道的新上传接管；后台/休眠可能让 /ota/update 没发出，
+        // 若这里提前拦截，后端 beginEsp32OtaWithRetry 的同通道清理分支永远没有机会执行。
+        // ERROR(8) 也放行给后端清理底层 OTA 句柄；FINALIZING(6)/REBOOTING(7) 是不可逆忙态。
+        if (ssc === 5 && otaChannel === 1 && _pi < 3) continue;
+        var esp32Busy = (ssc === 6 || ssc === 7 || (ssc === 5 && otaChannel !== 0));
+        // GD32 STORING(1) 可由同一 WiFi 通道的新上传接管；RELAYING(3) 不可中断。
+        var gd32Busy = (ssc === 3 || (ssc === 1 && otaChannel !== 0));
         if ((esp32Busy || gd32Busy)) {
-          addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ')，拒绝本次 ' + chip.toUpperCase() + ' 上传');
+          addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ', channel=' + otaChannelName + ')，拒绝本次 ' + chip.toUpperCase() + ' 上传');
           showToast('设备正在 OTA 中，请等待结束后再试', 'error');
           isUploading = false;
           resumePollingAfterUpload();

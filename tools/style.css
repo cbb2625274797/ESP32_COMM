@@ -1,4 +1,4 @@
-﻿/* ===== ESP32 OTA 控制台 — 工业调试台风格 ===== */
+/* ===== ESP32 OTA 控制台 — 工业调试台风格 ===== */
 
 :root {
   --bg-root: #090e15;
@@ -1013,13 +1013,27 @@ select option { background: var(--bg-panel); color: var(--text); }
   overflow: auto;
 }
 .message-table {
-  min-width: 1200px;
+  /* 列宽随左栏宽度自适应压缩，不再强制水平滚动 */
+  min-width: 0;
+  width: 100%;
 }
 .message-table-head,
 .message-row {
   display: grid;
-  grid-template-columns: 52px minmax(180px, 1.6fr) 150px 88px 88px 76px 76px 150px minmax(220px, 1fr);
+  grid-template-columns:
+    36px              /* 勾选 */
+    32px              /* 展开 */
+    40px              /* # */
+    minmax(0, 1.6fr)  /* 报文名称 */
+    96px              /* 标识符 */
+    52px              /* 通道 */
+    52px              /* 类型 */
+    46px              /* DLC */
+    50px              /* 信号 */
+    minmax(0, 1fr)    /* 发送节点 */
+    minmax(0, 2fr);   /* 注释 */
   align-items: center;
+  min-width: 0;
 }
 .message-table-head {
   position: sticky;
@@ -1772,4 +1786,361 @@ code { color: #d3f9ff; font-family: var(--font-mono); }
 .fb-data-cell {
   max-width: 200px; overflow: hidden; text-overflow: ellipsis;
   font-size: 11px; word-break: break-all; line-height: 1.4;
+}
+
+/* === CAN message row expand / batch additions === */
+.message-col-check,
+.message-col-toggle {
+  text-align: center;
+  padding: 6px 4px;
+}
+.message-check {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--accent, #22d3ee);
+}
+.message-toggle {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(255,255,255,.04);
+  color: #c8d6e7;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.message-toggle:hover {
+  background: rgba(34,211,238,.12);
+  border-color: rgba(34,211,238,.4);
+  color: #e6fbff;
+}
+.message-toggle.expanded {
+  background: rgba(34,211,238,.18);
+  border-color: rgba(34,211,238,.55);
+  color: #e6fbff;
+}
+
+.message-row-expand {
+  grid-column: 1 / -1;
+  background: rgba(255,255,255,.02);
+  border-top: 1px dashed rgba(255,255,255,.06);
+  border-bottom: 1px solid rgba(255,255,255,.04);
+  padding: 10px 14px 14px;
+}
+.message-row-expand[hidden] {
+  display: none;
+}
+.message-row-expand .signal-table-host {
+  margin-top: 0;
+}
+.message-row-expand .signal-table {
+  border-radius: 10px;
+}
+.message-row-expand .signal-table-body {
+  max-height: 360px;
+}
+
+.can-batch-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim, #93a4bf);
+  cursor: pointer;
+  user-select: none;
+}
+.checkbox-inline input {
+  accent-color: var(--accent, #22d3ee);
+  cursor: pointer;
+}
+.card-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.btn.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.btn[disabled] {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+/* === 2026-06-30c: 报文列表与右侧操作栏并列布局调整 === */
+/* 报文列表移入 can-editor-layout 后，作为左列；侧栏作为右列；不再需要顶部独立信号编辑卡。 */
+.can-editor-layout > .can-table-card {
+  margin-top: 0;
+}
+.can-sidepanel .card-body { padding-top: 14px; }
+.can-frame-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.can-frame-actions .btn { flex: 1 1 auto; min-width: 120px; }
+.can-frame-panel-compact .can-frame-hex { word-break: break-all; }
+
+
+/* === 2026-06-30c: 报文列表压缩列宽 + 纵向滚动美化 === */
+.message-list {
+  /* 提高可视高度，并改用美化的纵向滚动条 */
+  max-height: calc(100vh - 300px);
+  min-height: 420px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34,211,238,.35) transparent;
+}
+.message-list::-webkit-scrollbar { width: 8px; }
+.message-list::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px 0;
+}
+.message-list::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(34,211,238,.45), rgba(34,211,238,.18));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.message-list::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(34,211,238,.65), rgba(34,211,238,.28));
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* 单元格统一省略号 */
+.message-row .message-col,
+.message-table-head .message-col {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 紧凑列的内边距收一点，腾出空间给名称/注释 */
+.message-col-index,
+.message-col-channel,
+.message-col-type,
+.message-col-dlc,
+.message-col-signal {
+  padding-left: 6px;
+  padding-right: 6px;
+}
+.message-col-check,
+.message-col-toggle {
+  padding-left: 4px;
+  padding-right: 4px;
+}
+/* 注释列允许浅色降权显示 */
+.message-row .message-col-comment {
+  color: var(--muted);
+}
+
+/* === 2026-06-30c: 窄屏报文表降级（按位置缩为 0 宽，保持 grid 对齐） === */
+/* 列序：check(1) toggle(2) #(3) name(4) id(5) channel(6) type(7) dlc(8) signal(9) node(10) comment(11) */
+@media (max-width: 1280px) {
+  .message-table-head,
+  .message-row {
+    grid-template-columns:
+      36px 32px 40px
+      minmax(0, 1.6fr)  /* name */
+      90px              /* id */
+      52px              /* channel */
+      0                 /* type 隐藏 */
+      46px              /* dlc */
+      0                 /* signal 隐藏 */
+      minmax(0, 0.9fr)  /* node */
+      minmax(0, 1.8fr); /* comment */
+  }
+  .message-col-type,
+  .message-col-signal { padding: 0; border: 0; overflow: hidden; }
+}
+@media (max-width: 1024px) {
+  .message-table-head,
+  .message-row {
+    grid-template-columns:
+      36px 32px 36px
+      minmax(0, 1.6fr)
+      86px
+      0
+      0
+      46px
+      0
+      0
+      minmax(0, 1.8fr);
+  }
+  .message-col-channel,
+  .message-col-node { padding: 0; border: 0; overflow: hidden; }
+}
+
+
+/* 行内信号编辑展开区允许局部横向滚动（信号字段较多时），不影响外层报文表 */
+.message-row-expand {
+  overflow-x: auto;
+}
+.message-row-expand::-webkit-scrollbar { height: 6px; }
+.message-row-expand::-webkit-scrollbar-thumb {
+  background: rgba(34,211,238,.35);
+  border-radius: 4px;
+}
+
+
+/* === 2026-06-30e: 工作台设置 + 最近发送 双列布局 === */
+.can-top-layout {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 18px;
+  align-items: stretch;
+}
+/* 工作台卡和历史卡都放进 grid 后不需要单独的顶部外边距 */
+.can-top-layout > .can-toolbar-card,
+.can-top-layout > .can-history-card {
+  margin-top: 0;
+}
+/* 历史卡固定高度，仅容纳约 3 条历史，超出滚动 */
+.can-history-card { align-self: start; }
+.can-history-card .card-body {
+  display: flex;
+  flex-direction: column;
+}
+.can-history-card .history-list {
+  /* 约 3 条历史的高度：(每条 ~96px) * 3 + gap 10px * 2 ≈ 308px */
+  max-height: 312px;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34,211,238,.35) transparent;
+}
+.can-history-card .history-list::-webkit-scrollbar { width: 8px; }
+.can-history-card .history-list::-webkit-scrollbar-track { background: transparent; margin: 4px 0; }
+.can-history-card .history-list::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(34,211,238,.45), rgba(34,211,238,.18));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.can-history-card .history-list::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(34,211,238,.65), rgba(34,211,238,.28));
+  background-clip: padding-box;
+}
+
+/* 窄屏堆叠 */
+@media (max-width: 1100px) {
+  .can-top-layout { grid-template-columns: 1fr; }
+  .can-history-card .history-list { max-height: 312px; }
+}
+
+
+/* === 2026-07-01a: 发送节点过滤下拉 === */
+.can-node-filter {
+  position: relative;
+  display: inline-flex;
+}
+.can-node-filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.can-node-filter-btn.active {
+  border-color: rgba(34,211,238,.65);
+  color: var(--accent);
+  background: rgba(34,211,238,.08);
+}
+.can-node-filter-caret {
+  font-size: 10px;
+  opacity: .75;
+}
+.can-node-filter-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  min-width: 260px;
+  max-width: 320px;
+  background: #182330;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 18px 38px rgba(0,0,0,.45);
+  padding: 10px;
+}
+.can-node-filter-panel[hidden] { display: none; }
+.can-node-filter-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.can-node-filter-search {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.can-node-filter-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.can-node-filter-list {
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34,211,238,.35) transparent;
+}
+.can-node-filter-list::-webkit-scrollbar { width: 8px; }
+.can-node-filter-list::-webkit-scrollbar-thumb {
+  background: rgba(34,211,238,.35);
+  border-radius: 6px;
+}
+.can-node-filter-item {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text);
+  transition: background .12s;
+}
+.can-node-filter-item:hover {
+  background: rgba(255,255,255,.04);
+}
+.can-node-filter-item input[type="checkbox"] {
+  margin: 0;
+}
+.can-node-filter-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.can-node-filter-count {
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(255,255,255,.05);
+  border-radius: 999px;
+  padding: 1px 8px;
+  min-width: 26px;
+  text-align: center;
 }

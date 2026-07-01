@@ -477,13 +477,17 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
         //   两通道并发写同一 OTA 分区（之前 BLE 与 WiFi 可同时 OTA 的根因）。
         //   避免连续 isIdle() + getSystemState() 各加锁一次（共 2 次锁）。
         ota_system_state_t cur = getSystemState();
-        if (!isIdleState(cur)) {
+        if (!isIdleState(cur) && cur != OTA_SYS_ERROR) {
             DEBUG_WARN(TAG, "ESP32 OTA 被拒绝且系统非空闲 (state=%d)，不强制清理，直接失败",
                        (int)cur);
             return err;
         }
-        // 协调器空闲但 Esp32OtaCore.begin 仍被拒 → 锁残留，强制清理后重试
-        DEBUG_WARN(TAG, "ESP32 OTA 被拒绝但系统空闲，判定为锁残留，强制清理状态机后重试");
+
+        if (cur == OTA_SYS_ERROR) {
+            DEBUG_WARN(TAG, "ESP32 OTA 被拒绝但协调器处于 ERROR，清理底层残留句柄后重试");
+        } else {
+            DEBUG_WARN(TAG, "ESP32 OTA 被拒绝但系统空闲，判定为锁残留，强制清理状态机后重试");
+        }
         Esp32OtaCore::instance().forceCleanup();
         err = beginEsp32Ota(total_size, channel);
     }
@@ -738,6 +742,7 @@ OtaSnapshot OtaCoordinator::getSnapshot() const
     bool h = lock();
     if (h) {
         snap.sys_state = m_sysState;
+        snap.channel = m_otaChannel;
         snap.storage_done = m_gd32StorageDone;
         // 就地把状态枚举转字符串，与 sys_state 来自同一时刻
         snap.sys_state_str = stateToString(snap.sys_state);

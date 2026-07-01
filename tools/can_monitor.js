@@ -9,10 +9,13 @@
     'monIp', 'monTestBtn', 'monConnPill', 'monConnTxt',
     'monConnIndicator', 'monConnIndicatorTxt', 'monHelper',
     'fbModePill', 'fbPollStatus',
-    'fb0State', 'fb0Rx', 'fb0Tx', 'fb0Drop', 'fb0Err', 'fb0Seq', 'fb0Delta',
-    'fb1State', 'fb1Rx', 'fb1Tx', 'fb1Drop', 'fb1Err', 'fb1Seq', 'fb1Delta',
-    'fb2State', 'fb2Rx', 'fb2Tx', 'fb2Drop', 'fb2Err', 'fb2Seq', 'fb2Delta',
-    'btnModeAllPass', 'btnModeFilter',
+    'fb0State', 'fb0Rx', 'fb0Tx', 'fb0Drop', 'fb0Err', 'fb0Tec', 'fb0Rec', 'fb0Bus', 'fb0Seq', 'fb0Delta',
+    'fb0LastId', 'fb0Dlc', 'fb0Flags', 'fb0LastData',
+    'fb1State', 'fb1Rx', 'fb1Tx', 'fb1Drop', 'fb1Err', 'fb1Tec', 'fb1Rec', 'fb1Bus', 'fb1Seq', 'fb1Delta',
+    'fb1LastId', 'fb1Dlc', 'fb1Flags', 'fb1LastData',
+    'fb2State', 'fb2Rx', 'fb2Tx', 'fb2Drop', 'fb2Err', 'fb2Tec', 'fb2Rec', 'fb2Bus', 'fb2Seq', 'fb2Delta',
+    'fb2LastId', 'fb2Dlc', 'fb2Flags', 'fb2LastData',
+    'btnModeAllPass', 'btnModeFilter', 'btnModeBridge',
     'idsnapChannel', 'idsnapStatus', 'idsnapBody',
     'toast', 'toastIco', 'toastMsg'
   ];
@@ -103,17 +106,54 @@
     if (el[p + 'Tx'])   el[p + 'Tx'].textContent = ch.tx;
     if (el[p + 'Drop']) { el[p + 'Drop'].textContent = ch.drop; el[p + 'Drop'].className = 'fb-val' + (ch.drop > 0 ? ' warn' : ''); }
     if (el[p + 'Err'])  { el[p + 'Err'].textContent = ch.err;  el[p + 'Err'].className = 'fb-val' + (ch.err > 0 ? ' err' : ''); }
+    if (el[p + 'Tec']) { el[p + 'Tec'].textContent = (ch.tec !== undefined && ch.tec !== null) ? ch.tec : '--'; el[p + 'Tec'].className = 'fb-val' + (ch.tec > 0 ? ' warn' : ''); }
+    if (el[p + 'Rec']) { el[p + 'Rec'].textContent = (ch.rec !== undefined && ch.rec !== null) ? ch.rec : '--'; el[p + 'Rec'].className = 'fb-val' + (ch.rec > 0 ? ' warn' : ''); }
+    if (el[p + 'Bus']) {
+      if (ch.bus_state === undefined || ch.bus_state === null) {
+        el[p + 'Bus'].textContent = '未知';
+        el[p + 'Bus'].className = 'fb-val';
+      } else {
+        var bs = ch.bus_state;
+        var parts = [];
+        if (bs & 1) parts.push('INIT');
+        if (bs & 2) parts.push('SLEEP');
+        if (bs & 4) parts.push('ERR_PASSIVE');
+        if (bs & 8) parts.push('BUS_OFF');
+        if (bs & 16) parts.push('ERR_WARN');
+        el[p + 'Bus'].textContent = (bs === 0) ? '正常' : (parts.length ? parts.join(' ') : '正常');
+        el[p + 'Bus'].className = 'fb-val' + ((bs & 8) ? ' err' : (bs & (4|16)) ? ' warn' : '');
+      }
+    }
     if (el[p + 'Seq'])  el[p + 'Seq'].textContent = ch.seq;
     if (el[p + 'Delta']) { el[p + 'Delta'].textContent = ch.count || 0; el[p + 'Delta'].className = 'fb-val'; }
-    if (i === 0 && el.fbModePill) el.fbModePill.textContent = '模式: ' + (ch.mode === 1 ? '过滤' : '全收');
+    // 最新帧摘要
+    var entries = ch.entries;
+    if (entries && entries.length) {
+      var last = entries[entries.length - 1];
+      if (el[p + 'LastId'])   { el[p + 'LastId'].textContent = last.id;   el[p + 'LastId'].className = 'fb-val mono'; }
+      if (el[p + 'Dlc'])      el[p + 'Dlc'].textContent = last.dlc;
+      if (el[p + 'Flags'])    el[p + 'Flags'].textContent = (last.fd ? 'FD' : '-') + ' / ' + (last.brs ? 'BRS' : '-') + ' / ' + (last.esi ? 'ESI' : '-');
+      if (el[p + 'LastData']) { el[p + 'LastData'].textContent = last.data || '--'; el[p + 'LastData'].className = 'fb-val mono fb-data-cell'; }
+    } else {
+      if (el[p + 'LastId'])   { el[p + 'LastId'].textContent = '--';   el[p + 'LastId'].className = 'fb-val mono'; }
+      if (el[p + 'Dlc'])      el[p + 'Dlc'].textContent = '--';
+      if (el[p + 'Flags'])    el[p + 'Flags'].textContent = '--';
+      if (el[p + 'LastData']) { el[p + 'LastData'].textContent = '--'; el[p + 'LastData'].className = 'fb-val mono fb-data-cell'; }
+    }
+    if (i === 0 && el.fbModePill) {
+      var modeText = ch.mode === 2 ? '桥接(CAN0→1/2)' : (ch.mode === 1 ? '过滤' : '全收');
+      el.fbModePill.textContent = '模式: ' + modeText;
+    }
   }
 
   function renderChannelEmpty(i) {
     var p = 'fb' + i;
     if (el[p + 'State']) { el[p + 'State'].textContent = 'SPI 离线'; el[p + 'State'].className = 'fb-val err'; }
-    ['Rx','Tx','Drop','Err','Seq','Delta'].forEach(function (f) {
+    ['Rx','Tx','Drop','Err','Tec','Rec','Bus','Seq','Delta','Dlc','Flags'].forEach(function (f) {
       if (el[p + f]) { el[p + f].textContent = '--'; el[p + f].className = 'fb-val'; }
     });
+    if (el[p + 'LastId'])   { el[p + 'LastId'].textContent = '--';   el[p + 'LastId'].className = 'fb-val mono'; }
+    if (el[p + 'LastData']) { el[p + 'LastData'].textContent = '--'; el[p + 'LastData'].className = 'fb-val mono fb-data-cell'; }
   }
   function renderIdTable(entries, count) {
     var tbody = el.idsnapBody;
@@ -168,7 +208,7 @@
       });
       var data = await resp.json();
       if (data.ok) {
-        showToast('CAN 模式已切换: ' + (data.actual === 1 ? '过滤' : '全收'), 'success');
+        showToast('CAN 模式已切换: ' + (data.actual === 2 ? '桥接(CAN0→1/2)' : (data.actual === 1 ? '过滤' : '全收')), 'success');
       } else {
         showToast('模式切换失败', 'error');
       }
@@ -185,6 +225,7 @@
     if (el.monIp) el.monIp.addEventListener('change', testConnection);
     if (el.btnModeAllPass) el.btnModeAllPass.addEventListener('click', function () { setCanMode(0); });
     if (el.btnModeFilter)  el.btnModeFilter.addEventListener('click', function () { setCanMode(1); });
+    if (el.btnModeBridge)  el.btnModeBridge.addEventListener('click', function () { setCanMode(2); });
     if (el.idsnapChannel) el.idsnapChannel.addEventListener('change', pollFeedback);
     setTimeout(testConnection, 150);
     pollFeedback();

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * http_handlers.cpp - HTTP 请求处理器实现
  * 从 wifi_ota.cpp 提取的 HTTP handler 函数
  */
@@ -746,13 +746,17 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         if (valid[i]) {
             p += sprintf(p,
                 ",\"mode\":%u,\"seq\":%lu,\"rx\":%lu,\"tx\":%lu,"
-                "\"drop\":%lu,\"err\":%lu,\"count\":%u,\"entries\":[",
+                "\"drop\":%lu,\"err\":%lu,\"tec\":%u,\"rec\":%u,"
+                "\"bus_state\":%u,\"count\":%u,\"entries\":[",
                 (unsigned)r.stats.mode,
                 (unsigned long)r.stats.snapshot_seq,
                 (unsigned long)r.stats.rx_count,
                 (unsigned long)r.stats.tx_count,
                 (unsigned long)r.stats.rx_drop_count,
                 (unsigned long)r.stats.error_count,
+                (unsigned)r.stats.tec,
+                (unsigned)r.stats.rec,
+                (unsigned)r.stats.bus_state,
                 (unsigned)r.total_count);
             for (uint8_t j = 0; j < r.total_count && j < CANFD_ID_SNAPSHOT_MAX; ++j) {
                 const id_snapshot_entry_t &e = r.entries[j];
@@ -836,8 +840,12 @@ esp_err_t can_mode_handler(httpd_req_t *req)
     int requested = (int)cJSON_GetNumberValue(mode_item);
     cJSON_Delete(root);
 
-    can_rx_mode_t target = (requested == 1) ? CAN_RX_MODE_FILTER_ID
-                                            : CAN_RX_MODE_ALL_PASS;
+    can_rx_mode_t target = CAN_RX_MODE_ALL_PASS;
+    if (requested == 1) {
+        target = CAN_RX_MODE_FILTER_ID;
+    } else if (requested == 2) {
+        target = CAN_RX_MODE_BRIDGE_0_TO_12;
+    }
     can_rx_mode_t actual = CAN_RX_MODE_ALL_PASS;
     int rc = canFdSetRxMode(target, &actual, 500);
 
@@ -1258,7 +1266,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
         "\"internal_heap_total\": %lu, \"default_heap_total\": %lu, "
         "\"temperature\": %.1f, \"uptime_sec\": %lu, "
         "\"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, "
-        "\"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, "
+        "\"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"channel\": %d, \"channel_name\": \"%s\", \"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, "
         "\"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, "
         "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}, ",
         FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
@@ -1278,6 +1286,8 @@ esp_err_t system_status_handler(httpd_req_t *req)
         connected ? "true" : "false",
         snap.sys_state_str,
         (int)snap.sys_state,
+        (int)snap.channel,
+        snap.channel == OTA_CHANNEL_BLE ? "BLE" : "WIFI",
         (unsigned long)snap.meta.total_size,
         (unsigned long)snap.meta.stored_size,
         snap.storage_done ? "true" : "false",

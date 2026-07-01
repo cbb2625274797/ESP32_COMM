@@ -57,6 +57,7 @@ typedef enum {
 struct OtaSnapshot {
     ota_system_state_t sys_state = OTA_SYS_IDLE;  ///< 系统级 OTA 状态
     const char *sys_state_str = "IDLE";            ///< 状态字符串
+    ota_channel_t channel = OTA_CHANNEL_WIFI;      ///< 当前/最近一次 OTA 通道
     bool storage_done = false;                     ///< GD32 固件存储完成标志
     ota_meta_t meta = {};                          ///< GD32 NVS 元数据
     RelaySnapshot relay;                           ///< 中继进度快照

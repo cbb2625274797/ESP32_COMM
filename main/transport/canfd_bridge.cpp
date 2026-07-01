@@ -1,4 +1,4 @@
-﻿/*
+/*
  * canfd_bridge.cpp - CANFD 3通道通信桥接实现（M4: 从 SpiMaster 提取）
  */
 #include <string.h>
@@ -109,7 +109,7 @@ int canFdPollFeedback(can_channel_t channel,
     out->valid = 0;
     uint8_t entryIdx = 0U;
 
-    constexpr uint8_t kFixedHeader = 25U; /* ch+page+total+cnt+mode+seq+rx+tx+drop+err */
+    constexpr uint8_t kFixedHeader = 28U; /* ch+page+total+cnt+mode+seq+rx+tx+drop+err+tec+rec+bus_state */
 
     for (uint8_t page = 0U; page < 2U; ++page) {
         uint8_t req[2] = { static_cast<uint8_t>(channel & CAN_CHANNEL_MASK), page };
@@ -134,6 +134,9 @@ int canFdPollFeedback(can_channel_t channel,
             out->stats.tx_count       = readU32Le(&resp_buf[13]);
             out->stats.rx_drop_count  = readU32Le(&resp_buf[17]);
             out->stats.error_count    = readU32Le(&resp_buf[21]);
+            out->stats.tec            = resp_buf[25];
+            out->stats.rec            = resp_buf[26];
+            out->stats.bus_state      = resp_buf[27];
             out->total_count          = resp_buf[2];
         }
 
@@ -250,7 +253,7 @@ int canFdSetRxMode(can_rx_mode_t mode,
                    can_rx_mode_t *actual,
                    uint32_t timeout_ms)
 {
-    if (mode != CAN_RX_MODE_ALL_PASS && mode != CAN_RX_MODE_FILTER_ID) {
+    if (mode != CAN_RX_MODE_ALL_PASS && mode != CAN_RX_MODE_FILTER_ID && mode != CAN_RX_MODE_BRIDGE_0_TO_12) {
         return -1;
     }
 

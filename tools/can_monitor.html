@@ -42,6 +42,7 @@
           <div class="input-group">
             <button class="btn btn-primary btn-sm" id="btnModeAllPass" type="button">全收模式</button>
             <button class="btn btn-outline btn-sm" id="btnModeFilter" type="button">过滤模式</button>
+            <button class="btn btn-outline btn-sm" id="btnModeBridge" type="button" title="CAN0 收到的每一帧按原帧格式自动转发到 CAN1 与 CAN2">CAN0→1/2 桥接</button>
           </div>
         </div>
       </div>
@@ -51,7 +52,7 @@
           <span id="monConnIndicatorTxt">等待连接测试</span>
         </div>
         <div class="helper-note" id="monHelper">
-          页面每 1 秒通过 <code>/can/feedback</code> 拉取三路 CAN 通道快照。无 RX 的通道显示 <b>空（无 RX）</b>。
+          页面每 1 秒通过 <code>/can/feedback</code> 拉取三路 CAN 通道快照。无 RX 的通道显示 <b>空（无 RX）</b>。<br><b>桥接模式</b>：CAN0 收到的每一帧（11/29 位、FD、BRS）自动由 CAN1 与 CAN2 转发出去。
         </div>
       </div>
     </div>
@@ -70,6 +71,9 @@
           <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb0Tx">--</span></div>
           <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb0Drop">--</span></div>
           <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb0Err">--</span></div>
+          <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb0Tec">--</span></div>
+          <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb0Rec">--</span></div>
+          <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb0Bus">--</span></div>
           <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb0LastId">--</span></div>
           <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb0Dlc">--</span></div>
           <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb0Flags">--</span></div>
@@ -85,6 +89,9 @@
           <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb1Tx">--</span></div>
           <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb1Drop">--</span></div>
           <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb1Err">--</span></div>
+          <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb1Tec">--</span></div>
+          <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb1Rec">--</span></div>
+          <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb1Bus">--</span></div>
           <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb1LastId">--</span></div>
           <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb1Dlc">--</span></div>
           <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb1Flags">--</span></div>
@@ -100,6 +107,9 @@
           <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb2Tx">--</span></div>
           <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb2Drop">--</span></div>
           <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb2Err">--</span></div>
+          <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb2Tec">--</span></div>
+          <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb2Rec">--</span></div>
+          <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb2Bus">--</span></div>
           <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb2LastId">--</span></div>
           <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb2Dlc">--</span></div>
           <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb2Flags">--</span></div>
@@ -111,12 +121,6 @@
       </div>
     </div>
   </section>
-
-</div>
-
-<div class="toast" id="toast">
-  <span class="toast-ico" id="toastIco">✓</span>
-  <span id="toastMsg">操作成功</span>
 
   <!-- ═══ 每 ID 快照表 ═══ -->
   <section class="card" id="idSnapshotSection" style="margin-top:18px;">
@@ -147,6 +151,11 @@
     </div>
   </section>
 
+</div>
+
+<div class="toast" id="toast">
+  <span class="toast-ico" id="toastIco">✓</span>
+  <span id="toastMsg">操作成功</span>
 </div>
 
 <script src="can_monitor.js?v=20260629b"></script>

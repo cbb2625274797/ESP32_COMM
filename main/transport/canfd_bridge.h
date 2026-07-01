@@ -1,4 +1,4 @@
-﻿/*
+/*
  * canfd_bridge.h - CANFD 3通道通信桥接（M4: 从 SpiMaster 提取）
  *
  * 封装 CANFD 帧格式构建 + SPI 传输，与 SpiMaster 的 OTA 协议职责解耦。
@@ -91,6 +91,7 @@ typedef struct {
 typedef enum {
     CAN_RX_MODE_ALL_PASS  = 0,  ///< 默认：禁用 ID 过滤，三路全部接收
     CAN_RX_MODE_FILTER_ID = 1,  ///< 按 CONFIG_CAN_RX_FILTER_ID/MASK 做标准帧过滤
+    CAN_RX_MODE_BRIDGE_0_TO_12 = 2, ///< CAN0 桥接：CAN0 收到的每一帧按原帧格式自动转发到 CAN1 与 CAN2
 } can_rx_mode_t;
 
 /**
@@ -104,6 +105,9 @@ typedef struct {
     uint32_t  tx_count;
     uint32_t  rx_drop_count;
     uint32_t  error_count;
+    uint8_t   tec;         /**< 硬件发送错误计数器 (0~255) */
+    uint8_t   rec;         /**< 硬件接收错误计数器 (0~255) */
+    uint8_t   bus_state;   /**< 总线状态位图：bit0=init,bit1=sleep,bit2=error_passive,bit3=bus_off,bit4=error_warning */
 } can_channel_feedback_t;
 
 /**

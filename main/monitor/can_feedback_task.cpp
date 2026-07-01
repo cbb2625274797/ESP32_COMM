@@ -57,19 +57,7 @@ static void taskLoop(void *)
             if (rc == 0) {
                 publish(ch, fb);
 
-                const bool prevOk  = s_prev_poll_ok[ch];
-                const bool changed = (!s_prev_valid[ch]) ||
-                                     (fb.stats.rx_count      != s_prev_stats[ch].rx_count) ||
-                                     (fb.stats.tx_count      != s_prev_stats[ch].tx_count) ||
-                                     (fb.stats.rx_drop_count != s_prev_stats[ch].rx_drop_count) ||
-                                     (fb.stats.error_count   != s_prev_stats[ch].error_count) ||
-                                     (fb.stats.mode          != s_prev_stats[ch].mode) ||
-                                     (fb.stats.snapshot_seq  != s_prev_stats[ch].snapshot_seq);
-                const bool abnormal = (fb.stats.rx_drop_count != 0U) ||
-                                      (fb.stats.error_count   != 0U) ||
-                                      (fb.stats.mode          != 0U);
-
-                if (!prevOk || changed || abnormal) {
+                if (fb.stats.error_count != 0U) {
                     DEBUG_INFO(kTag,
                         "CH%u seq=%lu mode=%u rx=%lu tx=%lu drop=%lu err=%lu ids=%u",
                         static_cast<unsigned>(ch),
