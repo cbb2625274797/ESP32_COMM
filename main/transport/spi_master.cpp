@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "driver/spi_master.h"
+#include "driver/gpio.h"
 #include "soc/spi_struct.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -33,6 +34,44 @@ SpiMaster& SpiMaster::instance()
 {
     static SpiMaster inst;
     return inst;
+}
+
+/**
+ * @brief 等待 GD32 PB6 SPI Ready 握手引脚拉高(就绪)。
+ *        GD32 从机在 CS 断言瞬间拉低 PB6(忙),在响应帧就绪后拉高(就绪)。
+ *        主机每次发起 CS 前调用,确保从机已准备好接收下一笔事务。
+ * @param timeout_ms 超时时间(毫秒),0 表示不等待直接返回。
+ * @return ESP_OK 表示从机就绪;ESP_ERR_TIMEOUT 表示超时(退化为继续发起)。
+ */
+esp_err_t SpiMaster::waitSpiReady(uint32_t timeout_ms)
+{
+    if (timeout_ms == 0U) {
+        return ESP_OK;
+    }
+
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    for (;;) {
+        int level = gpio_get_level((gpio_num_t)SPI_READY_GPIO);
+        if (level == 1) {
+            /* 从机就绪:复位超时计数器,下次掉线时首次超时又能立即告警 */
+            m_spiReadyTimeoutCount = 0U;
+            return ESP_OK;
+        }
+        if (xTaskGetTickCount() >= deadline) {
+            /* 限频:首次超时立即告警,之后每 kSpiReadyWarnEvery 次打印一条,
+             * 避免 GD32 掉线/卡死时高频日志刷屏。计数器无锁:仅在持锁的
+             * transferClocked 路径调用,单任务访问,无需保护。 */
+            ++m_spiReadyTimeoutCount;
+            if (m_spiReadyTimeoutCount == 1U ||
+                (m_spiReadyTimeoutCount % kSpiReadyWarnEvery) == 0U) {
+                DEBUG_WARN("SPI", "waitSpiReady 超时: GPIO%d 仍为 LOW(从机忙), timeout=%ums, 累计=%lu",
+                           SPI_READY_GPIO, (unsigned)timeout_ms,
+                           (unsigned long)m_spiReadyTimeoutCount);
+            }
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
 }
 
 // ============================================================
@@ -68,6 +107,11 @@ esp_err_t SpiMaster::transferClocked(const uint8_t *tx_buf, size_t tx_len,
     if (total_len > kSpiTransferMaxBytes) {
         return ESP_ERR_INVALID_SIZE;
     }
+
+    /* CS 断言前等待 GD32 PB6 拉高(就绪):从机在上一笔 onCsRelease/
+     * processCommand 末尾才会拉高 PB6,提前发起 CS 会因从机未装好
+     * DMA/响应帧而丢失字节。超时退化为继续发起,保留原有容错路径。 */
+    (void)waitSpiReady(SPI_READY_TIMEOUT_MS);
 
     uint8_t tx_staging[kSpiTransferMaxBytes];
     uint8_t rx_staging[kSpiTransferMaxBytes];
@@ -335,6 +379,23 @@ esp_err_t SpiMaster::init()
 
     DEBUG_INFO("SPI", "SPI2 总线初始化完成: MOSI=GPIO5, MISO=GPIO7, SCLK=GPIO6, CS=GPIO%d, CLK=%d Hz",
                SPI_MASTER_CS_GPIO, SPI_CLOCK_HZ);
+
+    /* 配置 SPI Ready 握手输入引脚(GPIO10),监测 GD32 PB6 电平。
+     * GD32 在 CS 下降沿拉低 PB6(忙),在 onCsRelease/processCommand 末尾拉高(就绪)。
+     * 主机每次发起 CS 前须等待 PB6=HIGH,避免从机未就绪时抢跑丢帧。 */
+    gpio_config_t ready_cfg = {};
+    ready_cfg.pin_bit_mask = (1ULL << SPI_READY_GPIO);
+    ready_cfg.mode = GPIO_MODE_INPUT;
+    ready_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    ready_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    ready_cfg.intr_type = GPIO_INTR_DISABLE;
+    esp_err_t gpio_ret = gpio_config(&ready_cfg);
+    if (gpio_ret != ESP_OK) {
+        DEBUG_WARN("SPI", "SPI Ready 握手引脚 GPIO%d 配置失败: %s", SPI_READY_GPIO, esp_err_to_name(gpio_ret));
+        /* 非致命:握手失败时退化为不等待,保持原有行为 */
+    } else {
+        DEBUG_INFO("SPI", "SPI Ready 握手输入已配置: GPIO%d (监测 GD32 PB6)", SPI_READY_GPIO);
+    }
 
     return ESP_OK;
 }

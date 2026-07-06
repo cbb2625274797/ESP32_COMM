@@ -1,4 +1,4 @@
-/*
+﻿/*
  * spi_master.h - SPI Master 驱动头文件
  * CANFD 3通道发送接口 + 底层 SPI 总线
  *
@@ -17,6 +17,8 @@
 #define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 4MHz
 #define SPI_MODE              (0)           // CPOL=0, CPHA=0
 #define SPI_QUEUE_SIZE        (1)           ///< SPI 事务队列深度
+#define SPI_READY_GPIO       (10)          // GD32 PB6 SPI Ready 握手输入引脚(HIGH=就绪,LOW=忙)
+#define SPI_READY_TIMEOUT_MS (100)         // waitSpiReady 单次超时(毫秒)
 #define SPI_OTA_FRAME_MAX     (133)          ///< SPI OTA 单帧最大字节数
 
 // GD32 SPI OTA 帧类型
@@ -153,6 +155,11 @@ private:
         SemaphoreHandle_t m_lock;
     };
 
+    /** @brief 等待 GD32 PB6 SPI Ready 握手引脚拉高(就绪),CS 断言前调用。 */
+    esp_err_t waitSpiReady(uint32_t timeout_ms = SPI_READY_TIMEOUT_MS);
+    // waitSpiReady 超时日志限频:每 kSpiReadyWarnEvery 次超时打印一条,避免 GD32 掉线时刷屏
+    static constexpr uint32_t kSpiReadyWarnEvery = 32U;  ///< 超时日志打印间隔
+    uint32_t m_spiReadyTimeoutCount = 0U;                 ///< 累计超时次数(用于限频)
     // 内部 SPI 传输
     /**
      * @brief 执行底层 SPI 时钟同步传输。

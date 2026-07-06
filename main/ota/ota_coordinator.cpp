@@ -456,6 +456,7 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
             m_busySinceTick = xTaskGetTickCount();  // ★ 记录起始时刻
             DEBUG_INFO(TAG, "ESP32 OTA 开始: %" PRIu32 " 字节, 系统状态 → ESP32_RECEIVING (epoch=%u, channel=%d)",
                        total_size, m_otaEpoch, (int)channel);
+            pauseCanFeedbackTask(true);
         } else {
             DEBUG_WARN(TAG, "ESP32 OTA begin 失败: %s", esp_err_to_name(err));
         }
@@ -582,6 +583,7 @@ void OtaCoordinator::doAbortLocked()
         Esp32OtaCore::instance().abort();
     }
 
+    pauseCanFeedbackTask(false);
     m_sysState = OTA_SYS_IDLE;
     m_gd32StorageDone = false;
     m_busySinceTick = 0;

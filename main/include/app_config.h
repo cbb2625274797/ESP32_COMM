@@ -54,16 +54,23 @@ inline constexpr uint8_t     WIFI_AP_MAX_CONNECT = 4;              ///< AP 模�
 // ============================================================
 inline constexpr uint16_t HTTP_SERVER_PORT      = 80;              ///< HTTP 服务器监听端口
 inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;           ///< HTTP 服务器任务栈大小（字节）
+// ★ 曾降至 6142 省 2KB，但 system_status_handler→sample_cpu_usage() 在栈上分配
+//   TaskStatus_t tasks[24](~864B)+previous_samples[24](192B)+CpuUsageSnapshot(~608B)≈1.7KB，
+//   加上 spi_send_handler 的 buf[512]+resp[1024]+SPI 调用链 ≈3.5KB，
+//   再加 httpd 框架开销 ~2KB → 总需求逼近 6KB，6144 栈导致栈溢出 → TCB 被破坏
+//   → "Stack protection fault"(栈边界被 "http" ASCII 覆盖)。恢复 8192 留足余量。
 
 // ============================================================
 // OTA 配置
 // ============================================================
-inline constexpr size_t  OTA_BLOCK_SIZE         = 8192;
+inline constexpr size_t  OTA_BLOCK_SIZE         = 4096;            ///< OTA 上传静态接收缓冲区，从 8192 降到 4096 省 4KB
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB = 221184B = 0x35F90，固件大小上限
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
 inline constexpr uint32_t OTA_POLL_RETRIES      = 40;          // 每包 ACK 轮询次数
 inline constexpr uint32_t OTA_RESEND_RETRIES    = 10;           // 每包重发次数上限
 inline constexpr uint32_t OTA_PACKET_DELAY_MS   = 5;            // 每包发送后延时(ms)，给 GD32 处理时间
+inline constexpr uint32_t OTA_POST_SEND_DELAY_MS    = 3;        // 发送请求后首次轮询前的延迟(ms)，无 READY 拉低时防止读到 stale 数据
+inline constexpr uint32_t OTA_POLL_NO_FRAME_DELAY_MS = 8;       // 轮询未找到帧时的重试延迟(ms)，无 READY 拉低时需更长
 
 // ============================================================
 // 健康监控阈值
@@ -127,4 +134,3 @@ inline constexpr uint8_t GD32_CHIP_UID[] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
     0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B
 };
-

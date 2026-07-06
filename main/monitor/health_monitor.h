@@ -65,8 +65,6 @@ public:
     /** @brief OTA 中继转发阶段执行健康检查（跳过 WiFi 检查）。 */
     health_status_t checkBeforeOtaRelay();
 
-    /** @brief 记录一条健康事件日志。 */
-    void logEvent(const char *event, int value);
 
     /** @brief 获取当前系统健康状态（线程安全）。 */
     health_state_t getCurrent();

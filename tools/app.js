@@ -27,6 +27,7 @@ let latestSystemStatus = null;
 let isEsp32Rebooting = false;
 let rebootStartTime = 0;
 let pollingPausedForUpload = false;
+let uploadPollChip = null; // 当前暂停轮询的上传目标，用于区分 WiFi/日志策略
 let activeXhr = null;           // 当前上传 XHR，用于 abort
 let uploadBtnOrigText = '';     // 上传按钮原始文字
 let activeUploadChip = null;    // 当前上传目标芯片 ('esp32' | 'gd32' | null)
@@ -588,6 +589,9 @@ function updateHeapAndTaskStatusUi(data) {
 
   setText('sOtaState', (ota.sys_state || '--') + (Number.isFinite(ota.sys_state_code) ? ' (' + ota.sys_state_code + ')' : ''));
   setText('sRelayState', Number.isFinite(ota.relay_state) ? String(ota.relay_state) : '--');
+  // 缓存最近一次成功的 sys_state_code / relay_state，供 pollStatus 失败时判断设备是否在忙
+  if (Number.isFinite(ota.sys_state_code)) lastSysStateCode = ota.sys_state_code;
+  if (Number.isFinite(ota.relay_state)) lastRelayState = ota.relay_state;
   var storedText = '--';
   if (ota.total_size || ota.stored_size) {
     storedText = formatBytes(ota.stored_size || 0) + ' / ' + formatBytes(ota.total_size || 0);
@@ -795,6 +799,7 @@ function updateSystemStatusUi(data) {
     if (stErr) stErr.textContent = 'GD32 错误（待机）';
   } else if (isGd32Complete || rs === 5 || (gd32AppAlive && sysState === 'GD32_COMPLETE')) {
     markPhaseDone('gd32Ota');
+    currentOtaTarget = null; // GD32 OTA 完成，允许切换目标
     setOtaProgressBadge(100);
     setProgress(100, 'GD32 刷写完成');
     var sbDone = document.getElementById('stageStatusBar');
@@ -830,6 +835,7 @@ function updateSystemStatusUi(data) {
     setOtaProgressBadge(95);
     if (gd32AppAlive) {
       markPhaseDone('gd32Ota');
+      currentOtaTarget = null; // GD32 OTA 完成，允许切换目标
       setProgress(100, 'GD32 刷写完成');
       var sb = document.getElementById('stageStatusBar');
       var st = document.getElementById('stageStatusText');
@@ -856,7 +862,7 @@ async function testConnection() {
   // 立即发一次请求检测
   try {
     var resp = await fetch(getBaseUrl() + '/system/status', {
-      signal: AbortSignal.timeout(3000)
+      signal: statusAbortCtrl.signal
     });
     if (resp.ok) {
       var data = await resp.json();
@@ -885,10 +891,10 @@ async function refreshSystemStatusNow(event) {
     event.preventDefault();
     event.stopPropagation();
   }
-  if (pollingPausedForUpload) return;
+  // ★ ESP32 上传期间也允许日志轮询，让用户看到完整进展
   try {
     var resp = await fetch(getBaseUrl() + '/system/status', {
-      signal: AbortSignal.timeout(3000)
+      signal: statusAbortCtrl.signal
     });
     if (!resp.ok) {
       addLog('E', '状态', '刷新失败: HTTP ' + resp.status);
@@ -1749,6 +1755,9 @@ var logsTimerId = null;
 var pollSlowMode = false;   // 降速模式（10s 一次）
 var lastDiagTime = 0;       // 上次诊断时间
 var diagResult = '';        // 最近一次诊断结果
+var lastSysStateCode = -1;  // 上次成功的 sys_state_code，用于失败时判断设备是否在忙
+var lastRelayState = 0;     // 上次成功的 relay_state
+var statusAbortCtrl = null;  // 取消上一次 in-flight pollStatus，防止堆积刷新
 // 从设备 IP 推导网关 IP（取前三段 + .1）
 function getGatewayIp() {
   var parts = getEspIp().split('.');
@@ -1818,15 +1827,19 @@ function restorePolling() {
 function pausePollingForUpload() {
   if (pollingPausedForUpload) return;
   pollingPausedForUpload = true;
+  uploadPollChip = activeUploadChip || window.flashTarget || null;
   consecutivePollFailures = 0;
   if (statusTimerId) clearInterval(statusTimerId);
   if (logsTimerId) clearInterval(logsTimerId);
-  statusTimerId = null;
-  logsTimerId = null;
+  // ★ ESP32/GD32 上传期间均保持轮询，让用户在网页上看到完整 OTA 进展
+  //   ESP32 用 3s 间隔（上传为主），GD32 用 2.5s（中继进度依赖 status）
+  statusTimerId = setInterval(pollStatus, uploadPollChip === "gd32" ? 2500 : 3000);
+  logsTimerId = setInterval(pollLogs, uploadPollChip === "gd32" ? 2500 : 3000);
 }
 function resumePollingAfterUpload() {
   if (!pollingPausedForUpload) return;
   pollingPausedForUpload = false;
+  uploadPollChip = null;
   consecutivePollFailures = 0;
   if (pollSlowMode) {
     statusTimerId = setInterval(pollStatus, 10000);
@@ -1840,10 +1853,14 @@ function resumePollingAfterUpload() {
 }
 /** @description 轮询 ESP32 系统状态（GET /status）并更新 UI。 */
 async function pollStatus() {
-  if (pollingPausedForUpload) return;
+  // ★ 上传期间状态轮询间隔已在 pausePollingForUpload 中缩短，此处不再拦截
+  // 取消上一次 in-flight 请求，防止慢响应堆积导致 UI 瞬间刷新多次
+  if (statusAbortCtrl) { try { statusAbortCtrl.abort(); } catch(_e) {} }
+  statusAbortCtrl = new AbortController();
+  var pollTimer = setTimeout(function() { try { statusAbortCtrl.abort(); } catch(_e) {} }, 3000);
   try {
     var resp = await fetch(getBaseUrl() + '/system/status', {
-      signal: AbortSignal.timeout(3000)
+      signal: statusAbortCtrl.signal
     });
     if (resp.ok) {
       var data = await resp.json();
@@ -1865,12 +1882,26 @@ async function pollStatus() {
       }
       try { updateSystemStatusUi(data); } catch (e2) { console.warn('updateSystemStatusUi 异常:', e2); }
     }
+    clearTimeout(pollTimer);
   } catch (e) {
+    clearTimeout(pollTimer);
+    // 自身 AbortController 触发的取消不算失败，静默返回
+    if (e && e.name === "AbortError") return;
     // 后台期间 setInterval 会被 Chrome/Edge 节流到最低 1 分钟/次，
     // 因此后台累积的失败计数不应递增，避免切回前台瞬间误触发 5-fail 诊断。
     if (pageVisible) consecutivePollFailures++;
+    // 判断设备是否处于"已知忙/重启"状态（依据最近一次成功轮询的 sys_state_code）：
+    //   1=GD32_STORING, 3=GD32_RELAYING, 5=ESP32_RECEIVING,
+    //   6=ESP32_FINALIZING, 7=ESP32_REBOOTING
+    // 也包含 relay_state 非 IDLE（1-4 表示握手/协商/传输/收尾）
+    var lastDeviceBusy =
+      lastSysStateCode === 1 || lastSysStateCode === 3 ||
+      lastSysStateCode === 5 || lastSysStateCode === 6 ||
+      lastSysStateCode === 7 ||
+      (lastRelayState >= 1 && lastRelayState <= 4);
     // OTA/传输/重启中屏蔽网关无响应的检测功能（设备忙或正在重启，无法响应轮询是正常的）
-    if (pageVisible && consecutivePollFailures >= 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting && !currentOtaTarget) {
+    // 设备已知忙时：保持 1s 轮询，不触发降速诊断，避免错过设备恢复的即时反馈
+    if (pageVisible && consecutivePollFailures >= 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting && !currentOtaTarget && !lastDeviceBusy) {
       addLog('W', '诊断', '设备连续 5 次无响应，正在诊断网络...');
       var diag = await diagnoseNetwork();
       addLog('W', '诊断', diag);
@@ -1895,6 +1926,18 @@ async function pollStatus() {
       } else {
         applyRebootingRuntimeState();
       }
+    } else if (lastDeviceBusy) {
+      // 设备在 OTA/中继/重启期间不响应是正常的：保持 1s 轮询，UI 标记为"设备忙"
+      // 不调用 applyRebootingRuntimeState（避免显示"重启中 Xs"误导）
+      var pc = document.getElementById('pillConn');
+      var pct = document.getElementById('pillConnTxt');
+      if (pc) pc.className = 'pill processing';
+      if (pct) pct.textContent = '设备忙';
+      var cs = document.getElementById('connStatus');
+      var cst = document.getElementById('connStatusTxt');
+      if (cs) cs.className = 'conn-indicator warn';
+      if (cst) cst.textContent = '设备忙（OTA/重启中），保持 1s 轮询';
+      updateConnectionUi(true, '设备忙');
     } else if (!pollSlowMode) {
       updateConnectionUi(false, '未连接');
       applyDisconnectedRuntimeState();
@@ -1919,7 +1962,7 @@ document.addEventListener('visibilitychange', function () {
 var lastLogTimestamp = 0;
 /** @description 轮询 ESP32 日志（GET /logs）并追加到日志面板。 */
 async function pollLogs() {
-  if (pollingPausedForUpload) return;
+  // ★ ESP32 上传期间也允许日志轮询
   try {
     var resp = await fetch(getBaseUrl() + '/logs', {
       signal: AbortSignal.timeout(2000)

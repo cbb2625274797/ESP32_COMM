@@ -225,19 +225,6 @@ void HealthMonitor::taskEntry(void *pvParameters)
 }
 
 // ============================================================
-// 健康事件日志
-// ============================================================
-/**
-  * @brief 记录一条健康事件日志。
- * @param event 事件名称。
- * @param value 事件值。
- */
-void HealthMonitor::logEvent(const char *event, int value)
-{
-    DEBUG_INFO("HEALTH", "[健康事件] %s: %d", event, value);
-}
-
-// ============================================================
 // OTA 健康检查
 // ============================================================
 /**
@@ -353,30 +340,30 @@ void HealthMonitor::setWifiConnected(bool connected)
  */
 health_status_t HealthMonitor::updateFromWifiRssi(int8_t rssi)
 {
+    health_state_t cur = getState();
+    health_state_t next = SYS_NORMAL;
     if (rssi < WIFI_RSSI_CRITICAL) {
-        setState(SYS_CRITICAL);
-        DEBUG_WARN("HEALTH", "WiFi RSSI 危险: %d dBm < %d dBm", rssi, WIFI_RSSI_CRITICAL);
-        logEvent("WIFI危险", rssi);
-        return HEALTH_MON_CRITICAL;
+        next = SYS_CRITICAL;
     } else if (rssi < WIFI_RSSI_NORMAL) {
-        health_state_t cur = getState();
-        if (cur < SYS_WARNING) {
-            setState(SYS_WARNING);
-            DEBUG_WARN("HEALTH", "WiFi RSSI 警告: %d dBm < %d dBm", rssi, WIFI_RSSI_NORMAL);
-            logEvent("WIFI警告", rssi);
-        }
-        return HEALTH_MON_WARNING;
+        next = SYS_WARNING;
     }
 
-    // RSSI 已恢复正常（>= WIFI_RSSI_NORMAL）：从 WARNING 或 CRITICAL 任一状态降级到 NORMAL。
-    // 历史缺陷：原仅当 cur == SYS_WARNING 时降级，导致 CRITICAL 状态下 RSSI 恢复正常无法降级。
-    // 注意：SAFE_SHUTDOWN 不应被 RSSI 恢复降级，仅处理 WARNING/CRITICAL。
-    health_state_t cur = getState();
-    if ((cur == SYS_WARNING || cur == SYS_CRITICAL) && rssi >= WIFI_RSSI_NORMAL) {
-        setState(SYS_NORMAL);
-        DEBUG_INFO("HEALTH", "WiFi RSSI 恢复: %d dBm >= %d dBm (从 %d 降级)", rssi, WIFI_RSSI_NORMAL, (int)cur);
-        logEvent("WIFI恢复", rssi);
+    // 仅在状态发生转换时打印一次，避免同一阈值下反复刷屏。
+    if (next != cur) {
+        if (next == SYS_CRITICAL) {
+            setState(SYS_CRITICAL);
+            DEBUG_WARN("HEALTH", "WiFi RSSI 危险: %d dBm < %d dBm", rssi, WIFI_RSSI_CRITICAL);
+        } else if (next == SYS_WARNING) {
+            setState(SYS_WARNING);
+            DEBUG_WARN("HEALTH", "WiFi RSSI 警告: %d dBm < %d dBm", rssi, WIFI_RSSI_NORMAL);
+        } else { // next == SYS_NORMAL，从 WARNING/CRITICAL 恢复
+            setState(SYS_NORMAL);
+            DEBUG_INFO("HEALTH", "WiFi RSSI 恢复: %d dBm >= %d dBm (从 %d 降级)", rssi, WIFI_RSSI_NORMAL, (int)cur);
+        }
     }
+
+    if (next == SYS_CRITICAL) return HEALTH_MON_CRITICAL;
+    if (next == SYS_WARNING) return HEALTH_MON_WARNING;
 
     return HEALTH_MON_OK;
 }

@@ -53,8 +53,12 @@
 
   // ── 1Hz 轮询 /can/feedback ─────────────────────────────────
   async function pollFeedback() {
+    // 取消上一次 in-flight 请求，防止 SPI 慢响应堆积导致 UI 瞬间刷新多次
+    if (state.fbAbortCtrl) { try { state.fbAbortCtrl.abort(); } catch(_e) {} }
+    state.fbAbortCtrl = new AbortController();
+    var fbPollTimer = setTimeout(function() { try { state.fbAbortCtrl.abort(); } catch(_e) {} }, 3000);
     try {
-      var resp = await fetch(getBaseUrl() + '/can/feedback', { signal: AbortSignal.timeout(3000) });
+      var resp = await fetch(getBaseUrl() + '/can/feedback', { signal: state.fbAbortCtrl.signal });
       if (!resp.ok) return;
       var data = await resp.json();
       var channels = data.channels || [];
@@ -86,7 +90,11 @@
         el.fbPollStatus.className = 'pill online';
       }
       setConnState(true, '已连接');
+      clearTimeout(fbPollTimer);
     } catch (e) {
+      clearTimeout(fbPollTimer);
+      // 自身 AbortController 触发的取消不算失败，静默返回
+      if (e && e.name === "AbortError") return;
       if (el.fbPollStatus) {
         el.fbPollStatus.textContent = '轮询: 离线';
         el.fbPollStatus.className = 'pill offline';

@@ -1039,12 +1039,6 @@
     return json;
   }
 
-  function buildSendResponseText(result) {
-    if (result.status === 'ok') {
-      return result.recv ? ('0x' + result.recv + ' (' + result.recv_len + ' 字节)') : '无响应数据';
-    }
-    return '发送失败: code=' + result.code;
-  }
 
   function updateResponseBox(box, textEl, result, mode) {
     if (!box || !textEl) return;
@@ -1476,6 +1470,21 @@
     refreshManualHint();
     renderHistory();
     setTimeout(testConnection, 150);
+  }
+
+  var CAN_SEND_ERR_DESC = {
+    '-1': '参数错误（通道/ID/DLC 无效）',
+    '-2': 'SPI 通信失败（ESP32 与 GD32 通信异常）',
+    '-3': 'GD32 CAN 总线拒绝（BUS_OFF / TEC 过高 / 邮箱满）',
+  };
+
+  function buildSendResponseText(result) {
+    if (result.status === 'ok') {
+      return result.recv ? ('0x' + result.recv + ' (' + result.recv_len + ' 字节)') : '无响应数据';
+    }
+    var code = String(result.code);
+    var desc = CAN_SEND_ERR_DESC[code] || '未知错误';
+    return '发送失败: ' + desc + ' (code=' + result.code + ')';
   }
 
   init();

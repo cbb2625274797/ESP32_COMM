@@ -118,10 +118,12 @@ char* DebugLog::ringDrainJson(int *out_len)
     if (!out_len) return NULL;
     *out_len = 0;
     int count = ringCount();
+    // ★ 限制单次导出条数，避免 count=64 时 malloc(32KB) 在堆紧张时失败
+    //   前端每秒轮询，16 条/次足够保持实时性；超出的旧条目下一轮再拉
+    static constexpr int kMaxDrain = 16;
+    if (count > kMaxDrain) count = kMaxDrain;
     int capacity = count * (LOG_RING_SIZE * 2) + 16;
     if (capacity < 16) capacity = 16;
-    // 当 count 较大（如 64）时 capacity 可能达 32KB+，单次 malloc 有风险。
-    //   当前为简化实现保留单次 malloc；若后续日志量增大，可改为按 8KB 分块 realloc。
     char *buf = (char*)malloc(capacity);
     if (!buf) return NULL;
 
@@ -390,14 +392,27 @@ void DebugLog::log(debug_log_level_t level, const char *tag, const char *fmt, ..
     }
     snprintf(prefix, sizeof(prefix), "[%s][%s]", level_str, tag);
 
+    // 控制单条日志栈缓冲大小，避免调用任务（如 can_fb）因日志格式化爆栈。
     va_list args;
     va_start(args, fmt);
-    char msg[512];
+    char msg[256];
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
-    char log_buf[600];
+    char log_buf[320];
     int total = snprintf(log_buf, sizeof(log_buf), "%s %s\n", prefix, msg);
+
+    // ★ snprintf 截断时返回"本应写入的长度"(可能 > sizeof(log_buf))，
+    //   直接传给 send() 会越界读取栈外内存 → 破坏相邻任务 TCB → "Stack protection fault"
+    //   (崩溃栈中出现 HTTP User-Agent / "/ota/relay" 等字符串即此症状)。
+    //   截断到实际缓冲区大小，避免越界读。
+    if (total < 0) {
+        return;
+    }
+    if ((size_t)total >= sizeof(log_buf)) {
+        total = (int)sizeof(log_buf) - 1;
+        log_buf[total] = '\0';
+    }
 
     send((const uint8_t *)log_buf, total);
 }

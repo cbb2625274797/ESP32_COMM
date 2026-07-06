@@ -1,4 +1,4 @@
-﻿<!--
+<!--
   index.html - ESP32 OTA 中继控制台主页面
   支持 WiFi OTA（ESP32 本机 + GD32 中继）和 BLE OTA 双通道固件升级。
   配套脚本：app.js (WiFi OTA), ble_ota.js (BLE OTA), style.css (UI 样式)
@@ -427,7 +427,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260626a"></script>
+<script src="app.js?v=20260705b"></script>
 <script>
 window.connectionMode = window.connectionMode || 'wifi';
 window.flashTarget = window.flashTarget || 'esp32';
@@ -484,6 +484,13 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   };
 
   window.selectFlashTarget = function (target) {
+      // OTA 上传进行中禁止切换目标：避免前端状态与后端 relay/upload 不同步导致卡死
+      if (window.isUploading) {
+        var active = (window.activeUploadChip || 'OTA').toUpperCase();
+        if (typeof addLog === 'function') addLog('W', 'OTA', active + ' 刷写进行中，无法切换目标');
+        if (typeof showToast === 'function') showToast('当前有 ' + active + ' 任务在运行，请等待结束后再切换', 'error');
+        return;
+      }
     window.flashTarget = target === 'gd32' ? 'gd32' : 'esp32';
     applySharedModeUi();
     syncBleFileFromSelectedTarget();

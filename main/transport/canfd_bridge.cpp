@@ -4,6 +4,7 @@
 #include <string.h>
 #include "canfd_bridge.h"
 #include "spi_master.h"
+#include "monitor/debug_log.h"
 
 namespace {
 
@@ -39,7 +40,16 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
         &resp_len,
         timeout_ms);
     if (ret != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
-        return -1;
+        if (ret != ESP_OK) {
+            DEBUG_WARN("CAN", "CAN_SEND SPI失败: ch=%u id=0x%08lX err=%s",
+                       (unsigned)channel, (unsigned long)ext_id, esp_err_to_name(ret));
+            return -2;  /* SPI 通信失败 */
+        }
+        /* resp_type != ACK: 读取 GD32 返回的错误码 */
+        uint8_t gd32_err = (resp_len > 0 && recv_buf) ? recv_buf[0] : 0xFF;
+        DEBUG_WARN("CAN", "CAN_SEND GD32拒绝: ch=%u id=0x%08lX resp=0x%02X err=0x%02X",
+                   (unsigned)channel, (unsigned long)ext_id, resp_type, gd32_err);
+        return -3;  /* GD32 返回 ERROR */
     }
 
     if (recv_buf == nullptr || recv_max == 0U) {
@@ -67,6 +77,7 @@ static inline uint32_t readU32Le(const uint8_t *p) {
 /**
  * @brief 发送一帧 CANFD 数据，可选等待并读取响应。
  *        通过 SPI 协议帧发送给 GD32 APP，并读取 ACK/ERROR 响应。
+ *        返回值: >=0 成功(接收数据长度), -1 参数错误, -2 SPI通信失败, -3 GD32拒绝。
  */
 int canFdSend(can_channel_t channel, uint32_t ext_id,
               const uint8_t *data, uint8_t dlc,

@@ -2,8 +2,10 @@
 CONFIG_ESP_WIFI_RX_BA_WIN=6
 CONFIG_ESP_WIFI_TX_BA_WIN=6
 
-# LWIP: HTTP server max_open_sockets=4 + WiFi/LWIP 内部 ~3 = 7 够用
-CONFIG_LWIP_MAX_SOCKETS=7
+# LWIP: HTTP server max_open_sockets=4 + WiFi/LWIP 内部 ~3 + UDP debug log + 余量
+# 原值 7 与 httpd max_open_sockets=4 仅余 3 个 socket,一旦 handler 阻塞即 accept(EMFILE)
+# 提到 12 留足缓冲,配合 can_feedback_task 退避从根本上避免 socket 饥荒
+CONFIG_LWIP_MAX_SOCKETS=12
 CONFIG_LWIP_TCP_WND_DEFAULT=11480
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
 

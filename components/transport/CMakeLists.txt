@@ -17,6 +17,7 @@ idf_component_register(
         "../../main/include"         # app_config.h
     REQUIRES
         esp_driver_spi               # SPI 主设备驱动
+        esp_driver_gpio              # GPIO 驱动（SPI Ready 握手引脚）
         freertos                     # FreeRTOS 内核
         mbedtls                      # AES 加密
         esp_timer                    # 高精度定时器

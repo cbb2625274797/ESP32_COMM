@@ -418,7 +418,7 @@ esp_err_t WifiOta::httpServerStart()
     config.server_port = HTTP_SERVER_PORT;
     config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
-    config.max_open_sockets = 4;   // LWIP_MAX_SOCKETS 默认 7，HTTP 内部占 3，最多 4
+    config.max_open_sockets = 4;   // 配合 LWIP_MAX_SOCKETS=12: 4(httpd) + 1(UDP) + ~3(LWIP内部) = 8, 余量 4; 空闲时前端 status/logs/上传可能并发，3 个易被 LRU 踢掉导致连接中断
     config.lru_purge_enable = true;  // socket 满时自动清理最久未用的连接
     config.recv_wait_timeout = 30;  // GD32 上传前会擦除 Flash，5 秒默认值过紧
     config.send_wait_timeout = 30;
@@ -734,6 +734,30 @@ void WifiOta::taskEntry(void *pvParameters)
         DEBUG_ERR("WIFI", "HTTP 服务器启动失败");
     }
 
+    // ★ 开机清理：如果 NVS 中有不完整的 OTA 元数据（上次 OTA 中断），
+    //   GD32 可能还卡在 Bootloader 中，导致 SPI 全面超时 → HTTP socket 饥荒。
+    //   主动清除残留元数据并尝试恢复 GD32 APP。
+    {
+        ota_meta_t boot_meta;
+        if (OtaCoordinator::instance().loadGd32Meta(&boot_meta) == ESP_OK &&
+            boot_meta.total_size > 0 && boot_meta.stored_size < boot_meta.total_size) {
+            DEBUG_WARN("WIFI", "检测到不完整 OTA 缓存 (stored=%u total=%u)，清除残留状态",
+                       (unsigned)boot_meta.stored_size, (unsigned)boot_meta.total_size);
+            OtaCoordinator::instance().clearGd32Meta();
+            OtaCoordinator::instance().abortCurrent();
+            // 给 GD32 时间从 Bootloader 超时退出并重启到 APP
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            // 尝试探测 GD32 APP 是否恢复
+            gd32_version_t ver = {};
+            if (OtaCoordinator::instance().probeGd32AppOnce(&ver, nullptr) == ESP_OK) {
+                DEBUG_INFO("WIFI", "GD32 APP 已恢复: v%d.%d.%d.%d",
+                           ver.app_major, ver.app_minor, ver.app_patch, ver.app_build);
+            } else {
+                DEBUG_WARN("WIFI", "GD32 APP 未恢复，SPI 链路可能不可用");
+            }
+        }
+    }
+
     // ★ WiFi 已连接，UDP 从这里开始能通
     // 等待网络栈稳定（ARP 表建立、路由就绪），避免首批 UDP 包丢失
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -772,16 +796,9 @@ void WifiOta::taskEntry(void *pvParameters)
             int8_t rssi = WifiOta::getRssi();
             if (rssi != -127) {
                 HealthMonitor::instance().updateFromWifiRssi(rssi);
-
-                if (rssi < WIFI_RSSI_CRITICAL) {
-                    DEBUG_WARN("WIFI", "WiFi RSSI 危险: %d dBm (阈值: %d)", rssi, WIFI_RSSI_CRITICAL);
-                } else if (rssi < WIFI_RSSI_WARNING) {
-                    DEBUG_WARN("WIFI", "WiFi RSSI 较弱: %d dBm", rssi);
-                }
             }
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
-
