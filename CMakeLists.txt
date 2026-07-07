@@ -1,5 +1,6 @@
-﻿# ESP32-C3 OTA 中继项目 - 根构建文件
+# ESP32-C3 OTA 中继项目 - 根构建文件
 # 要求 ESP-IDF v6.0+，使用 idf.py build 编译
+# Kconfig.projbuild 提供 DCU_SPI_CLOCK_HZ 等可配置项
 cmake_minimum_required(VERSION 3.22)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

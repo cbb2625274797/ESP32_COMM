@@ -1,6 +1,14 @@
 # WiFi perf -- OTA acceleration
 CONFIG_ESP_WIFI_RX_BA_WIN=6
 CONFIG_ESP_WIFI_TX_BA_WIN=6
+CONFIG_DCU_OTA_POLL_BACKOFF_MS=5
+CONFIG_DCU_OTA_FINISH_TIMEOUT_MS=10000
+
+# DCU SPI clock -- default 4 MHz, can be raised via menuconfig to speed up GD32 OTA
+CONFIG_DCU_SPI_CLOCK_HZ=4000000
+
+# DCU OTA packet interval -- default 1 ms, can be lowered to speed up GD32 OTA
+CONFIG_DCU_OTA_PACKET_INTERVAL_MS=1
 
 # LWIP: HTTP server max_open_sockets=4 + WiFi/LWIP 内部 ~3 + UDP debug log + 余量
 # 原值 7 与 httpd max_open_sockets=4 仅余 3 个 socket,一旦 handler 阻塞即 accept(EMFILE)

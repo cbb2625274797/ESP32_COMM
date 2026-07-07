@@ -1,0 +1,42 @@
+menu "DCU OTA Configuration"
+
+    config DCU_SPI_CLOCK_HZ
+        int "SPI clock frequency for GD32 (Hz)"
+        default 4000000
+        range 1000000 20000000
+        help
+            SPI clock speed between ESP32-C3 and GD32E50x.
+            Higher value speeds up GD32 OTA relay, but must be
+            validated against actual wiring length/quality and GD32
+            SPI slave timing.
+
+    config DCU_OTA_PACKET_INTERVAL_MS
+        int "Delay between GD32 OTA packets (ms)"
+        default 1
+        range 0 50
+        help
+            Idle delay inserted after each successfully acknowledged
+            firmware packet before sending the next one.
+            Lower value speeds up OTA, but if GD32 cannot finish
+            flash write / prepare next ACK in time, set it back.
+
+    config DCU_OTA_POLL_BACKOFF_MS
+        int "Polling backoff when GD32 is not ready (ms)"
+        default 2
+        range 0 50
+        help
+            Delay between SPI response polls when GD32 returns WAIT
+            or does not drive MISO yet. Lower value reduces per-packet
+            idle time and can significantly speed up OTA, but if GD32
+            cannot finish flash write before the next poll, increase it.
+
+    config DCU_OTA_FINISH_TIMEOUT_MS
+        int "Timeout for FINISH_OTA command (ms)"
+        default 10000
+        range 3000 60000
+        help
+            How long ESP32 waits for GD32 to respond to the FINISH_OTA
+            command. GD32 may need extra time to drain flash buffers,
+            verify firmware, or prepare the APP jump.
+
+endmenu

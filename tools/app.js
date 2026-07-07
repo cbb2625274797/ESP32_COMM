@@ -860,9 +860,12 @@ async function testConnection() {
     restorePolling();
   }
   // 立即发一次请求检测
+  // 手动检测使用独立的 AbortController，避免打断递归调度的 pollStatus
+  var testAbort = new AbortController();
+  var testTimer = setTimeout(function() { try { testAbort.abort(); } catch(_e) {} }, 3000);
   try {
     var resp = await fetch(getBaseUrl() + '/system/status', {
-      signal: statusAbortCtrl.signal
+      signal: testAbort.signal
     });
     if (resp.ok) {
       var data = await resp.json();
@@ -884,6 +887,8 @@ async function testConnection() {
     var diag = await diagnoseNetwork();
     addLog('W', '诊断', diag);
     showToast('无法连接: ' + diag, 'error');
+  } finally {
+    clearTimeout(testTimer);
   }
 }
 async function refreshSystemStatusNow(event) {
@@ -891,10 +896,12 @@ async function refreshSystemStatusNow(event) {
     event.preventDefault();
     event.stopPropagation();
   }
-  // ★ ESP32 上传期间也允许日志轮询，让用户看到完整进展
+  // 手动刷新使用独立的 AbortController，避免与递归调度的 pollStatus 互相干扰
+  var manualAbort = new AbortController();
+  var manualTimer = setTimeout(function() { try { manualAbort.abort(); } catch(_e) {} }, 3000);
   try {
     var resp = await fetch(getBaseUrl() + '/system/status', {
-      signal: statusAbortCtrl.signal
+      signal: manualAbort.signal
     });
     if (!resp.ok) {
       addLog('E', '状态', '刷新失败: HTTP ' + resp.status);
@@ -910,6 +917,8 @@ async function refreshSystemStatusNow(event) {
   } catch (e) {
     addLog('E', '状态', '刷新失败: ' + e.message);
     showToast('状态刷新失败', 'error');
+  } finally {
+    clearTimeout(manualTimer);
   }
 }
 // ==================== CAN 帧发送 ====================
@@ -1757,7 +1766,9 @@ var lastDiagTime = 0;       // 上次诊断时间
 var diagResult = '';        // 最近一次诊断结果
 var lastSysStateCode = -1;  // 上次成功的 sys_state_code，用于失败时判断设备是否在忙
 var lastRelayState = 0;     // 上次成功的 relay_state
-var statusAbortCtrl = null;  // 取消上一次 in-flight pollStatus，防止堆积刷新
+var statusAbortCtrl = null;  // 当前 /system/status 请求的 AbortController（3s 超时用）
+var statusPollIntervalMs = 1000;  // 状态轮询目标间隔
+var statusPollInFlight = false;   // 是否正在请求 /system/status，防止重叠
 // 从设备 IP 推导网关 IP（取前三段 + .1）
 function getGatewayIp() {
   var parts = getEspIp().split('.');
@@ -1798,30 +1809,52 @@ async function diagnoseNetwork() {
   diagResult = result.join('；');
   return diagResult;
 }
+/** @description 调度下一次 /system/status 轮询（递归 setTimeout）。
+ *  上一次请求完成（或 3s 超时）后才调度下一次，避免 setInterval 把慢响应
+ *  直接 abort 而导致堆/任务栈/CPU 等卡片刷新率不稳。
+ */
+function scheduleStatusPoll(delayMs) {
+  if (statusTimerId) clearTimeout(statusTimerId);
+  statusTimerId = setTimeout(function() {
+    statusTimerId = null;
+    pollStatus();
+  }, delayMs !== undefined ? delayMs : statusPollIntervalMs);
+}
+
 /** @description 启动定时轮询（状态 + 日志）。 */
+
 function startPolling() {
   consecutivePollFailures = 0;
   pollSlowMode = false;
-  if (statusTimerId) clearInterval(statusTimerId);
+  statusPollIntervalMs = 1000;
+  if (statusTimerId) clearTimeout(statusTimerId);
   if (logsTimerId) clearInterval(logsTimerId);
-  statusTimerId = setInterval(pollStatus, 1000);
+  scheduleStatusPoll(0);   // 立即开始第一次，完成后按 interval 递归调度
   logsTimerId = setInterval(pollLogs, 1000);
 }
 function slowDownPolling() {
   pollSlowMode = true;
-  if (statusTimerId) clearInterval(statusTimerId);
+  statusPollIntervalMs = 10000;
+  // 不中断正在进行的请求；它完成后会按新的 10s 间隔调度下一次
+  if (!statusPollInFlight) {
+    if (statusTimerId) clearTimeout(statusTimerId);
+    scheduleStatusPoll(statusPollIntervalMs);
+  }
   if (logsTimerId) clearInterval(logsTimerId);
-  statusTimerId = setInterval(pollStatus, 10000);
   logsTimerId = setInterval(pollLogs, 10000);
 }
 function restorePolling() {
   if (pollSlowMode) {
     pollSlowMode = false;
     consecutivePollFailures = 0;
-    if (statusTimerId) clearInterval(statusTimerId);
+    statusPollIntervalMs = 1000;
     if (logsTimerId) clearInterval(logsTimerId);
-    statusTimerId = setInterval(pollStatus, 1000);
     logsTimerId = setInterval(pollLogs, 1000);
+  }
+  // 如果当前没有请求在飞，立即触发一次，确保 UI 尽快恢复
+  if (!statusPollInFlight) {
+    if (statusTimerId) clearTimeout(statusTimerId);
+    scheduleStatusPoll(0);
   }
 }
 function pausePollingForUpload() {
@@ -1829,33 +1862,35 @@ function pausePollingForUpload() {
   pollingPausedForUpload = true;
   uploadPollChip = activeUploadChip || window.flashTarget || null;
   consecutivePollFailures = 0;
-  if (statusTimerId) clearInterval(statusTimerId);
-  if (logsTimerId) clearInterval(logsTimerId);
+  statusPollIntervalMs = uploadPollChip === "gd32" ? 2500 : 3000;
   // ★ ESP32/GD32 上传期间均保持轮询，让用户在网页上看到完整 OTA 进展
   //   ESP32 用 3s 间隔（上传为主），GD32 用 2.5s（中继进度依赖 status）
-  statusTimerId = setInterval(pollStatus, uploadPollChip === "gd32" ? 2500 : 3000);
-  logsTimerId = setInterval(pollLogs, uploadPollChip === "gd32" ? 2500 : 3000);
+  if (statusTimerId) clearTimeout(statusTimerId);
+  if (logsTimerId) clearInterval(logsTimerId);
+  scheduleStatusPoll(statusPollIntervalMs);
+  logsTimerId = setInterval(pollLogs, statusPollIntervalMs);
 }
 function resumePollingAfterUpload() {
   if (!pollingPausedForUpload) return;
   pollingPausedForUpload = false;
   uploadPollChip = null;
   consecutivePollFailures = 0;
-  if (pollSlowMode) {
-    statusTimerId = setInterval(pollStatus, 10000);
-    logsTimerId = setInterval(pollLogs, 10000);
+  statusPollIntervalMs = pollSlowMode ? 10000 : 1000;
+  if (logsTimerId) clearInterval(logsTimerId);
+  logsTimerId = setInterval(pollLogs, statusPollIntervalMs);
+  // 上传结束立即刷新一次状态；若当前已在请求中，则让它完成后按新间隔继续
+  if (statusPollInFlight) {
+    if (statusTimerId) clearTimeout(statusTimerId);
   } else {
-    statusTimerId = setInterval(pollStatus, 1000);
-    logsTimerId = setInterval(pollLogs, 1000);
+    scheduleStatusPoll(0);
   }
-  pollStatus();
   pollLogs();
 }
 /** @description 轮询 ESP32 系统状态（GET /status）并更新 UI。 */
 async function pollStatus() {
-  // ★ 上传期间状态轮询间隔已在 pausePollingForUpload 中缩短，此处不再拦截
-  // 取消上一次 in-flight 请求，防止慢响应堆积导致 UI 瞬间刷新多次
-  if (statusAbortCtrl) { try { statusAbortCtrl.abort(); } catch(_e) {} }
+  // 递归 setTimeout 调度，正常情况下不会重叠；做个保险避免并发请求
+  if (statusPollInFlight) return;
+  statusPollInFlight = true;
   statusAbortCtrl = new AbortController();
   var pollTimer = setTimeout(function() { try { statusAbortCtrl.abort(); } catch(_e) {} }, 3000);
   try {
@@ -1942,6 +1977,9 @@ async function pollStatus() {
       updateConnectionUi(false, '未连接');
       applyDisconnectedRuntimeState();
     }
+  } finally {
+    statusPollInFlight = false;
+    scheduleStatusPoll();
   }
 }
 startPolling();
@@ -1953,7 +1991,13 @@ document.addEventListener('visibilitychange', function () {
   pageVisible = !document.hidden;
   if (!pageVisible) return;
   consecutivePollFailures = 0;
-  pollStatus();
+  // 切回前台立即刷新状态；若当前已在请求中，取消等待中的下一次让它尽快重排
+  if (statusPollInFlight) {
+    if (statusTimerId) clearTimeout(statusTimerId);
+  } else {
+    if (statusTimerId) clearTimeout(statusTimerId);
+    scheduleStatusPoll(0);
+  }
   pollLogs();
   // 之前若在慢速模式（10s），切回前台先用 1s 观察一会儿
   if (pollSlowMode) restorePolling();

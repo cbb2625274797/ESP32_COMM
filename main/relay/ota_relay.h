@@ -317,7 +317,7 @@ private:
      * @brief 执行握手请求（发送 HANDSHAKE_REQ）.
      * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_TIMEOUT 超时。
      */
-    ota_result_t doHandshakeReq();
+    ota_result_t doHandshakeReq(uint32_t attempts = 20U);
     /**
      * @brief 执行挑战认证.
      * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_AUTH 认证失败。

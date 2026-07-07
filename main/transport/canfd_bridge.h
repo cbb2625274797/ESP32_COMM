@@ -121,15 +121,20 @@ typedef struct {
 } can_feedback_result_t;
 
 /**
- * @brief 拉取一路 CAN 通道的 1Hz 反馈快照。
- * @param channel    目标通道 0/1/2。
- * @param out        输出快照（不可为 nullptr）。
- * @param timeout_ms SPI 事务超时。
- * @return 0 成功，<0 失败（ERROR 应答、payload 长度不足或 SPI 错误）。
+ * @brief 解析 GD32 主动推送的一页 CAN 反馈 payload，累积到结果结构中。
+ *
+ * GD32 APP 通过 requestEsp32Read(0xC1) 主动推送每页反馈，ESP32 收到后
+ * 调用本函数解析。page=0 时重置 out 并填充固定头 + 首批条目；
+ * page=1 时在已有条目后追加。每页解析后置 out->valid=1。
+ *
+ * @param payload  GD32 推送帧的 payload（[channel, page, total, count, mode, seq, ...]）。
+ * @param len      payload 长度。
+ * @param out      累积结果（跨 page 0/1 累积）。
+ * @param entryIdx 当前已填充条目数（page 0 时被重置为 0，调用方按通道维护）。
+ * @return 0 成功，<0 失败（payload 过短或通道非法）。
  */
-int canFdPollFeedback(can_channel_t channel,
-                      can_feedback_result_t *out,
-                      uint32_t timeout_ms);
+int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
+                           can_feedback_result_t *out, uint8_t *entryIdx);
 
 /**
  * @brief 切换 GD32 三路 CAN 的接收过滤模式。

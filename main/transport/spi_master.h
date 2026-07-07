@@ -1,31 +1,41 @@
-﻿/*
+/*
  * spi_master.h - SPI Master 驱动头文件
  * CANFD 3通道发送接口 + 底层 SPI 总线
  *
  * SpiMaster 类封装 SPI 总线初始化、CANFD 通信和 SPI OTA 协议。
+ *
+ * 握手架构（线与 SPIready，GPIO10<->GD32 PB6 开漏单线）：
+ * - 空闲态线 HIGH（双方释放，靠上拉）。
+ * - ESP32 主动发起：下拉 SPIready -> 立刻 CS 发请求 -> CS 释放后保持下拉，
+ *   GD32 在 onCsRelease() ISR 内完成帧处理+响应装载后释放 SPIready（高），
+ *   ESP32 GPIO 上升沿中断唤醒后发起 CS#2 读响应。
+ * - GD32 主动按铃：下拉 SPIready -> ESP32 下降沿中断唤醒后发起读事务。
  */
 #ifndef SPI_MASTER_H
 #define SPI_MASTER_H
 
 #include <stdint.h>
 #include "driver/spi_master.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 // SPI 配置常量
 #define SPI_MASTER_CS_GPIO    (4)           // CS 片选引脚
-#define SPI_CLOCK_HZ          (4 * 1000 * 1000)  // 4MHz
+#define SPI_CLOCK_HZ          CONFIG_DCU_SPI_CLOCK_HZ  // 默认 4MHz，可在 menuconfig 手动提速
 #define SPI_MODE              (0)           // CPOL=0, CPHA=0
-#define SPI_QUEUE_SIZE        (1)           ///< SPI 事务队列深度
-#define SPI_READY_GPIO       (10)          // GD32 PB6 SPI Ready 握手输入引脚(HIGH=就绪,LOW=忙)
-#define SPI_READY_TIMEOUT_MS (100)         // waitSpiReady 单次超时(毫秒)
-#define SPI_OTA_FRAME_MAX     (133)          ///< SPI OTA 单帧最大字节数
+#define SPI_QUEUE_SIZE        (4)           ///< SPI 事务队列深度
+#define SPI_READY_GPIO       (10)          // 线与 SPIready 握手引脚（开漏，GPIO10<->GD32 PB6）
+#define SPI_READY_TIMEOUT_MS (200)         // 等待 SPIready 上升沿超时（毫秒）
+#define SPI_OTA_FRAME_MAX     (256)          ///< SPI 同步帧最大字节数
+// ESP32 下拉 SPIready 后到拉 CS 之间的微秒延时（零延时起步，按需测算调大）
+#define SPI_READY_DRIVE_DELAY_US (0)
 
-// GD32 SPI OTA 帧类型
-#define SPI_OTA_SOF           (0xA5)
+// GD32 SPI 同步帧类型
+#define SPI_SYNC_SOF0         (0xA5)
+#define SPI_SYNC_SOF1         (0x5A)
 #define SPI_OTA_CMD_REQ       (0x01)
 #define SPI_OTA_CMD_DATA      (0x02)
-#define SPI_OTA_CMD_CANCEL    (0x03)
 #define SPI_APP_ENTER_BOOT_CMD (0xB0)
 #define SPI_APP_ENTER_BOOT_ACK_OK (0xB5)  // GD32 APP 固件须同步修改 ACK 字节为 0xB5
 #define SPI_OTA_RSP_ACK       (0x80)
@@ -63,21 +73,6 @@ public:
     esp_err_t init();
 
     // ============================================================
-    // 底层 SPI 传输
-    // ============================================================
-
-    /** @brief 执行一次同步 SPI 事务，先发送请求，再读取响应字节。 */
-    esp_err_t syncTransfer(uint8_t cmd, const uint8_t *payload,
-                           size_t payload_len, uint8_t *recv_buf,
-                           size_t recv_len, uint32_t timeout_ms);
-
-    /** @brief 仅发送 SPI 请求数据，不关心返回内容。 */
-    esp_err_t send(uint8_t cmd, const uint8_t *payload, size_t len);
-
-    /** @brief 仅接收 SPI 数据，必要时先发送命令字节。 */
-    esp_err_t recv(uint8_t cmd, uint8_t *recv_buf, size_t len, uint32_t timeout_ms);
-
-    // ============================================================
     // SPI OTA 协议
     // ============================================================
 
@@ -90,21 +85,50 @@ public:
     esp_err_t otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
                               size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
 
+    /** @brief 读取对端最新上报的 CREDIT（0 表示对端忙，应 POLL 等待而非重发）。 */
+    uint8_t remoteCredit() const { return m_remoteCredit; }
+
     /** @brief 通知 GD32 DCU_APP 设置 OTA 标志并软复位进入 Bootloader。 */
     esp_err_t appRequestBootloader();
+
+    /** @brief 方案A: 通过 PB6 LOW→HIGH 序列等待 Bootloader 就绪。
+     * Phase1 轮询等待 LOW (APP 复位前拉低 / Bootloader 极早拉低)；
+     * Phase2 轮询等待 HIGH 并确认稳定 10ms (Bootloader init 完成释放)。
+     * 超时返回 ESP_ERR_TIMEOUT，调用方应退化为固定延时。 */
+    esp_err_t waitForBootloaderReady(uint32_t timeout_ms);
 
     /** @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。 */
     esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version = nullptr);
 
-    /** @brief 执行带重试的 SPI 同步传输。 */
-    esp_err_t transferWithRetry(uint8_t cmd, const uint8_t *payload,
-                                size_t payload_len, uint8_t *recv_buf,
-                                size_t recv_len, int max_retries);
-
     // ── CANFD 接口已迁移至 transport/canfd_bridge.h（M4 解耦）──
 
-    /** @brief 获取 SPI 设备句柄（供外部状态查询）。 */
-    spi_device_handle_t deviceHandle() const { return m_spiDevice; }
+    /**
+     * @brief 检查 GD32 是否有主动按铃请求，若有则发起读事务读取请求帧。
+     *
+     * GD32 下拉 SPIready 表示「我有请求帧要给你读」。此函数检测到该状态后
+     * 发起一次 SPI 读事务（发 dummy 字节，读回 GD32 准备的请求帧）。
+     * 读取成功后按帧 TYPE 交给上层处理（如 CAN feedback 轮询、重启请求等）。
+     *
+     * @param timeout_ms 等待 GD32 请求的超时（毫秒），0 表示不等待仅检查。
+     * @return ESP_OK 成功读到请求帧；ESP_ERR_NOT_FOUND 当前无请求；其余为错误码。
+     *
+     * @note 应在主循环或 OTA 空闲时周期调用，以响应 GD32 主动上报。
+     */
+    esp_err_t checkGd32Request(uint32_t timeout_ms = 0U);
+
+    /**
+     * @brief 取出最近一次 GD32 按铃请求帧（线程安全，取出后清空内部缓冲）。
+     *
+     * checkGd32Request() 成功读取一帧后将其 type/payload 存入内部缓冲，
+     * 上层调用本函数取出并消费。取出后缓冲清空，避免重复消费。
+     *
+     * @param[out] type    请求帧 TYPE（如 0xC1）。
+     * @param[out] payload 输出 payload 拷贝缓冲。
+     * @param[in]  max_len payload 缓冲最大长度。
+     * @param[out] len     实际 payload 长度。
+     * @return true 表示有数据被取出；false 表示当前无数据。
+     */
+    bool takeRingRx(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len);
 
 private:
     /**
@@ -127,39 +151,63 @@ private:
     spi_device_handle_t m_spiDevice = NULL;
     SemaphoreHandle_t m_mutex = NULL;
 
+    // ── 线与 SPIready 握手状态机 ──
+    /** 握手状态机枚举。 */
+    enum class HandshakeState : uint8_t {
+        IDLE = 0,             ///< 空闲，线 HIGH
+        MASTER_SENDING,       ///< ESP32 已下拉 SPIready，正在 CS#1 发送请求
+        WAITING_RESPONSE,     ///< CS#1 完成，等待 GD32 释放 SPIready（上升沿唤醒）
+        SERVING_GD32_RING,    ///< 响应 GD32 按铃，正在读 GD32 请求帧
+        WAITING_BOOT_READY,   ///< 方案A: 等待 Bootloader 就绪（LOW→HIGH 序列）
+    };
+    volatile HandshakeState m_hsState = HandshakeState::IDLE;
+    /** GD32 主动按铃标志：GPIO 下降沿 ISR 置位，SPI 任务消费。 */
+    volatile bool m_gd32RequestPending = false;
+    /** SPI 任务句柄（用于 ISR 唤醒）。 */
+    TaskHandle_t m_spiTaskHandle = NULL;
+    /** GD32 按铃请求帧缓冲区。 */
+    uint8_t m_ringRxBuf[SPI_OTA_FRAME_MAX] = {};
+    size_t  m_ringRxLen = 0;
+    uint8_t m_ringRxType = 0;   ///< GD32 按铃请求帧 TYPE（checkGd32Request 填充）
+
+    // ── 帧内同步状态机 ──
+    volatile uint8_t  m_localCredit = 8;  ///< 本端剩余可接收帧数（信用窗口）
+    volatile uint8_t  m_remoteCredit = 8; ///< 对端上报的剩余信用
+
     // RAII 锁守卫
     class LockGuard {
     public:
-        /**
-         * @brief 构造加锁守卫，获取互斥锁。
-         * @param mutex 互斥锁句柄。
-         */
-        explicit LockGuard(SemaphoreHandle_t mutex) : m_lock(mutex) {
+        explicit LockGuard(SemaphoreHandle_t lock) : m_lock(lock) {
             if (m_lock) { xSemaphoreTake(m_lock, portMAX_DELAY); }
         }
-        /**
-         * @brief 析构解锁守卫，释放互斥锁。
-         */
         ~LockGuard() {
             if (m_lock) { xSemaphoreGive(m_lock); }
         }
-        /**
-         * @brief 禁止复制构造。
-         */
         LockGuard(const LockGuard&) = delete;
-        /**
-         * @brief 禁止复制赋值。
-         */
         LockGuard& operator=(const LockGuard&) = delete;
     private:
         SemaphoreHandle_t m_lock;
     };
 
-    /** @brief 等待 GD32 PB6 SPI Ready 握手引脚拉高(就绪),CS 断言前调用。 */
-    esp_err_t waitSpiReady(uint32_t timeout_ms = SPI_READY_TIMEOUT_MS);
-    // waitSpiReady 超时日志限频:每 kSpiReadyWarnEvery 次超时打印一条,避免 GD32 掉线时刷屏
-    static constexpr uint32_t kSpiReadyWarnEvery = 32U;  ///< 超时日志打印间隔
-    uint32_t m_spiReadyTimeoutCount = 0U;                 ///< 累计超时次数(用于限频)
+    /** @brief 下拉 SPIready（开漏驱动低）。 */
+    void driveReadyLow();
+    /** @brief 释放 SPIready（开漏高阻，靠上拉拉高）。 */
+    void releaseReady();
+    /**
+     * @brief 等 GD32 释放 SPIready（上升沿），中断驱动非忙等。
+     *
+     * 调用前须将 m_hsState 置为 WAITING_RESPONSE，ISR 上升沿检测到该状态
+     * 后发 0x02 通知唤醒本任务。GD32 写 Flash 期间保持 PB6 低，本函数阻塞，
+     * 写完拉高 → 唤醒 → 继续，自然避免 overrun。
+     *
+     * @param timeout_ms 超时(毫秒)，0 表示不等待。
+     * @return ESP_OK 线已高；ESP_ERR_TIMEOUT 超时。
+     */
+    esp_err_t waitSpiReady(uint32_t timeout_ms);
+
+    /** @brief GPIO 边沿中断回调（注册到 ESP-IDF GPIO ISR 服务）。 */
+    static void IRAM_ATTR onReadyEdgeISR(void *arg);
+
     // 内部 SPI 传输
     /**
      * @brief 执行底层 SPI 时钟同步传输。
@@ -173,21 +221,6 @@ private:
     esp_err_t transferClocked(const uint8_t *tx_buf, size_t tx_len,
                               uint8_t *rx_buf, size_t rx_len,
                               uint32_t timeout_ms = 0U);
-    /**
-     * @brief 执行 SPI 请求-响应组合传输。
-     * @param cmd 命令字节（0 表示无命令）。
-     * @param payload 负载数据缓冲区。
-     * @param payload_len 负载数据长度。
-     * @param rx_buf 接收数据缓冲区。
-     * @param rx_len 期望接收的数据长度。
-     * @param timeout_ms 超时时间（毫秒），0 表示无限等待。
-     * @return ESP_OK 表示成功，否则返回错误码。
-     */
-    esp_err_t transferRequestResponse(uint8_t cmd, const uint8_t *payload, size_t payload_len,
-                                      uint8_t *rx_buf, size_t rx_len,
-                                      uint32_t timeout_ms = 0U);
-
-
     // 无锁内部版本（供已持锁的公共方法调用，避免递归死锁）
     /**
      * @brief 无锁版本的 OTA 响应轮询（调用者须已持有锁）。
@@ -201,50 +234,12 @@ private:
     esp_err_t otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_payload,
                                       size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
     // OTA 帧工具（静态，无状态）
-    /**
-     * @brief 计算 OTA 帧的 8 位 CRC 校验和。
-     * @param data 数据缓冲区。
-     * @param len 数据长度。
-     * @return 计算得到的 CRC 值。
-     */
-    static uint8_t otaCrc8(const uint8_t *data, size_t len);
-    /**
-     * @brief 构建 OTA 协议帧。
-     * @param type 帧类型。
-     * @param payload 负载数据缓冲区。
-     * @param payload_len 负载数据长度。
-     * @param out 输出帧缓冲区。
-     * @param out_len 输出实际帧长度。
-     * @return true 表示构建成功，false 表示失败。
-     */
+    static uint32_t otaCrc32(const uint8_t *data, size_t len);
     static bool otaBuildFrame(uint8_t type, const uint8_t *payload, size_t payload_len,
                               uint8_t *out, size_t *out_len);
-    /**
-     * @brief 解析 OTA 协议帧。
-     * @param frame 帧数据缓冲区。
-     * @param frame_len 帧数据长度。
-     * @param type 输出解析得到的帧类型。
-     * @param payload 输出指向负载数据的指针。
-     * @param payload_len 输出负载数据长度。
-     * @return true 表示解析成功，false 表示失败。
-     */
-    static bool otaParseFrame(const uint8_t *frame, size_t frame_len,
-                              uint8_t *type, const uint8_t **payload, size_t *payload_len);
-    /**
-     * @brief 在数据缓冲区中搜索并解析 OTA 帧。
-     * @param buf 数据缓冲区。
-     * @param buf_len 数据缓冲区长度。
-     * @param type 输出帧类型。
-     * @param payload 输出指向负载数据的指针。
-     * @param payload_len 输出负载数据长度。
-     * @param frame_offset 输出帧在缓冲区中的偏移位置。
-     * @return true 表示找到并成功解析，false 表示未找到。
-     */
     static bool otaFindFrame(const uint8_t *buf, size_t buf_len,
                              uint8_t *type, const uint8_t **payload, size_t *payload_len,
                              size_t *frame_offset);
 };
 
 #endif // SPI_MASTER_H
-
-

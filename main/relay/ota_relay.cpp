@@ -278,6 +278,8 @@ ota_result_t OtaRelay::handleHandshaking(relay_event_t event, const uint8_t *pay
     DEBUG_INFO("OTA", "=== 阶段1: 握手与认证开始 ===");
 
     // 步骤1: 请求 GD32 进入 Bootloader
+    // 0xB0 对 APP：触发写标志+复位 → BOOT 启动
+    // 0xB0 对 BOOT：返回 0xB5 + resetToIdle()（IDLE 状态下无害）
     esp_err_t err = requestGd32AppEnterBootloader();
     if (err != ESP_OK) {
         DEBUG_WARN("OTA", "GD32 进入 Bootloader 请求未确认，继续尝试握手");
@@ -778,31 +780,35 @@ void OtaRelay::calculateCrc32WithKey(const uint8_t *key, const uint8_t *data48, 
 esp_err_t OtaRelay::requestGd32AppEnterBootloader()
 {
     DEBUG_INFO("OTA", "尝试通知 GD32 APP 进入 Bootloader OTA 窗口");
-    esp_err_t err = SpiMaster::instance().appRequestBootloader();
-    if (err == ESP_OK) {
-        DEBUG_INFO("OTA", "GD32 已确认进入 Bootloader，等待就绪");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        return ESP_OK;
+    SpiMaster::instance().appRequestBootloader();
+
+    /* 方案A: 通过 PB6 LOW→HIGH 序列等待 Bootloader 就绪
+     * APP 模式: 复位前拉低 PB6 → BOOT 极早拉低 → init 完成释放 HIGH
+     * BOOT 模式: PB6 一直 HIGH，Phase1 超时后直接握手
+     * 超时退化为固定延时（容错旧固件） */
+    esp_err_t wait_err = SpiMaster::instance().waitForBootloaderReady(3000);
+    if (wait_err != ESP_OK) {
+        DEBUG_WARN("OTA", "硬件就绪信号超时，退化为固定延时");
+        vTaskDelay(pdMS_TO_TICKS(1500));
     }
-    DEBUG_WARN("OTA", "GD32 APP 未确认进入 Bootloader: %s", esp_err_to_name(err));
-    return err;
+    return ESP_OK;
 }
 
-/** @brief 协议子步骤：发送握手请求（0x00 0xAC）并等待 GD32 回显 ACK。 */
-ota_result_t OtaRelay::doHandshakeReq()
+/** @brief 协议子步骤：发送握手请求（0x00 0xAC）并等待 GD32 回显 ACK。
+ *  @param attempts 最大尝试次数，默认 20。先用 3 次快速探测 GD32 是否已在 BOOT。 */
+ota_result_t OtaRelay::doHandshakeReq(uint32_t attempts)
 {
-    DEBUG_INFO("OTA", "--- 握手请求 ---");
+    DEBUG_INFO("OTA", "--- 握手请求 (max=%" PRIu32 ") ---", attempts);
 
     uint8_t payload[] = {0x00, 0xAC};
     uint8_t last_resp_type = 0U;
     size_t last_resp_len = 0U;
     esp_err_t last_err = ESP_OK;
-    constexpr uint32_t kHandshakeAttempts = 10U;
     constexpr uint32_t kHandshakeReqTimeoutMs = 200U;
     constexpr uint32_t kHandshakePollTimeoutMs = 200U;
     constexpr uint32_t kHandshakeRetryGapMs = 100U;
 
-    for (uint32_t attempt = 0U; attempt < kHandshakeAttempts; ++attempt) {
+    for (uint32_t attempt = 0U; attempt < attempts; ++attempt) {
         uint8_t resp_type = 0U;
         uint8_t resp_payload[64] = {0};
         size_t resp_len = 0U;
@@ -830,7 +836,7 @@ ota_result_t OtaRelay::doHandshakeReq()
         }
 
         DEBUG_WARN("OTA", "HANDSHAKE_REQ 未就绪，重试 %" PRIu32 "/%" PRIu32 ": err=%d resp_type=0x%02X resp_len=%u",
-                   attempt + 1U, kHandshakeAttempts, last_err, last_resp_type, (unsigned)last_resp_len);
+                   attempt + 1U, attempts, last_err, last_resp_type, (unsigned)last_resp_len);
         vTaskDelay(pdMS_TO_TICKS(kHandshakeRetryGapMs));
     }
 
@@ -961,7 +967,8 @@ ota_result_t OtaRelay::prepareRelayPacket(uint32_t seq, const ota_meta_t &meta, 
         return OTA_RESULT_ERR_STORAGE;
     }
 
-    tx_buf[0] = 0x00; tx_buf[1] = 0x00; tx_buf[2] = 0x00; tx_buf[3] = 0x00;
+    /* session_num = nonce_server 前 4 字节，GD32 端做校验防重放/乱序 */
+    memcpy(&tx_buf[0], m_nonceServer, 4);
     tx_buf[4] = (uint8_t)(seq & 0xFFU);
     tx_buf[5] = (uint8_t)((seq >> 8) & 0xFFU);
     tx_buf[6] = 0x00;
@@ -995,7 +1002,11 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
     size_t resp_len = 0;
     uint32_t retry_count = 0;
     ota_result_t result = OTA_RESULT_OK;
+    bool got_expected_credit_ok = false;
     const uint32_t expected_ack = (seq == m_transferTotalPackets - 1) ? kLastPacketAckSeq : (seq + 1U);
+
+    // ★ 单包耗时统计，用于定位 OTA 速度瓶颈。
+    TickType_t pkt_start = xTaskGetTickCount();
 
     // 注意：goto resend_packet 保持原有语义，仅作用范围缩小到本 helper。
     // 完全去除 goto 需配合 GD32 全链路 OTA 回归验证后再进行。
@@ -1034,7 +1045,30 @@ resend_packet:
                 }
             }
 
+            /* CREDIT 感知：若 GD32 报 CREDIT=0，说明它在写 Flash 缓冲，
+             * 此时重发只会被丢弃。改为耐心 POLL 等待 CREDIT 恢复，最多等 500ms。 */
+            if (SpiMaster::instance().remoteCredit() == 0U) {
+                DEBUG_DBG("OTA", "包 %" PRIu32 " GD32 CREDIT=0(写Flash中)，POLL 等待...", seq);
+                for (uint32_t cw = 0; cw < 50U; ++cw) {
+                    err = SpiMaster::instance().otaPollResponse(&resp_type, resp_payload,
+                                                                sizeof(resp_payload), &resp_len, 100);
+                    if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK &&
+                        isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
+                        got_expected_credit_ok = true;
+                        break;
+                    }
+                    if (err == ESP_OK && SpiMaster::instance().remoteCredit() > 0U) {
+                        break;  /* CREDIT 恢复，可以继续轮询或重发 */
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+            }
+
             bool got_expected = false;
+            if (got_expected_credit_ok) {
+                m_transferFlashOffset += (uint32_t)chunk_size;
+                break;
+            }
             for (uint32_t retry = 0; retry < 10; ++retry) {
                 DEBUG_DBG("OTA", "包 %" PRIu32 " 收到非目标ACK(seq不匹配)，继续轮询(%" PRIu32 "/5)...", seq, retry + 1);
                 err = SpiMaster::instance().otaPollResponse(&resp_type, resp_payload, sizeof(resp_payload), &resp_len, 2000);
@@ -1050,6 +1084,7 @@ resend_packet:
                     }
                     // ★ resend 前延迟
                     vTaskDelay(pdMS_TO_TICKS(1));
+                    got_expected_credit_ok = false;
                     goto resend_packet;
                 }
                 if (isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
@@ -1090,6 +1125,10 @@ resend_packet:
         m_transferFlashOffset += (uint32_t)chunk_size;
         break;
     }
+
+    TickType_t pkt_elapsed = xTaskGetTickCount() - pkt_start;
+    DEBUG_DBG("OTA", "包 %" PRIu32 " 完成: elapsed=%" PRIu32 " ms, retries=%" PRIu32, seq,
+              (uint32_t)(pkt_elapsed * portTICK_PERIOD_MS), retry_count);
 
     if (result != OTA_RESULT_OK) {
         *out_result = result;
@@ -1151,8 +1190,8 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
 
         // ★ 包间延迟：给 GD32 Bootloader 充足时间完成 flash 写入并准备下一包 ACK。
         //   无此延迟时，ESP32 立即 poll 会读到上一包的 stale ACK，导致误判为丢包。
-        if (seq < m_transferTotalPackets - 1) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+        if (seq < m_transferTotalPackets - 1 && CONFIG_DCU_OTA_PACKET_INTERVAL_MS > 0) {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_DCU_OTA_PACKET_INTERVAL_MS));
         }
     }
     return result;
@@ -1202,7 +1241,8 @@ ota_result_t OtaRelay::doSendFinishOta()
         memset(resp_payload, 0, sizeof(resp_payload));
 
         esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_DATA, finish_payload, sizeof(finish_payload),
-                                         &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
+                                         &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
+                                         CONFIG_DCU_OTA_FINISH_TIMEOUT_MS);
         logRespPayload("FINISH_OTA", resp_type, resp_payload, resp_len);
         if (err != ESP_OK) {
             DEBUG_WARN("OTA", "FINISH_OTA 传输失败, err=%d, retry=%" PRIu32 "/10", err, retry + 1);

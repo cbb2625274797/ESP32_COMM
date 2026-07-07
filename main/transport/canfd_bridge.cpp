@@ -106,89 +106,79 @@ int canFdSendNoReply(can_channel_t channel, uint32_t ext_id,
 
 
 /**
- * @brief 拉取一路 CAN 通道的 1Hz 反馈 + ID 快照表（GD32 SPI 帧类型 0xC1，分页）。
- *        连续拉取 page=0 和 page=1，合并为完整结果。
+ * @brief 解析 GD32 主动推送的一页 CAN 反馈 payload，累积到结果结构中。
+ *
+ * GD32 APP 通过 requestEsp32Read(0xC1) 主动推送每页反馈，ESP32 收到后
+ * 调用本函数解析：
+ *   page=0 → 重置 out，填充 28 字节固定头 + 首批条目；
+ *   page=1 → 在已有条目后追加。
+ * 调用方按通道维护 entryIdx，page=0 时会被重置为 0。
  */
-int canFdPollFeedback(can_channel_t channel,
-                      can_feedback_result_t *out,
-                      uint32_t timeout_ms)
+int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
+                           can_feedback_result_t *out, uint8_t *entryIdx)
 {
-    if (channel >= CAN_CHANNEL_MAX || out == nullptr) {
+    if (payload == nullptr || out == nullptr || entryIdx == nullptr) {
         return -1;
     }
 
-    out->valid = 0;
-    uint8_t entryIdx = 0U;
-
-    constexpr uint8_t kFixedHeader = 28U; /* ch+page+total+cnt+mode+seq+rx+tx+drop+err+tec+rec+bus_state */
-
-    for (uint8_t page = 0U; page < 2U; ++page) {
-        uint8_t req[2] = { static_cast<uint8_t>(channel & CAN_CHANNEL_MASK), page };
-        uint8_t resp_buf[kFeedbackPayloadLen] = {};
-        uint8_t resp_type = 0U;
-        size_t  resp_len  = 0U;
-
-        esp_err_t ret = SpiMaster::instance().otaTransfer(
-            kSpiCanFeedbackType,
-            req, 2U,
-            &resp_type, resp_buf, sizeof(resp_buf), &resp_len, timeout_ms);
-        if (ret != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < kFixedHeader) {
-            return -1;
-        }
-
-        /* 第一页时解析固定头 */
-        if (page == 0U) {
-            out->stats.channel        = resp_buf[0];
-            out->stats.mode           = resp_buf[4];
-            out->stats.snapshot_seq   = readU32Le(&resp_buf[5]);
-            out->stats.rx_count       = readU32Le(&resp_buf[9]);
-            out->stats.tx_count       = readU32Le(&resp_buf[13]);
-            out->stats.rx_drop_count  = readU32Le(&resp_buf[17]);
-            out->stats.error_count    = readU32Le(&resp_buf[21]);
-            out->stats.tec            = resp_buf[25];
-            out->stats.rec            = resp_buf[26];
-            out->stats.bus_state      = resp_buf[27];
-            out->total_count          = resp_buf[2];
-        }
-
-        const uint8_t entryCount = resp_buf[3];
-        if (entryCount == 0U) break;
-
-        uint16_t offset = kFixedHeader;
-        for (uint8_t i = 0U; i < entryCount && entryIdx < CANFD_ID_SNAPSHOT_MAX; ++i) {
-            if (offset + 8U > resp_len) break;
-
-            id_snapshot_entry_t &e = out->entries[entryIdx];
-            e.id  = readU32Le(&resp_buf[offset]);
-            e.dlc = resp_buf[offset + 4U];
-            const uint8_t flags = resp_buf[offset + 5U];
-            e.fd_flag = (flags & 0x01U) ? 1U : 0U;
-            e.brs     = (flags & 0x02U) ? 1U : 0U;
-            e.esi     = (flags & 0x04U) ? 1U : 0U;
-
-            const uint8_t dataLen = (e.dlc < CANFD_ID_SNAPSHOT_DATA_MAX)
-                                    ? e.dlc : static_cast<uint8_t>(CANFD_ID_SNAPSHOT_DATA_MAX);
-            const uint16_t entrySize = static_cast<uint16_t>(8U + dataLen);
-            if (offset + entrySize > resp_len) break;
-
-            memcpy(e.data, &resp_buf[offset + 8U], dataLen);
-            for (uint8_t d = dataLen; d < CANFD_ID_SNAPSHOT_DATA_MAX; ++d) {
-                e.data[d] = 0U;
-            }
-
-            offset += entrySize;
-            entryIdx++;
-        }
-
-        if (entryIdx >= out->total_count) break;
+    constexpr uint8_t kFixedHeader = 28U;
+    if (len < kFixedHeader) {
+        return -1;
     }
+
+    const uint8_t channel = payload[0];
+    const uint8_t page    = payload[1];
+    if (channel >= CAN_CHANNEL_MAX) {
+        return -1;
+    }
+
+    /* page=0：重置并解析固定头 */
+    if (page == 0U) {
+        *entryIdx = 0U;
+        out->stats.channel        = channel;
+        out->stats.mode           = payload[4];
+        out->stats.snapshot_seq   = readU32Le(&payload[5]);
+        out->stats.rx_count       = readU32Le(&payload[9]);
+        out->stats.tx_count       = readU32Le(&payload[13]);
+        out->stats.rx_drop_count  = readU32Le(&payload[17]);
+        out->stats.error_count    = readU32Le(&payload[21]);
+        out->stats.tec            = payload[25];
+        out->stats.rec            = payload[26];
+        out->stats.bus_state      = payload[27];
+        out->total_count          = payload[2];
+    }
+
+    /* 解析本页条目并追加 */
+    const uint8_t entryCount = payload[3];
+    uint16_t offset = kFixedHeader;
+    for (uint8_t i = 0U; i < entryCount && *entryIdx < CANFD_ID_SNAPSHOT_MAX; ++i) {
+        if (offset + 8U > len) break;
+
+        id_snapshot_entry_t &e = out->entries[*entryIdx];
+        e.id  = readU32Le(&payload[offset]);
+        e.dlc = payload[offset + 4U];
+        const uint8_t flags = payload[offset + 5U];
+        e.fd_flag = (flags & 0x01U) ? 1U : 0U;
+        e.brs     = (flags & 0x02U) ? 1U : 0U;
+        e.esi     = (flags & 0x04U) ? 1U : 0U;
+
+        const uint8_t dataLen = (e.dlc < CANFD_ID_SNAPSHOT_DATA_MAX)
+                                ? e.dlc : static_cast<uint8_t>(CANFD_ID_SNAPSHOT_DATA_MAX);
+        const uint16_t entrySize = static_cast<uint16_t>(8U + dataLen);
+        if (offset + entrySize > len) break;
+
+        memcpy(e.data, &payload[offset + 8U], dataLen);
+        for (uint8_t d = dataLen; d < CANFD_ID_SNAPSHOT_DATA_MAX; ++d) {
+            e.data[d] = 0U;
+        }
+
+        offset += entrySize;
+        (*entryIdx)++;
+    }
+
     out->valid = 1;
     return 0;
 }
-
-/**
- * @brief 切换 GD32 三路 CAN 接收过滤模式（GD32 SPI 帧类型 0xC2）。
- */
 
 /**
  * @brief 拉取指定通道的不重复 ID 快照表（GD32 SPI 帧类型 0xC3）。
