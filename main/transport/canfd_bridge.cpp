@@ -30,34 +30,30 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
 
     uint8_t resp_type = 0U;
     size_t resp_len = 0U;
-    esp_err_t ret = SpiMaster::instance().otaTransfer(
+    /* 两步法：otaTransfer 发命令（丢弃延迟一拍的过期响应）+ otaPollResponse 读真实响应。
+     * CAN 帧非幂等，命令只发一次，不重发。 */
+    esp_err_t ret = SpiMaster::instance().otaSendAndPoll(
         kSpiCanFrameType,
-        tx_buf,
-        tx_len,
-        &resp_type,
-        recv_buf,
-        recv_max,
-        &resp_len,
-        timeout_ms);
-    if (ret != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
-        if (ret != ESP_OK) {
-            DEBUG_WARN("CAN", "CAN_SEND SPI失败: ch=%u id=0x%08lX err=%s",
-                       (unsigned)channel, (unsigned long)ext_id, esp_err_to_name(ret));
-            return -2;  /* SPI 通信失败 */
+        tx_buf, tx_len,
+        &resp_type, recv_buf, recv_max, &resp_len, timeout_ms);
+
+    if (ret != ESP_OK) {
+        DEBUG_WARN("CAN", "CAN_SEND SPI失败: ch=%u id=0x%08lX err=%s",
+                   (unsigned)channel, (unsigned long)ext_id, esp_err_to_name(ret));
+        return -2;  /* SPI 通信失败 */
+    }
+    if (resp_type == SPI_OTA_RSP_ACK) {
+        if (recv_buf == nullptr || recv_max == 0U) {
+            return static_cast<int>(resp_len);
         }
-        /* resp_type != ACK: 读取 GD32 返回的错误码 */
-        uint8_t gd32_err = (resp_len > 0 && recv_buf) ? recv_buf[0] : 0xFF;
-        DEBUG_WARN("CAN", "CAN_SEND GD32拒绝: ch=%u id=0x%08lX resp=0x%02X err=0x%02X",
-                   (unsigned)channel, (unsigned long)ext_id, resp_type, gd32_err);
-        return -3;  /* GD32 返回 ERROR */
+        const size_t copied_len = (resp_len < recv_max) ? resp_len : recv_max;
+        return static_cast<int>(copied_len);
     }
-
-    if (recv_buf == nullptr || recv_max == 0U) {
-        return static_cast<int>(resp_len);
-    }
-
-    const size_t copied_len = (resp_len < recv_max) ? resp_len : recv_max;
-    return static_cast<int>(copied_len);
+    /* resp_type == ERROR: 读取 GD32 返回的错误码 */
+    uint8_t gd32_err = (resp_len > 0 && recv_buf) ? recv_buf[0] : 0xFF;
+    DEBUG_WARN("CAN", "CAN_SEND GD32拒绝: ch=%u id=0x%08lX resp=0x%02X err=0x%02X",
+               (unsigned)channel, (unsigned long)ext_id, resp_type, gd32_err);
+    return -3;  /* GD32 返回 ERROR */
 }
 
 constexpr uint8_t kSpiCanFeedbackType   = 0xC1U;
@@ -202,7 +198,7 @@ int canFdPullIdSnapshot(can_channel_t channel,
         uint8_t resp_type = 0U;
         size_t  resp_len  = 0U;
 
-        esp_err_t ret = SpiMaster::instance().otaTransfer(
+        esp_err_t ret = SpiMaster::instance().otaSendAndPoll(
             kSpiIdSnapshotType,
             req, 2U,
             &resp_type, resp_buf, sizeof(resp_buf), &resp_len, timeout_ms);
@@ -263,15 +259,18 @@ int canFdSetRxMode(can_rx_mode_t mode,
     uint8_t resp_type = 0U;
     size_t  resp_len  = 0U;
 
-    esp_err_t ret = SpiMaster::instance().otaTransfer(
+    /* 两步法破解延迟一拍：发命令一次 + poll 真实响应。
+     * 0xC2 幂等，但两步法避免无效重试。 */
+    esp_err_t ret = SpiMaster::instance().otaSendAndPoll(
         kSpiCanSetModeType,
         &req, 1U,
         &resp_type, resp_buf, sizeof(resp_buf), &resp_len, timeout_ms);
-    if (ret != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 1U) {
-        return -1;
+
+    if (ret == ESP_OK && resp_type == SPI_OTA_RSP_ACK && resp_len >= 1U) {
+        if (actual != nullptr) {
+            *actual = static_cast<can_rx_mode_t>(resp_buf[0]);
+        }
+        return 0;
     }
-    if (actual != nullptr) {
-        *actual = static_cast<can_rx_mode_t>(resp_buf[0]);
-    }
-    return 0;
+    return -1;
 }

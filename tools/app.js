@@ -1,4 +1,4 @@
-﻿/**
+/**
  * app.js - ESP32 OTA 中继控制台主脚本（WiFi OTA 通道）
  *
  * 职责：
@@ -1614,12 +1614,15 @@ async function verifyEsp32Firmware() {
       cleanupAfterOtaFailure('校验失败');
     }
   } catch (e) {
-    addLog('W', 'OTA', '应用请求出现异常（设备可能已重启）: ' + e.message);
-    // 设备在收到请求后即会重启，网络中断属于正常现象，直接进入重启等待
-    showVerifyActions('none');
-    isEsp32Rebooting = true;
-    updateEsp32StagesFromPhase(5);
-    rebootStartTime = Date.now();
+    // fetch 异常仅代表请求未完成，不能推断设备已重启：
+    // 设备可能仍在 finalize（SHA 计算耗时）、可能已崩溃、可能网络抖动。
+    // 如实报告失败，由 pollStatus 探测设备真实状态。
+    addLog('E', 'OTA', '应用请求失败: ' + e.message + '（设备状态未知，等待轮询探测）');
+    showToast('应用请求失败: ' + e.message, 'error');
+    var resultEl = document.getElementById('sviResult');
+    if (resultEl) { resultEl.textContent = '✗ 请求失败: ' + e.message; resultEl.className = 'svi-val err'; }
+    showVerifyActions('retry');
+    cleanupAfterOtaFailure('应用请求失败');
   }
 }
 
@@ -1674,10 +1677,10 @@ async function applyEsp32Firmware() {
       showToast(detail, 'error');
     }
   } catch (e) {
-    addLog('W', 'OTA', '应用请求出现异常（设备可能已重启）: ' + e.message);
-    isEsp32Rebooting = true;
-    updateEsp32StagesFromPhase(5);
-    rebootStartTime = Date.now();
+    // fetch 异常仅代表请求未完成，不能推断设备已重启。
+    addLog('E', 'OTA', '应用请求失败: ' + e.message + '（设备状态未知，等待轮询探测）');
+    showToast('应用请求失败: ' + e.message, 'error');
+    cleanupAfterOtaFailure('应用请求失败');
   }
 }
 

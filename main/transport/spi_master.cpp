@@ -82,8 +82,8 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
     int level = readReadyLevelRaw();
     if (level == 0) {
         /* 下降沿 */
-        if (self->m_hsState == HandshakeState::IDLE) {
-            /* GD32 按铃 */
+        if (self->m_linkState.acceptRing()) {
+            /* GD32 按铃：仅 IDLE 态接受 */
             self->m_gd32RequestPending = true;
             if (self->m_spiTaskHandle) {
                 BaseType_t hp = pdFALSE;
@@ -91,7 +91,7 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
                                    eSetBits, &hp);
                 portYIELD_FROM_ISR(hp);
             }
-        } else if (self->m_hsState == HandshakeState::WAITING_BOOT_READY) {
+        } else if (self->m_linkState.state() == HandshakeState::WAITING_BOOT_READY) {
             /* 方案A: Bootloader 已接管（APP 拉低或 BOOT 极早拉低） */
             if (self->m_spiTaskHandle) {
                 BaseType_t hp = pdFALSE;
@@ -102,7 +102,7 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
         }
     } else {
         /* 上升沿 */
-        if (self->m_hsState == HandshakeState::WAITING_RESPONSE) {
+        if (self->m_linkState.state() == HandshakeState::WAITING_RESPONSE) {
             /* GD32 释放 SPIready，可发起新 CS */
             if (self->m_spiTaskHandle) {
                 BaseType_t hp = pdFALSE;
@@ -110,7 +110,7 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
                                    eSetBits, &hp);
                 portYIELD_FROM_ISR(hp);
             }
-        } else if (self->m_hsState == HandshakeState::WAITING_BOOT_READY) {
+        } else if (self->m_linkState.state() == HandshakeState::WAITING_BOOT_READY) {
             /* 方案A: Bootloader init 完成，释放 SPIready */
             if (self->m_spiTaskHandle) {
                 BaseType_t hp = pdFALSE;
@@ -125,7 +125,7 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
 /**
  * @brief 等 GD32 释放 SPIready（上升沿），中断驱动非忙等。
  *
- * 调用前须将 m_hsState 置为 WAITING_RESPONSE。ISR 上升沿检测到该状态后
+ * 调用前须将 m_linkState 置为 WAITING_RESPONSE（enterBusy）。ISR 上升沿检测到该状态后
  * 发 0x02 通知唤醒本任务。GD32 写 Flash 期间保持 PB6 低，本函数阻塞，
  * 写完拉高 → 唤醒 → 继续，自然避免 overrun。
  */
@@ -447,7 +447,7 @@ esp_err_t SpiMaster::init()
 
     /* 记录当前任务句柄，供 GPIO ISR 唤醒 */
     m_spiTaskHandle = xTaskGetCurrentTaskHandle();
-    m_hsState = HandshakeState::IDLE;
+    m_linkState.exitBusy();
     m_gd32RequestPending = false;
     m_localCredit = 8;
     m_remoteCredit = 8;
@@ -475,6 +475,18 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
                                  size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
 {
     LockGuard lock(m_mutex);
+    return otaTransferUnlocked(type, payload, payload_len,
+                               resp_type, resp_payload, resp_max, resp_len, timeout_ms);
+}
+
+/**
+ * @brief 无锁版本的 otaTransfer（调用者须已持有锁）。
+ */
+esp_err_t SpiMaster::otaTransferUnlocked(uint8_t type, const uint8_t *payload, size_t payload_len,
+                                         uint8_t *resp_type, uint8_t *resp_payload,
+                                         size_t resp_max, size_t *resp_len, uint32_t timeout_ms,
+                                         bool expect_stale)
+{
     uint8_t tx_frame[SPI_OTA_FRAME_MAX];
     size_t tx_len = 0;
     if (!otaBuildFrame(type, payload, payload_len, tx_frame, &tx_len)) {
@@ -482,17 +494,6 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
     }
 
     DEBUG_DBG("SPI", "OTA TX: type=0x%02X len=%u", type, (unsigned)tx_len);
-
-    /* OTA 帧内容 hex dump（前 18 字节），用于与 GD32 端 [RX-FRM] 日志对比诊断 CRC 问题。
-     * 仅对 OTA 帧类型(0x01~0x0F)打印，避免 CAN 反馈(0xC1)每秒刷屏。 */
-    if (type <= 0x0FU) {
-        char hexbuf[64] = {0};
-        size_t dump_len = (tx_len < 18U) ? tx_len : 18U;
-        for (size_t i = 0U; i < dump_len; ++i) {
-            snprintf(hexbuf + i * 3, sizeof(hexbuf) - i * 3, "%02X ", tx_frame[i]);
-        }
-        DEBUG_INFO("SPI", "OTA TX hex: %s", hexbuf);
-    }
 
     if (tx_len > SPI_OTA_FRAME_MAX) {
         DEBUG_ERR("SPI", "OTA frame too large: %u", (unsigned)tx_len);
@@ -504,13 +505,13 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
      * queueTxFrame() 只缓冲不启动 DMA。因此本笔 CS 内读到的响应属于上一笔请求，
      * 首笔请求必读 0xFF。握手请求幂等可通过重试匹配；唯一性请求需配合
      * otaPollResponse() 读取延迟响应。详见 SpiOta.cpp queueTxFrame 注释。 */
-    m_hsState = HandshakeState::WAITING_RESPONSE;
+    m_linkState.enterBusy(HandshakeState::WAITING_RESPONSE);
     /* 等 GD32 释放 PB6（上一笔 onCsRelease 处理完）再发起新 CS。
      * 中断驱动：GD32 拉高 → ISR 0x02 → 唤醒。GD32 写 Flash 期间
      * PB6 保持低，本函数阻塞直到写完，自然避免 overrun。
      * 0xB0 不走 otaTransfer，不受此等待影响。 */
     (void)waitSpiReady(SPI_READY_TIMEOUT_MS);
-    m_hsState = HandshakeState::MASTER_SENDING;
+    m_linkState.enterBusy(HandshakeState::MASTER_SENDING);
 
     driveReadyLow();
     if (SPI_READY_DRIVE_DELAY_US > 0U) {
@@ -521,7 +522,7 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
     if (tx_len > sizeof(tx_padded)) {
         DEBUG_ERR("SPI", "OTA frame %u exceeds tx_padded %u", (unsigned)tx_len, (unsigned)sizeof(tx_padded));
         releaseReady();
-        m_hsState = HandshakeState::IDLE;
+        m_linkState.exitBusy();
         return ESP_ERR_INVALID_SIZE;
     }
     memset(tx_padded, 0xFF, sizeof(tx_padded));
@@ -533,7 +534,7 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
 
     esp_err_t ret = transferClocked(tx_padded, sizeof(tx_padded), rx_raw, sizeof(rx_raw), timeout_ms);
     releaseReady();
-    m_hsState = HandshakeState::IDLE;
+    m_linkState.exitBusy();
     if (ret != ESP_OK) {
         DEBUG_WARN("SPI", "OTA sync transfer failed: %s", esp_err_to_name(ret));
         return ret;
@@ -555,7 +556,11 @@ esp_err_t SpiMaster::otaTransfer(uint8_t type, const uint8_t *payload, size_t pa
         return ESP_OK;
     }
 
-    DEBUG_WARN("SPI", "OTA sync transfer response not found");
+    if (expect_stale) {
+        DEBUG_DBG("SPI", "OTA step1 stale response (expected, delayed-by-one)");
+    } else {
+        DEBUG_WARN("SPI", "OTA sync transfer response not found");
+    }
     return ESP_ERR_INVALID_RESPONSE;
 }
 /**
@@ -596,7 +601,7 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
         /* 等 GD32 释放 PB6（当前帧 onCsRelease 处理完）再发起 CS#2 poll。
          * 中断驱动：GD32 拉高 → ISR 0x02 → 唤醒。GD32 写 Flash 期间
          * PB6 保持低，本函数阻塞直到写完，自然避免 overrun。 */
-        m_hsState = HandshakeState::WAITING_RESPONSE;
+        m_linkState.enterBusy(HandshakeState::WAITING_RESPONSE);
         if (waitSpiReady(SPI_READY_TIMEOUT_MS) != ESP_OK) {
             /* 超时则退化为继续 poll（容错） */
         }
@@ -650,16 +655,48 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
                 vTaskDelay(pdMS_TO_TICKS(CONFIG_DCU_OTA_POLL_BACKOFF_MS));
                 continue;
             }
-            m_hsState = HandshakeState::IDLE;
+            m_linkState.exitBusy();
             return ESP_OK;
         }
 
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 
-    m_hsState = HandshakeState::IDLE;
+    m_linkState.exitBusy();
     DEBUG_WARN("SPI", "OTA response timeout: %lu ms", (unsigned long)timeout_ms);
     return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief ESP32→GD32 发送命令 + 轮询读取真实响应（两步法，原子持锁）。
+ *
+ * 解决 GD32 "延迟一拍"协议：otaTransfer 首笔 CS 读到过期响应，
+ * otaPollResponse 读取本笔命令的真实响应。命令只发送一次，不重发。
+ * 适用于所有 ESP32→GD32 方向的命令（CAN 发送/模式切换/ID 快照等）。
+ */
+esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t payload_len,
+                                    uint8_t *resp_type, uint8_t *resp_payload,
+                                    size_t resp_max, size_t *resp_len, uint32_t timeout_ms)
+{
+    LockGuard lock(m_mutex);
+
+    /* 步骤 1: 发送命令（忽略延迟一拍的过期响应）。
+     * otaTransferUnlocked 可能返回:
+     *   ESP_OK                    - 读到过期帧（正常，忽略）
+     *   ESP_ERR_INVALID_RESPONSE  - 读到 0xFF（正常，延迟一拍）
+     *   其他                      - SPI 真实错误 */
+    const uint32_t send_timeout = (timeout_ms > 500U) ? 500U : timeout_ms;
+    esp_err_t send_ret = otaTransferUnlocked(type, payload, payload_len,
+                                             nullptr, nullptr, 0U, nullptr, send_timeout,
+                                             /*expect_stale=*/true);
+    if (send_ret != ESP_OK && send_ret != ESP_ERR_INVALID_RESPONSE) {
+        return send_ret;
+    }
+
+    /* 步骤 2: 轮询读取真实响应（dummy TX，不重发命令） */
+    const uint32_t poll_timeout = (timeout_ms > send_timeout)
+                                  ? (timeout_ms - send_timeout) : 500U;
+    return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, poll_timeout);
 }
 
 
@@ -740,7 +777,7 @@ esp_err_t SpiMaster::waitForBootloaderReady(uint32_t timeout_ms)
 
     /* Phase1: 等待下降沿 (APP 复位前拉低 / Bootloader 极早拉低)
      * 先检查当前电平，若已为 LOW 则跳过等待 */
-    m_hsState = HandshakeState::WAITING_BOOT_READY;
+    m_linkState.enterBusy(HandshakeState::WAITING_BOOT_READY);
 
     if (gpio_get_level((gpio_num_t)SPI_READY_GPIO) == 1) {
         /* 仍为 HIGH，等下降沿中断 */
@@ -759,7 +796,7 @@ esp_err_t SpiMaster::waitForBootloaderReady(uint32_t timeout_ms)
             if (gpio_get_level((gpio_num_t)SPI_READY_GPIO) == 0) { seen_low = true; break; }
         }
         if (!seen_low) {
-            m_hsState = HandshakeState::IDLE;
+            m_linkState.exitBusy();
             DEBUG_WARN("SPI", "waitForBootloaderReady: Phase1 未检测到 LOW");
             return ESP_ERR_TIMEOUT;
         }
@@ -781,7 +818,7 @@ esp_err_t SpiMaster::waitForBootloaderReady(uint32_t timeout_ms)
             /* 收到上升沿，确认 HIGH 持续 10ms 过滤虚假脉冲 */
             vTaskDelay(pdMS_TO_TICKS(10));
             if (gpio_get_level((gpio_num_t)SPI_READY_GPIO) == 1) {
-                m_hsState = HandshakeState::IDLE;
+                m_linkState.exitBusy();
                 DEBUG_INFO("SPI", "waitForBootloaderReady: Bootloader 就绪 (PB6 HIGH stable)");
                 return ESP_OK;
             }
@@ -792,14 +829,14 @@ esp_err_t SpiMaster::waitForBootloaderReady(uint32_t timeout_ms)
         if (gpio_get_level((gpio_num_t)SPI_READY_GPIO) == 1) {
             vTaskDelay(pdMS_TO_TICKS(10));
             if (gpio_get_level((gpio_num_t)SPI_READY_GPIO) == 1) {
-                m_hsState = HandshakeState::IDLE;
+                m_linkState.exitBusy();
                 DEBUG_INFO("SPI", "waitForBootloaderReady: Bootloader 就绪 (poll fallback)");
                 return ESP_OK;
             }
         }
     }
 
-    m_hsState = HandshakeState::IDLE;
+    m_linkState.exitBusy();
     DEBUG_WARN("SPI", "waitForBootloaderReady: Phase2 等待 HIGH 超时 (%ums)", (unsigned)timeout_ms);
     return ESP_ERR_TIMEOUT;
 }
@@ -836,7 +873,7 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
         memcpy(tx_padded, tx_frame, tx_len);  /* [0..4]=PING帧, [5..15]=0xFF */
 
         /* 同步单 CS PING：下拉 SPIready 后，在单次 SPI 事务中发送并读回响应。 */
-        m_hsState = HandshakeState::MASTER_SENDING;
+        m_linkState.enterBusy(HandshakeState::MASTER_SENDING);
         driveReadyLow();
         if (SPI_READY_DRIVE_DELAY_US > 0U) {
             esp_rom_delay_us(SPI_READY_DRIVE_DELAY_US);
@@ -847,7 +884,7 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
 
         esp_err_t err = transferClocked(tx_padded, sizeof(tx_padded), rx_raw, sizeof(rx_raw), 0U);
         releaseReady();
-        m_hsState = HandshakeState::IDLE;
+        m_linkState.exitBusy();
         if (err != ESP_OK) {
             DEBUG_DBG("SPI", "APP PING sync transfer failed[%lu]: %s",
                       (unsigned long)attempt, esp_err_to_name(err));
@@ -962,11 +999,16 @@ esp_err_t SpiMaster::checkGd32Request(uint32_t timeout_ms)
 
     LockGuard lock(m_mutex);
     m_gd32RequestPending = false;
-    m_hsState = HandshakeState::SERVING_GD32_RING;
+    m_linkState.enterBusy(HandshakeState::SERVING_GD32_RING);
 
-    /* GD32 已下拉 SPIready 并准备好请求帧在 TX buffer。
-     * 发起一次 SPI 读事务：发 dummy 字节，读回 GD32 的请求帧。
-     * GD32 在 CS 释放后释放 SPIready。 */
+    /* 占用 SPIready 线（保持低）：屏蔽 GD32 onCsRelease 的 setSpiReady(true)，
+     * 使线在 ESP32 完成前始终保持忙碌。完成后 releaseReady 产生上升沿，
+     * 作为 GD32 EXTI 的"ESP32 完成"信号。 */
+    driveReadyLow();
+    if (SPI_READY_DRIVE_DELAY_US > 0U) {
+        esp_rom_delay_us(SPI_READY_DRIVE_DELAY_US);
+    }
+
     constexpr size_t kRingReadBytes = 160U;
     uint8_t rx_raw[kRingReadBytes];
     uint8_t dummy[kRingReadBytes];
@@ -975,13 +1017,18 @@ esp_err_t SpiMaster::checkGd32Request(uint32_t timeout_ms)
 
     /* GD32 已下拉 SPIready，我们是响应方直接读 */
     esp_err_t ret = transferClocked(dummy, sizeof(dummy), rx_raw, sizeof(rx_raw), 500U);
+
+    /* 无论成功失败，先释放线 + 回 IDLE，
+     * 让 GD32 EXTI 上升沿触发，解除 GD32 发送阻塞 */
+    releaseReady();
+    m_linkState.exitBusy();
+
     if (ret != ESP_OK) {
         DEBUG_WARN("SPI", "checkGd32Request 读事务失败: %s", esp_err_to_name(ret));
-        m_hsState = HandshakeState::IDLE;
         return ret;
     }
 
-    /* 解析请求帧 */
+    /* 解析请求帧（m_linkState 已 IDLE，允许 GD32 下一帧按铃被 ISR 接受） */
     uint8_t found_type = 0;
     const uint8_t *found_payload = nullptr;
     size_t found_len = 0;
@@ -993,15 +1040,11 @@ esp_err_t SpiMaster::checkGd32Request(uint32_t timeout_ms)
         if (found_payload && found_len > 0 && found_len <= sizeof(m_ringRxBuf)) {
             memcpy(m_ringRxBuf, found_payload, found_len);
         }
-        DEBUG_INFO("SPI", "GD32 按铃请求帧: type=0x%02X len=%u",
-                   found_type, (unsigned)found_len);
-        m_hsState = HandshakeState::IDLE;
-        /* 上层通过 takeRingRx() 取出 type/payload 进行处理 */
+        /* 正常按铃静默，仅在异常时由上层告警 */
         return ESP_OK;
     }
 
     DEBUG_WARN("SPI", "GD32 按铃读事务未找到合法帧");
-    m_hsState = HandshakeState::IDLE;
     return ESP_ERR_INVALID_RESPONSE;
 }
 

@@ -1302,7 +1302,7 @@
 
         state.ackGeneration++;
         try {
-          await waitForAck(cfg.packetCmd, endSeq, 3000, { expectedTotalSize: totalSize, payloadSize });
+          await waitForAck(cfg.packetCmd, endSeq, 5000, { expectedTotalSize: totalSize, payloadSize });
         } catch (e) {
           bleLog('OTA', `ACK 等待失败: ${e.message}，进入重试`, 'W');
         }

@@ -244,7 +244,7 @@ health_status_t HealthMonitor::checkBeforeOta()
         return HEALTH_MON_CRITICAL;
     } else if (cur >= SYS_WARNING) {
         status = HEALTH_MON_WARNING;
-        DEBUG_WARN("HEALTH", "OTA 前检查: SYS_WARNING，继续传输但需注意");
+        DEBUG_DBG("HEALTH", "OTA 前检查: SYS_WARNING，继续传输但需注意");
     }
 
     bool wifi_connected;
@@ -303,7 +303,7 @@ health_status_t HealthMonitor::checkBeforeOtaRelay()
         DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_CRITICAL (WiFi 相关)，SPI 中继允许继续");
     } else if (cur >= SYS_WARNING) {
         status = HEALTH_MON_WARNING;
-        DEBUG_WARN("HEALTH", "OTA 中继检查: SYS_WARNING，继续传输");
+        DEBUG_DBG("HEALTH", "OTA 中继检查: SYS_WARNING，继续传输");
     }
 
     /* 跳过 WiFi 连接状态和 RSSI 检查：

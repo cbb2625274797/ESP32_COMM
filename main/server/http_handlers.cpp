@@ -805,7 +805,7 @@ esp_err_t can_mode_handler(httpd_req_t *req)
             httpd_resp_send(req, resp, len);
         } else {
             can_rx_mode_t actual = CAN_RX_MODE_ALL_PASS;
-            int rc = canFdSetRxMode(CAN_RX_MODE_ALL_PASS, &actual, 500);
+            int rc = canFdSetRxMode(CAN_RX_MODE_ALL_PASS, &actual, 2000);
             char resp[64];
             int len = snprintf(resp, sizeof(resp),
                 "{\"mode\":%u,\"source\":\"spi\",\"ok\":%s}",
@@ -847,7 +847,7 @@ esp_err_t can_mode_handler(httpd_req_t *req)
         target = CAN_RX_MODE_BRIDGE_0_TO_12;
     }
     can_rx_mode_t actual = CAN_RX_MODE_ALL_PASS;
-    int rc = canFdSetRxMode(target, &actual, 500);
+    int rc = canFdSetRxMode(target, &actual, 2000);
 
     char resp[96];
     int len = snprintf(resp, sizeof(resp),
@@ -909,7 +909,7 @@ esp_err_t can_send_handler(httpd_req_t *req)
 
     uint8_t resp_data[CAN_MAX_DLC] = {0};
     int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
-                                   resp_data, sizeof(resp_data), 1000);
+                                   resp_data, sizeof(resp_data), 2000);
 
     char resp[512];
     if (resp_len >= 0) {

@@ -86,19 +86,18 @@ static void taskLoop(void *)
         }
 
         /* 解析本页并累积到工作缓冲，page=0 会自动重置 */
+        const uint8_t page = ring_payload[1];
         if (canFdParseFeedbackPage(ring_payload, ring_len,
                                    &s_work[ch], &s_workIdx[ch]) == 0) {
             publish(ch, s_work[ch]);
 
+            /* 仅在出现错误时打印告警，正常工作静默 */
             if (s_work[ch].stats.error_count != 0U) {
-                DEBUG_INFO(kTag,
-                    "CH%u seq=%lu mode=%u rx=%lu tx=%lu drop=%lu err=%lu",
+                DEBUG_WARN(kTag,
+                    "CH%u P%u seq=%lu err=%lu",
                     static_cast<unsigned>(ch),
+                    static_cast<unsigned>(page),
                     static_cast<unsigned long>(s_work[ch].stats.snapshot_seq),
-                    static_cast<unsigned>(s_work[ch].stats.mode),
-                    static_cast<unsigned long>(s_work[ch].stats.rx_count),
-                    static_cast<unsigned long>(s_work[ch].stats.tx_count),
-                    static_cast<unsigned long>(s_work[ch].stats.rx_drop_count),
                     static_cast<unsigned long>(s_work[ch].stats.error_count));
             }
         }

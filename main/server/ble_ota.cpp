@@ -1144,6 +1144,7 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     }
 
     // ★ 使用带序号顺序保护的写入：拒绝乱序包并立即 ACK 通知发送端
+    uint32_t beforeReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
     esp_err_t err = esp32_write_ordered(seq, cmd, &buf[data_offset], data_len);
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "ESP32 OTA 写入失败: seq=%u err=%s",
@@ -1152,23 +1153,29 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
         return true;
     }
 
-    DEBUG_DBG(TAG, "ESP32 OTA 写入成功: seq=%u received=%u",
-              seq, (unsigned int)Esp32OtaCore::instance().getReceived());
+    // ★ 仅在实际写入新字节时才触发 ACK：重复包/乱序缓存包不写入 flash，
+    //   若在窗口边界触发 ACK 会携带陈旧字节数，被发送端误判为丢包。
+    uint32_t afterReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
+    bool progressMade = (afterReceived > beforeReceived);
+
+    DEBUG_DBG(TAG, "ESP32 OTA 写入成功: seq=%u received=%u progress=%d",
+              seq, (unsigned int)afterReceived, progressMade ? 1 : 0);
 
     // 完成判定：以实际按序写入字节数为准。
     bool isLastPacket = (expected_payload < BLE_OTA_CHUNK_PAYLOAD);
-    bool transferComplete = (total_size > 0 &&
-                             Esp32OtaCore::instance().getReceived() >= total_size);
+    bool transferComplete = (total_size > 0 && afterReceived >= total_size);
 
-    // ACK 触发条件
-    if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
-        transferComplete ||
-        isLastPacket) {
+    // ACK 触发条件：仅在实际写入新字节时触发窗口边界 ACK，
+    // 避免重复包/乱序缓存包在窗口边界发送陈旧 ACK
+    if (progressMade &&
+        ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U ||
+         transferComplete ||
+         isLastPacket)) {
         if (isLastPacket || transferComplete) {
             DEBUG_INFO(TAG, "ESP32 尾包/完成检测: seq=%u data_len=%zu received=%u total=%" PRIu32,
-                       seq, data_len, (unsigned int)Esp32OtaCore::instance().getReceived(), total_size);
+                       seq, data_len, (unsigned int)afterReceived, total_size);
         }
-        sendWindowAck(cmd, seq, (uint32_t)Esp32OtaCore::instance().getReceived());
+        sendWindowAck(cmd, seq, afterReceived);
     }
 
     if (transferComplete) {
@@ -1226,13 +1233,11 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     //       策略与 ESP32 fallback 路径一致（参考 esp32_write_ordered 行 459-477）。
     if (seq > 0 && meta.last_seq != (uint32_t)(seq - 1)) {
         // 重复包：seq <= last_seq（已写入过）
+        // ★ 重复包静默跳过，不发送 ACK：发送端已持有上一窗口的有效 ACK 进度，
+        //   重复包的 ACK 会携带未增长的字节数，被发送端误判为当前窗口丢包。
         if (seq <= meta.last_seq) {
             DEBUG_DBG(TAG, "GD32 重复包: seq=%u <= last_seq=%" PRIu32 "，跳过",
                       seq, meta.last_seq);
-            // 重复包不触发 ACK 风暴，只在窗口边界发一次
-            if ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U) {
-                sendWindowAck(cmd, (uint16_t)meta.last_seq, meta.stored_size);
-            }
             return false;  // 外层推进 offset，继续下一包
         }
 
