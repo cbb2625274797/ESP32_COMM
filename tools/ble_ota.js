@@ -833,31 +833,7 @@
   }
 
 
-  // ===== 重启设备 + 自动重连 =====
-  async function restartEsp32() {
-    if (!state.ctrlChar || !state.device) return;
-    if (!confirm('确定要重启 ESP32 吗？\n\n重启后页面会自动重连。')) return;
-    if (state.expectedReboot) return;
-    state.expectedReboot = true;
-    state.reconnectAttempts = 0;
-    if (typeof connectionMode !== 'undefined' && connectionMode === 'ble') {
-      if (els.connState) els.connState.textContent = '重启中';
-      if (els.connState && els.connState.parentElement) els.connState.parentElement.className = 'pill processing';
-    }
-    setConnectionState(!!state.server);
-    bleLog('SYS', '=== 触发 ESP32 重启 (0xFA) ===');
-    showToast('ESP32 重启中...', 'success');
-    try {
-      await state.ctrlChar.writeValue(new Uint8Array([0xFA]));
-      bleLog('SYS', '0xFA 已发，等待设备端推送 FINISH_REBOOT_NOW 后断开');
-    } catch (e) {
-      bleLog('SYS', '0xFA 发送失败: ' + e.message, 'E');
-      showToast('0xFA 发送失败', 'error');
-      state.expectedReboot = false;
-      setConnectionState(!!state.server);
-    }
-  }
-
+  // ===== 自动重连 =====
   async function tryReconnect() {
     if (!state.device || !state.expectedReboot) {
       state.reconnecting = false;

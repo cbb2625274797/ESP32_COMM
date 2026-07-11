@@ -26,6 +26,7 @@ let pageVisible = !document.hidden;   // 页面可见性：切到后台/最小�
 let latestSystemStatus = null;
 let isEsp32Rebooting = false;
 let rebootStartTime = 0;
+let rebootObservedDown = false;  // 是否已观察到设备实际下线（重启），用于避免 pre-reboot 窗口内误清除重启状态
 let pollingPausedForUpload = false;
 let uploadPollChip = null; // 当前暂停轮询的上传目标，用于区分 WiFi/日志策略
 let activeXhr = null;           // 当前上传 XHR，用于 abort
@@ -174,11 +175,6 @@ function cleanupAfterOtaFailure(reason) {
 
   // 11. 日志
   addLog('E', 'OTA', '刷写流程已中止: ' + (reason || '未知原因'));
-}
-
-function showVerifyActions(type) {
-  // 已移除确认/重试/取消按钮：SHA-256 校验通过后自动重启，校验失败仅记录日志
-  void type;
 }
 
 /** @description 设置当前活跃 OTA 阶段并更新 UI 步骤指示器。 */
@@ -366,38 +362,6 @@ function updateUploadButtonLabel() {
   var gd32Btn = document.getElementById('uploadGd32Btn');
   if (esp32Btn) esp32Btn.disabled = !esp32File || isUploading;
   if (gd32Btn) gd32Btn.disabled = !gd32File || isUploading;
-}
-function setHelper(id, text, type) {
-  var el = document.getElementById(id);
-  if (!el) return;
-  el.className = 'helper-note ' + (type || '');
-  el.innerHTML = text;
-}
-function updateCanHint() {
-  var dlcEl = document.getElementById('canDlc');
-  var dataEl = document.getElementById('canData');
-  var hintEl = document.getElementById('canHint');
-  if (!dlcEl || !dataEl || !hintEl) return;
-  var dlc = parseInt(dlcEl.value) || 0;
-  var dataHex = dataEl.value.trim().replace(/\s/g, '');
-  if (!dataHex) {
-    setHelper('canHint', '输入十六进制数据后会自动检查字节数是否与 DLC 一致。', '');
-    return;
-  }
-  if (!/^[0-9a-fA-F]*$/.test(dataHex)) {
-    setHelper('canHint', '数据包含非 HEX 字符，请只输入 <code>0-9 A-F</code>。', 'err');
-    return;
-  }
-  if (dataHex.length % 2 !== 0) {
-    setHelper('canHint', 'HEX 长度必须为偶数，当前还差半个字节。', 'err');
-    return;
-  }
-  var bytes = dataHex.length / 2;
-  if (dlc && bytes !== dlc) {
-    setHelper('canHint', '当前数据为 <b>' + bytes + '</b> 字节，但 DLC = <b>' + dlc + '</b>。发送前建议对齐。', 'warn');
-    return;
-  }
-  setHelper('canHint', 'HEX 数据合法，当前长度 <b>' + bytes + '</b> 字节，与 DLC 一致。', 'ok');
 }
 function resetStageFlow() {
   ['s1', 's2', 's3', 's4', 's5', 's6'].forEach(function (id) {
@@ -779,7 +743,6 @@ function updateSystemStatusUi(data) {
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
   var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
-  function setOtaProgressBadge() {}  // OTA 进度卡片已移除，保留空壳避免调用报错
   // GD32 relay forwarding progress
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
@@ -800,7 +763,6 @@ function updateSystemStatusUi(data) {
   } else if (isGd32Complete || rs === 5 || (gd32AppAlive && sysState === 'GD32_COMPLETE')) {
     markPhaseDone('gd32Ota');
     currentOtaTarget = null; // GD32 OTA 完成，允许切换目标
-    setOtaProgressBadge(100);
     setProgress(100, 'GD32 刷写完成');
     var sbDone = document.getElementById('stageStatusBar');
     var stDone = document.getElementById('stageStatusText');
@@ -809,30 +771,25 @@ function updateSystemStatusUi(data) {
   } else if (isGd32Storing || (total > 0 && stored < total && !isUploading)) {
     setActivePhase('gd32Ota');
     var storeOverall = Math.min(45, Math.round(storageProgress * 0.45));
-    setOtaProgressBadge(storeOverall);
     if (!isUploading) {
       setProgress(storeOverall, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
     }
   } else if (rs === 1) {
     // HANDSHAKING: 握手 + 挑战认证
     setActivePhase('gd32Ota');
-    setOtaProgressBadge(50);
     setProgress(50, '握手与认证中...');
   } else if (rs === 2) {
     // SIZE_NEG: 固件大小协商
     setActivePhase('gd32Ota');
-    setOtaProgressBadge(55);
     setProgress(55, '协商固件大小...');
   } else if (rs === 3) {
     // TRANSFERRING: 数据包传输
     setActivePhase('gd32Ota');
     var relayOverall = 60 + Math.round(relayProgress * 0.30);
-    setOtaProgressBadge(relayOverall);
     setProgress(relayOverall, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
   } else if (rs === 4) {
     // FINISHING: 结束OTA + APP存活验证
     setActivePhase('gd32Ota');
-    setOtaProgressBadge(95);
     if (gd32AppAlive) {
       markPhaseDone('gd32Ota');
       currentOtaTarget = null; // GD32 OTA 完成，允许切换目标
@@ -846,10 +803,7 @@ function updateSystemStatusUi(data) {
     }
   } else if (total > 0 && stored >= total) {
     setActivePhase('gd32Ota');
-    setOtaProgressBadge(45);
     setProgress(45, '上传完成，等待自动启动 GD32 OTA...');
-  } else {
-    setOtaProgressBadge(storageProgress);
   }
 }
 /** @description 测试与 ESP32 的连接（GET /status）。 */
@@ -920,62 +874,6 @@ async function refreshSystemStatusNow(event) {
   } finally {
     clearTimeout(manualTimer);
   }
-}
-// ==================== CAN 帧发送 ====================
-async function sendCanFrame() {
-  var chEl = document.getElementById('canChannel');
-  var idEl = document.getElementById('canId');
-  var dlcEl = document.getElementById('canDlc');
-  var dataEl = document.getElementById('canData');
-  if (!chEl || !idEl || !dlcEl || !dataEl) {
-    showToast('请在独立 CAN 页面中发送帧', 'warning');
-    return;
-  }
-  var ch = parseInt(chEl.value);
-  var idStr = idEl.value.trim();
-  var dlc = parseInt(dlcEl.value) || 8;
-  var dataStr = dataEl.value.trim();
-  var extId = 0;
-  if (idStr.toLowerCase().indexOf('0x') === 0) extId = parseInt(idStr, 16);
-  else { extId = parseInt(idStr, 10); if (isNaN(extId)) extId = parseInt(idStr, 16); }
-  if (isNaN(extId)) { showToast('ID 格式错误', 'error'); return; }
-  var dataHex = dataStr.replace(/\s/g, '');
-  if (dataHex.length % 2 !== 0) { showToast('数据长度必须为偶数', 'error'); return; }
-  addLog('I', 'CAN', '发送 CH' + ch + ' ID=0x' + extId.toString(16).toUpperCase() + ' DLC=' + dlc);
-  try {
-    var resp = await fetch(getBaseUrl() + '/can/send', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ch: ch, id: extId, dlc: dlc, data: dataHex }),
-      signal: AbortSignal.timeout(5000)
-    });
-    var result = await resp.json();
-    if (result.status === 'ok') {
-      addLog('I', 'CAN', '响应: ' + (result.recv || '(无数据)') + ' (' + (result.recv_len || 0) + 'B)');
-      var rd = document.getElementById('canResp');
-      rd.style.display = 'block';
-      document.getElementById('canRespText').textContent =
-        result.recv ? '0x' + result.recv + ' (' + result.recv_len + ' 字节)' : '无响应数据';
-      showToast('CH' + ch + ' 发送成功', 'success');
-    } else {
-      addLog('E', 'CAN', '发送失败: code=' + result.code);
-      showToast('发送失败: code=' + result.code, 'error');
-    }
-  } catch (e) {
-    addLog('E', 'CAN', '发送失败: ' + e.message);
-    showToast('发送失败', 'error');
-  }
-}
-function clearCanFields() {
-  var idEl = document.getElementById('canId');
-  var dlcEl = document.getElementById('canDlc');
-  var dataEl = document.getElementById('canData');
-  var respEl = document.getElementById('canResp');
-  if (!idEl || !dlcEl || !dataEl) return;
-  idEl.value = '0x18DA00F1';
-  dlcEl.value = '8';
-  dataEl.value = '0102030405060708';
-  if (respEl) respEl.style.display = 'none';
-  updateCanHint();
 }
 // ==================== SPI 发送 ====================
 function updateSpiHint() {
@@ -1118,10 +1016,6 @@ function setupDropZone(zoneId, chip) {
 }
 setupDropZone('uploadZoneEsp32', 'esp32');
 setupDropZone('uploadZoneGd32', 'gd32');
-var canDataEl = document.getElementById('canData');
-var canDlcEl = document.getElementById('canDlc');
-if (canDataEl) canDataEl.addEventListener('input', updateCanHint);
-if (canDlcEl) canDlcEl.addEventListener('input', updateCanHint);
 var spiTypeEl = document.getElementById('spiType');
 var spiDataEl = document.getElementById('spiData');
 if (spiTypeEl) spiTypeEl.addEventListener('input', updateSpiHint);
@@ -1599,9 +1493,9 @@ async function verifyEsp32Firmware() {
       // 服务器已设置启动分区并自动重启，前端直接进入重启等待状态
       addLog('I', 'OTA', 'SHA-256 校验通过，设备自动重启中...');
       showToast('校验通过，设备重启中...', 'success');
-      showVerifyActions('none');
       updateEsp32StagesFromPhase(4);  // 应用固件
       isEsp32Rebooting = true;
+      rebootObservedDown = false;    // 重置：尚未观察到设备实际下线
       updateEsp32StagesFromPhase(5);  // 重启中
       rebootStartTime = Date.now();
     } else {
@@ -1610,7 +1504,6 @@ async function verifyEsp32Firmware() {
       showToast('校验失败: ' + detail, 'error');
       var resultEl = document.getElementById('sviResult');
       if (resultEl) { resultEl.textContent = '✗ ' + detail; resultEl.className = 'svi-val err'; }
-      showVerifyActions('retry');
       cleanupAfterOtaFailure('校验失败');
     }
   } catch (e) {
@@ -1621,69 +1514,9 @@ async function verifyEsp32Firmware() {
     showToast('应用请求失败: ' + e.message, 'error');
     var resultEl = document.getElementById('sviResult');
     if (resultEl) { resultEl.textContent = '✗ 请求失败: ' + e.message; resultEl.className = 'svi-val err'; }
-    showVerifyActions('retry');
     cleanupAfterOtaFailure('应用请求失败');
   }
 }
-
-async function retryEsp32Upload() {
-  addLog('I', 'OTA', '重新上传固件...');
-  showVerifyActions('none');
-  var verifyInfo = document.getElementById('stageVerifyInfo');
-  if (verifyInfo) verifyInfo.style.display = 'none';
-  var sviFront = document.getElementById('sviFrontSha');
-  var sviDevice = document.getElementById('sviDeviceSha');
-  var sviResult = document.getElementById('sviResult');
-  if (sviFront) sviFront.textContent = '-';
-  if (sviDevice) sviDevice.textContent = '-';
-  if (sviResult) { sviResult.textContent = '-'; sviResult.className = 'svi-val'; }
-  startUpload('esp32');
-}
-
-async function cancelEsp32Ota() {
-  addLog('I', 'OTA', '用户取消 OTA 刷写');
-  showToast('已取消 OTA', 'error');
-  showVerifyActions('none');
-  var xhr = activeXhr;
-  activeXhr = null;
-  if (xhr) {
-    try { xhr.abort(); } catch (_) {}
-  }
-  cleanupAfterOtaFailure('用户取消');
-}
-
-async function applyEsp32Firmware() {
-  addLog('I', 'OTA', '确认应用固件并重启 ESP32...');
-  showToast('正在应用固件并重启...', 'success');
-  try {
-    var resp = await fetch(getBaseUrl() + '/ota/update', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-      signal: AbortSignal.timeout(120000)
-    });
-
-    if (resp.ok) {
-      var data = await resp.json();
-      addLog('I', 'OTA', '升级完成: ' + (data.message || ''));
-      updateEsp32StagesFromPhase(4);  // 应用固件
-      isEsp32Rebooting = true;
-      updateEsp32StagesFromPhase(5);  // 重启中
-      rebootStartTime = Date.now();
-    } else {
-      var detail = '应用失败: HTTP ' + resp.status;
-      try { var d = await resp.json(); detail += ' - ' + (d.message || ''); } catch (_) {}
-      addLog('E', 'OTA', detail);
-      showToast(detail, 'error');
-    }
-  } catch (e) {
-    // fetch 异常仅代表请求未完成，不能推断设备已重启。
-    addLog('E', 'OTA', '应用请求失败: ' + e.message + '（设备状态未知，等待轮询探测）');
-    showToast('应用请求失败: ' + e.message, 'error');
-    cleanupAfterOtaFailure('应用请求失败');
-  }
-}
-
 
 async function restartEsp32() {
   if (!confirm('确定要重启 ESP32 吗？')) return;
@@ -1698,6 +1531,7 @@ async function restartEsp32() {
       addLog('I', '系统', '重启已触发: ' + data.message);
       showToast('ESP32 重启中，页面将自动恢复...', 'success');
       isEsp32Rebooting = true;
+      rebootObservedDown = false;    // 重置：尚未观察到设备实际下线
       rebootStartTime = Date.now();
     }
   } catch (e) {
@@ -1754,12 +1588,6 @@ async function triggerGd32Relay() {
   }
 }
 
-// ==================== 手动触发 GD32 OTA (调试/旧页面兜底) ====================
-/** @description 触发 GD32 OTA 中继（封装函数，调用实际 API）。 */
-async function triggerRelay() {
-  // 转发到统一入口：自动使用最近一次上传的 GD32 文件 SHA
-  await triggerGd32Relay();
-}
 // ==================== 轮询状态 ====================
 var consecutivePollFailures = 0;
 var statusTimerId = null;
@@ -1913,12 +1741,26 @@ async function pollStatus() {
         }
       }
       if (isEsp32Rebooting) {
-        isEsp32Rebooting = false;
-        updateEsp32StagesFromPhase(6);  // 启动完成
-        addLog('I', '系统', 'ESP32 已恢复在线');
-        showToast('ESP32 已恢复在线', 'success');
+        var rbElapsed = Math.round((Date.now() - rebootStartTime) / 1000);
+        if (!rebootObservedDown && rbElapsed < 10) {
+          // pre-reboot 窗口：后端发响应后约 1s 才 esp_restart，期间设备仍响应轮询
+          // 保持"重启中"状态，不清除标志，不推进阶段
+          addLog('I', '系统', '设备尚未实际重启，等待 esp_restart...');
+        } else {
+          // 设备已重启并恢复在线（rebootObservedDown=true）
+          // 或超 10s 安全阈值仍未观察到下线（重启过快未捕获或未重启）——接受恢复
+          isEsp32Rebooting = false;
+          rebootObservedDown = false;
+          updateEsp32StagesFromPhase(6);  // 启动完成
+          addLog('I', '系统', 'ESP32 已恢复在线');
+          showToast('ESP32 已恢复在线', 'success');
+        }
       }
       try { updateSystemStatusUi(data); } catch (e2) { console.warn('updateSystemStatusUi 异常:', e2); }
+      // pre-reboot 窗口内 updateSystemStatusUi 会把连接胶囊刷成"已连接"，需覆盖回"重启中"
+      if (isEsp32Rebooting) {
+        applyRebootingRuntimeState();
+      }
     }
     clearTimeout(pollTimer);
   } catch (e) {
@@ -1954,9 +1796,11 @@ async function pollStatus() {
     if (isUploading) {
       applyUploadingRuntimeState();
     } else if (isEsp32Rebooting) {
+      rebootObservedDown = true;  // 确认设备已下线（正在重启）
       var elapsed = Math.round((Date.now() - rebootStartTime) / 1000);
       if (elapsed > 60) {
         isEsp32Rebooting = false;
+        rebootObservedDown = false;
         addLog('E', '系统', 'ESP32 重启超时，设备未恢复');
         showToast('ESP32 重启超时，请检查设备', 'error');
         updateConnectionUi(false, '未连接');
@@ -2030,7 +1874,6 @@ async function pollLogs() {
 }
 setTimeout(function () {
   updateUploadButtonLabel();
-  updateCanHint();
   addLog('I', '系统', '控制台初始化完成，等待固件文件...');
   updateSpiHint();
   // IP 输入变化时自动恢复轮询

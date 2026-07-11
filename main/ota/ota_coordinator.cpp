@@ -555,18 +555,6 @@ void OtaCoordinator::restartEsp32()
     // 不会返回
 }
 
-/**
- * @brief 将 ESP32 OTA finalize 错误码分类。
- * @param err finalize 返回的 esp_err_t。
- * @return 0=成功，1=SHA不匹配，2=其他失败。
- */
-int OtaCoordinator::esp32FinalizeErrCategory(esp_err_t err)
-{
-    if (err == ESP_OK)                  return 0;  // 成功
-    if (err == ESP_ERR_INVALID_VERSION) return 1;  // SHA 不匹配
-    return 2;                                       // 其他失败
-}
-
 // ============================================================
 // 中止
 // ============================================================
@@ -655,37 +643,10 @@ bool OtaCoordinator::isIdleState(ota_system_state_t s) const
             s == OTA_SYS_GD32_COMPLETE);
 }
 
-/** @brief 判断给定状态值是否属于 GD32 忙态（不加锁，纯判断）。 */
-bool OtaCoordinator::isGd32BusyState(ota_system_state_t s) const
-{
-    return (s == OTA_SYS_GD32_STORING ||
-            s == OTA_SYS_GD32_RELAYING);
-}
-
-/** @brief 判断给定状态值是否属于 ESP32 忙态（不加锁，纯判断）。 */
-bool OtaCoordinator::isEsp32BusyState(ota_system_state_t s) const
-{
-    return (s == OTA_SYS_ESP32_RECEIVING ||
-            s == OTA_SYS_ESP32_FINALIZING ||
-            s == OTA_SYS_ESP32_REBOOTING);
-}
-
 /** @brief 判断系统是否处于空闲状态（IDLE/STORED/COMPLETE）。 */
 bool OtaCoordinator::isIdle() const
 {
     return isIdleState(getSystemState());
-}
-
-/** @brief 判断 GD32 通道是否正忙（STORING 或 RELAYING）。 */
-bool OtaCoordinator::isGd32Busy() const
-{
-    return isGd32BusyState(getSystemState());
-}
-
-/** @brief 判断 ESP32 通道是否正忙（RECEIVING/FINALIZING/REBOOTING）。 */
-bool OtaCoordinator::isEsp32Busy() const
-{
-    return isEsp32BusyState(getSystemState());
 }
 
 /** @brief 把状态枚举转成可读字符串（不加锁，纯函数）。
@@ -706,27 +667,10 @@ const char* OtaCoordinator::stateToString(ota_system_state_t s)
     }
 }
 
-/** @brief 获取系统状态的字符串名称（用于日志和前端显示）。
- *         委托 stateToString(getSystemState())，保持向后兼容。 */
-const char* OtaCoordinator::getSystemStateString() const
-{
-    return stateToString(getSystemState());
-}
-
 /** @brief 获取 GD32 APP 存活状态（委托 OtaRelay）。 */
 bool OtaCoordinator::getGd32AppAlive() const
 {
     return OtaRelay::getGd32AppAlive();
-}
-
-/** @brief 获取 GD32 固件是否已存储完成（线程安全）。 */
-bool OtaCoordinator::isGd32StorageDone() const
-{
-    // ★ M1/L3: m_mutex 为 mutable + lock()/unlock() 为 const，无需 const_cast
-    bool h = lock();
-    bool done = m_gd32StorageDone;
-    unlock(h);
-    return done;
 }
 
 // ============================================================
@@ -738,7 +682,7 @@ OtaSnapshot OtaCoordinator::getSnapshot() const
 
     // ── coordinator 自身状态（一次 mutex，避免二次加锁导致快照不一致）──
     // 持锁时一次性取 m_sysState，并调不加锁的 stateToString()
-    //   就地转字符串。旧实现释放锁后再调 getSystemStateString() 二次加锁，
+    //   就地转字符串。旧实现释放锁后再调 stateToString(getSystemState()) 二次加锁，
     //   两次取值之间状态可能变化，导致 snap.sys_state 与 snap.sys_state_str
     //   描述不同时刻状态。
     bool h = lock();

@@ -123,29 +123,10 @@ relay_state_t OtaRelay::getState()
     return relayState;
 }
 
-uint32_t OtaRelay::getRelaySeq()
-{
-    StateLockGuard lock;
-    return relaySeq;
-}
-
-uint32_t OtaRelay::getRelayTotalPackets()
-{
-    StateLockGuard lock;
-    return relayTotalPackets;
-}
-
 bool OtaRelay::getGd32AppAlive()
 {
     StateLockGuard lock;
     return gd32AppAlive;
-}
-
-void OtaRelay::getGd32Version(gd32_version_t *out)
-{
-    if (!out) return;
-    StateLockGuard lock;
-    *out = gd32Version;
 }
 
 RelaySnapshot OtaRelay::getSnapshot()

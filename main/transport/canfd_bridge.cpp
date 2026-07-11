@@ -58,7 +58,6 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
 
 constexpr uint8_t kSpiCanFeedbackType   = 0xC1U;
 constexpr uint8_t kSpiCanSetModeType    = 0xC2U;
-constexpr uint8_t kSpiIdSnapshotType    = 0xC3U;
 constexpr size_t  kFeedbackPayloadLen   = 123U;  // 与 GD32 协议表对齐 (kTxBufSize=128 - overhead=5)
 
 static inline uint32_t readU32Le(const uint8_t *p) {
@@ -85,21 +84,6 @@ int canFdSend(can_channel_t channel, uint32_t ext_id,
     }
     return sendCanFrameOverSpi(channel, ext_id, data, dlc, recv_buf, recv_max, timeout_ms);
 }
-
-/**
- * @brief 发送一帧无需上层消费响应的 CANFD 数据。
- *        GD32 APP 仍会返回 ACK/ERROR，这里主动读走响应，避免残留到下一笔 SPI 事务。
- */
-int canFdSendNoReply(can_channel_t channel, uint32_t ext_id,
-                     const uint8_t *data, uint8_t dlc)
-{
-    if (channel >= CAN_CHANNEL_MAX || dlc > CAN_MAX_DLC || !data) {
-        return -1;
-    }
-
-    return (sendCanFrameOverSpi(channel, ext_id, data, dlc, nullptr, 0U, 1000U) >= 0) ? 0 : -1;
-}
-
 
 /**
  * @brief 解析 GD32 主动推送的一页 CAN 反馈 payload，累积到结果结构中。
@@ -176,76 +160,6 @@ int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
     return 0;
 }
 
-/**
- * @brief 拉取指定通道的不重复 ID 快照表（GD32 SPI 帧类型 0xC3）。
- *        分页拉取，每页 8 条，最多拉 2 页（16 条）。
- */
-int canFdPullIdSnapshot(can_channel_t channel,
-                        id_snapshot_entry_t *out,
-                        uint8_t *out_count,
-                        uint32_t timeout_ms)
-{
-    if (channel >= CAN_CHANNEL_MAX || out == nullptr || out_count == nullptr) {
-        return -1;
-    }
-
-    *out_count = 0U;
-    uint8_t total = 0U;
-
-    for (uint8_t page = 0U; page < 2U; ++page) {
-        uint8_t req[2] = { static_cast<uint8_t>(channel), page };
-        uint8_t resp_buf[kFeedbackPayloadLen] = {};
-        uint8_t resp_type = 0U;
-        size_t  resp_len  = 0U;
-
-        esp_err_t ret = SpiMaster::instance().otaSendAndPoll(
-            kSpiIdSnapshotType,
-            req, 2U,
-            &resp_type, resp_buf, sizeof(resp_buf), &resp_len, timeout_ms);
-        if (ret != ESP_OK || resp_type != SPI_OTA_RSP_ACK || resp_len < 4U) {
-            return -1;
-        }
-
-        /* resp: [ch][page][total_count][entry_count][entries...] */
-        if (page == 0U) {
-            total = resp_buf[2];
-        }
-        const uint8_t entryCount = resp_buf[3];
-        if (entryCount == 0U) break;
-
-        uint16_t offset = 4U;
-        for (uint8_t i = 0U; i < entryCount && *out_count < CANFD_ID_SNAPSHOT_MAX; ++i) {
-            if (offset + 16U > resp_len) break;
-
-            id_snapshot_entry_t &e = out[*out_count];
-            e.id       = readU32Le(&resp_buf[offset]);
-            e.seq      = readU32Le(&resp_buf[offset + 4U]);
-            e.rx_count = readU32Le(&resp_buf[offset + 8U]);
-            e.dlc      = resp_buf[offset + 12U];
-            const uint8_t flags = resp_buf[offset + 13U];
-            e.fd_flag  = (flags & 0x01U) ? 1U : 0U;
-            e.brs      = (flags & 0x02U) ? 1U : 0U;
-            e.esi      = (flags & 0x04U) ? 1U : 0U;
-
-            const uint8_t dataLen = (e.dlc < CANFD_ID_SNAPSHOT_DATA_MAX)
-                                    ? e.dlc : static_cast<uint8_t>(CANFD_ID_SNAPSHOT_DATA_MAX);
-            const uint16_t entrySize = 16U + dataLen;
-            if (offset + entrySize > resp_len) break;
-
-            memcpy(e.data, &resp_buf[offset + 16U], dataLen);
-            /* 清零剩余字节 */
-            for (uint8_t d = dataLen; d < CANFD_ID_SNAPSHOT_DATA_MAX; ++d) {
-                e.data[d] = 0U;
-            }
-
-            offset += entrySize;
-            (*out_count)++;
-        }
-
-        if (*out_count >= total) break; /* 已拉完 */
-    }
-    return 0;
-}
 int canFdSetRxMode(can_rx_mode_t mode,
                    can_rx_mode_t *actual,
                    uint32_t timeout_ms)

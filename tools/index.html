@@ -636,22 +636,6 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
     if (sentCount) sentCount.textContent = '0';
   };
 
-  window.attachSharedFirmwareDropBridge = function () {
-    ['esp32', 'gd32'].forEach(function (chip) {
-      var zone = document.getElementById(chip === 'gd32' ? 'uploadZoneGd32' : 'uploadZoneEsp32');
-      if (!zone) return;
-      zone.addEventListener('drop', function (event) {
-        var file = event && event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0] ? event.dataTransfer.files[0] : null;
-        if (file) {
-          window.sharedFirmwareFiles[chip] = { file: file, handle: null };
-        }
-        window.flashTarget = chip;
-        applySharedModeUi();
-        setTimeout(syncBleFileFromSelectedTarget, 120);
-      }, true);
-    });
-  };
-
   window.applySharedModeUi = function () {
     var isBle = window.connectionMode === 'ble';
     var isGd32 = window.flashTarget === 'gd32';

@@ -50,18 +50,6 @@ int canFdSend(can_channel_t channel, uint32_t ext_id,
               uint8_t *recv_buf, uint8_t recv_max,
               uint32_t timeout_ms);
 
-/**
- * @brief 发送一帧无需响应的 CANFD 数据。
- * @param channel CAN 通道编号（0~2）。
- * @param ext_id 扩展帧 ID（29 位）。
- * @param data CAN 数据负载。
- * @param dlc 数据长度。
- * @return 成功返回 0，失败返回 -1。
- */
-int canFdSendNoReply(can_channel_t channel, uint32_t ext_id,
-                     const uint8_t *data, uint8_t dlc);
-
-
 // ============================================================
 // 不重复 ID 快照表（SPI 0xC3 协议配套）
 // ============================================================
@@ -147,16 +135,4 @@ int canFdSetRxMode(can_rx_mode_t mode,
                    can_rx_mode_t *actual,
                    uint32_t timeout_ms);
 
-/**
- * @brief 拉取指定通道的不重复 ID 快照表（SPI 帧 0xC3，分页）。
- * @param channel    目标通道 0/1/2。
- * @param out        输出条目数组（至少 CANFD_ID_SNAPSHOT_MAX 个元素）。
- * @param out_count  输出实际条目数。
- * @param timeout_ms SPI 超时。
- * @return 0 成功，<0 失败。
- */
-int canFdPullIdSnapshot(can_channel_t channel,
-                        id_snapshot_entry_t *out,
-                        uint8_t *out_count,
-                        uint32_t timeout_ms);
 #endif // CANFD_BRIDGE_H

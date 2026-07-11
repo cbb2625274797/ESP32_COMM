@@ -135,25 +135,10 @@ public:
      */
     static relay_state_t getState();
     /**
-     * @brief 获取中继当前序号.
-     * @return 当前中继序号。
-     */
-    static uint32_t getRelaySeq();
-    /**
-     * @brief 获取中继总包数.
-     * @return 本次中继的总包数。
-     */
-    static uint32_t getRelayTotalPackets();
-    /**
      * @brief 获取GD32 APP存活标志位.
      * @return true 表示 GD32 APP 存活。
      */
     static bool getGd32AppAlive();
-    /**
-     * @brief 获取GD32固件版本.
-     * @param out 输出版本信息结构体指针。
-     */
-    static void getGd32Version(gd32_version_t *out);
     /**
      * @brief 一次性读取所有中继状态字段（单次锁保护）。
      *        消除逐 getter 调用之间 relay task 更新状态导致的不一致。
@@ -238,7 +223,6 @@ public:
         ~StateLockGuard() {
             if (m_locked && s_stateMutex) { xSemaphoreGive(s_stateMutex); }
         }
-        bool isLocked() const { return m_locked; }
         StateLockGuard(const StateLockGuard&) = delete;
         StateLockGuard& operator=(const StateLockGuard&) = delete;
     private:

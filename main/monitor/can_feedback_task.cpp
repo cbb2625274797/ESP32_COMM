@@ -39,6 +39,7 @@ static volatile bool          s_paused = false;
 /* 累积工作缓冲：跨 page 0/1 累积每通道的完整反馈 */
 static can_feedback_result_t s_work  [CAN_CHANNEL_MAX];
 static uint8_t               s_workIdx[CAN_CHANNEL_MAX];
+static uint32_t              s_lastLoggedError[CAN_CHANNEL_MAX];
 
 static void publish(uint8_t ch, const can_feedback_result_t &fb)
 {
@@ -86,19 +87,22 @@ static void taskLoop(void *)
         }
 
         /* 解析本页并累积到工作缓冲，page=0 会自动重置 */
-        const uint8_t page = ring_payload[1];
         if (canFdParseFeedbackPage(ring_payload, ring_len,
                                    &s_work[ch], &s_workIdx[ch]) == 0) {
             publish(ch, s_work[ch]);
 
-            /* 仅在出现错误时打印告警，正常工作静默 */
-            if (s_work[ch].stats.error_count != 0U) {
+            /* 累计错误发生变化时才告警一次；P0/P1 携带相同统计，不能重复打印。 */
+            if (s_work[ch].stats.error_count != 0U
+                && s_work[ch].stats.error_count != s_lastLoggedError[ch]) {
                 DEBUG_WARN(kTag,
-                    "CH%u P%u seq=%lu err=%lu",
+                    "CH%u seq=%lu err=%lu TEC=%u REC=%u state=0x%02X",
                     static_cast<unsigned>(ch),
-                    static_cast<unsigned>(page),
                     static_cast<unsigned long>(s_work[ch].stats.snapshot_seq),
-                    static_cast<unsigned long>(s_work[ch].stats.error_count));
+                    static_cast<unsigned long>(s_work[ch].stats.error_count),
+                    static_cast<unsigned>(s_work[ch].stats.tec),
+                    static_cast<unsigned>(s_work[ch].stats.rec),
+                    static_cast<unsigned>(s_work[ch].stats.bus_state));
+                s_lastLoggedError[ch] = s_work[ch].stats.error_count;
             }
         }
     }
@@ -123,6 +127,7 @@ bool startCanFeedbackTask()
         }
     }
     memset(s_latest, 0, sizeof(s_latest));
+    memset(s_lastLoggedError, 0, sizeof(s_lastLoggedError));
     memset(s_valid,  0, sizeof(s_valid));
     memset(s_work,   0, sizeof(s_work));
     memset(s_workIdx, 0, sizeof(s_workIdx));
@@ -151,21 +156,6 @@ void pauseCanFeedbackTask(bool pause)
     } else {
         DEBUG_INFO(kTag, "CAN 监听已恢复");
     }
-}
-
-bool getLatestIdSnapshot(uint8_t channel, id_snapshot_cache_t *out)
-{
-    if (channel >= CAN_CHANNEL_MAX || out == nullptr || s_mutex == nullptr) return false;
-    bool ok = false;
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (s_latest[channel].valid) {
-            out->count = s_latest[channel].valid;
-            memcpy(out->entries, s_latest[channel].entries, sizeof(out->entries));
-            ok = true;
-        }
-        xSemaphoreGive(s_mutex);
-    }
-    return ok;
 }
 
 /**

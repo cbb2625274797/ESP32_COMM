@@ -69,8 +69,6 @@ public:
     bool getStaRetryExhausted() const     { return m_staRetryExhausted.load(); }
     /** @brief 设置 STA 重试耗尽标志。 */
     void setStaRetryExhausted(bool v)     { m_staRetryExhausted.store(v); }
-    /** @brief 获取 GD32 固件存储完成标志。 */
-    bool getGd32StorageDone() const       { return m_gd32StorageDone.load(); }
     /** @brief 设置 GD32 固件存储完成标志。 */
     void setGd32StorageDone(bool v)       { m_gd32StorageDone.store(v); }
     // ── 状态互斥锁（保护复合读-改-写操作）──

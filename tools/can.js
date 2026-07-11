@@ -739,18 +739,13 @@
     });
   }
 
-  function renderSelectedMessage() {
-    // 顶部独立的“信号编辑”面板已移除，所有信号编辑现在通过报文行展开完成。
-    // 这里保留函数以兼容旧调用方（selectMessage 等），不再触碰已删除的 DOM。
-  }
-
-  function metaCard(label, value) {
-    return '<div class="can-meta-card"><span>' + sanitizeHtml(label) + '</span><b>' + sanitizeHtml(value) + '</b></div>';
-  }
-
-  function renderSignalGrid(/* message */) {
-    // 旧的独立信号编辑表已移除，信号编辑全部走报文行内展开 renderInlineSignalGrid。
-  }
+  /**
+   * @description 旧版“顶部独立信号编辑面板”的兼容 shim。
+   *              该面板已移除，信号编辑现在通过报文行展开完成；
+   *              仍被 selectMessage、handleDbcFile、clearDbc、handleSignalInputEvent 调用，
+   *              保留空函数以避免修改所有调用方。
+   */
+  function renderSelectedMessage() {}
 
   function renderSignalRow(message, signal, index) {
     var bag = getSignalValueMap(message);

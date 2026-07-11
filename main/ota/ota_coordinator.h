@@ -396,46 +396,11 @@ public:
     bool isIdleState(ota_system_state_t s) const;
 
     /**
-     * @brief 检查给定状态值是否属于 GD32 忙态（不加锁，纯判断）。
-     * @param s 状态枚举值。
-     * @return true 表示 STORING 或 RELAYING。
-     */
-    bool isGd32BusyState(ota_system_state_t s) const;
-
-    /**
-     * @brief 检查给定状态值是否属于 ESP32 忙态（不加锁，纯判断）。
-     * @param s 状态枚举值。
-     * @return true 表示 RECEIVING/FINALIZING/REBOOTING。
-     */
-    bool isEsp32BusyState(ota_system_state_t s) const;
-
-    /**
      * @brief 检查系统是否空闲（可接受新的 OTA 请求）。
      *        内部仍加锁取一次状态后调 isIdleState()。
      * @return true 系统空闲（IDLE/STORED/COMPLETE）。
      */
     bool isIdle() const;
-
-    /**
-     * @brief 检查是否有 GD32 相关操作正在进行。
-     *        内部仍加锁取一次状态后调 isGd32BusyState()。
-     * @return true 表示 STORING 或 RELAYING。
-     */
-    bool isGd32Busy() const;
-
-    /**
-     * @brief 检查是否有 ESP32 OTA 正在进行。
-     *        内部仍加锁取一次状态后调 isEsp32BusyState()。
-     * @return true 表示 RECEIVING/FINALIZING/REBOOTING。
-     */
-    bool isEsp32Busy() const;
-
-    /**
-     * @brief 获取系统状态的可读字符串描述。
-     *        内部委托 stateToString(getSystemState())，保持向后兼容。
-     * @return 状态名称字符串（如 "IDLE"、"GD32_STORING" 等）。
-     */
-    const char* getSystemStateString() const;
 
     // ── GD32 状态（供 status API 使用，委托给 OtaRelay 查询）──
     /**
@@ -444,26 +409,11 @@ public:
      */
     bool getGd32AppAlive() const;
 
-    /**
-     * @brief GD32 固件存储完成标志（供状态查询）。
-     * @return true 表示固件已完整存储。
-     */
-    bool isGd32StorageDone() const;
-
     // ── 完全复位 ──
     /**
      * @brief 完全复位协调器和所有子系统状态。
      */
     void reset();
-
-    // ── ESP32 OTA finalize 错误分类（BLE/WiFi 共用）──
-    /**
-     * @brief 把 finalize 返回的 esp_err_t 映射为前端可读的事件码。
-     *        统一 BLE/WiFi 两端语义，便于日志/状态一致。
-     * @param err finalize 返回的 esp_err_t。
-     * @return 0=成功；1=SHA 不匹配；2=其他失败。
-     */
-    static int esp32FinalizeErrCategory(esp_err_t err);
 
     // ── IRelayListener 接口实现（H4: OtaRelay 通过接口回调通知协调器）──
     /**
