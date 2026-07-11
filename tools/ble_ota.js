@@ -10,7 +10,7 @@
     version: 0x0004,
   };
 
-  const UI_BUILD = '2026-06-15-ble-merged-v2';
+  const UI_BUILD = '2026-07-12-ble-reorder-v6';
   const BLE_OTA_NOTIFY_ACK = 0xA1;
   const BLE_OTA_NOTIFY_FINISH = 0xB1;
   const BLE_OTA_NOTIFY_SHA256 = 0xC1;
@@ -1228,17 +1228,16 @@
       state.activePacketTotal = packetTotal;
       els.sentCount.textContent = '0';
       setProgress(0, `[${cfg.label}] 等待设备确认 0/${packetTotal} 包`);
-      bleLog('OTA', `开始写入 DATA_IN: target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`);
+      bleLog('OTA', `开始写入 DATA_IN: build=${UI_BUILD}, target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`);
 
       const MAX_WINDOW_RETRIES = 3;
-      let bleWriteTs = 0;  // 上一次 BLE 写入时间戳，用于节流
-      const BLE_WRITE_INTERVAL = 2;  // 最小写入间隔 (ms)，避免 BLE 栈过载
       for (let windowStart = 0; windowStart < packetTotal; windowStart += BLE_OTA_ACK_WINDOW) {
         if (state.abortRequested) throw new Error('用户中止');
 
         const endSeq = Math.min(windowStart + BLE_OTA_ACK_WINDOW, packetTotal) - 1;
 
-        // 流水线发送：不逐包 await，减少 BLE 栈 per-packet 开销
+        // Windows Web Bluetooth 同一时刻只允许一个 GATT 操作。逐包等待仅保证
+        // 提交顺序；实际吞吐由设备请求的高速 BLE 连接参数决定。
         // ★ 不再在循环内 setProgress：进度完全由设备 ACK 后的 state.lastAckBytes 驱动
         for (let seq = windowStart; seq <= endSeq; seq++) {
           // ★ 中止检查放在循环内：abortTask 可能在本窗口发送过程中触发
@@ -1248,13 +1247,6 @@
           const end = Math.min(start + payloadSize, totalSize);
           const payload = fileBytes.slice(start, end);
           const packet = buildPacket(seq, totalSize, payload, cfg.packetCmd);
-
-          // 节流：避免过快地向 BLE 栈提交写入
-          const now = performance.now();
-          const gap = now - bleWriteTs;
-          if (gap < BLE_WRITE_INTERVAL) {
-            await sleep(BLE_WRITE_INTERVAL - gap);
-          }
 
           // ★ seq=0 必须用 writeValueWithResponse（带响应）：
           // seq=0 触发设备端 esp_ota_begin()（flash 擦除 + OTA 会话创建），
@@ -1271,9 +1263,8 @@
             // seq=0 写入后等待设备完成 esp_ota_begin()（flash 擦除较耗时）
             await sleep(200);
           } else {
-            state.dataInChar.writeValueWithoutResponse(packet);  // fire-and-forget
+            await state.dataInChar.writeValueWithoutResponse(packet);
           }
-          bleWriteTs = performance.now();
         }
 
         state.ackGeneration++;
@@ -1296,8 +1287,7 @@
 
           // ★ 进度检测：如果重试后字节数没有增长，说明续传无效
           if (retryCount > 0 && state.lastAckBytes <= prevAckBytes) {
-            bleLog('OTA', `重试无进展: ackBytes=${state.lastAckBytes} 未增长 (前次=${prevAckBytes})，放弃`, 'E');
-            break;
+            bleLog('OTA', `上次重试暂未推进: ackBytes=${state.lastAckBytes} (前次=${prevAckBytes})，继续按缺口重试`, 'W');
           }
           prevAckBytes = state.lastAckBytes;
 
@@ -1322,10 +1312,6 @@
             const end = Math.min(start + payloadSize, totalSize);
             const payload = fileBytes.slice(start, end);
             const packet = buildPacket(seq, totalSize, payload, cfg.packetCmd);
-            // 流水线发送 + 节流
-            const now = performance.now();
-            const gap = now - bleWriteTs;
-            if (gap < BLE_WRITE_INTERVAL) await sleep(BLE_WRITE_INTERVAL - gap);
             // ★ 重试路径中 seq=0 也必须用 writeValueWithResponse
             if (seq === 0) {
               try {
@@ -1336,9 +1322,8 @@
               }
               await sleep(200);
             } else {
-              state.dataInChar.writeValueWithoutResponse(packet);
+              await state.dataInChar.writeValueWithoutResponse(packet);
             }
-            bleWriteTs = performance.now();
           }
 
           state.ackGeneration++;
@@ -1352,7 +1337,7 @@
 
         if (state.lastAckBytes < expectedBytes) {
           const missing = expectedBytes - state.lastAckBytes;
-          throw new Error(`BLE 丢包检测: seq=${endSeq} 期望${expectedBytes}字节 实际${state.lastAckBytes}字节 丢失${missing}字节(${(missing / payloadSize).toFixed(1)}包) 已重试${MAX_WINDOW_RETRIES}次`);
+          throw new Error(`BLE 丢包检测: seq=${endSeq} 期望${expectedBytes}字节 实际${state.lastAckBytes}字节 丢失${missing}字节(${(missing / payloadSize).toFixed(1)}包) 已重试${retryCount}次`);
         }
       }
 

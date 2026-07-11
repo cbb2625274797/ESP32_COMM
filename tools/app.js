@@ -728,6 +728,11 @@ function updateSystemStatusUi(data) {
       mOtaCache.className = 'v';
     }
   }
+  // 共享进度条按当前连接模式归属：BLE 模式下由 ble_ota.js 的设备 ACK
+  // 驱动包数、阶段和完成状态，HTTP 状态轮询不能覆盖这套实时进度。
+  if (window.connectionMode === 'ble') {
+    return;
+  }
   // relay state - skip GD32 relay UI when ESP32 OTA is active
   if (currentOtaTarget === 'esp32' && esp32OtaPhase > 0) {
     return;
