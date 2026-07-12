@@ -50,7 +50,6 @@ void Protocol::init()
     }
 
     m_initialized = true;
-    DEBUG_INFO("PROT", "协议层就绪");
 }
 
 /**

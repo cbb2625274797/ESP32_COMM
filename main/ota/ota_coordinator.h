@@ -124,10 +124,9 @@ public:
     esp_err_t beginGd32Storage(uint32_t total_size, ota_channel_t channel);
 
     /**
-     * @brief 统一 GD32 OTA 写入前的准备工作：校验大小 + begin + 擦除分区 + 清空 meta + 写入初始 meta。
-     *        供 BLE seq=0 首包 / HTTP GD32 upload（非 prepared 复用路径）调用，
-     *        消除两路径对"擦除/meta 初始化"序列的隐式差异（原 BLE 路径未擦除分区）。
-     *        任意步骤失败时内部调 abortCurrent 清理，调用方无需再清理。
+     * @brief 统一 GD32 OTA 写入前准备：校验大小 + begin + 复位按需擦除水位 + 清空 meta + 写入初始 meta。
+     *        扇区擦除在 writeGd32Chunk/flashWriteChunk 内按写入范围推进（非整段预擦）。
+     *        WiFi/BLE 上传入口共用，任意步骤失败时内部 abortCurrent，调用方无需再清理。
      * @param total_size 固件总字节数。
      * @param channel 发起通道（WiFi/BLE）。
      * @return ESP_OK 成功；ESP_ERR_INVALID_SIZE 大小非法；ESP_ERR_INVALID_STATE 系统忙；其他擦除/写入错误。
@@ -139,6 +138,13 @@ public:
      *        更新系统状态为 OTA_SYS_GD32_STORED。
      */
     void completeGd32Storage();
+
+    /**
+     * @brief 收流完成后的统一收尾：completeGd32Storage + finalizeGd32Checksum。
+     *        WiFi/BLE 传输层共用，避免一端只 complete、另一端漏算 SHA 的分叉。
+     * @return finalizeGd32Checksum 的返回值（complete 本身无错误码）。
+     */
+    esp_err_t finishGd32StorageAfterReceive();
 
     // ── GD32 存储操作（传输层通过协调器操作 Flash，解决 H3 绕过问题）──
     /**

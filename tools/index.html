@@ -427,7 +427,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script src="app.js?v=20260712a"></script>
+<script src="app.js?v=20260713i"></script>
 <script>
 window.connectionMode = window.connectionMode || 'wifi';
 window.flashTarget = window.flashTarget || 'esp32';
@@ -485,8 +485,10 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
 
   window.selectFlashTarget = function (target) {
       // OTA 上传进行中禁止切换目标：避免前端状态与后端 relay/upload 不同步导致卡死
-      if (window.isUploading) {
-        var active = (window.activeUploadChip || 'OTA').toUpperCase();
+      // ★ 兼容 BLE 模式：BLE 上传用 bleOta.state.uploading，window.isUploading 仅 WiFi 通道使用。
+      var bleBusy = window.bleOta && window.bleOta.isUploading && window.bleOta.isUploading();
+      if (window.isUploading || bleBusy) {
+        var active = bleBusy ? 'BLE' : ((window.activeUploadChip || 'OTA').toUpperCase());
         if (typeof addLog === 'function') addLog('W', 'OTA', active + ' 刷写进行中，无法切换目标');
         if (typeof showToast === 'function') showToast('当前有 ' + active + ' 任务在运行，请等待结束后再切换', 'error');
         return;
@@ -670,6 +672,6 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   applySharedModeUi();
 })();
 </script>
-<script src="ble_ota.js?v=20260712d"></script>
+<script src="ble_ota.js?v=20260712e"></script>
 </body>
 </html>

@@ -9,9 +9,11 @@ idf_component_register(
         "server/wifi_ota.cpp"          # WiFi HTTP OTA 服务器
         "server/http_handlers.cpp"     # HTTP 路由处理（H2 从 wifi_ota 提取）
         "server/ble_ota.cpp"           # BLE GATT OTA 服务器
-        "monitor/health_monitor.cpp"   # 系统健康监控（温度/RSSI/堆内存）
+        "monitor/health_monitor.cpp"   # 系统健康监控（温度/RSSI/堆内存/栈水位主动巡检）
         "monitor/can_feedback_task.cpp" # CAN 1Hz 反馈轮询任务（0xC1）
         "monitor/debug_log.cpp"        # 三路调试日志（UART/UDP/环形缓冲）
+        "monitor/task_stack_check.cpp" # 任务栈水位指标收集（health_mon 巡检 + /system/status 共享）
+        "monitor/stack_overflow_hook.cpp" # FreeRTOS 栈溢出钩子（canary 触发时 UART 硬写告警）
     INCLUDE_DIRS
         "."
         "core"

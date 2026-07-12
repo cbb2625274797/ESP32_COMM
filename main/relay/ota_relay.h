@@ -353,7 +353,7 @@ private:
      */
     ota_result_t doSendFinishOta();
     /**
-     * @brief 轮询等待 GD32 APP 存活（30 次重试）.
+     * @brief 轮询等待 GD32 APP 存活（10 次重试）.
      * @param timeout_ms 单次 appPing 超时（毫秒）。
      * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_GD32 超时失败。
      */

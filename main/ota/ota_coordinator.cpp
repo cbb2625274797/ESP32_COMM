@@ -181,9 +181,6 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t ch
     return h ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
-// GD32 Flash 扇区大小（与 http_handlers.cpp 中的常量保持一致，用于擦除时向上对齐）
-static constexpr uint32_t kGd32FlashSectorSize = 4096U;
-
 esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t channel)
 {
     // 1. 校验固件大小（统一 BLE/HTTP 两路径的大小检查）
@@ -200,18 +197,12 @@ esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t 
         return err;
     }
 
-    // 3. 擦除 GD32 OTA 分区（按扇区大小向上对齐）
-    //    ★ 原 BLE 路径未擦除分区，此处统一补齐，确保两路径行为一致。
-    const uint32_t erase_size =
-        ((total_size + kGd32FlashSectorSize - 1U) / kGd32FlashSectorSize) * kGd32FlashSectorSize;
-    DEBUG_INFO(TAG, "prepareGd32Storage: 擦除 gd32_ota 分区 %u bytes (fw=%" PRIu32 ")",
-               (unsigned)erase_size, total_size);
-    err = eraseGd32Partition(erase_size);
-    if (err != ESP_OK) {
-        DEBUG_ERR(TAG, "prepareGd32Storage: 擦除失败: %s", esp_err_to_name(err));
-        abortCurrent();
-        return err;
-    }
+    // 3. 复位按需擦除水位（不在此处整段预擦）
+    //    旧实现在 prepare 阶段 erase 整包固件对应分区：HTTP 主线程阻塞数秒～数十秒，
+    //    期间不 httpd_req_recv → TCP 窗口塞满后浏览器进度先到 100%，再空等擦+写+SHA。
+    //    现改为 flashWriteChunk 内按扇区 ensureErased，边收边擦写，进度与真实处理对齐。
+    Gd32FlashStore::instance().beginWriteSession();
+    DEBUG_INFO(TAG, "prepareGd32Storage: 按需擦除会话已复位 (fw=%" PRIu32 ")", total_size);
 
     // 4. 清空旧 meta + 写入初始 meta（total_size + stored_size=0 + last_seq=0）
     clearGd32Meta();
@@ -241,6 +232,12 @@ void OtaCoordinator::completeGd32Storage()
         DEBUG_WARN(TAG, "completeGd32Storage 在非预期状态: %d", (int)m_sysState);
     }
     unlock(h);
+}
+
+esp_err_t OtaCoordinator::finishGd32StorageAfterReceive()
+{
+    completeGd32Storage();
+    return finalizeGd32Checksum();
 }
 
 // ============================================================

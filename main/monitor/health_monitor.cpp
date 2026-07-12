@@ -14,10 +14,25 @@
 #include "esp_wifi.h"
 #include "esp_timer.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "driver/temperature_sensor.h"
 
 #include "health_monitor.h"
 #include "debug_log.h"
+#include "task_stack_check.h"
+#include "stack_overflow_hook.h"
+
+// ============================================================
+// 栈水位主动巡检
+// ============================================================
+// 告警阈值：剩余高水位 < 栈大小 20% 即告警（复用 /system/status 的任务表）。
+// 去重：每个任务只在"水位由安全跌入危险"时告警一次，恢复后再跌入才再次告警，
+//   避免 5 秒巡检刷屏。health_mon 任务从不被 OTA 暂停，DEBUG_ERR 经 UDP/UART
+//   直发，不受 OTA 门控抑制。
+static constexpr float STACK_WARN_RATIO = 0.20f;   ///< 剩余水位告警阈值（栈大小比例）
+static constexpr size_t STACK_TASK_MAX = 8;        ///< 受监控任务上限
+static bool s_stackWarned[STACK_TASK_MAX] = {};    ///< 各任务是否已告警（去重）
 
 // ============================================================
 // 单例
@@ -190,7 +205,6 @@ void HealthMonitor::taskEntry(void *pvParameters)
         DEBUG_ERR("MON", "温度传感器初始化失败: %s", esp_err_to_name(err));
     } else {
         ESP_ERROR_CHECK(temperature_sensor_enable(self.m_tempHandle));
-        DEBUG_INFO("MON", "温度传感器已启用 (范围 20°C ~ 80°C)");
     }
 
     // 定时器，每1秒读取一次温度
@@ -202,7 +216,6 @@ void HealthMonitor::taskEntry(void *pvParameters)
 
     if (esp_timer_create(&timer_args, &self.m_tempTimer) == ESP_OK) {
         esp_timer_start_periodic(self.m_tempTimer, 1000000);  // 1秒
-        DEBUG_INFO("MON", "温度监控定时器已启动 (1秒间隔)");
     } else {
         self.m_tempTimer = nullptr;
         DEBUG_ERR("MON", "创建温度监控定时器失败");
@@ -210,16 +223,62 @@ void HealthMonitor::taskEntry(void *pvParameters)
 
     // 周期性巡检
     while (1) {
+        // 栈溢出 canary 触发检测：vApplicationStackOverflowHook 置位后，
+        //   在 health_mon 完好栈上用 DEBUG_ERR 经 UDP/UART 发详细告警。
+        //   标志只在置位后告警一次，不自动清除（canary 触发即不可逆，需重启恢复）。
+        if (g_stackOverflowDetected) {
+            DEBUG_ERR("MON", "!!! 栈溢出已被内核 canary 检测到，请检查任务栈大小 !!!");
+            // 告警一次后清标志，避免 5 秒刷屏；后续若再次触发会重新置位
+            g_stackOverflowDetected = false;
+        }
+
         uint32_t free_heap = esp_get_free_heap_size();
         if (free_heap < HEAP_WARNING_MIN) {
-            uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-            DEBUG_WARN("MON", "堆内存不足: free=%lu min=%lu largest_blk=%lu",
-                       free_heap, esp_get_minimum_free_heap_size(), largest_block);
+            /* OTA 期间堆会短暂变紧，限流避免串口/UDP 二次吃堆、刷屏 */
+            static TickType_t s_last_heap_warn = 0;
+            TickType_t now = xTaskGetTickCount();
+            if ((now - s_last_heap_warn) >= pdMS_TO_TICKS(2000)) {
+                s_last_heap_warn = now;
+                uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+                DEBUG_WARN("MON", "堆内存不足: free=%lu min=%lu largest_blk=%lu",
+                           (unsigned long)free_heap,
+                           (unsigned long)esp_get_minimum_free_heap_size(),
+                           (unsigned long)largest_block);
+            }
         }
         health_state_t cur = self.getState();
         if (cur >= SYS_CRITICAL) {
             DEBUG_ERR("MON", "健康状态危险: %d", cur);
         }
+
+        // 栈水位主动巡检：复用 /system/status 的任务表，低水位时 DEBUG_ERR 主动告警。
+        //   health_mon 任务不被 OTA 暂停，告警经 UDP/UART 直发，穿透 OTA 门控。
+        TaskStackMetric metrics[STACK_TASK_MAX];
+        size_t count = collectTaskStackMetrics(metrics, STACK_TASK_MAX);
+        for (size_t i = 0; i < count && i < STACK_TASK_MAX; ++i) {
+            if (metrics[i].handle == NULL || metrics[i].stack_size_bytes == 0) {
+                continue;
+            }
+            UBaseType_t hw = uxTaskGetStackHighWaterMark(metrics[i].handle);
+            size_t warn_bytes = (size_t)(metrics[i].stack_size_bytes * STACK_WARN_RATIO);
+            if (hw < (UBaseType_t)warn_bytes) {
+                if (!s_stackWarned[i]) {
+                    DEBUG_ERR("MON", "!!! 栈水位过低 !!! 任务=%s 剩余=%luB 阈值=%luB(%.0f%%) 栈大小=%luB",
+                              metrics[i].name,
+                              (unsigned long)hw,
+                              (unsigned long)warn_bytes,
+                              STACK_WARN_RATIO * 100.0f,
+                              (unsigned long)metrics[i].stack_size_bytes);
+                    s_stackWarned[i] = true;
+                }
+            } else if (s_stackWarned[i]) {
+                // 水位恢复，清除告警标志，允许下次再次跌入时告警
+                s_stackWarned[i] = false;
+                DEBUG_INFO("MON", "栈水位恢复: 任务=%s 剩余=%luB",
+                           metrics[i].name, (unsigned long)hw);
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }

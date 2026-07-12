@@ -1196,8 +1196,6 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     uint32_t afterReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
     bool progressMade = (afterReceived > beforeReceived);
 
-    DEBUG_DBG(TAG, "ESP32 OTA 写入成功: seq=%u received=%u progress=%d",
-              seq, (unsigned int)afterReceived, progressMade ? 1 : 0);
 
     // 完成判定：以实际按序写入字节数为准。
     bool isLastPacket = (expected_payload < BLE_OTA_CHUNK_PAYLOAD);
@@ -1239,35 +1237,59 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
  * @brief 处理单个 GD32 OTA 数据包（ble_ota_process_data_batch 子步骤）。
  * @return true 中止整个 batch；false 继续下一包（offset 由外层统一推进）。
  */
+/** GD32 路径硬失败：与 WiFi abortCurrentIfEpoch 对齐，复位协调器 + 本通道 RAM meta。 */
+static void ble_gd32_fail_abort(const char *why)
+{
+    DEBUG_ERR(TAG, "GD32 OTA 中止: %s", why ? why : "?");
+    OtaCoordinator::instance().abortCurrent();
+    s_ble_gd32_meta = {};
+    s_ble_gd32_meta_active = false;
+    s_gd32_ooo_count = 0;
+    ble_ota_restore_wifi_ps();
+}
+
 static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
                                  const uint8_t *buf, size_t data_offset, size_t data_len,
                                  uint32_t expected_payload)
 {
     if (seq == 0 && total_size > 0) {
-        // ★ 统一调用 prepareGd32Storage 完成：validate + begin + erase + clearMeta + saveMeta
-        //   原 BLE 路径未擦除分区，现通过 prepareGd32Storage 与 HTTP 路径对齐。
-        esp_err_t prep_err = OtaCoordinator::instance().prepareGd32Storage(total_size, OTA_CHANNEL_BLE);
-        if (prep_err == ESP_ERR_INVALID_SIZE) {
-            DEBUG_ERR(TAG, "GD32 固件大小非法: raw=%" PRIu32 " max=%zu",
-                      total_size, OTA_MAX_FIRMWARE_SIZE);
-            sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_SIZE, total_size);
-            return true;
-        } else if (prep_err == ESP_ERR_INVALID_STATE) {
-            DEBUG_ERR(TAG, "GD32 OTA 协调器拒绝存储（系统忙）");
-            sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
-            return true;
-        } else if (prep_err != ESP_OK) {
-            DEBUG_ERR(TAG, "GD32 OTA 准备失败: %s", esp_err_to_name(prep_err));
-            sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
-            return true;
-        }
+        // 与 ESP32 BLE 路径一致：活跃会话中的 seq=0 视为首包重传，禁止再次 prepare
+        // （否则会 erase 分区、清 meta，毁掉已写入进度）。
+        if (s_ble_gd32_meta_active && s_ble_gd32_meta.total_size == total_size) {
+            if (s_ble_gd32_meta.stored_size > 0) {
+                DEBUG_INFO(TAG, "GD32 会话已激活，seq=0 视为重传，跳过写入 stored=%" PRIu32,
+                           s_ble_gd32_meta.stored_size);
+                sendWindowAck(cmd, 0, s_ble_gd32_meta.stored_size);
+                return false;
+            }
+            DEBUG_INFO(TAG, "GD32 会话已激活且未落盘，seq=0 重传首块（不重新 prepare）");
+            // fall through：stored_size==0 时重写 offset 0
+        } else {
+            // 与 WiFi 共用 prepareGd32Storage：validate + begin + erase + clearMeta + saveMeta
+            esp_err_t prep_err = OtaCoordinator::instance().prepareGd32Storage(
+                total_size, OTA_CHANNEL_BLE);
+            if (prep_err == ESP_ERR_INVALID_SIZE) {
+                DEBUG_ERR(TAG, "GD32 固件大小非法: raw=%" PRIu32 " max=%zu",
+                          total_size, OTA_MAX_FIRMWARE_SIZE);
+                sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_SIZE, total_size);
+                return true;
+            } else if (prep_err == ESP_ERR_INVALID_STATE) {
+                DEBUG_ERR(TAG, "GD32 OTA 协调器拒绝存储（系统忙）");
+                sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
+                return true;
+            } else if (prep_err != ESP_OK) {
+                DEBUG_ERR(TAG, "GD32 OTA 准备失败: %s", esp_err_to_name(prep_err));
+                sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
+                return true;
+            }
 
-        DEBUG_INFO(TAG, "GD32 固件存储开始: total=%" PRIu32 ", payload=%zu",
-                   total_size, data_len);
-        s_ble_gd32_meta = {};
-        s_ble_gd32_meta.total_size = total_size;
-        s_ble_gd32_meta_active = true;
-        ble_ota_boost_wifi_ps();
+            DEBUG_INFO(TAG, "GD32 固件存储开始: total=%" PRIu32 ", payload=%zu",
+                       total_size, data_len);
+            s_ble_gd32_meta = {};
+            s_ble_gd32_meta.total_size = total_size;
+            s_ble_gd32_meta_active = true;
+            ble_ota_boost_wifi_ps();
+        }
     }
 
     if (!s_ble_gd32_meta_active || s_ble_gd32_meta.total_size == 0) {
@@ -1325,6 +1347,8 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     if (flash_offset + (uint32_t)data_len > meta.total_size) {
         DEBUG_ERR(TAG, "GD32 写入越界: offset=%" PRIu32 " len=%zu total=%" PRIu32,
                   flash_offset, data_len, meta.total_size);
+        ble_gd32_fail_abort("write OOB");
+        sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, 0);
         return true;
     }
 
@@ -1332,6 +1356,8 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "Flash 写入失败: seq=%u offset=%" PRIu32 " err=%s",
                   seq, flash_offset, esp_err_to_name(err));
+        ble_gd32_fail_abort(esp_err_to_name(err));
+        sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)err);
         return true;
     }
 
@@ -1351,6 +1377,7 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
         if (err != ESP_OK) {
             DEBUG_ERR(TAG, "GD32 元数据 checkpoint 失败 (seq=%u): %s",
                       seq, esp_err_to_name(err));
+            ble_gd32_fail_abort(esp_err_to_name(err));
             sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)err);
             return true;
         }
@@ -1365,9 +1392,9 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
         DEBUG_INFO(TAG, "★ GD32 固件接收完毕: %" PRIu32 " / %" PRIu32 " 字节 (共 %u 块)",
                    meta.stored_size, meta.total_size, seq + 1);
         s_ble_gd32_meta_active = false;
-        OtaCoordinator::instance().completeGd32Storage();
         ble_ota_restore_wifi_ps();
-        esp_err_t sha_err = OtaCoordinator::instance().finalizeGd32Checksum();
+        // 与 WiFi 共用 finishGd32StorageAfterReceive：complete + SHA
+        esp_err_t sha_err = OtaCoordinator::instance().finishGd32StorageAfterReceive();
         if (sha_err != ESP_OK) {
             DEBUG_ERR(TAG, "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
         }

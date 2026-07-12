@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include "esp_partition.h"
+#include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
@@ -15,6 +16,7 @@
 #include "gd32_flash_store.h"
 #include "monitor/debug_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 
 // ============================================================
@@ -73,6 +75,49 @@ const esp_partition_t* Gd32FlashStore::getPartition()
 // Flash 分区读写
 // ============================================================
 
+void Gd32FlashStore::beginWriteSession()
+{
+    m_erasedUpTo = 0;
+}
+
+/** @brief 确保 [offset, offset+len) 覆盖的扇区已擦除（从 m_erasedUpTo 顺序推进）。 */
+esp_err_t Gd32FlashStore::ensureErasedForWrite(uint32_t offset, size_t len)
+{
+    if (len == 0) return ESP_OK;
+    const esp_partition_t *part = getPartition();
+    if (!part) return ESP_ERR_NOT_FOUND;
+
+    const uint32_t end = offset + (uint32_t)len;
+    // 目标区间已在水位内：无需再擦（顺序 OTA 不回写旧扇区）
+    if (end <= m_erasedUpTo) return ESP_OK;
+
+    // 水位始终扇区对齐；只从 m_erasedUpTo 向高地址推进，禁止重擦已写扇区。
+    // 若写入跳空，一并擦掉空隙，保持 [0, m_erasedUpTo) 连续已擦。
+    uint32_t erase_to = (end + (kFlashSectorSize - 1U)) & ~(kFlashSectorSize - 1U);
+    if (erase_to > part->size) {
+        erase_to = part->size;
+    }
+    uint32_t erase_from = m_erasedUpTo;
+    if (erase_from >= erase_to) return ESP_OK;
+
+    for (uint32_t addr = erase_from; addr < erase_to; ) {
+        uint32_t chunk = kFlashSectorSize;
+        if (addr + chunk > erase_to) {
+            chunk = erase_to - addr;
+        }
+        esp_err_t err = esp_partition_erase_range(part, addr, chunk);
+        if (err != ESP_OK) {
+            DEBUG_ERR("OTA", "ensureErased: erase @%" PRIu32 " len=%" PRIu32 " failed: %s",
+                      addr, chunk, esp_err_to_name(err));
+            return err;
+        }
+        addr += chunk;
+        m_erasedUpTo = addr;
+        (void)esp_task_wdt_reset();
+    }
+    return ESP_OK;
+}
+
 /** @brief 向 gd32_ota 分区写入数据块，自动处理非 4 字节对齐的读写。 */
 esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, size_t len)
 {
@@ -89,6 +134,12 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
         DEBUG_ERR("OTA", "flashWriteChunk越界: offset=%" PRIu32 " len=%zu aligned_off=%" PRIu32 " aligned_len=%zu part=%" PRIu32,
                   offset, len, aligned_offset, aligned_len, part->size);
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    // 写入前按需擦除目标扇区（替代 prepare 阶段整段预擦）
+    esp_err_t erase_err = ensureErasedForWrite(aligned_offset, aligned_len);
+    if (erase_err != ESP_OK) {
+        return erase_err;
     }
 
     // 快速路径：offset 和 len 都对齐
@@ -155,7 +206,24 @@ esp_err_t Gd32FlashStore::erasePartition(uint32_t size)
         DEBUG_ERR("OTA", "erasePartition: size=%" PRIu32 " > partition=%" PRIu32, size, part->size);
         return ESP_ERR_INVALID_SIZE;
     }
-    return esp_partition_erase_range(part, 0, size);
+    // 按扇区擦除并喂狗，避免大块 erase 长时间占住调用任务
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t chunk = kFlashSectorSize;
+        if (done + chunk > size) {
+            chunk = size - done;
+        }
+        esp_err_t err = esp_partition_erase_range(part, done, chunk);
+        if (err != ESP_OK) {
+            return err;
+        }
+        done += chunk;
+        if (done > m_erasedUpTo) {
+            m_erasedUpTo = done;
+        }
+        (void)esp_task_wdt_reset();
+    }
+    return ESP_OK;
 }
 
 // ============================================================
@@ -279,7 +347,7 @@ esp_err_t Gd32FlashStore::metaUpdate(uint32_t stored_size, uint32_t last_seq)
 /** @brief OTA 完成或中止时清除元数据（全零写入）。 */
 esp_err_t Gd32FlashStore::metaClear()
 {
-    DEBUG_INFO("OTA", "清除 OTA 元数据");
+    DEBUG_DBG("OTA", "清除 OTA 元数据");
     bool locked = lockNvs(kNvsLockTimeoutMs);
     if (!locked) {
         DEBUG_WARN("OTA", "metaClear 加锁超时");
@@ -307,43 +375,49 @@ esp_err_t Gd32FlashStore::computeFlashSha256(uint8_t out_sha256[32])
         return ESP_ERR_INVALID_STATE;
     }
 
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    if (mbedtls_sha256_starts(&ctx, 0) != 0) {
-        mbedtls_sha256_free(&ctx);
+    /* static context：OTA 串行；勿放 httpd 栈（上传 100% 后 SHA 易栈溢出） */
+    static mbedtls_sha256_context s_sha_ctx;
+    mbedtls_sha256_init(&s_sha_ctx);
+    if (mbedtls_sha256_starts(&s_sha_ctx, 0) != 0) {
+        mbedtls_sha256_free(&s_sha_ctx);
         return ESP_FAIL;
     }
 
     static constexpr size_t kChunkSize = 1024;
     uint8_t *buf = (uint8_t *)malloc(kChunkSize);
     if (!buf) {
-        mbedtls_sha256_free(&ctx);
+        mbedtls_sha256_free(&s_sha_ctx);
         return ESP_ERR_NO_MEM;
     }
 
     uint32_t remaining = meta.total_size;
     uint32_t offset = 0;
+    uint32_t wdt_chunk = 0;
     while (remaining > 0) {
         size_t to_read = (remaining > kChunkSize) ? kChunkSize : remaining;
         err = flashReadChunk(offset, buf, to_read);
         if (err != ESP_OK) {
             DEBUG_ERR("OTA", "computeSha256: Flash 读取失败 offset=%" PRIu32, offset);
             free(buf);
-            mbedtls_sha256_free(&ctx);
+            mbedtls_sha256_free(&s_sha_ctx);
             return err;
         }
-        if (mbedtls_sha256_update(&ctx, buf, to_read) != 0) {
+        if (mbedtls_sha256_update(&s_sha_ctx, buf, to_read) != 0) {
             free(buf);
-            mbedtls_sha256_free(&ctx);
+            mbedtls_sha256_free(&s_sha_ctx);
             return ESP_FAIL;
         }
         offset += to_read;
         remaining -= to_read;
+        if ((++wdt_chunk & 0x0FU) == 0U) {
+            (void)esp_task_wdt_reset();
+            taskYIELD();
+        }
     }
 
     free(buf);
-    int ret = mbedtls_sha256_finish(&ctx, out_sha256);
-    mbedtls_sha256_free(&ctx);
+    int ret = mbedtls_sha256_finish(&s_sha_ctx, out_sha256);
+    mbedtls_sha256_free(&s_sha_ctx);
     return (ret == 0) ? ESP_OK : ESP_FAIL;
 }
 

@@ -150,6 +150,7 @@ bool startCanFeedbackTask()
 
 void pauseCanFeedbackTask(bool pause)
 {
+    if (s_paused == pause) return;  // 幂等：状态未变时不重复日志
     s_paused = pause;
     if (pause) {
         DEBUG_INFO(kTag, "CAN 监听已暂停（OTA 进行中）");

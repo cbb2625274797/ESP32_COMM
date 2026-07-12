@@ -69,8 +69,6 @@ public:
     bool getStaRetryExhausted() const     { return m_staRetryExhausted.load(); }
     /** @brief 设置 STA 重试耗尽标志。 */
     void setStaRetryExhausted(bool v)     { m_staRetryExhausted.store(v); }
-    /** @brief 设置 GD32 固件存储完成标志。 */
-    void setGd32StorageDone(bool v)       { m_gd32StorageDone.store(v); }
     // ── 状态互斥锁（保护复合读-改-写操作）──
     /** @brief 获取状态互斥锁句柄。 */
     SemaphoreHandle_t getStateMutex() const { return m_stateMutex; }
@@ -107,7 +105,6 @@ private:
     std::atomic<bool> m_staConnected{false};
     std::atomic<int>  m_staRetryCount{0};
     std::atomic<bool> m_staRetryExhausted{false};
-    std::atomic<bool> m_gd32StorageDone{false};
     SemaphoreHandle_t m_stateMutex = NULL;
     TaskHandle_t m_taskHandle = nullptr;
 

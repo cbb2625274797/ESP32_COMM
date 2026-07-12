@@ -8,10 +8,12 @@
 idf_component_register(
     SRCS
         "../../main/transport/spi_master.cpp"
+        "../../../spi_link/spi_link_v2.cpp"
         "../../main/transport/canfd_bridge.cpp"
         "../../main/transport/protocol.cpp"
     INCLUDE_DIRS
         "../../main/transport"       # spi_master.h, canfd_bridge.h, protocol.h
+        "../../../spi_link"           # spi_link_v2.h（三工程共享协议头）
     PRIV_INCLUDE_DIRS
         "../../main"                 # monitor/debug_log.h（仅本组件编译时使用）
         "../../main/include"         # app_config.h

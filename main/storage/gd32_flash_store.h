@@ -71,6 +71,12 @@ public:
      */
     esp_err_t erasePartition(uint32_t size);
 
+    /**
+     * @brief 新一轮 GD32 固件写入会话开始时调用：复位按需擦除水位。
+     *        prepareGd32Storage 在开始收流前调用，避免整段预擦阻塞 HTTP/BLE 收包。
+     */
+    void beginWriteSession();
+
     // ── NVS 元数据持久化 ──
 
     /**
@@ -146,6 +152,13 @@ private:
     Gd32FlashStore& operator=(const Gd32FlashStore&) = delete;
 
     const esp_partition_t *m_partition = nullptr; ///< gd32_ota 分区指针（懒初始化）
+
+    // ── 按需擦除水位：已保证 [0, m_erasedUpTo) 为擦除态（扇区对齐）──
+    //   收流时 flashWriteChunk 按写入范围推进擦除，替代上传前整段预擦。
+    //   这样 HTTP 主线程可边收边擦写，浏览器进度不会在“100% 发完”后空等整段擦除。
+    static constexpr uint32_t kFlashSectorSize = 4096U;
+    uint32_t m_erasedUpTo = 0;
+    esp_err_t ensureErasedForWrite(uint32_t offset, size_t len);
 
     // ── NVS 互斥锁（保护元数据读-改-写原子性）──
     //   lockNvs 返回是否成功 take；unlockNvs(handle) 据此决定是否 give，

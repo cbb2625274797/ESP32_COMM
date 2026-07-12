@@ -12,6 +12,8 @@
 #include "esp_system.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
 
 #define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
 #include "mbedtls/private/sha256.h"
@@ -170,19 +172,23 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         return beginCleanupAndReturn(ESP_FAIL);
     }
 
-    // BLE OTA 修复：传固件实际大小而非分区全尺寸，避免全分区擦除导致
-    // 长时间阻塞触发 Task Watchdog（ESP32-C3 单核 5s 超时）。
-    // esp_ota_begin 按 image_size 擦除；esp_ota_end 仅校验已写数据，
-    // 未擦除残留扇区不影响校验。size 对齐到 64KB 块边界确保尾部干净。
-    size_t erase_size = (total_size + 0xFFFF) & ~0xFFFFULL;
-    if (erase_size > m_partition->size) {
-        erase_size = m_partition->size;
-    }
-    esp_err_t err = esp_ota_begin(m_partition, erase_size, &m_handle);
+    /* ★ 用 OTA_WITH_SEQUENTIAL_WRITES：边写边按扇区擦除，begin 几乎瞬时返回。
+     * 旧逻辑按 64KB 对齐预擦 ~1MB，会在 /ota/upload 开头阻塞几十秒～数分钟：
+     * 浏览器 upload 进度已到 100%，设备还在擦 Flash → 表现为“卡在 100% 很久才成功”。 */
+    DEBUG_INFO(TAG, "esp_ota_begin(SEQUENTIAL) 目标=%s size=%u free=%lu...",
+               m_partition->label, (unsigned)total_size,
+               (unsigned long)esp_get_free_heap_size());
+    const int64_t t0 = esp_timer_get_time();
+    esp_err_t err = esp_ota_begin(m_partition, OTA_WITH_SEQUENTIAL_WRITES, &m_handle);
+    const int64_t t1 = esp_timer_get_time();
     if (err != ESP_OK) {
-        DEBUG_ERR(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(err));
+        DEBUG_ERR(TAG, "esp_ota_begin 失败: %s (耗时 %lld ms)",
+                  esp_err_to_name(err), (long long)((t1 - t0) / 1000));
         return beginCleanupAndReturn(err);
     }
+    DEBUG_INFO(TAG, "esp_ota_begin 完成 耗时 %lld ms free=%lu",
+               (long long)((t1 - t0) / 1000),
+               (unsigned long)esp_get_free_heap_size());
 
     m_received = 0;
     m_active = true;
@@ -190,7 +196,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     m_ended = false;
     memset(m_sha256, 0, sizeof(m_sha256));
 
-    DEBUG_INFO(TAG, "ESP32 OTA 开始，目标分区: %s, 声明大小: %u 字节",
+    DEBUG_INFO(TAG, "ESP32 OTA 开始，目标分区: %s, 声明大小: %u 字节 (sequential erase)",
                m_partition->label, (unsigned)total_size);
     return ESP_OK;
 }
@@ -207,11 +213,14 @@ esp_err_t Esp32OtaCore::write(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* sequential 模式写时可能触发扇区擦除，喂狗防 WDT */
+    (void)esp_task_wdt_reset();
     esp_err_t err = esp_ota_write(m_handle, data, len);
     if (err == ESP_OK) {
         m_received += len;
     } else {
-        DEBUG_ERR(TAG, "esp_ota_write 失败: %s (len=%u)", esp_err_to_name(err), (unsigned)len);
+        DEBUG_ERR(TAG, "esp_ota_write 失败: %s (len=%u offset=%u)",
+                  esp_err_to_name(err), (unsigned)len, (unsigned)m_received);
     }
     return err;
 }
@@ -228,30 +237,36 @@ esp_err_t Esp32OtaCore::computeShaFromPartition()
 
     DEBUG_INFO(TAG, "从 OTA 分区读回计算 SHA-256 (%u 字节)...", (unsigned)m_received);
 
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
+    /* static context + 小读缓冲：勿占 httpd 栈，也勿再静态吃 4KB BSS */
+    static mbedtls_sha256_context s_sha_ctx;
+    static uint8_t s_sha_read_buf[1024];
 
-    // ★ static 缓冲区：OTA 操作由 OtaCoordinator 互斥串行化，无并发风险
-    static uint8_t s_sha_read_buf[OTA_BLOCK_SIZE];
+    mbedtls_sha256_init(&s_sha_ctx);
+    mbedtls_sha256_starts(&s_sha_ctx, 0);
 
     size_t offset = 0;
+    uint32_t wdt_chunk = 0;
     while (offset < m_received) {
         size_t to_read = m_received - offset;
-        if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
+        if (to_read > sizeof(s_sha_read_buf)) to_read = sizeof(s_sha_read_buf);
         esp_err_t rd_err = esp_partition_read(m_partition, offset, s_sha_read_buf, to_read);
         if (rd_err != ESP_OK) {
             DEBUG_ERR(TAG, "SHA 计算: 分区读失败 @offset %u: %s",
                       (unsigned)offset, esp_err_to_name(rd_err));
-            mbedtls_sha256_free(&ctx);
+            mbedtls_sha256_free(&s_sha_ctx);
             return rd_err;
         }
-        mbedtls_sha256_update(&ctx, s_sha_read_buf, to_read);
+        mbedtls_sha256_update(&s_sha_ctx, s_sha_read_buf, to_read);
         offset += to_read;
+        /* 长固件 SHA 可能 > TASK_WDT(5s)；在 httpd 上跑时必须喂狗 */
+        if ((++wdt_chunk & 0x0FU) == 0U) {
+            (void)esp_task_wdt_reset();
+            taskYIELD();
+        }
     }
 
-    mbedtls_sha256_finish(&ctx, m_sha256);
-    mbedtls_sha256_free(&ctx);
+    mbedtls_sha256_finish(&s_sha_ctx, m_sha256);
+    mbedtls_sha256_free(&s_sha_ctx);
     m_shaComputed = true;
 
     char hex[65] = {0};

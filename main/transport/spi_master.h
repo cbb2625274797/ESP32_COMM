@@ -19,6 +19,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "spi_link_v2.h"
 
 // SPI 配置常量
 #define SPI_MASTER_CS_GPIO    (4)           // CS 片选引脚
@@ -76,7 +77,8 @@ public:
     // SPI OTA 协议
     // ============================================================
 
-    /** @brief 按 GD32 SPI OTA 最小协议执行一次请求 + 响应读取。 */
+    /** @brief 按 GD32 SPI OTA 协议执行一次请求 + 响应读取（延迟一拍两步法）。
+     *  内部等价于 otaSendAndPoll：首笔 CS 发请求（忽略旧响应），次笔 CS 收真实响应。 */
     esp_err_t otaTransfer(uint8_t type, const uint8_t *payload, size_t payload_len,
                           uint8_t *resp_type, uint8_t *resp_payload,
                           size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
@@ -108,13 +110,49 @@ public:
     /** @brief 读取对端最新上报的 CREDIT（0 表示对端忙，应 POLL 等待而非重发）。 */
     uint8_t remoteCredit() const { return m_remoteCredit; }
 
+    // ============================================================
+    // SPI Link v2 链路层（阶段1：帧格式 + 状态成员就位）
+    // ============================================================
+
+    /** @brief v2 链路状态统计（SPEC/spi_link_v2.md §12）。 */
+    struct SpiLinkStats {
+        uint32_t crc_errors;            ///< CRC 校验失败计数
+        uint32_t duplicate_requests;    ///< 重复请求计数（序号回退）
+        uint32_t seq_errors;            ///< 序号跳变计数
+        uint32_t retries;               ///< 重试总数
+        uint32_t ready_timeouts;        ///< DATA_READY 超时计数
+        uint32_t rx_overruns;           ///< RX overrun 计数
+        uint32_t resyncs;               ///< HELLO 重同步次数
+        uint32_t max_resp_latency_us;   ///< 最大响应延迟（微秒）
+    };
+
+    /** @brief 当前会话 ID（0 = 未建立 session）。 */
+    uint32_t sessionId() const { return m_sessionId; }
+
+    /** @brief v2 session 是否已激活。 */
+    bool v2Active() const { return m_v2Active; }
+
+    /** @brief 最近一次 HELLO 得到的 GD32 角色（0=unknown, 1=app, 2=boot）。 */
+    uint8_t gd32Role() const { return m_gd32Role; }
+
+    /** @brief 获取链路统计快照（线程安全，持锁读取）。 */
+    SpiLinkStats linkStats();
+
+    /** @brief 发起 HELLO 握手建立 v2 session（SPEC §5.1）。
+     *  生成随机非零 SESSION_ID，发送 LINK_HELLO，等待 HELLO_ACK。
+     *  成功后 m_v2Active=true，序号归零。
+     *  @param timeout_ms 总超时（毫秒），默认 3000。
+     *  @param role_hint  期望的对端角色（0=any, 1=app, 2=boot）。
+     *  @return ESP_OK 成功；ESP_ERR_TIMEOUT 超时；ESP_ERR_INVALID_RESPONSE 响应异常。 */
+    esp_err_t hello(uint32_t timeout_ms = 3000U, uint8_t role_hint = 0U);
+
     /** @brief 通知 GD32 DCU_APP 设置 OTA 标志并软复位进入 Bootloader。 */
     esp_err_t appRequestBootloader();
 
-    /** @brief 方案A: 通过 PB6 LOW→HIGH 序列等待 Bootloader 就绪。
-     * Phase1 轮询等待 LOW (APP 复位前拉低 / Bootloader 极早拉低)；
-     * Phase2 轮询等待 HIGH 并确认稳定 10ms (Bootloader init 完成释放)。
-     * 超时返回 ESP_ERR_TIMEOUT，调用方应退化为固定延时。 */
+    /** @brief 通过 HELLO 轮询等待 Bootloader 就绪（v2 方式，不再依赖 PB6 序列）。
+     * App→Boot 切换后，ESP32 每 20ms 发送 HELLO(role_hint=boot)，
+     * 等待 HELLO_ACK 且 role=boot，最长等待 timeout_ms。
+     * 超时返回 ESP_ERR_TIMEOUT。 */
     esp_err_t waitForBootloaderReady(uint32_t timeout_ms);
 
     /** @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。 */
@@ -226,6 +264,16 @@ private:
     volatile uint8_t  m_localCredit = 8;  ///< 本端剩余可接收帧数（信用窗口）
     volatile uint8_t  m_remoteCredit = 8; ///< 对端上报的剩余信用
 
+    // ── SPI Link v2 会话/序号状态（阶段1 就位，阶段2 启用校验）──
+    volatile uint32_t m_sessionId = 0;       ///< 会话 ID（0 = 未建立，HELLO 时由 ESP32 生成）
+    volatile uint8_t  m_txSeq = 0;           ///< 本端发送序号（每发一帧递增，重发不变）
+    volatile uint8_t  m_lastSentSeq = 0;     ///< 上次发送的序号（用于响应归属匹配）
+    volatile uint8_t  m_rxAckedSeq = 0;     ///< 已确认的对端最新序号
+    volatile uint8_t  m_expectedRxSeq = 0;  ///< 期望收到的对端序号
+    volatile uint8_t  m_gd32Role = 0;       ///< GD32 角色（0=unknown, 1=app, 2=boot）
+    volatile bool     m_v2Active = false;   ///< v2 session 是否激活
+    SpiLinkStats m_stats = {};               ///< 链路统计
+
     // RAII 锁守卫
     class LockGuard {
     public:
@@ -284,7 +332,8 @@ private:
      * @return ESP_OK 表示成功，否则返回错误码。
      */
     esp_err_t otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_payload,
-                                      size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
+                                      size_t resp_max, size_t *resp_len, uint32_t timeout_ms,
+                                      uint8_t expected_type = 0xFFU);
     /** @brief 无锁版本的 otaTransfer（调用者须已持有锁）。
      *  @param expect_stale true 表示调用方预期读到过期/空响应（如 otaSendAndPoll 步骤1），
      *                      找不到帧时降级为 DBG 日志，不打 WARN。 */
@@ -292,6 +341,14 @@ private:
                                   uint8_t *resp_type, uint8_t *resp_payload,
                                   size_t resp_max, size_t *resp_len, uint32_t timeout_ms,
                                   bool expect_stale = false);
+
+    /** @brief 带重试退避的事务（SPEC §9.2）。
+     *  同序号重试最多 3 次，退避 10/30/90ms；
+     *  3 次失败后 HELLO 重同步，再试 1 次。
+     *  调用者须已持有锁。 */
+    esp_err_t transactWithRetry(uint8_t type, const uint8_t *payload, size_t payload_len,
+                                 uint8_t *resp_type, uint8_t *resp_payload,
+                                 size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
     // OTA 帧工具（静态，无状态）
     static uint32_t otaCrc32(const uint8_t *data, size_t len);
     static bool otaBuildFrame(uint8_t type, const uint8_t *payload, size_t payload_len,

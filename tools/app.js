@@ -32,6 +32,116 @@ let uploadPollChip = null; // 当前暂停轮询的上传目标，用于区分 W
 let activeXhr = null;           // 当前上传 XHR，用于 abort
 let uploadBtnOrigText = '';     // 上传按钮原始文字
 let activeUploadChip = null;    // 当前上传目标芯片 ('esp32' | 'gd32' | null)
+let uploadWaitHeartbeatId = null; // 发完 body 后等待 HTTP 响应的心跳定时器
+let uploadWaitStartMs = 0;
+
+/** @description 停止「等待设备 HTTP 响应」心跳，避免残留定时器改进度条。 */
+function stopUploadWaitHeartbeat() {
+  if (uploadWaitHeartbeatId) {
+    clearInterval(uploadWaitHeartbeatId);
+    uploadWaitHeartbeatId = null;
+  }
+  uploadWaitStartMs = 0;
+}
+
+/**
+ * @description 浏览器 body 已发完但尚未收到 HTTP 响应时启动心跳。
+ *              上传期轮询已暂停，若无此反馈会像“卡在 100%”。
+ */
+function startUploadWaitHeartbeat() {
+  stopUploadWaitHeartbeat();
+  uploadWaitStartMs = Date.now();
+  uploadWaitHeartbeatId = setInterval(function () {
+    if (!activeXhr) {
+      stopUploadWaitHeartbeat();
+      return;
+    }
+    var sec = Math.round((Date.now() - uploadWaitStartMs) / 1000);
+    setProgress(100, '数据已发完，设备处理中… 已等待 ' + sec + 's');
+    // 每 10s 打一条日志，便于区分“仍在处理”与“真死锁”
+    if (sec > 0 && sec % 10 === 0) {
+      addLog('I', '上传', '仍在等待设备 HTTP 响应（已 ' + sec +
+        's；设备可能仍在写 Flash / 算 SHA，或连接异常）');
+    }
+  }, 5000);
+}
+
+// ==================== 前端 OTA 会话状态机 ====================
+// 统一管理一次 OTA 会话的完整生命周期，消除散布的布尔标志
+// (isUploading / currentOtaTarget / activeUploadChip / isEsp32Rebooting)
+// 在网络错误后被轮询错误覆盖、状态混乱的问题。
+//
+// 状态流转：
+//   IDLE → UPLOADING → (ESP32: VERIFYING → REBOOTING) → DONE
+//   IDLE → UPLOADING → (GD32:  RELAYING)              → DONE
+//   任意活跃态 ──(failure/abort)──→ FAILED
+//   FAILED/DONE ──(startUpload)──→ UPLOADING
+//   FAILED/DONE ──(device idle detected by poll)──→ IDLE
+var OtaSessionState = {
+  IDLE: 'idle',          // 无会话
+  UPLOADING: 'uploading', // 固件上传中（XHR 上传阶段）
+  VERIFYING: 'verifying', // ESP32 SHA-256 校验 + 应用中
+  RELAYING: 'relaying',   // GD32 中继转发中（triggerGd32Relay 发起后）
+  REBOOTING: 'rebooting', // ESP32 重启等待中
+  DONE: 'done',           // 会话成功完成
+  FAILED: 'failed'        // 会话失败/中止
+};
+var otaSessionState = OtaSessionState.IDLE;
+var otaSessionTarget = null;  // 'esp32' | 'gd32' | null — 本会话的目标芯片
+var otaFailReason = '';       // FAILED 时的失败原因（用于 UI 显示）
+
+/** @description 查询当前 OTA 会话是否处于活跃态（非 IDLE/DONE/FAILED）。 */
+function otaSessionActive() {
+  return otaSessionState === OtaSessionState.UPLOADING ||
+         otaSessionState === OtaSessionState.VERIFYING ||
+         otaSessionState === OtaSessionState.RELAYING ||
+         otaSessionState === OtaSessionState.REBOOTING;
+}
+
+/** @description 查询当前 OTA 会话是否已终结（DONE 或 FAILED）。 */
+function otaSessionTerminated() {
+  return otaSessionState === OtaSessionState.DONE ||
+         otaSessionState === OtaSessionState.FAILED;
+}
+
+/**
+ * @description 转换 OTA 会话状态。
+ *              统一在此处维护状态机一致性，同时同步旧标志位
+ *              (isUploading / currentOtaTarget)，保证渐进式迁移期间两套标志不冲突。
+ * @param {string} newState 目标状态。
+ * @param {string} [reason] 失败原因（仅转入 FAILED 时使用）。
+ */
+function otaSessionTransition(newState, reason) {
+  var prev = otaSessionState;
+  otaSessionState = newState;
+  if (newState === OtaSessionState.FAILED) {
+    otaFailReason = reason || '未知原因';
+  } else if (newState === OtaSessionState.UPLOADING) {
+    otaFailReason = '';
+  }
+  // 同步旧标志（渐进式迁移）：UPLOADING 对应 isUploading=true
+  if (newState === OtaSessionState.UPLOADING) isUploading = true;
+  else if (newState === OtaSessionState.IDLE ||
+           newState === OtaSessionState.DONE ||
+           newState === OtaSessionState.FAILED) isUploading = false;
+  // REBOOTING 复用 isEsp32Rebooting（pollStatus 重启检测依赖）
+  if (newState === OtaSessionState.REBOOTING) isEsp32Rebooting = true;
+  else if (newState !== OtaSessionState.VERIFYING) isEsp32Rebooting = false;
+}
+
+/** @description 将会话从 FAILED/DONE 复位到 IDLE（用户发起新上传或设备空闲时调用）。 */
+function otaSessionReset() {
+  stopRelayProgressWatch();
+  gd32CompleteAnnounced = false;
+  relayWatchLastSeq = -1;
+  if (otaSessionState !== OtaSessionState.IDLE) {
+    otaSessionState = OtaSessionState.IDLE;
+    otaSessionTarget = null;
+    otaFailReason = '';
+    currentOtaTarget = null;
+    isUploading = false;
+  }
+}
 
 // ==================== 折叠面板 ====================
 function toggleCollapse(headEl) {
@@ -120,11 +230,20 @@ function updateEsp32StagesError() {
  * @description OTA 失败后的统一清理函数。
  * 所有上传失败、校验失败、中继触发失败等异常路径都应调用此函数，
  * 确保 UI 状态完整重置，不会残留"上传中"或中间态。
+ *
+ * ★ 状态机改造：转入 FAILED 态，置位 otaFailReason。
+ *   之后轮询（pollStatus/updateSystemStatusUi）不得覆盖此失败态，
+ *   直到用户发起新上传（otaSessionReset）或检测到设备已回 IDLE。
  * @param {string} reason 失败原因描述
  */
 function cleanupAfterOtaFailure(reason) {
+  stopRelayProgressWatch();
+  // 0. 状态机：转入 FAILED（先于标志重置，确保 otaSessionActive() 即刻返回 false）
+  otaSessionTransition(OtaSessionState.FAILED, reason);
+
   // 1. 重置上传锁
   isUploading = false;
+  stopUploadWaitHeartbeat();
 
   // 2. 中止正在进行的 XHR（如有）
   if (activeXhr) {
@@ -159,7 +278,7 @@ function cleanupAfterOtaFailure(reason) {
   if (verifyInfo) verifyInfo.style.display = 'none';
 
   // 9. 恢复上传按钮（基于实际上传的芯片，而非当前 UI 选中的标签）
-  var chip = activeUploadChip || window.flashTarget || 'esp32';
+  var chip = activeUploadChip || otaSessionTarget || window.flashTarget || 'esp32';
   var btnId = (chip === 'gd32') ? 'uploadGd32Btn' : 'uploadEsp32Btn';
   var btn = document.getElementById(btnId);
   if (btn && uploadBtnOrigText) {
@@ -285,15 +404,31 @@ function isOtaBusyError(status, detail) {
     text.indexOf('系统忙') >= 0;
 }
 /** @description 显示 Toast 提示消息，支持 info/success/warning/error 类型。 */
+var _toastHideTimer = null;
+var _toastLastKey = '';
+var _toastLastAt = 0;
 function showToast(message, type) {
   type = type || 'success';
+  // 相同文案 5s 内不重复弹，避免轮询把 ✓ 刷成「疯狂跳」
+  var key = type + '|' + message;
+  var now = Date.now();
+  if (key === _toastLastKey && (now - _toastLastAt) < 5000) {
+    return;
+  }
+  _toastLastKey = key;
+  _toastLastAt = now;
+
   const toast = document.getElementById('toast');
   const ico = document.getElementById('toastIco');
   const msg = document.getElementById('toastMsg');
   toast.className = 'toast ' + (type === 'success' ? 'ok' : type === 'error' ? 'err' : 'warn') + ' show';
   ico.textContent = type === 'success' ? '\u2713' : type === 'error' ? '\u2715' : '\u26A0';
   msg.textContent = message;
-  setTimeout(function () { toast.classList.remove('show'); }, 3000);
+  if (_toastHideTimer) clearTimeout(_toastHideTimer);
+  _toastHideTimer = setTimeout(function () {
+    toast.classList.remove('show');
+    _toastHideTimer = null;
+  }, 3000);
 }
 function getEspIp() {
   return document.getElementById('espIp').value.trim() || '192.168.31.127';
@@ -380,7 +515,10 @@ function resetStageFlow() {
 function applyDisconnectedRuntimeState() {
   document.getElementById('pillIP').textContent = '--';
   document.getElementById('pillRSSI').textContent = '--';
-  if (isUploading || currentOtaTarget) return;
+  // ★ 状态机守卫：会话活跃时不重置进度/阶段，避免覆盖进行中的 OTA 进度
+  if (otaSessionActive()) return;
+  // FAILED 态：保留失败进度显示，只清连接胶囊（让用户看到失败原因）
+  if (otaSessionState === OtaSessionState.FAILED) return;
   resetProgress();
   resetStageFlow();
 }
@@ -399,6 +537,12 @@ function applyRebootingRuntimeState() {
   if (bc) bc.className = 'v warn';
 }
 function applyUploadingRuntimeState() {
+  // ★ 状态机守卫：会话已失败/完成时，绝不重新应用"上传中"运行时态，
+  //   防止网络抖动后的轮询错误分支把 UI 拉回"上传中"。
+  if (otaSessionState === OtaSessionState.FAILED ||
+      otaSessionState === OtaSessionState.DONE) {
+    return;
+  }
   var pc = document.getElementById('pillConn');
   var pct = document.getElementById('pillConnTxt');
   pc.className = 'pill processing';
@@ -737,6 +881,10 @@ function updateSystemStatusUi(data) {
   if (currentOtaTarget === 'esp32' && esp32OtaPhase > 0) {
     return;
   }
+  // ★ 状态机守卫：本会话已 FAILED 时，禁止后端状态覆盖失败 UI。
+  //   后端可能仍在跑 GD32 中继（网络断开不会停止设备端流程），
+  //   若不拦截，会把进度条/阶段从"网络错误"错误地刷回"数据转发"。
+  //   只有设备真正回 IDLE 才允许自动复位状态机（见下方 else 分支）。
   var rs = ota.relay_state;
   var sysState = ota.sys_state || '';
   var sysStateCode = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
@@ -748,15 +896,38 @@ function updateSystemStatusUi(data) {
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
   var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
-  // GD32 relay forwarding progress
+  // GD32 relay forwarding progress — 以 /system/status 的 relay_seq 为准，不依赖日志
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
   var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
   var gd32AppAlive = ota.gd32_app_alive;
+
+  if (otaSessionState === OtaSessionState.FAILED) {
+    var _deviceIdle = (sysStateCode === 0 || sysStateCode === 2 || sysStateCode === 4) &&
+                      (rs === 0 || rs === 5);
+    if (!_deviceIdle) {
+      // 会话已失败，但设备可能仍在中继：继续用 relay_seq 刷进度，避免“假卡死”
+      if ((rs === 3 || isGd32Relaying) && relayTotal > 0) {
+        setActivePhase('gd32Ota');
+        var failRelayOverall = 60 + Math.round(relayProgress * 0.30);
+        setProgress(failRelayOverall,
+          '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包（设备仍在跑）');
+        updateStagesFromRelayState(3);
+      } else {
+        updateStagesFromRelayState(255);
+      }
+      return;
+    }
+    // 设备已回 IDLE —— 自动复位状态机，恢复正常 UI
+    otaSessionReset();
+    stopRelayProgressWatch();
+    // 落到下方正常分支刷新 UI
+  }
+
   var displayRelayState = isGd32Complete ? 5 : (isGd32Relaying && rs === 0 ? 1 : rs);
   if (currentOtaTarget !== 'esp32') { updateStagesFromRelayState(displayRelayState); }
 
-  if (isGd32Error && currentOtaTarget === 'gd32') {
+  if (isGd32Error && (currentOtaTarget === 'gd32' || otaSessionTarget === 'gd32')) {
     cleanupAfterOtaFailure('GD32 OTA 失败');
   } else if (isGd32Error) {
     // 非当前 OTA 会话的错误：仅标记阶段指示器，不触发完整清理
@@ -765,59 +936,56 @@ function updateSystemStatusUi(data) {
     var stErr = document.getElementById('stageStatusText');
     if (sbErr) sbErr.className = 'stage-status-bar err';
     if (stErr) stErr.textContent = 'GD32 错误（待机）';
-  } else if (isGd32Complete || rs === 5 || (gd32AppAlive && sysState === 'GD32_COMPLETE')) {
-    markPhaseDone('gd32Ota');
-    currentOtaTarget = null; // GD32 OTA 完成，允许切换目标
-    setProgress(100, 'GD32 刷写完成');
-    var sbDone = document.getElementById('stageStatusBar');
-    var stDone = document.getElementById('stageStatusText');
-    if (sbDone) sbDone.className = 'stage-status-bar ok';
-    if (stDone) stDone.textContent = 'GD32 刷写完成';
+  } else if (isGd32Complete || rs === 5 ||
+             (gd32AppAlive && (sysState === 'GD32_COMPLETE' || sysStateCode === 4)) ||
+             /* 包已全部转发且 APP 已起来：即使日志停在 SEND_SIZE 也算完成 */
+             (gd32AppAlive && relayTotal > 0 && relaySeq >= relayTotal &&
+              (isGd32Relaying || otaSessionState === OtaSessionState.RELAYING || rs >= 3))) {
+    // 已完成：只进一次 UI/toast，后续轮询直接忽略
+    if (!gd32CompleteAnnounced && otaSessionState !== OtaSessionState.DONE) {
+      markGd32OtaUiComplete('GD32 刷写完成');
+    }
   } else if (isGd32Storing || (total > 0 && stored < total && !isUploading)) {
     setActivePhase('gd32Ota');
     var storeOverall = Math.min(45, Math.round(storageProgress * 0.45));
     if (!isUploading) {
-      setProgress(storeOverall, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
+      setProgress(storeOverall, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total) + '');
     }
   } else if (rs === 1) {
     // HANDSHAKING: 握手 + 挑战认证
     setActivePhase('gd32Ota');
     setProgress(50, '握手与认证中...');
-  } else if (rs === 2) {
-    // SIZE_NEG: 固件大小协商
-    setActivePhase('gd32Ota');
-    setProgress(55, '协商固件大小...');
-  } else if (rs === 3) {
-    // TRANSFERRING: 数据包传输
+  } else if (rs === 3 || (relayTotal > 0 && relaySeq > 0)) {
+    // TRANSFERRING：以 relay_seq 为准（优先于 rs===2，避免 total 预写后一直显示 0/N）
     setActivePhase('gd32Ota');
     var relayOverall = 60 + Math.round(relayProgress * 0.30);
-    setProgress(relayOverall, '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包');
+    var relayLabel = relayTotal > 0
+      ? ('已转发 ' + relaySeq + ' / ' + relayTotal + ' 包 (' + relayProgress + '%)')
+      : '数据包传输中...';
+    setProgress(relayOverall, relayLabel);
+  } else if (rs === 2 || (isGd32Relaying && relaySeq === 0)) {
+    // SIZE_NEG：只说协商中，不写「0/N」（total 会提前写入 status，易被误认为卡在 0 包）
+    setActivePhase('gd32Ota');
+    setProgress(55, relayTotal > 0
+      ? ('大小协商中（共 ' + relayTotal + ' 包）')
+      : '固件大小协商中');
   } else if (rs === 4) {
     // FINISHING: 结束OTA + APP存活验证
     setActivePhase('gd32Ota');
     if (gd32AppAlive) {
-      markPhaseDone('gd32Ota');
-      currentOtaTarget = null; // GD32 OTA 完成，允许切换目标
-      setProgress(100, 'GD32 刷写完成');
-      var sb = document.getElementById('stageStatusBar');
-      var st = document.getElementById('stageStatusText');
-      if (sb) sb.className = 'stage-status-bar ok';
-      if (st) st.textContent = 'GD32 刷写完成';
-    } else {
+      if (!gd32CompleteAnnounced && otaSessionState !== OtaSessionState.DONE) {
+        markGd32OtaUiComplete('GD32 刷写完成');
+      }
+    } else if (!gd32CompleteAnnounced) {
       setProgress(95, '收尾中，等待 APP 启动...');
     }
-  } else if (total > 0 && stored >= total) {
+  } else if (total > 0 && stored >= total && !isGd32Relaying && otaSessionState !== OtaSessionState.RELAYING) {
     setActivePhase('gd32Ota');
     setProgress(45, '上传完成，等待自动启动 GD32 OTA...');
   }
 }
 /** @description 测试与 ESP32 的连接（GET /status）。 */
 async function testConnection() {
-  // 如果在降速模式，先恢复正常轮询
-  if (pollSlowMode) {
-    addLog('I', '连接', '正在重新连接...');
-    restorePolling();
-  }
   // 立即发一次请求检测
   // 手动检测使用独立的 AbortController，避免打断递归调度的 pollStatus
   var testAbort = new AbortController();
@@ -871,7 +1039,6 @@ async function refreshSystemStatusNow(event) {
     latestSystemStatus = data;
     updateSystemStatusUi(data);
     consecutivePollFailures = 0;
-    if (pollSlowMode) restorePolling();
     addLog('I', '状态', '已手动刷新 /system/status');
   } catch (e) {
     addLog('E', '状态', '刷新失败: ' + e.message);
@@ -1217,18 +1384,26 @@ function clearFile(chip) {
 async function startUpload(chip) {
   var file = chip === 'esp32' ? esp32File : gd32File;
   if (!file) return;
-  if (isUploading) {
-    var busyChip = (activeUploadChip || window.flashTarget || chip || 'ota').toUpperCase();
-    addLog('W', '上传', '已有 ' + busyChip + ' OTA 正在进行，拒绝新的 ' + chip.toUpperCase() + ' 上传');
+  // ★ 状态机守卫：用统一的会话活跃判断替代裸 isUploading。
+  //   FAILED/DONE 会话需要先复位才能发起新上传（下方 otaSessionReset）。
+  if (otaSessionActive()) {
+    var busyChip = (otaSessionTarget || activeUploadChip || window.flashTarget || chip || 'ota').toUpperCase();
+    addLog('W', '上传', '已有 ' + busyChip + ' OTA 会话进行中 (' + otaSessionState + ')，拒绝新的 ' + chip.toUpperCase() + ' 上传');
     showToast('OTA 通道正在占用，请等待当前刷写结束', 'error');
     return;
   }
+  // 上一次会话已终结（DONE/FAILED）：发起新会话前先复位状态机
+  if (otaSessionTerminated()) otaSessionReset();
+  // 记录本会话目标
+  otaSessionTarget = chip;
+
   pausePollingForUpload();
   // ★ 必须先抢锁再 await：守卫同步设置，await 期间重复点击才能被拦下。
   //   旧实现把 isUploading 设在 await handle.getFile() 之后 → 用户在 BLE 期间
   //   狂点 WiFi 上传按钮时，多个 startUpload 都能通过守卫，最终并发 xhr.send，
   //   设备端互斥被绕过、403 路径走漏。
-  isUploading = true;
+  // ★ 状态机：进入 UPLOADING 态（内部同步 isUploading = true）
+  otaSessionTransition(OtaSessionState.UPLOADING);
   activeUploadChip = chip;
   // 跨通道互斥前置检查（含 BLE 取消后的瞬态重试）
   var _probeReady = false;
@@ -1258,8 +1433,8 @@ async function startUpload(chip) {
         if ((esp32Busy || gd32Busy)) {
           addLog('E', '上传', '设备已有 OTA 进行中 (sys_state=' + (ota.sys_state || ssc) + ', channel=' + otaChannelName + ')，拒绝本次 ' + chip.toUpperCase() + ' 上传');
           showToast('设备正在 OTA 中，请等待结束后再试', 'error');
-          isUploading = false;
-          resumePollingAfterUpload();
+          // ★ 状态机：预检失败也需完整清理（转入 FAILED）
+          cleanupAfterOtaFailure('设备 OTA 占用中');
           return;
         }
       }
@@ -1304,8 +1479,8 @@ async function startUpload(chip) {
       addLog('E', '文件', '本地文件已变更或失效，请重新选择文件');
       showToast('文件已变更，请重新选择', 'error');
       clearFile(chip);
-      isUploading = false;
-      resumePollingAfterUpload();
+      // ★ 状态机：文件失效属于会话失败
+      cleanupAfterOtaFailure('本地文件失效');
       return;
     }
   }
@@ -1359,7 +1534,9 @@ async function startUpload(chip) {
     if (chip === 'esp32') {
       var headerObj = { type: 'esp32', total_size: fileSize };
       var payload = arrayBuffer;
-      addLog('I', '上传', '直传: ' + formatBytes(fileSize));
+      addLog('I', '上传', '直传: ' + formatBytes(fileSize) +
+        '（设备边收边写 Flash；进度 100% 后仍需等 HTTP 响应）');
+      setProgress(1, '连接设备并开始写入…');
       var headerJson = JSON.stringify(headerObj);
       var encoder = new TextEncoder();
       var headerBytes = encoder.encode(headerJson);
@@ -1388,12 +1565,30 @@ async function startUpload(chip) {
         if (chip === 'gd32') {
           var overallPct = Math.min(45, Math.round(pct * 0.45));
           setProgress(overallPct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
+        } else if (pct >= 100) {
+          setProgress(100, '数据已发完，等待设备写 Flash 并响应…');
         } else {
           setProgress(pct, '已上传 ' + formatBytes(e.loaded) + ' / ' + formatBytes(e.total));
         }
       }
     });
+    xhr.upload.addEventListener('load', function () {
+      // 请求体发送完毕 ≠ 服务端处理完毕
+      setProgress(100, '数据已发完，等待设备写 Flash 并响应…');
+      addLog('I', '上传', '浏览器已发完全部数据，等待 ESP32 HTTP 响应…');
+      startUploadWaitHeartbeat();
+    });
+    // 1MB+ 固件：服务端写 Flash 可能较久；禁止无限挂起无反馈
+    xhr.timeout = 300000;
+    xhr.addEventListener('timeout', function () {
+      stopUploadWaitHeartbeat();
+      if (activeXhr) {
+        cleanupAfterOtaFailure('上传超时（设备未在 5 分钟内响应）');
+        showToast('上传超时：设备可能忙或连接被踢，请重试', 'error');
+      }
+    });
     xhr.addEventListener('load', function () {
+      stopUploadWaitHeartbeat();
       isUploading = false;
       activeXhr = null;
       resumePollingAfterUpload();
@@ -1401,18 +1596,24 @@ async function startUpload(chip) {
       uploadBtn.textContent = uploadBtnOrigText;
       updateUploadButtonLabel();
       if (xhr.status === 200) {
-        addLog('I', '上传', '固件上传完成！');
-        showToast(chip === 'gd32' ? '上传完成，GD32 OTA 已自动开始' : '固件上传成功', 'success');
-        setProgress(100, '上传完成');
+        // 成功路径只打一条「上传完成」日志，避免 [上传]+[OTA] 语义重复
         if (chip === 'esp32') {
+          addLog('I', 'OTA', '上传完成，开始 SHA-256 校验…');
+          showToast('固件上传成功', 'success');
+          setProgress(100, '上传完成');
           markPhaseDone('esp32Ota');
           updateEsp32StagesFromPhase(2);  // OTA 写入阶段
-          addLog('I', 'OTA', '固件上传完成，准备 SHA-256 校验...');
+          // ★ 状态机：ESP32 上传完成 → 进入 VERIFYING（verifyEsp32Firmware 内部继续推进）
+          otaSessionTransition(OtaSessionState.VERIFYING);
           verifyEsp32Firmware();
         } else {
+          addLog('I', 'OTA', '上传完成，校验 SHA 并触发 GD32 中继…');
+          showToast('上传完成，GD32 OTA 已自动开始', 'success');
           switchStageFlow('gd32');
           setActivePhase('gd32Ota');
-          setProgress(45, '上传完成，校验并触发 GD32 OTA...');
+          setProgress(45, '上传完成，校验并触发 GD32 OTA…');
+          // ★ 状态机：GD32 上传完成 → 进入 RELAYING（triggerGd32Relay 内部驱动中继）
+          otaSessionTransition(OtaSessionState.RELAYING);
           triggerGd32Relay();
         }
       } else if (isOtaBusyError(xhr.status, formatHttpErrorDetail(xhr.responseText))) {
@@ -1429,12 +1630,14 @@ async function startUpload(chip) {
       }
     });
     xhr.addEventListener('error', function () {
+      stopUploadWaitHeartbeat();
       if (activeXhr) {
         cleanupAfterOtaFailure('网络错误');
         showToast('上传过程发生网络错误', 'error');
       }
     });
     xhr.addEventListener('abort', function () {
+      stopUploadWaitHeartbeat();
       if (activeXhr) {
         cleanupAfterOtaFailure('已中止');
         showToast('上传已中止', 'error');
@@ -1464,11 +1667,9 @@ async function verifyEsp32Firmware() {
 
   showToast('ESP32 正在校验固件并应用...', 'success');
   try {
-    // verify_only=false: 服务器端会先校验 SHA-256，匹配后自动设置启动分区并重启
-    // 单次请求即完成全部流程，无需前端再发送"应用"请求
+    // 带 sha256 时设备端校验、set_boot 并自动重启；无需二次“应用”请求
     var requestBody = {};
     if (sha256) requestBody.sha256 = sha256;
-    requestBody.verify_only = false;
 
     var resp = await fetch(getBaseUrl() + '/ota/update', {
       method: 'POST',
@@ -1499,10 +1700,11 @@ async function verifyEsp32Firmware() {
       addLog('I', 'OTA', 'SHA-256 校验通过，设备自动重启中...');
       showToast('校验通过，设备重启中...', 'success');
       updateEsp32StagesFromPhase(4);  // 应用固件
-      isEsp32Rebooting = true;
       rebootObservedDown = false;    // 重置：尚未观察到设备实际下线
       updateEsp32StagesFromPhase(5);  // 重启中
       rebootStartTime = Date.now();
+      // ★ 状态机：校验通过 → 进入 REBOOTING（内部同步 isEsp32Rebooting = true）
+      otaSessionTransition(OtaSessionState.REBOOTING);
     } else {
       var detail = data.message || (data.device ? '不匹配' : '未知错误');
       addLog('E', 'OTA', '校验失败: ' + detail);
@@ -1545,6 +1747,108 @@ async function restartEsp32() {
   }
 }
 // ==================== GD32 OTA 触发（带 SHA-256 校验，对齐 BLE 0xF7）====================
+/**
+ * GD32 中继进度观察：以 /system/status 为唯一真相源。
+ * 日志环只有 64 条，中继/擦除期间 INFO 会被挤掉，时间戳还是浏览器本地时间——
+ * 绝不能用「最后一条日志停在 SEND_SIZE」判断卡死。
+ */
+var relayWatchTimerId = null;
+var relayWatchLastUiLogAt = 0;
+var relayWatchInFlight = false;
+var gd32CompleteAnnounced = false;
+var relayWatchLastSeq = -1;
+
+function markGd32OtaUiComplete(msg) {
+  // 已公告过：禁止再改 className / setProgress / toast，否则每 400ms 重触发动效会「疯狂跳 ✓」
+  if (gd32CompleteAnnounced) {
+    return;
+  }
+  gd32CompleteAnnounced = true;
+  stopRelayProgressWatch();
+
+  markPhaseDone('gd32Ota');
+  currentOtaTarget = null;
+  setProgress(100, msg || 'GD32 刷写完成');
+  var sbDone = document.getElementById('stageStatusBar');
+  var stDone = document.getElementById('stageStatusText');
+  if (sbDone) sbDone.className = 'stage-status-bar ok';
+  if (stDone) stDone.textContent = msg || 'GD32 刷写完成';
+  if (otaSessionState === OtaSessionState.RELAYING ||
+      otaSessionState === OtaSessionState.FAILED) {
+    otaSessionTransition(OtaSessionState.DONE);
+  }
+  addLog('I', 'OTA', msg || 'GD32 刷写完成');
+  showToast(msg || 'GD32 刷写完成', 'success');
+}
+
+function stopRelayProgressWatch() {
+  if (relayWatchTimerId) {
+    clearInterval(relayWatchTimerId);
+    relayWatchTimerId = null;
+  }
+  relayWatchInFlight = false;
+  if (statusPollIntervalMs < 1000) {
+    statusPollIntervalMs = 1000;
+  }
+}
+
+function startRelayProgressWatch() {
+  stopRelayProgressWatch();
+  if (pollingPausedForUpload) {
+    resumePollingAfterUpload();
+  }
+  statusPollIntervalMs = 400;
+  scheduleStatusPoll(0);
+  pollLogs();
+  addLog('I', 'OTA', '跟踪中继进度：看进度条与 relay_seq（/system/status），勿只看日志');
+  relayWatchTimerId = setInterval(function () {
+    var active = otaSessionState === OtaSessionState.RELAYING ||
+                 (otaSessionState === OtaSessionState.FAILED &&
+                  (lastSysStateCode === 3 || lastRelayState >= 1 && lastRelayState <= 4));
+    if (!active) {
+      if (otaSessionState === OtaSessionState.DONE) {
+        stopRelayProgressWatch();
+      }
+      return;
+    }
+    if (relayWatchInFlight) return;
+    relayWatchInFlight = true;
+    fetch(getBaseUrl() + '/system/status', { signal: AbortSignal.timeout(3000) })
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        try { updateSystemStatusUi(data); } catch (e) { /* ignore */ }
+        var o = data.ota || {};
+        var code = Number(o.sys_state_code);
+        var rstate = Number(o.relay_state);
+        var alive = !!o.gd32_app_alive;
+        var rseq = Number(o.relay_seq) || 0;
+        var rtot = Number(o.relay_total_packets) || 0;
+        if (code === 4 || rstate === 5 || (alive && rtot > 0 && rseq >= rtot && rstate >= 3)) {
+          markGd32OtaUiComplete('GD32 刷写完成');
+          pollLogs();
+          return;
+        }
+        if (code === 8 || rstate === 255) {
+          stopRelayProgressWatch();
+          pollLogs();
+          return;
+        }
+        // 前端进度同步：包数变化时更新进度条（updateSystemStatusUi 已做）并写一条前端日志
+        // 后端不再打「转发进度」文字，只靠这里 + 进度条
+        if (rtot > 0 && rseq > 0 && rseq !== relayWatchLastSeq) {
+          relayWatchLastSeq = rseq;
+          var pct = Math.round(rseq * 100 / rtot);
+          setProgress(60 + Math.round(pct * 0.30),
+            '已转发 ' + rseq + ' / ' + rtot + ' 包 (' + pct + '%)');
+          addLog('I', 'OTA', '转发 ' + rseq + '/' + rtot + ' (' + pct + '%)');
+        }
+      })
+      .catch(function () { /* 下轮继续 */ })
+      .then(function () { relayWatchInFlight = false; });
+  }, 400);
+}
+
 /** @description 触发 GD32 中继 OTA 流程（通过 HTTP 接口）。 */
 async function triggerGd32Relay() {
   var sha256 = window._gd32FileSha256;
@@ -1556,12 +1860,14 @@ async function triggerGd32Relay() {
   }
   addLog('I', 'OTA', 'GD32 SHA-256: ' + sha256 + ' → 触发中继...');
   showToast('正在触发 GD32 OTA', 'success');
+  setProgress(48, '校验 SHA 并触发 GD32 中继…');
   try {
+    // 仅触发中继（设备端异步跑），不阻塞到刷写结束；SHA 读分区可能数秒
     var resp = await fetch(getBaseUrl() + '/ota/relay', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sha256: sha256 }),
-      signal: AbortSignal.timeout(30000)  // 中继可能耗时较长
+      signal: AbortSignal.timeout(120000)
     });
     var text = await resp.text();
     if (resp.ok) {
@@ -1569,8 +1875,12 @@ async function triggerGd32Relay() {
         var data = JSON.parse(text);
         if (data.sha256) addLog('I', 'OTA', '设备端 SHA-256: ' + data.sha256);
       } catch (_) {}
-      addLog('I', 'OTA', 'GD32 OTA 已触发，等待设备响应...');
+      addLog('I', 'OTA', 'GD32 OTA 已触发；进度看状态栏包数（勿只看日志时间戳）');
       showToast('GD32 OTA 已触发', 'success');
+      setProgress(50, '中继已启动，同步进度…');
+      gd32CompleteAnnounced = false;
+      relayWatchLastSeq = -1;
+      startRelayProgressWatch();
     } else {
       // 尝试解析错误响应中的 device SHA
       try {
@@ -1587,6 +1897,28 @@ async function triggerGd32Relay() {
       cleanupAfterOtaFailure('触发失败 HTTP ' + resp.status);
     }
   } catch (e) {
+    // 请求超时/断连 ≠ 设备未启动中继：先探测 status 再决定是否标失败
+    try {
+      var probe = await fetch(getBaseUrl() + '/system/status', {
+        signal: AbortSignal.timeout(3000)
+      });
+      if (probe.ok) {
+        var st = await probe.json();
+        var o = st.ota || {};
+        var code = Number(o.sys_state_code);
+        var rstate = Number(o.relay_state);
+        if (code === 3 || (rstate >= 1 && rstate <= 4)) {
+          addLog('W', 'OTA', '触发请求中断(' + e.message + ')，但设备已在中继，继续跟踪进度');
+          showToast('设备已在刷写，同步进度中', 'success');
+          if (otaSessionState !== OtaSessionState.RELAYING) {
+            otaSessionTransition(OtaSessionState.RELAYING);
+          }
+          try { updateSystemStatusUi(st); } catch (_) {}
+          startRelayProgressWatch();
+          return;
+        }
+      }
+    } catch (_) { /* probe 失败再走失败清理 */ }
     addLog('E', 'OTA', 'GD32 触发失败: ' + e.message);
     showToast('GD32 触发失败', 'error');
     cleanupAfterOtaFailure('触发异常');
@@ -1597,7 +1929,6 @@ async function triggerGd32Relay() {
 var consecutivePollFailures = 0;
 var statusTimerId = null;
 var logsTimerId = null;
-var pollSlowMode = false;   // 降速模式（10s 一次）
 var lastDiagTime = 0;       // 上次诊断时间
 var diagResult = '';        // 最近一次诊断结果
 var lastSysStateCode = -1;  // 上次成功的 sys_state_code，用于失败时判断设备是否在忙
@@ -1651,67 +1982,56 @@ async function diagnoseNetwork() {
  */
 function scheduleStatusPoll(delayMs) {
   if (statusTimerId) clearTimeout(statusTimerId);
+  // 中继期加快：进度条依赖 status.relay_seq，1s 间隔体感像卡死
+  var interval = statusPollIntervalMs;
+  if (otaSessionState === OtaSessionState.RELAYING) {
+    interval = Math.min(interval, 400);
+  }
   statusTimerId = setTimeout(function() {
     statusTimerId = null;
     pollStatus();
-  }, delayMs !== undefined ? delayMs : statusPollIntervalMs);
+  }, delayMs !== undefined ? delayMs : interval);
 }
 
 /** @description 启动定时轮询（状态 + 日志）。 */
 
 function startPolling() {
   consecutivePollFailures = 0;
-  pollSlowMode = false;
   statusPollIntervalMs = 1000;
   if (statusTimerId) clearTimeout(statusTimerId);
   if (logsTimerId) clearInterval(logsTimerId);
   scheduleStatusPoll(0);   // 立即开始第一次，完成后按 interval 递归调度
   logsTimerId = setInterval(pollLogs, 1000);
 }
-function slowDownPolling() {
-  pollSlowMode = true;
-  statusPollIntervalMs = 10000;
-  // 不中断正在进行的请求；它完成后会按新的 10s 间隔调度下一次
-  if (!statusPollInFlight) {
-    if (statusTimerId) clearTimeout(statusTimerId);
-    scheduleStatusPoll(statusPollIntervalMs);
-  }
-  if (logsTimerId) clearInterval(logsTimerId);
-  logsTimerId = setInterval(pollLogs, 10000);
-}
-function restorePolling() {
-  if (pollSlowMode) {
-    pollSlowMode = false;
-    consecutivePollFailures = 0;
-    statusPollIntervalMs = 1000;
-    if (logsTimerId) clearInterval(logsTimerId);
-    logsTimerId = setInterval(pollLogs, 1000);
-  }
-  // 如果当前没有请求在飞，立即触发一次，确保 UI 尽快恢复
-  if (!statusPollInFlight) {
-    if (statusTimerId) clearTimeout(statusTimerId);
-    scheduleStatusPoll(0);
-  }
-}
 function pausePollingForUpload() {
   if (pollingPausedForUpload) return;
   pollingPausedForUpload = true;
   uploadPollChip = activeUploadChip || window.flashTarget || null;
   consecutivePollFailures = 0;
-  statusPollIntervalMs = uploadPollChip === "gd32" ? 2500 : 3000;
-  // ★ ESP32/GD32 上传期间均保持轮询，让用户在网页上看到完整 OTA 进展
-  //   ESP32 用 3s 间隔（上传为主），GD32 用 2.5s（中继进度依赖 status）
-  if (statusTimerId) clearTimeout(statusTimerId);
-  if (logsTimerId) clearInterval(logsTimerId);
-  scheduleStatusPoll(statusPollIntervalMs);
-  logsTimerId = setInterval(pollLogs, statusPollIntervalMs);
+  // ★ 上传大固件期间必须停掉 status/logs 轮询。
+  //   httpd max_open_sockets=4 + lru_purge：轮询会再占 socket，LRU 可能踢掉
+  //   正在写 Flash 的 /ota/upload 连接 → 浏览器 upload 进度已 100%（发完），
+  //   但永远等不到 HTTP 响应，卡在「已上传 xxx / xxx」。
+  if (statusTimerId) {
+    clearTimeout(statusTimerId);
+    statusTimerId = null;
+  }
+  if (logsTimerId) {
+    clearInterval(logsTimerId);
+    logsTimerId = null;
+  }
+  if (statusAbortCtrl) {
+    try { statusAbortCtrl.abort(); } catch (e) { /* ignore */ }
+    statusAbortCtrl = null;
+    statusPollInFlight = false;
+  }
 }
 function resumePollingAfterUpload() {
   if (!pollingPausedForUpload) return;
   pollingPausedForUpload = false;
   uploadPollChip = null;
   consecutivePollFailures = 0;
-  statusPollIntervalMs = pollSlowMode ? 10000 : 1000;
+  statusPollIntervalMs = 1000;
   if (logsTimerId) clearInterval(logsTimerId);
   logsTimerId = setInterval(pollLogs, statusPollIntervalMs);
   // 上传结束立即刷新一次状态；若当前已在请求中，则让它完成后按新间隔继续
@@ -1735,22 +2055,18 @@ async function pollStatus() {
     });
     if (resp.ok) {
       var data = await resp.json();
-      // 恢复：如果之前在降速模式，切回 1 秒轮询
-      if (consecutivePollFailures > 0 || pollSlowMode) {
-        var wasSlow = pollSlowMode;
+      // 恢复：之前有失败计数，说明设备曾离线，现在恢复在线
+      if (consecutivePollFailures > 0) {
         consecutivePollFailures = 0;
-        if (wasSlow) {
-          restorePolling();
-          addLog('I', '系统', '设备已恢复在线，轮询恢复正常');
-          showToast('设备已恢复在线', 'success');
-        }
+        addLog('I', '系统', '设备已恢复在线，轮询恢复正常');
+        showToast('设备已恢复在线', 'success');
       }
       if (isEsp32Rebooting) {
         var rbElapsed = Math.round((Date.now() - rebootStartTime) / 1000);
         if (!rebootObservedDown && rbElapsed < 10) {
           // pre-reboot 窗口：后端发响应后约 1s 才 esp_restart，期间设备仍响应轮询
           // 保持"重启中"状态，不清除标志，不推进阶段
-          addLog('I', '系统', '设备尚未实际重启，等待 esp_restart...');
+          // ★ 真正的"重启完成"由 pollLogs 收到启动 banner（MAIN: ESP32-C3 OTA Relay v1.0 启动）触发
         } else {
           // 设备已重启并恢复在线（rebootObservedDown=true）
           // 或超 10s 安全阈值仍未观察到下线（重启过快未捕获或未重启）——接受恢复
@@ -1759,6 +2075,8 @@ async function pollStatus() {
           updateEsp32StagesFromPhase(6);  // 启动完成
           addLog('I', '系统', 'ESP32 已恢复在线');
           showToast('ESP32 已恢复在线', 'success');
+          // ★ 状态机：ESP32 重启完成 → DONE
+          if (otaSessionState === OtaSessionState.REBOOTING) otaSessionTransition(OtaSessionState.DONE);
         }
       }
       try { updateSystemStatusUi(data); } catch (e2) { console.warn('updateSystemStatusUi 异常:', e2); }
@@ -1786,7 +2104,11 @@ async function pollStatus() {
       (lastRelayState >= 1 && lastRelayState <= 4);
     // OTA/传输/重启中屏蔽网关无响应的检测功能（设备忙或正在重启，无法响应轮询是正常的）
     // 设备已知忙时：保持 1s 轮询，不触发降速诊断，避免错过设备恢复的即时反馈
-    if (pageVisible && consecutivePollFailures >= 5 && !pollSlowMode && !isUploading && !isEsp32Rebooting && !currentOtaTarget && !lastDeviceBusy) {
+    // ★ 状态机：用统一的会话活跃/失败判断替代散布的标志。
+    //   FAILED 态不触发诊断降速（让用户尽快看到设备恢复），但也不覆盖失败 UI。
+    var sessionActive = otaSessionActive();
+    var sessionFailed = otaSessionState === OtaSessionState.FAILED;
+    if (pageVisible && consecutivePollFailures >= 5 && !sessionActive && !isEsp32Rebooting && !currentOtaTarget && !lastDeviceBusy && !sessionFailed) {
       addLog('W', '诊断', '设备连续 5 次无响应，正在诊断网络...');
       var diag = await diagnoseNetwork();
       addLog('W', '诊断', diag);
@@ -1794,16 +2116,31 @@ async function pollStatus() {
       applyDisconnectedRuntimeState();
       var cst = document.getElementById('connStatusTxt');
       if (cst) cst.textContent = '诊断中: ' + diag;
-      // 降速到 10 秒继续监测，等待设备恢复
-      slowDownPolling();
-      addLog('I', '系统', '已切换为慢速轮询（10s），持续监测设备恢复...');
     }
-    if (isUploading) {
+    // ★ 状态机优先：会话已 FAILED → 保持失败 UI，仅标连接胶囊为"设备忙/未连接"
+    if (sessionFailed) {
+      if (lastDeviceBusy) {
+        // 设备端仍在跑（中继没停），标"设备忙"但不覆盖进度/阶段
+        var pcF = document.getElementById('pillConn');
+        var pctF = document.getElementById('pillConnTxt');
+        if (pcF) pcF.className = 'pill processing';
+        if (pctF) pctF.textContent = '设备忙';
+        var csF = document.getElementById('connStatus');
+        var cstF = document.getElementById('connStatusTxt');
+        if (csF) csF.className = 'conn-indicator warn';
+        if (cstF) cstF.textContent = '设备忙（OTA 后台运行中），等待回 IDLE';
+        updateConnectionUi(true, '设备忙');
+      } else {
+        // 设备已回 IDLE：连接胶囊显示未连接，但失败进度保留
+        updateConnectionUi(false, '未连接');
+      }
+    } else if (otaSessionState === OtaSessionState.UPLOADING) {
       applyUploadingRuntimeState();
-    } else if (isEsp32Rebooting) {
+    } else if (otaSessionState === OtaSessionState.REBOOTING || isEsp32Rebooting) {
       rebootObservedDown = true;  // 确认设备已下线（正在重启）
       var elapsed = Math.round((Date.now() - rebootStartTime) / 1000);
       if (elapsed > 60) {
+        otaSessionTransition(OtaSessionState.FAILED, 'ESP32 重启超时');
         isEsp32Rebooting = false;
         rebootObservedDown = false;
         addLog('E', '系统', 'ESP32 重启超时，设备未恢复');
@@ -1813,7 +2150,7 @@ async function pollStatus() {
       } else {
         applyRebootingRuntimeState();
       }
-    } else if (lastDeviceBusy) {
+    } else if (sessionActive || lastDeviceBusy) {
       // 设备在 OTA/中继/重启期间不响应是正常的：保持 1s 轮询，UI 标记为"设备忙"
       // 不调用 applyRebootingRuntimeState（避免显示"重启中 Xs"误导）
       var pc = document.getElementById('pillConn');
@@ -1825,7 +2162,7 @@ async function pollStatus() {
       if (cs) cs.className = 'conn-indicator warn';
       if (cst) cst.textContent = '设备忙（OTA/重启中），保持 1s 轮询';
       updateConnectionUi(true, '设备忙');
-    } else if (!pollSlowMode) {
+    } else {
       updateConnectionUi(false, '未连接');
       applyDisconnectedRuntimeState();
     }
@@ -1851,8 +2188,6 @@ document.addEventListener('visibilitychange', function () {
     scheduleStatusPoll(0);
   }
   pollLogs();
-  // 之前若在慢速模式（10s），切回前台先用 1s 观察一会儿
-  if (pollSlowMode) restorePolling();
 });
 // ==================== ESP32 实时日志拉取 (增量) ====================
 var lastLogTimestamp = 0;
@@ -1871,6 +2206,18 @@ async function pollLogs() {
       var m = line.match(/^\[([EWID])\]\[([^\]]+)\]\s*(.*)$/);
       if (m) {
         addLog(levelMap[m[1]] || 'I', m[2], m[3].trimEnd());
+        // ★ 复用设备启动 banner 作为 ESP32 重启完成的权威信号。
+        //   esp_restart() 是硬件复位，不保证 TCP FIN/RST；靠轮询超时/网络错误判断
+        //   "已下线"不可靠。设备启动后会推 [I][MAIN] ESP32-C3 OTA Relay v1.0 启动，
+        //   收到这行即说明设备已重启回来，直接推进到阶段 6（启动完成）。
+        if (isEsp32Rebooting && m[2] === 'MAIN' && /OTA Relay v1\.0 启动/.test(m[3])) {
+          isEsp32Rebooting = false;
+          rebootObservedDown = false;
+          updateEsp32StagesFromPhase(6);  // 启动完成
+          addLog('I', '系统', 'ESP32 已恢复在线（启动 banner 收到）');
+          showToast('ESP32 已恢复在线', 'success');
+          if (otaSessionState === OtaSessionState.REBOOTING) otaSessionTransition(OtaSessionState.DONE);
+        }
       } else {
         addLog('I', 'ESP32', line.trimEnd());
       }
@@ -1881,13 +2228,15 @@ setTimeout(function () {
   updateUploadButtonLabel();
   addLog('I', '系统', '控制台初始化完成，等待固件文件...');
   updateSpiHint();
-  // IP 输入变化时自动恢复轮询
+  // IP 输入变化时清零失败计数并立即刷新状态
   var ipInput = document.getElementById('espIp');
   if (ipInput) {
     ipInput.addEventListener('change', function () {
-      if (pollSlowMode) {
-        addLog('I', '系统', 'IP 已修改，重新启动轮询...');
-        restorePolling();
+      consecutivePollFailures = 0;
+      addLog('I', '系统', 'IP 已修改，重新启动轮询...');
+      if (!statusPollInFlight) {
+        if (statusTimerId) clearTimeout(statusTimerId);
+        scheduleStatusPoll(0);
       }
     });
   }

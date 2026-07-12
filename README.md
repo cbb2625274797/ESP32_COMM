@@ -391,7 +391,7 @@ curl http://192.168.31.1/logs
 | 等级 | 名称 | 触发条件 | OTA 影响 |
 |------|------|----------|----------|
 | 0 | SYS_NORMAL | 正常 | 允许 |
-| 1 | SYS_WARNING | 温度 ≥ 80°C 或 RSSI < -75 dBm | 允许（带警告）|
+| 1 | SYS_WARNING | 温度 ≥ 80°C 或 RSSI < -80 dBm | 允许（带警告）|
 | 2 | SYS_CRITICAL | RSSI < -85 dBm | ESP32 OTA 禁止，SPI 中继允许 |
 | 3 | SYS_SAFE_SHUTDOWN | 温度 ≥ 100°C | 所有 OTA 禁止 |
 
@@ -427,7 +427,7 @@ UDP socket 延迟创建（首次 `send()` 时才分配），WiFi 未连接时 `s
 | WiFi | `CONFIG_WIFI_MODE` | 1 (STA) | 0=AP, 1=STA |
 | WiFi | `WIFI_STA_SSID` | "004舰桥" | 路由器名称 |
 | WiFi | `WIFI_AP_SSID` | "ESP32_OTA_RELAY" | 热点名称 |
-| WiFi | `WIFI_RSSI_WARNING` | -75 dBm | RSSI 警告阈值 |
+| WiFi | `WIFI_RSSI_WARNING` | -80 dBm | RSSI 警告阈值 |
 | WiFi | `WIFI_RSSI_CRITICAL` | -85 dBm | RSSI 危险阈值 |
 | OTA | `OTA_BLOCK_SIZE` | 8192 | 读写块大小 |
 | OTA | `OTA_MAX_FIRMWARE_SIZE` | 216KB | GD32 固件上限 |

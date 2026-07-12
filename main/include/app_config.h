@@ -53,17 +53,15 @@ inline constexpr uint8_t     WIFI_AP_MAX_CONNECT = 4;              ///< AP 模�
 // HTTP 服务器配置
 // ============================================================
 inline constexpr uint16_t HTTP_SERVER_PORT      = 80;              ///< HTTP 服务器监听端口
-inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 8192;           ///< HTTP 服务器任务栈大小（字节）
-// ★ 曾降至 6142 省 2KB，但 system_status_handler→sample_cpu_usage() 在栈上分配
-//   TaskStatus_t tasks[24](~864B)+previous_samples[24](192B)+CpuUsageSnapshot(~608B)≈1.7KB，
-//   加上 spi_send_handler 的 buf[512]+resp[1024]+SPI 调用链 ≈3.5KB，
-//   再加 httpd 框架开销 ~2KB → 总需求逼近 6KB，6144 栈导致栈溢出 → TCB 被破坏
-//   → "Stack protection fault"(栈边界被 "http" ASCII 覆盖)。恢复 8192 留足余量。
+inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 10240;          ///< HTTP 服务器任务栈大小（字节）
+// ★ 历史：6144 栈溢出；8192 在上传收尾仍紧。曾提到 12288 但 ESP32-C3 堆极紧
+//   （OTA 后 free~5KB、largest~1KB）。SHA context 已改 static，httpd 栈 10KB 折中。
+//   真·栈溢出钩子会 abort；卡 100% 更多是堆碎导致回包/后续分配失败。
 
 // ============================================================
 // OTA 配置
 // ============================================================
-inline constexpr size_t  OTA_BLOCK_SIZE         = 4096;            ///< OTA 上传静态接收缓冲区，从 8192 降到 4096 省 4KB
+inline constexpr size_t  OTA_BLOCK_SIZE         = 2048;            ///< 上传接收块：2KB 降峰值堆（原 4/8KB）
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB = 221184B = 0x35F90，固件大小上限
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
 inline constexpr uint32_t OTA_POLL_RETRIES      = 40;          // 每包 ACK 轮询次数
@@ -76,7 +74,7 @@ inline constexpr uint32_t OTA_POLL_NO_FRAME_DELAY_MS = 8;       // 轮询未找�
 // 健康监控阈值
 // ============================================================
 inline constexpr int32_t WIFI_RSSI_CRITICAL = -85;                 ///< WiFi 信号严重警告阈值（dBm）
-inline constexpr int32_t WIFI_RSSI_WARNING  = -75;                 ///< WiFi 信号一般警告阈值（dBm）
+inline constexpr int32_t WIFI_RSSI_WARNING  = -80;                 ///< WiFi 信号一般警告阈值（dBm）
 inline constexpr int32_t OTA_WIFI_RSSI_CRITICAL = -88;             ///< OTA 传输期间 WiFi 信号临界阈值
 inline constexpr uint32_t OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS = 15000; ///< RSSI 采样最大有效期（毫秒）
 inline constexpr uint32_t OTA_PACKET_HEALTH_CHECK_INTERVAL = 32;   ///< 每 N 包执行一次健康检查

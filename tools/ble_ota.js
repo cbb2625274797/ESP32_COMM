@@ -413,7 +413,11 @@
   function refreshTargetUi() {
     const cfg = currentTarget();
     updateBleStageLabels(cfg);
-    if (state.selectedFile) updateFileInfo(state.selectedFile);
+    // ★ 上传进行中不调用 updateFileInfo：避免目标切换时进度条被重置。
+    //   阶段标签更新（updateBleStageLabels）安全，不碰进度条。
+    if (state.selectedFile && !state.uploading && !state.autoFlashing) {
+      updateFileInfo(state.selectedFile);
+    }
     setConnectionState(!!state.server);
     // 同步目标胶囊标签
     var espTab = document.getElementById('targetEsp32Tab');
@@ -964,6 +968,16 @@
   }
 
   function updateFileInfo(file) {
+    // ★ 上传进行中禁止重置进度/阶段：目标切换、模式切换、syncBleFileFromSelectedTarget
+    //   等事件会在上传期间调用本函数，若不拦截会触发 finalizeFileInfo → setProgress(0, ...)
+    //   把进度条从"已确认 N/M 包"错误地刷回"等待选择文件 0%"。
+    var isUploading = state.uploading || state.autoFlashing;
+    if (isUploading && file && state.selectedFile) {
+      // 上传中且文件未变：仅刷新元数据（文件名/大小等），不碰进度条和阶段
+      bleLog('FILE', '上传进行中，跳过 updateFileInfo 进度重置', 'D');
+      return Promise.resolve();
+    }
+
     els.fileName.textContent = file ? file.name : '-';
     els.fileType.textContent = file ? (file.name.toLowerCase().includes('.hex') ? 'Intel HEX' : 'Binary') : '-';
     els.fileSize.textContent = file ? formatBytes(file.size) : '0 B';
@@ -1018,6 +1032,13 @@
   }
 
   function finalizeFileInfo(file) {
+    // ★ 上传进行中禁止重置进度条/阶段：防止目标切换等事件在上传期间
+    //   通过 finalizeFileInfo → setProgress(0, '等待选择文件') 覆盖上传进度。
+    var isUploading = state.uploading || state.autoFlashing;
+    if (isUploading) {
+      bleLog('FILE', '上传进行中，跳过 finalizeFileInfo 进度重置', 'D');
+      return;
+    }
     setConnectionState(!!state.server);
     if (file) {
       setProgress(0, `已选择 ${file.name}`);
@@ -1065,6 +1086,9 @@
   }
 
   async function syncSelectedFileFromInput() {
+    // ★ 上传进行中禁止同步：window focus / file input change 事件会在上传期间
+    //   触发本函数，若不拦截会通过 updateFileInfo 把进度条重置为"等待选择文件 0%"。
+    if (state.uploading || state.autoFlashing) return;
     // FSAPI 选择的文件以 selectedFileHandle 为准，不从 input 元素同步，避免切标签页回来误清空
     if (state.selectedFileHandle) return;
     const file = (els.firmwareFile && els.firmwareFile.files && els.firmwareFile.files[0]) || null;
@@ -1099,6 +1123,12 @@
   }
 
   function clearSelectedFile() {
+    // ★ 上传进行中禁止清除文件：防止目标切换/模式切换在上传期间清空文件引用，
+    //   导致进度条被重置为"等待选择文件 0%"并中断上传数据源。
+    if (state.uploading || state.autoFlashing) {
+      bleLog('FILE', '上传进行中，拒绝清除文件', 'W');
+      return;
+    }
     state.selectedFile = null;
     state.selectedFileHandle = null;
     state.lastUploadStatus = 'idle';
@@ -1592,6 +1622,12 @@
     disconnect: disconnectBle,
     showToast: showToast,
     notifyFileChange: async function(file, handle) {
+      // ★ 上传进行中拒绝外部文件变更通知：防止 index.html 的 syncBleFileFromSelectedTarget
+      //   在上传期间调用本函数 → updateFileInfo → setProgress(0, ...) 覆盖上传进度。
+      if (state.uploading || state.autoFlashing) {
+        bleLog('FILE', '上传进行中，忽略外部 notifyFileChange', 'D');
+        return;
+      }
       if (file) {
         if (handle) state.selectedFileHandle = handle;
         await updateFileInfo(file);
@@ -1602,6 +1638,10 @@
       setConnectionState(!!state.server);
     },
     refreshTargetUi: refreshTargetUi,
+    // ★ 暴露上传状态查询，供 index.html 的 selectFlashTarget 等外部守卫使用
+    isUploading: function() {
+      return !!(state.uploading || state.autoFlashing);
+    },
   };
 
   // 脚本在 body 末尾同步加载，DOM 元素已就绪，直接初始化

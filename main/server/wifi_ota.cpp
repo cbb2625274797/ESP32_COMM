@@ -418,9 +418,13 @@ esp_err_t WifiOta::httpServerStart()
     config.server_port = HTTP_SERVER_PORT;
     config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
-    config.max_open_sockets = 4;   // 配合 LWIP_MAX_SOCKETS=12: 4(httpd) + 1(UDP) + ~3(LWIP内部) = 8, 余量 4; 空闲时前端 status/logs/上传可能并发，3 个易被 LRU 踢掉导致连接中断
-    config.lru_purge_enable = true;  // socket 满时自动清理最久未用的连接
-    config.recv_wait_timeout = 30;  // GD32 上传前会擦除 Flash，5 秒默认值过紧
+    /* LWIP_MAX_SOCKETS=12；HTTP 内部约 3 + UDP 日志 1 → 业务 socket 不宜过大。
+     * 上传期间前端必须停 status/logs（见 app.js pausePollingForUpload）。 */
+    config.max_open_sockets = 4;
+    /* 上传中途若再开 status 连接，LRU 会踢掉 /ota/upload → 浏览器卡在 100%。
+     * 关闭 LRU 踢连接：宁可新连接失败，也不拆正在写 Flash 的长传。 */
+    config.lru_purge_enable = false;
+    config.recv_wait_timeout = 60;  // 1MB OTA 写 Flash 可能超过 30s 空闲读
     config.send_wait_timeout = 30;
 
     DEBUG_INFO("WIFI", "=== 启动 HTTP OTA 服务器 ===");
@@ -432,13 +436,13 @@ esp_err_t WifiOta::httpServerStart()
         return err;
     }
 
-    // 从 NVS 恢复固件存储状态（重启后保留）
+    // GD32 固件就绪真相源为 OtaCoordinator / NVS meta（/system/status），
+    // 不再在 WifiOta 上维护影子 storage_done 标志。
     {
         ota_meta_t boot_meta;
         if (OtaCoordinator::instance().loadGd32Meta(&boot_meta) == ESP_OK &&
             boot_meta.total_size > 0 && boot_meta.stored_size >= boot_meta.total_size) {
-            WifiOta::instance().setGd32StorageDone(true);
-            DEBUG_INFO("WIFI", "从 NVS 恢复: 固件已就绪 (%u bytes)", boot_meta.total_size);
+            DEBUG_INFO("WIFI", "从 NVS 恢复: GD32 固件已就绪 (%u bytes)", boot_meta.total_size);
         }
     }
 
