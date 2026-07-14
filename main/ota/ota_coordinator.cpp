@@ -10,6 +10,7 @@
 #include "relay/ota_relay.h"
 #include "storage/gd32_flash_store.h"
 #include "transport/spi_master.h"
+#include "server/ble_ota.h"
 #include "monitor/debug_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -17,6 +18,23 @@
 #include <inttypes.h>
 
 #define TAG "OTA_COORD"
+
+/** WiFi OTA 时挂起 BLE；BLE 通道自身 OTA 不挂。调用勿持 m_mutex。 */
+static void wifiOtaSuspendBleIfNeeded(ota_channel_t channel)
+{
+    if (channel != OTA_CHANNEL_WIFI) {
+        return;
+    }
+    (void)BleOta::instance().suspendStack();
+}
+
+/** 回到可空闲态时恢复 BLE。调用勿持 m_mutex。 */
+static void wifiOtaResumeBleIfNeeded(void)
+{
+    if (BleOta::instance().isSuspendedForWifiOta()) {
+        (void)BleOta::instance().resumeStack();
+    }
+}
 
 // ============================================================
 // 单例
@@ -190,10 +208,16 @@ esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t 
         return err;
     }
 
+    /* WiFi GD32 上传前先挂 BLE，腾堆给 HTTP 收流 */
+    wifiOtaSuspendBleIfNeeded(channel);
+
     // 2. 进入 GD32_STORING 状态（系统忙则拒绝）
     err = beginGd32Storage(total_size, channel);
     if (err != ESP_OK) {
         DEBUG_WARN(TAG, "prepareGd32Storage: 协调器拒绝存储（系统忙）");
+        if (channel == OTA_CHANNEL_WIFI) {
+            wifiOtaResumeBleIfNeeded();
+        }
         return err;
     }
 
@@ -223,15 +247,20 @@ esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t 
 void OtaCoordinator::completeGd32Storage()
 {
     bool h = lock();
+    bool resume_ble = false;
     if (h && m_sysState == OTA_SYS_GD32_STORING) {
         m_sysState = OTA_SYS_GD32_STORED;
         m_gd32StorageDone = true;
         m_busySinceTick = 0;  // ★ STORED 是非忙状态
+        resume_ble = (m_otaChannel == OTA_CHANNEL_WIFI);
         DEBUG_INFO(TAG, "GD32 固件存储完成, 系统状态 → GD32_STORED");
     } else if (h) {
         DEBUG_WARN(TAG, "completeGd32Storage 在非预期状态: %d", (int)m_sysState);
     }
     unlock(h);
+    if (resume_ble) {
+        wifiOtaResumeBleIfNeeded();
+    }
 }
 
 esp_err_t OtaCoordinator::finishGd32StorageAfterReceive()
@@ -315,7 +344,7 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
     DEBUG_INFO(TAG, "触发 GD32 中继, 系统状态 → GD32_RELAYING");
 
     uint32_t cmd = 1;
-    BaseType_t ret = xQueueSend(dq, &cmd, pdMS_TO_TICKS(200));
+    BaseType_t ret = xQueueSend(dq, &cmd, pdMS_TO_TICKS(100));
     if (ret != pdTRUE) {
         DEBUG_ERR(TAG, "向 OtaRelay 发送启动消息失败");
         m_sysState = OTA_SYS_GD32_STORED;
@@ -360,6 +389,8 @@ void OtaCoordinator::notifyRelayComplete(bool success)
         }
     }
     unlock(h);
+    /* 中继结束：若 BLE 仍因 WiFi OTA 挂起则恢复 */
+    wifiOtaResumeBleIfNeeded();
 }
 
 // ============================================================
@@ -451,8 +482,6 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
             m_otaChannel = channel;  // ★ 记录发起通道
             m_sysState = OTA_SYS_ESP32_RECEIVING;
             m_busySinceTick = xTaskGetTickCount();  // ★ 记录起始时刻
-            DEBUG_INFO(TAG, "ESP32 OTA 开始: %" PRIu32 " 字节, 系统状态 → ESP32_RECEIVING (epoch=%u, channel=%d)",
-                       total_size, m_otaEpoch, (int)channel);
             pauseCanFeedbackTask(true);
         } else {
             DEBUG_WARN(TAG, "ESP32 OTA begin 失败: %s", esp_err_to_name(err));
@@ -465,6 +494,9 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
 
 esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channel_t channel)
 {
+    /* WiFi 路径：在 begin 前挂 BLE，把 BT 堆腾给 OTA 收流（BLE 通道 OTA 不挂）。 */
+    wifiOtaSuspendBleIfNeeded(channel);
+
     esp_err_t err = beginEsp32Ota(total_size, channel);
     if (err == ESP_ERR_INVALID_STATE) {
         // ★ 仅当系统确实空闲（无任何活跃 OTA）时才允许 forceCleanup：
@@ -478,6 +510,9 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
         if (!isIdleState(cur) && cur != OTA_SYS_ERROR) {
             DEBUG_WARN(TAG, "ESP32 OTA 被拒绝且系统非空闲 (state=%d)，不强制清理，直接失败",
                        (int)cur);
+            if (channel == OTA_CHANNEL_WIFI) {
+                wifiOtaResumeBleIfNeeded();
+            }
             return err;
         }
 
@@ -488,6 +523,9 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
         }
         Esp32OtaCore::instance().forceCleanup();
         err = beginEsp32Ota(total_size, channel);
+    }
+    if (err != ESP_OK && channel == OTA_CHANNEL_WIFI) {
+        wifiOtaResumeBleIfNeeded();
     }
     return err;
 }
@@ -547,7 +585,7 @@ Esp32FinalizeResult OtaCoordinator::finalizeForReboot(const char *frontend_sha_h
 void OtaCoordinator::restartEsp32()
 {
     notifyEsp32Rebooting();
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
     // 不会返回
 }
@@ -573,6 +611,7 @@ void OtaCoordinator::doAbortLocked()
     m_gd32StorageDone = false;
     m_busySinceTick = 0;
     DEBUG_INFO(TAG, "已中止, 系统状态 → IDLE");
+    /* 释放协调器锁后由调用方 resume BLE；doAbortLocked 可能持锁，标记后外层 resume */
 }
 
 void OtaCoordinator::abortCurrent()
@@ -582,6 +621,7 @@ void OtaCoordinator::abortCurrent()
         doAbortLocked();
     }
     unlock(h);
+    wifiOtaResumeBleIfNeeded();
 }
 
 uint32_t OtaCoordinator::getOtaEpoch() const
@@ -607,6 +647,7 @@ bool OtaCoordinator::abortCurrentIfEpoch(uint32_t epoch)
     doAbortLocked();
 
     unlock(h);
+    wifiOtaResumeBleIfNeeded();
     return true;
 }
 

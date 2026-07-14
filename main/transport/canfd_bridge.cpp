@@ -32,7 +32,7 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
     size_t resp_len = 0U;
     /* 两步法：otaTransfer 发命令（丢弃延迟一拍的过期响应）+ otaPollResponse 读真实响应。
      * CAN 帧非幂等，命令只发一次，不重发。 */
-    esp_err_t ret = SpiMaster::instance().otaSendAndPoll(
+    esp_err_t ret = SpiMaster::instance().transact(
         kSpiCanFrameType,
         tx_buf, tx_len,
         &resp_type, recv_buf, recv_max, &resp_len, timeout_ms);
@@ -175,7 +175,7 @@ int canFdSetRxMode(can_rx_mode_t mode,
 
     /* 两步法破解延迟一拍：发命令一次 + poll 真实响应。
      * 0xC2 幂等，但两步法避免无效重试。 */
-    esp_err_t ret = SpiMaster::instance().otaSendAndPoll(
+    esp_err_t ret = SpiMaster::instance().transact(
         kSpiCanSetModeType,
         &req, 1U,
         &resp_type, resp_buf, sizeof(resp_buf), &resp_len, timeout_ms);

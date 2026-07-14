@@ -14,8 +14,19 @@ CONFIG_DCU_OTA_PACKET_INTERVAL_MS=3
 # 原值 7 与 httpd max_open_sockets=4 仅余 3 个 socket,一旦 handler 阻塞即 accept(EMFILE)
 # 提到 12 留足缓冲,配合 can_feedback_task 退避从根本上避免 socket 饥荒
 CONFIG_LWIP_MAX_SOCKETS=12
-CONFIG_LWIP_TCP_WND_DEFAULT=11480
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
+# C3 堆紧：WiFi+BLE 双栈时 TCP 窗口过大 → OTA 收流 free 压到 ~5KB → 卡半/堆爆。
+# 6144=6KB≈4*MSS：优先压峰值堆；OTA 瓶颈多在 Flash 擦写，吞吐损失通常可接受。
+# 注意：仅改 defaults 不会覆盖已有 sdkconfig，构建前须同步写入 sdkconfig。
+CONFIG_LWIP_TCP_WND_DEFAULT=6144
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=6144
+# 乱序队列 pbuf：4→2，少占堆；HTTP 顺序上传基本不需要大 OOSEQ
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2
+
+# WiFi 动态缓冲（C3 + NimBLE 常驻）：32 过大，OTA 峰值与 TCP 窗口叠加易堆碎。
+# 16/16/6 对单连接 OTA 足够，省出 ~10–20KB 峰值给 Flash 写路径。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 
 # FreeRTOS runtime stats -- /system/status CPU usage
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
@@ -39,10 +50,12 @@ CONFIG_BT_NIMBLE_HR_SERVICE=n
 CONFIG_BT_NIMBLE_BAS_SERVICE=n
 CONFIG_BT_NIMBLE_DIS_SERVICE=n
 
-# ── NimBLE: OTA 窗口突发接收容量（恢复 7feef70 对应的 IDF 6.0 默认值）──
+# ── NimBLE: 缓冲略收（WiFi OTA 优先；BLE OTA 单连接仍够用）──
+# 原 24/24 为 BLE 突发优化，但与 WiFi OTA 抢堆导致“卡半 + free~5KB”。
+# 12/16：BLE 吞吐略降，WiFi 峰值堆更稳。
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=24
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=24
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=16
 # Event buffers: 30→16 (省 ~1 KB)
 CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=16
 # Prepared write entries: 64→16 (省 ~1 KB)

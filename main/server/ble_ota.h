@@ -31,6 +31,23 @@ public:
  * @return ESP_OK 成功，其他失败。
  */
     esp_err_t serverStart();
+
+    /**
+     * @brief WiFi OTA 期间软挂起 BLE（停广播、断连、拒收写；不 deinit 控制器）。
+     *        ESP32-C3 上 hard deinit 会打挂 WiFi 共存，导致上传立刻失联。
+     * @return ESP_OK 已挂起或本就未运行。
+     */
+    esp_err_t suspendStack();
+
+    /**
+     * @brief WiFi OTA 结束后恢复 BLE 广播（栈仍在则只重新 adv）。
+     * @return ESP_OK 成功或无需恢复。
+     */
+    esp_err_t resumeStack();
+
+    /** @brief 当前是否因 WiFi OTA 挂起 BLE。 */
+    bool isSuspendedForWifiOta() const { return m_suspendedForWifiOta; }
+
     /**
   * @brief 通过 BLE Notify 推送响应数据。
  * @param data 待推送的数据指针。
@@ -60,6 +77,8 @@ public:
     uint16_t m_esp32LastSeq = 0xFFFFU;   ///< 最后一次数据包序号（用于补发 ACK）
     TaskHandle_t m_taskHandle = nullptr;           ///< BLE OTA 守护任务句柄
     TaskHandle_t m_workerTaskHandle = nullptr;     ///< BLE OTA 数据工作线程句柄
+    bool m_stackRunning = false;                   ///< NimBLE 已 init 且 host 在跑
+    bool m_suspendedForWifiOta = false;            ///< 因 WiFi OTA 主动挂起
 };
 
 #endif // BLE_OTA_H

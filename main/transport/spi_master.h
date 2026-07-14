@@ -19,6 +19,8 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "spi_link_v2.h"
 
 // SPI 配置常量
@@ -110,6 +112,33 @@ public:
     /** @brief 读取对端最新上报的 CREDIT（0 表示对端忙，应 POLL 等待而非重发）。 */
     uint8_t remoteCredit() const { return m_remoteCredit; }
 
+    /**
+     * @brief OTA 中继期间禁止 worker 按铃读。
+     *
+     * PB6 在 OTA 下也会因 WAIT/ACK 拉低。若 worker 在 job 间隙把 RESPONSE
+     * 当 EVENT 偷读，业务 poll 只能空等 → 约 10s 后 DATA 重发 → GD32 DUP-SEQ，
+     * 表现为刷写断断续续。中继开始设 true，结束/复位设 false。
+     */
+    void setSuppressRingService(bool suppress);
+
+    /**
+     * @brief OTA 业务层确认当前请求已成功（结构化 ACK 校验通过）。
+     * 在 SPI 头 ack_seq 偶发失配但仍接受业务 ACK 时补齐 m_txSeq，避免后续包卡死。
+     */
+    void confirmTxSeqAccepted();
+
+    /**
+     * @brief L4 统一请求入口：经 SPI worker 串行执行（send+poll）。
+     */
+    esp_err_t transact(uint8_t type, const uint8_t *payload, size_t payload_len,
+                       uint8_t *resp_type, uint8_t *resp_payload,
+                       size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
+
+    /**
+     * @brief L4 取出 GD32 EVENT 帧（worker 已读入事件队列）。
+     */
+    bool takeEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len);
+
     // ============================================================
     // SPI Link v2 链路层（阶段1：帧格式 + 状态成员就位）
     // ============================================================
@@ -137,6 +166,9 @@ public:
 
     /** @brief 获取链路统计快照（线程安全，持锁读取）。 */
     SpiLinkStats linkStats();
+
+    /** @brief L4 链路状态（linkStats 别名）。 */
+    SpiLinkStats linkStatus() { return linkStats(); }
 
     /** @brief 发起 HELLO 握手建立 v2 session（SPEC §5.1）。
      *  生成随机非零 SESSION_ID，发送 LINK_HELLO，等待 HELLO_ACK。
@@ -251,14 +283,71 @@ private:
     };
 
     SpiLinkState m_linkState;
-    /** GD32 主动按铃标志：GPIO 下降沿 ISR 置位，SPI 任务消费。 */
+    /** GD32 主动按铃标志：GPIO 下降沿 ISR 置位，仅 SPI worker 消费。 */
     volatile bool m_gd32RequestPending = false;
-    /** SPI 任务句柄（用于 ISR 唤醒）。 */
+    /** OTA 中继时为 true：worker 不 serviceRing，避免偷读 OTA ACK/WAIT。 */
+    volatile bool m_suppressRingService = false;
+    /** SPI worker 任务句柄（ISR 唯一通知目标）。 */
     TaskHandle_t m_spiTaskHandle = NULL;
-    /** GD32 按铃请求帧缓冲区。 */
+    TaskHandle_t m_workerTask = NULL;
+    QueueHandle_t m_jobQueue = NULL;
+    /** 事件计数信号量（worker push / takeEvent pop）。 */
+    SemaphoreHandle_t m_eventSem = NULL;
+
+    /** GD32 按铃请求帧缓冲区（兼容 takeRingRx 单槽）。 */
     uint8_t m_ringRxBuf[SPI_OTA_FRAME_MAX] = {};
     size_t  m_ringRxLen = 0;
-    uint8_t m_ringRxType = 0;   ///< GD32 按铃请求帧 TYPE（checkGd32Request 填充）
+    uint8_t m_ringRxType = 0;
+
+    // ── L4 多槽事件队列（worker 写入，业务 takeEvent 读出）──
+    static constexpr uint8_t kEventSlots = 4U;
+    struct EventSlot {
+        uint8_t  type;
+        uint16_t len;
+        uint8_t  data[SPI_OTA_FRAME_MAX];
+    };
+    EventSlot m_eventQ[kEventSlots] = {};
+    uint8_t m_eventHead = 0;
+    uint8_t m_eventTail = 0;
+    uint8_t m_eventCount = 0;
+
+    // ── L4 作业提交（调用方栈上 Job + StaticSemaphore，worker 执行）──
+    enum class JobKind : uint8_t {
+        Transact = 0,
+        Poll,
+        Hello,
+        EnterBoot,
+        Ping,
+        WaitBoot,
+        ServiceRing,
+    };
+    struct Job {
+        JobKind kind = JobKind::Transact;
+        uint32_t timeout_ms = 0;
+        uint8_t type = 0;
+        uint8_t expected_type = 0xFFU;
+        uint8_t role_hint = 0;
+        size_t payload_len = 0;
+        uint8_t payload[SPI_OTA_FRAME_MAX] = {};
+        uint8_t *out_type = nullptr;
+        uint8_t *out_payload = nullptr;
+        size_t out_max = 0;
+        size_t *out_len = nullptr;
+        uint32_t *out_uptime = nullptr;
+        gd32_version_t *out_version = nullptr;
+        esp_err_t result = ESP_FAIL;
+        SemaphoreHandle_t done = nullptr;
+    };
+    static constexpr UBaseType_t kJobQueueLen = 6;
+
+    bool onWorker() const;
+    esp_err_t submitJob(Job &job);
+    void executeJob(Job &job);
+    static void workerEntry(void *arg);
+    void workerLoop();
+    esp_err_t serviceRingOnce();
+    bool pushEvent(uint8_t type, const uint8_t *payload, size_t len);
+    bool popEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len);
 
     // ── 帧内同步状态机 ──
     volatile uint8_t  m_localCredit = 8;  ///< 本端剩余可接收帧数（信用窗口）
@@ -272,6 +361,8 @@ private:
     volatile uint8_t  m_expectedRxSeq = 0;  ///< 期望收到的对端序号
     volatile uint8_t  m_gd32Role = 0;       ///< GD32 角色（0=unknown, 1=app, 2=boot）
     volatile bool     m_v2Active = false;   ///< v2 session 是否激活
+    /** 最近一次 otaFindFrame 解析到的 RESPONSE 是否与 m_lastSentSeq 归属匹配 */
+    volatile bool     m_lastRxAckMatched = false;
     SpiLinkStats m_stats = {};               ///< 链路统计
 
     // RAII 锁守卫
@@ -321,6 +412,26 @@ private:
     esp_err_t transferClocked(const uint8_t *tx_buf, size_t tx_len,
                               uint8_t *rx_buf, size_t rx_len,
                               uint32_t timeout_ms = 0U);
+
+    /**
+     * @brief 底层传输，支持 SPI 事务 flags（如 SPI_TRANS_CS_KEEP_ACTIVE）。
+     * 多段同 CS 变长读时：先 spi_device_acquire_bus，段间 KEEP_ACTIVE，末段清 flag 后 release_bus。
+     */
+    esp_err_t transferClockedFlags(const uint8_t *tx_buf, size_t tx_len,
+                                   uint8_t *rx_buf, size_t rx_len,
+                                   uint32_t timeout_ms, uint32_t trans_flags);
+
+    /**
+     * @brief L3 变长读：同 CS 先读 16B Header，再按 LEN 读 payload+CRC。
+     * 调用者须已持锁；仅在 DATA_READY 已低（有数据）时调用，禁止盲读。
+     * @param out_frame  完整帧输出（含头+payload+CRC）
+     * @param out_max    输出缓冲容量
+     * @param out_len    实际帧长
+     * @param timeout_ms 单段 SPI 超时
+     */
+    esp_err_t readV2FrameVarlen(uint8_t *out_frame, size_t out_max, size_t *out_len,
+                                uint32_t timeout_ms);
+
     // 无锁内部版本（供已持锁的公共方法调用，避免递归死锁）
     /**
      * @brief 无锁版本的 OTA 响应轮询（调用者须已持有锁）。

@@ -24,6 +24,8 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "driver/uart.h"
 
 #include "debug_log.h"
@@ -117,13 +119,37 @@ char* DebugLog::ringDrainJson(int *out_len)
 {
     if (!out_len) return NULL;
     *out_len = 0;
+
+    /* 堆紧时不 malloc：返回堆上最小 "[]"，调用方仍 free。 */
+    const uint32_t free_now = esp_get_free_heap_size();
+    if (free_now < kDrainMinFree) {
+        char *empty = (char *)malloc(3);
+        if (!empty) return NULL;
+        empty[0] = '[';
+        empty[1] = ']';
+        empty[2] = '\0';
+        *out_len = 2;
+        return empty;
+    }
+
     int count = ringCount();
-    // ★ 限制单次导出条数，避免 count=64 时 malloc(32KB) 在堆紧张时失败
-    //   前端每秒轮询，16 条/次足够保持实时性；超出的旧条目下一轮再拉
-    static constexpr int kMaxDrain = 16;
+    /* OTA 沉默失败排查需要一次多拉；上限 24 条 */
+    static constexpr int kMaxDrain = 24;
     if (count > kMaxDrain) count = kMaxDrain;
     int capacity = count * (LOG_RING_SIZE * 2) + 16;
     if (capacity < 16) capacity = 16;
+
+    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    if (largest < (size_t)capacity) {
+        char *empty = (char *)malloc(3);
+        if (!empty) return NULL;
+        empty[0] = '[';
+        empty[1] = ']';
+        empty[2] = '\0';
+        *out_len = 2;
+        return empty;
+    }
+
     char *buf = (char*)malloc(capacity);
     if (!buf) return NULL;
 
@@ -333,14 +359,16 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
 {
     esp_err_t udp_ret = ESP_FAIL;
     esp_err_t uart_ret = ESP_FAIL;
+    const uint32_t free_now = esp_get_free_heap_size();
 
     // UART 通道（UART 不可用时跳过 uart_write_bytes 调用）
     if (m_uartAvailable) {
         uart_ret = uartSend(data, len);
     }
 
-    // UDP 通道（WiFi 未连接时 sendto 失败，静默跳过）
-    if (m_initialized) {
+    /* UDP 通道：堆紧时跳过 sendto，避免申请 LWIP TX pbuf 与 HTTP 回包抢堆。
+     * WiFi 未连接时 sendto 失败也静默跳过。 */
+    if (m_initialized && free_now >= kSkipUdpFree) {
         if (m_udpSock < 0) {
             ensureUdpSocket();
         }
@@ -355,10 +383,14 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
         }
     }
 
-    // 同时写入环形缓冲区（供 HTTP /logs 拉取）
+    // 同时写入环形缓冲区（供 HTTP /logs 拉取）——静态，不占堆
     ringPush((const char *)data, (int)len);
 
     if (udp_ret == ESP_OK || uart_ret == ESP_OK) {
+        return ESP_OK;
+    }
+    /* 仅 ring 成功也算可用（OTA 堆紧时常见） */
+    if (m_logRingMutex) {
         return ESP_OK;
     }
     return ESP_FAIL;
@@ -381,7 +413,22 @@ void DebugLog::log(debug_log_level_t level, const char *tag, const char *fmt, ..
         return;
     }
 
-    char prefix[32];
+    /* 堆门控：OTA/SPI 的 INFO 必须进 ring，否则 WebUI 只能看到“沉默失败”。 */
+    const uint32_t free_now = esp_get_free_heap_size();
+    const bool keep_ota_spi = (tag != nullptr &&
+                               (strcmp(tag, "OTA") == 0 || strcmp(tag, "SPI") == 0));
+    if (!keep_ota_spi) {
+        if (free_now < kDropWarnFree && level > DEBUG_LOG_ERR) {
+            return;  // 无关模块：仅 ERR
+        }
+        if (free_now < kDropInfoFree && level > DEBUG_LOG_WARN) {
+            return;  // 无关模块：丢 INFO/DBG
+        }
+    } else if (free_now < kDropWarnFree && level >= DEBUG_LOG_DBG) {
+        return;  // OTA/SPI：极紧时仍丢 DBG，INFO/WARN/ERR 保留
+    }
+
+    char prefix[24];
     const char *level_str;
     switch (level) {
         case DEBUG_LOG_ERR:  level_str = "E"; break;
@@ -392,14 +439,14 @@ void DebugLog::log(debug_log_level_t level, const char *tag, const char *fmt, ..
     }
     snprintf(prefix, sizeof(prefix), "[%s][%s]", level_str, tag);
 
-    // 控制单条日志栈缓冲大小，避免调用任务（如 can_fb）因日志格式化爆栈。
+    /* 栈缓冲与 LOG_RING_SIZE 对齐，减轻 httpd 等任务栈压。 */
     va_list args;
     va_start(args, fmt);
-    char msg[256];
+    char msg[160];
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
-    char log_buf[320];
+    char log_buf[192];
     int total = snprintf(log_buf, sizeof(log_buf), "%s %s\n", prefix, msg);
 
     // ★ snprintf 截断时返回"本应写入的长度"(可能 > sizeof(log_buf))，

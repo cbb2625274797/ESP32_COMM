@@ -28,7 +28,7 @@ namespace {
 constexpr uint32_t kWaitRingMs      = 500U;    ///< 单次等待 GD32 按铃超时
 constexpr uint32_t kPauseDelayMs    = 100U;    ///< 暂停时的轮询间隔
 constexpr uint8_t  kSpiCanFeedbackType = 0xC1U;
-constexpr size_t   kRingPayloadMax  = 128U;    ///< 反馈 payload 最大长度
+constexpr size_t   kRingPayloadMax  = SPI_OTA_FRAME_MAX;  ///< 与变长读一致，避免截断
 constexpr const char *kTag           = "CAN_FB";
 
 static can_feedback_result_t s_latest[CAN_CHANNEL_MAX];
@@ -72,8 +72,8 @@ static void taskLoop(void *)
         }
 
         /* 取出 checkGd32Request 存入的 type/payload */
-        if (!SpiMaster::instance().takeRingRx(&ring_type, ring_payload,
-                                              sizeof(ring_payload), &ring_len)) {
+        if (!SpiMaster::instance().takeEvent(&ring_type, ring_payload,
+                                             sizeof(ring_payload), &ring_len)) {
             continue;
         }
 

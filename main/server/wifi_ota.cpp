@@ -424,8 +424,10 @@ esp_err_t WifiOta::httpServerStart()
     /* 上传中途若再开 status 连接，LRU 会踢掉 /ota/upload → 浏览器卡在 100%。
      * 关闭 LRU 踢连接：宁可新连接失败，也不拆正在写 Flash 的长传。 */
     config.lru_purge_enable = false;
-    config.recv_wait_timeout = 60;  // 1MB OTA 写 Flash 可能超过 30s 空闲读
-    config.send_wait_timeout = 30;
+    /* 1MB sequential 擦写时，httpd 在 write 阶段可能 >60s 不调 recv；
+     * 超时后 handler 内会重试，但过短会放大“卡 100%”观感。 */
+    config.recv_wait_timeout = 120;
+    config.send_wait_timeout = 60;
 
     DEBUG_INFO("WIFI", "=== 启动 HTTP OTA 服务器 ===");
     DEBUG_INFO("WIFI", "HTTP 服务器端口: %d", config.server_port);

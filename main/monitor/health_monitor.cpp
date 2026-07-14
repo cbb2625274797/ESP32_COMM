@@ -22,6 +22,7 @@
 #include "debug_log.h"
 #include "task_stack_check.h"
 #include "stack_overflow_hook.h"
+#include "ota/ota_coordinator.h"
 
 // ============================================================
 // 栈水位主动巡检
@@ -234,13 +235,19 @@ void HealthMonitor::taskEntry(void *pvParameters)
 
         uint32_t free_heap = esp_get_free_heap_size();
         if (free_heap < HEAP_WARNING_MIN) {
-            /* OTA 期间堆会短暂变紧，限流避免串口/UDP 二次吃堆、刷屏 */
+            /* WiFi OTA 收流时 TCP 窗口 + httpd 会把 free 压到 5~10KB，属预期，勿当故障刷屏。 */
             static TickType_t s_last_heap_warn = 0;
             TickType_t now = xTaskGetTickCount();
-            if ((now - s_last_heap_warn) >= pdMS_TO_TICKS(2000)) {
+            const bool ota_busy = !OtaCoordinator::instance().isIdle();
+            const uint32_t interval_ms = ota_busy ? 15000U : 3000U;
+            /* OTA 中只在 free 极低（<4KB）时告警；空闲时维持 10KB 阈值 */
+            const uint32_t warn_floor = ota_busy ? 4096U : (uint32_t)HEAP_WARNING_MIN;
+            if (free_heap < warn_floor &&
+                (now - s_last_heap_warn) >= pdMS_TO_TICKS(interval_ms)) {
                 s_last_heap_warn = now;
                 uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-                DEBUG_WARN("MON", "堆内存不足: free=%lu min=%lu largest_blk=%lu",
+                DEBUG_WARN("MON", "堆内存偏紧%s: free=%lu min=%lu largest_blk=%lu",
+                           ota_busy ? "(OTA中)" : "",
                            (unsigned long)free_heap,
                            (unsigned long)esp_get_minimum_free_heap_size(),
                            (unsigned long)largest_block);

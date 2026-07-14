@@ -31,6 +31,7 @@
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
+#include "nimble/ble.h"  /* BLE_ERR_REM_USER_CONN_TERM */
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "host/ble_att.h"
@@ -829,6 +830,10 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
     (void)attr_handle;
     (void)arg;
 
+    if (BleOta::instance().isSuspendedForWifiOta()) {
+        return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+    }
+
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
     }
@@ -1092,6 +1097,10 @@ static int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
     (void)conn_handle;
     (void)attr_handle;
     (void)arg;
+
+    if (BleOta::instance().isSuspendedForWifiOta()) {
+        return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+    }
 
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
@@ -1490,9 +1499,10 @@ static void ble_ota_data_worker_task(void *pvParameters)
                 continue;
             }
 
-            // 若 BLE 已断开，丢弃队列中的残留数据
-            if (!BleOta::instance().isConnected()) {
-                DEBUG_DBG(TAG, "BLE 已断开，丢弃 %zu 字节队列数据", item.len);
+            // 若 BLE 已断开或 WiFi OTA 挂起，丢弃队列中的残留数据
+            if (!BleOta::instance().isConnected() ||
+                BleOta::instance().isSuspendedForWifiOta()) {
+                DEBUG_DBG(TAG, "BLE 不可用/挂起，丢弃 %zu 字节队列数据", item.len);
                 free(item.data);
                 continue;
             }
@@ -1640,6 +1650,15 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
+            if (BleOta::instance().isSuspendedForWifiOta()) {
+                /* WiFi OTA 中拒绝 BLE 连接，立刻踢掉 */
+                DEBUG_WARN(TAG, "WiFi OTA 中，拒绝 BLE 连接 handle=%d",
+                           event->connect.conn_handle);
+                (void)ble_gap_terminate(event->connect.conn_handle,
+                                        BLE_ERR_REM_USER_CONN_TERM);
+                BleOta::instance().m_bleConnected = false;
+                return 0;
+            }
             // 连接成功
             BleOta::instance().m_bleConnected = true;
             BleOta::instance().m_connHandle   = event->connect.conn_handle;
@@ -1673,6 +1692,13 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
         BleOta::instance().m_bleConnected = false;
         BleOta::instance().m_connHandle   = BLE_HS_CONN_HANDLE_NONE;
         s_conn_fallback_requested = false;
+
+        /* WiFi OTA 软挂起期间：主动踢连触发的 disconnect 不得 abort WiFi OTA，也不得再开广播 */
+        if (BleOta::instance().isSuspendedForWifiOta()) {
+            DEBUG_INFO(TAG, "WiFi OTA 挂起中：忽略 BLE 断开对 OTA 状态的影响");
+            return 0;
+        }
+
         // ★ BLE 断开时恢复 WiFi 射频
         ble_ota_restore_wifi_ps();
 
@@ -1688,16 +1714,24 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
             if (cur == OTA_SYS_GD32_RELAYING || cur == OTA_SYS_ESP32_REBOOTING) {
                 DEBUG_WARN(TAG, "BLE 断开但 %s 进行中，保留状态等待自然结束",
                            OtaCoordinator::stateToString(cur));
-            } else {
-                if (cur == OTA_SYS_GD32_STORING) {
-                    DEBUG_WARN(TAG, "BLE 断开，中止未完成的 GD32 固件存储");
-                } else if (cur == OTA_SYS_ESP32_RECEIVING ||
-                           cur == OTA_SYS_ESP32_FINALIZING) {
-                    DEBUG_WARN(TAG, "BLE 断开，中止未完成的 ESP32 OTA");
+            } else if (cur == OTA_SYS_ESP32_RECEIVING ||
+                       cur == OTA_SYS_ESP32_FINALIZING ||
+                       cur == OTA_SYS_GD32_STORING) {
+                /* 仅当当前 OTA 通道是 BLE 时才因断连中止；WiFi 通道的 RECEIVING 不能被误杀 */
+                ota_channel_t ch = OTA_CHANNEL_WIFI;
+                {
+                    /* get channel via snapshot if available */
+                    OtaSnapshot snap = OtaCoordinator::instance().getSnapshot();
+                    ch = snap.channel;
                 }
-                // ble_ota_session_reset() 统一负责 abortCurrent + core.abort 兜底 +
-                // 会话状态复位（m_esp32LastSeq/m_esp32LastCmd/m_esp32RebootPending/
-                // reorder/s_gd32_ooo_count）
+                if (ch == OTA_CHANNEL_BLE) {
+                    DEBUG_WARN(TAG, "BLE 断开，中止 BLE 通道 OTA (state=%s)",
+                               OtaCoordinator::stateToString(cur));
+                    ble_ota_session_reset();
+                } else {
+                    DEBUG_INFO(TAG, "BLE 断开但当前为 WiFi OTA，不中止会话");
+                }
+            } else {
                 ble_ota_session_reset();
             }
         }
@@ -1706,6 +1740,9 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
+        if (BleOta::instance().isSuspendedForWifiOta()) {
+            return 0; /* WiFi OTA 中不要自动再开广播 */
+        }
         DEBUG_INFO(TAG, "广播周期结束，重新开始");
         ble_ota_start_advertising();
         return 0;
@@ -1750,6 +1787,11 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
  */
 static void ble_ota_start_advertising(void)  // kept as free function for BLE callback compatibility
 {
+    if (BleOta::instance().isSuspendedForWifiOta()) {
+        DEBUG_DBG(TAG, "WiFi OTA 挂起中，跳过广播");
+        return;
+    }
+
     int rc;
 
     // 自动推断可用地址类型（优先 Public，不可用则生成 Random）
@@ -1886,6 +1928,11 @@ esp_err_t BleOta::serverStart()
 {
     int rc;
 
+    if (m_stackRunning) {
+        DEBUG_INFO(TAG, "serverStart: 栈已在运行，跳过");
+        return ESP_OK;
+    }
+
     DEBUG_INFO(TAG, "=== 初始化 BLE OTA GATT 服务器 ===");
     DEBUG_INFO(TAG, "  Device: %s", BLE_DEVICE_NAME);
     DEBUG_INFO(TAG, "  MTU:    %" PRIu16, BLE_MTU_SIZE);
@@ -1935,7 +1982,77 @@ esp_err_t BleOta::serverStart()
     nimble_port_freertos_init(ble_ota_nimble_host_task);
 
     // s_data_out_val_handle 由 on_sync 回调填充，此处不复制
+    BleOta::instance().m_stackRunning = true;
+    BleOta::instance().m_suspendedForWifiOta = false;
     DEBUG_INFO(TAG, "BLE OTA 服务器初始化完成");
+    return ESP_OK;
+}
+
+esp_err_t BleOta::suspendStack()
+{
+    /*
+     * ★ 软挂起 only（ESP32-C3 WiFi/BLE 共用射频）。
+     * 禁止在此调用 nimble_port_stop / deinit / controller_disable：
+     *   - 会从 httpd 任务阻塞甚至打挂 WiFi，表现为「一点击上传就失联」；
+     *   - C3 上 deinit BT 控制器与 WiFi 共存状态机冲突。
+     * 软挂起：停广播、断连、拒收新数据，NimBLE host 仍跑、WiFi 不受影响。
+     */
+    if (m_suspendedForWifiOta) {
+        DEBUG_DBG(TAG, "suspendStack: 已挂起，跳过");
+        return ESP_OK;
+    }
+
+
+    if (m_stackRunning) {
+        (void)ble_gap_adv_stop();
+        if (m_bleConnected && m_connHandle != 0xFFFFU) {
+            (void)ble_gap_terminate(m_connHandle, BLE_ERR_REM_USER_CONN_TERM);
+            /* 短等即可，勿长时间阻塞 httpd */
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+    }
+
+    m_bleConnected = false;
+    m_connHandle = 0xFFFFU;
+    /* 保持 m_bleReady / m_stackRunning：栈仍在，仅业务拒绝连接与写 */
+    m_suspendedForWifiOta = true;
+
+    if (s_otaDataQueue) {
+        BleOtaDataBatch drop;
+        while (xQueueReceive(s_otaDataQueue, &drop, 0) == pdTRUE) {
+            free(drop.data);
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t BleOta::resumeStack()
+{
+    if (!m_suspendedForWifiOta) {
+        return ESP_OK;
+    }
+
+    m_suspendedForWifiOta = false;
+
+    if (!m_stackRunning) {
+        /* 仅当历史上曾 hard-deinit 过才需要完整 serverStart */
+        DEBUG_INFO(TAG, "WiFi OTA 结束：BLE 栈未运行，尝试 serverStart free=%lu",
+                   (unsigned long)esp_get_free_heap_size());
+        esp_err_t err = serverStart();
+        if (err != ESP_OK) {
+            DEBUG_ERR(TAG, "resumeStack/serverStart 失败: %s", esp_err_to_name(err));
+            m_suspendedForWifiOta = true;
+            return err;
+        }
+        return ESP_OK;
+    }
+
+    /* 软挂起恢复：重新开广播即可 */
+    DEBUG_INFO(TAG, "WiFi OTA 结束：恢复 BLE 广播 free=%lu",
+               (unsigned long)esp_get_free_heap_size());
+    m_bleReady = true;
+    ble_ota_start_advertising();
     return ESP_OK;
 }
 

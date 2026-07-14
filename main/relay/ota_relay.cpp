@@ -50,6 +50,8 @@ static ota_result_t commonReject(relay_event_t e, bool allowHealth = false)
 static constexpr uint32_t kMaxResendOnNack        = 10U;  // ACK 失败/轮询耗尽重发上限
 static constexpr uint32_t kMaxResendOnStructError = 3U;   // 结构化错误重发上限
 static constexpr uint32_t kLastPacketAckSeq        = 0xF0F0F0F0U;  // 末包 ACK 序号约定
+// 10 秒无成功帧停刷：跨包级别的背压/卡死检测，比单包 15s 超时更早触发。
+static constexpr uint32_t kStallTimeoutMs = 8000U;
 
 // ============================================================
 // 静态成员定义
@@ -349,6 +351,17 @@ ota_result_t OtaRelay::handleTransferring(relay_event_t event, const uint8_t *pa
 
     DEBUG_INFO("OTA", "=== 阶段3: 数据包传输 (%" PRIu32 " 包) ===", m_transferTotalPackets);
 
+    /* 转发预算：自本阶段起算。正常 ~15ms/包，预算 40ms/包 + 20s 底（上限 120s）。 */
+    constexpr uint32_t kXferMinMs = 20U * 1000U;
+    constexpr uint32_t kXferMaxMs = 120U * 1000U;
+    constexpr uint32_t kXferPerPktMs = 40U;
+    uint32_t xfer_ms = kXferMinMs + m_transferTotalPackets * kXferPerPktMs;
+    if (xfer_ms > kXferMaxMs) {
+        xfer_ms = kXferMaxMs;
+    }
+    m_transferDeadline = xTaskGetTickCount() + pdMS_TO_TICKS(xfer_ms);
+    DEBUG_INFO("OTA", "转发超时预算: %" PRIu32 " ms (%" PRIu32 " 包)", xfer_ms, m_transferTotalPackets);
+
     ota_result_t res = doRelayPackets(m_transferDeadline);
     if (res != OTA_RESULT_OK) {
         setState(RELAY_ERROR);
@@ -437,6 +450,9 @@ ota_result_t OtaRelay::forwardFirmware()
 
     DEBUG_INFO("OTA", "开始固件转发: %" PRIu32 " 字节", meta.total_size);
 
+    /* 中继全程禁止 worker 把 OTA ACK/WAIT 当 EVENT 偷读 */
+    SpiMaster::instance().setSuppressRingService(true);
+
     // 固件完整性校验
     {
         esp_err_t verify_err = Gd32FlashStore::instance().metaVerifyChecksum();
@@ -447,16 +463,10 @@ ota_result_t OtaRelay::forwardFirmware()
         }
     }
 
-    // 全局超时计算
-    constexpr uint32_t kMinGlobalTimeoutMs = 20U * 1000U;        // 20 s 最小超时
-    constexpr uint32_t kMaxGlobalTimeoutMs = 60U * 1000U;        // 60 s 硬上限
-    uint32_t dynamic_ms = kMinGlobalTimeoutMs + (meta.total_size / 1024U) * 50U;  // 50 ms / KB
-    uint32_t global_timeout_ms = (dynamic_ms > kMaxGlobalTimeoutMs) ? kMaxGlobalTimeoutMs : dynamic_ms;
-    TickType_t start_tick = xTaskGetTickCount();
-    m_transferDeadline = start_tick + pdMS_TO_TICKS(global_timeout_ms);
-
-    DEBUG_INFO("OTA", "全局超时: %" PRIu32 " ms, start_tick=%" PRIu32 ", deadline tick=%" PRIu32,
-               global_timeout_ms, (uint32_t)start_tick, (uint32_t)m_transferDeadline);
+    /* 全局 deadline 在进入 TRANSFERRING 时才启动（见 handleTransferring）。
+     * 握手 + Boot 擦 Flash（SIZE 阶段长时间 WAIT）不得占用转发预算，
+     * 否则 1117 包会在擦除后仅剩十余秒被“全局超时”误杀。 */
+    m_transferDeadline = 0;
 
     // ── 驱动状态机 ──
     // 5 步顺序推进：IDLE → HANDSHAKING → SIZE_NEG → TRANSFERRING → FINISHING → DONE
@@ -475,6 +485,9 @@ ota_result_t OtaRelay::forwardFirmware()
     if (res != OTA_RESULT_OK) {
         DEBUG_ERR("OTA", "中继失败: result=%d, state=%d", (int)res, (int)getState());
         reset();
+    } else {
+        /* 成功路径：解除按铃抑制（reset 也会做，成功时状态机可能停在 DONE） */
+        SpiMaster::instance().setSuppressRingService(false);
     }
     return res;
 }
@@ -498,6 +511,7 @@ void OtaRelay::reset()
     memset(m_kSession, 0, sizeof(m_kSession));
     memset(m_nonceServer, 0, sizeof(m_nonceServer));
     memset(m_gd32UidRuntime, 0, sizeof(m_gd32UidRuntime));
+    SpiMaster::instance().setSuppressRingService(false);
     DEBUG_INFO("OTA", "状态机已复位 → IDLE");
 }
 
@@ -977,6 +991,7 @@ ota_result_t OtaRelay::doSendFirmwareSize(uint32_t size)
         return OTA_RESULT_ERR_TIMEOUT;
     }
 
+    SpiMaster::instance().confirmTxSeqAccepted();
     DEBUG_INFO("OTA", "大小协商完成: %" PRIu32 " 字节，GD32 已就绪收包", size);
     return OTA_RESULT_OK;
 }
@@ -1034,162 +1049,111 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
     uint8_t resp_type = 0;
     uint8_t resp_payload[32] = {0};
     size_t resp_len = 0;
-    uint32_t retry_count = 0;
-    ota_result_t result = OTA_RESULT_OK;
-    bool got_expected_credit_ok = false;
     const uint32_t expected_ack = (seq == m_transferTotalPackets - 1) ? kLastPacketAckSeq : (seq + 1U);
+    /*
+     * 协议要点：
+     * - GD32 ISR 收 DATA 后立刻回 WAIT，主循环 AES/Flash 后再 ACK。
+     * - 一旦见过 WAIT，说明包已进从机；再发 DATA = DUP-SEQ，只会反复 WAIT。
+     * - 因此：见 WAIT 后只 poll；仅「完全无响应」才允许重发 DATA。
+     */
+    constexpr uint32_t kMaxDataSends = 3U;
+    constexpr uint32_t kAckWaitMs = 6000U;   /* 单次发送后等 ACK 上限（覆盖 GD32 增量 drain） */
+    constexpr uint32_t kPollSliceMs = 80U;
 
-    // ★ 单包耗时统计，用于定位 OTA 速度瓶颈。
     TickType_t pkt_start = xTaskGetTickCount();
-    /* 单包硬超时：避免重试环 + WAIT/CREDIT 轮询在异常时“静默卡死”十几分钟。 */
-    const TickType_t pkt_deadline = pkt_start + pdMS_TO_TICKS(15000);
-    TickType_t last_stall_log = pkt_start;
+    bool saw_wait = false;
 
-    // 注意：goto resend_packet 保持原有语义，仅作用范围缩小到本 helper。
-    // 完全去除 goto 需配合 GD32 全链路 OTA 回归验证后再进行。
-resend_packet:
-    while (1) {
-        if (xTaskGetTickCount() >= pkt_deadline) {
-            DEBUG_ERR("OTA", "包 %" PRIu32 " 单包超时(15s), retries=%" PRIu32 " credit=%u",
-                      seq, retry_count, (unsigned)SpiMaster::instance().remoteCredit());
-            result = OTA_RESULT_ERR_TIMEOUT;
-            break;
-        }
-        if ((xTaskGetTickCount() - last_stall_log) >= pdMS_TO_TICKS(2000)) {
-            DEBUG_INFO("OTA", "包 %" PRIu32 " 仍在等待 ACK (retry=%" PRIu32 " credit=%u)",
-                       seq, retry_count, (unsigned)SpiMaster::instance().remoteCredit());
-            last_stall_log = xTaskGetTickCount();
-        }
-
-        resp_len = 0;
-        esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_DATA, tx_buf, 64,
-                              &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
-        logRespPayload("DATA_PACKET", resp_type, resp_payload, resp_len);
-        if (err == ESP_OK) {
-            /* WAIT 常见于 GD32 主循环 AES/写 Flash：多轮 poll，勿过早放弃。 */
-            err = waitUntilNotWait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 200, 40);
-        }
-        if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
-            DEBUG_WARN("OTA", "数据包 %" PRIu32 " 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu", seq, err, resp_type, resp_len);
-            if (++retry_count >= kMaxResendOnNack) {
-                DEBUG_ERR("OTA", "包 %" PRIu32 " 重发次数超限", seq);
-                result = OTA_RESULT_ERR_TIMEOUT;
-                break;
+    for (uint32_t send_i = 0; send_i < kMaxDataSends; ++send_i) {
+        /* 已见 WAIT：禁止再发 DATA，只延长 poll */
+        if (saw_wait && send_i > 0U) {
+            DEBUG_INFO("OTA", "包 %" PRIu32 " 已见 WAIT，继续 poll 不重发", seq);
+        } else {
+            resp_len = 0;
+            resp_type = 0;
+            esp_err_t err = SpiMaster::instance().otaTransfer(
+                SPI_OTA_CMD_DATA, tx_buf, 64,
+                &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1200);
+            logRespPayload("DATA_PACKET", resp_type, resp_payload, resp_len);
+            if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
+                saw_wait = true;
             }
-            vTaskDelay(pdMS_TO_TICKS(2));
-            continue;  // 重发本包
-        }
-
-        if (!isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
-            uint32_t err_seq = 0;
-            uint8_t err_code = 0;
-            if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code)) {
-                if (err_seq == seq) {
-                    DEBUG_WARN("OTA", "包 %" PRIu32 " 收到结构化错误 err=0x%02X，准备重发", seq, err_code);
-                    if (++retry_count >= kMaxResendOnStructError) {
-                        DEBUG_ERR("OTA", "包 %" PRIu32 " 重发次数超限", seq);
-                        result = (err_code == 0x04U) ? OTA_RESULT_ERR_CRC : OTA_RESULT_ERR_GD32;
-                        break;
-                    }
-                    continue;
-                }
-            }
-
-            /* CREDIT 感知：GD32 写 Flash / DATA 队列满时 CREDIT=0，耐心 POLL。 */
-            if (SpiMaster::instance().remoteCredit() == 0U) {
-                DEBUG_INFO("OTA", "包 %" PRIu32 " GD32 CREDIT=0，等待恢复...", seq);
-                for (uint32_t cw = 0; cw < 100U; ++cw) {
-                    if (xTaskGetTickCount() >= pkt_deadline) {
-                        break;
-                    }
-                    err = SpiMaster::instance().otaPollResponse(&resp_type, resp_payload,
-                                                                sizeof(resp_payload), &resp_len, 100);
-                    if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK &&
-                        isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
-                        got_expected_credit_ok = true;
-                        break;
-                    }
-                    if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
-                        continue;
-                    }
-                    if (err == ESP_OK && SpiMaster::instance().remoteCredit() > 0U) {
-                        break;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(2));
-                }
-            }
-
-            bool got_expected = false;
-            if (got_expected_credit_ok) {
+            if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK &&
+                isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
+                SpiMaster::instance().confirmTxSeqAccepted();
                 m_transferFlashOffset += (uint32_t)chunk_size;
-                break;
+                if (seq < 5U || (seq % 10U) == 0U || seq + 1U == m_transferTotalPackets) {
+                    DEBUG_INFO("OTA", "转发进度 %" PRIu32 "/%" PRIu32,
+                               seq + 1U, m_transferTotalPackets);
+                }
+                return false;
             }
-            for (uint32_t retry = 0; retry < 10; ++retry) {
-                DEBUG_DBG("OTA", "包 %" PRIu32 " 收到非目标ACK(seq不匹配)，继续轮询(%" PRIu32 "/5)...", seq, retry + 1);
-                err = SpiMaster::instance().otaPollResponse(&resp_type, resp_payload, sizeof(resp_payload), &resp_len, 2000);
-                if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
-                    err = waitUntilNotWait("DATA_PACKET", &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 100, 5);
-                }
-                if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK) {
-                    DEBUG_WARN("OTA", "包 %" PRIu32 " poll 超时/非ACK，重发 (retry=%" PRIu32 "/3)", seq, retry_count + 1);
-                    if (++retry_count >= kMaxResendOnStructError) {
-                        DEBUG_ERR("OTA", "包 %" PRIu32 " 重发次数超限", seq);
-                        result = OTA_RESULT_ERR_GD32;
-                        break;
-                    }
-                    // ★ resend 前延迟
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                    got_expected_credit_ok = false;
-                    goto resend_packet;
-                }
-                if (isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
-                    got_expected = true;
-                    break;
-                }
-                if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code) && err_seq == seq) {
-                    break;
-                }
+        }
+
+        const TickType_t poll_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(kAckWaitMs);
+        TickType_t last_hb = xTaskGetTickCount();
+        while (xTaskGetTickCount() < poll_deadline) {
+            if ((xTaskGetTickCount() - last_hb) >= pdMS_TO_TICKS(1000)) {
+                DEBUG_INFO("OTA", "包 %" PRIu32 " 等 ACK… send=%" PRIu32 " type=0x%02X wait=%d credit=%u",
+                           seq, send_i, resp_type, (int)saw_wait,
+                           (unsigned)SpiMaster::instance().remoteCredit());
+                last_hb = xTaskGetTickCount();
             }
 
-            if (got_expected) {
-                m_transferFlashOffset += (uint32_t)chunk_size;
-                break;
-            }
+            esp_err_t err = SpiMaster::instance().otaPollResponse(
+                &resp_type, resp_payload, sizeof(resp_payload), &resp_len, kPollSliceMs);
 
-            if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code) && err_seq == seq) {
-                DEBUG_WARN("OTA", "包 %" PRIu32 " 收到结构化错误 err=0x%02X，准备重发", seq, err_code);
-                if (++retry_count >= kMaxResendOnNack) {
-                    DEBUG_ERR("OTA", "包 %" PRIu32 " 重发次数超限", seq);
-                    result = (err_code == 0x04U) ? OTA_RESULT_ERR_CRC : OTA_RESULT_ERR_GD32;
-                    break;
-                }
+            if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
+                saw_wait = true;
                 continue;
             }
-
-            DEBUG_WARN("OTA", "包 %" PRIu32 " 轮询耗尽未匹配，重发 (retry=%" PRIu32 "/10)", seq, retry_count + 1);
-            if (++retry_count >= kMaxResendOnNack) {
-                DEBUG_ERR("OTA", "包 %" PRIu32 " 重发次数超限", seq);
-                result = OTA_RESULT_ERR_GD32;
-                break;
+            if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK) {
+                if (isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
+                    SpiMaster::instance().confirmTxSeqAccepted();
+                    m_transferFlashOffset += (uint32_t)chunk_size;
+                    if (seq < 5U || (seq % 10U) == 0U || seq + 1U == m_transferTotalPackets) {
+                        DEBUG_INFO("OTA", "转发进度 %" PRIu32 "/%" PRIu32,
+                                   seq + 1U, m_transferTotalPackets);
+                    }
+                    return false;
+                }
+                uint32_t err_seq = 0;
+                uint8_t err_code = 0;
+                if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code) &&
+                    err_seq == seq) {
+                    DEBUG_WARN("OTA", "包 %" PRIu32 " 结构化错误 err=0x%02X", seq, err_code);
+                    if (err_code == 0x04U) {
+                        *out_result = OTA_RESULT_ERR_CRC;
+                        return true;
+                    }
+                    saw_wait = false; /* 允许带错误码的重发 */
+                    break;
+                }
+                /* 陈旧 ACK，继续 poll */
             }
-            // ★ resend 前延迟：给 GD32 时间处理上一包并更新 SPI 响应缓冲区
-            vTaskDelay(pdMS_TO_TICKS(1));
-            goto resend_packet;
         }
 
-        m_transferFlashOffset += (uint32_t)chunk_size;
-        break;
+        /* 超时：仅当从未见 WAIT 时才重发 DATA；见过 WAIT 则再 poll 一轮 */
+        if (saw_wait) {
+            if (send_i + 1U >= kMaxDataSends) {
+                break;
+            }
+            /* 把下一轮当作「只 poll」：send_i 增加但 saw_wait 使跳过 transfer */
+            continue;
+        }
+        if (send_i + 1U < kMaxDataSends) {
+            DEBUG_WARN("OTA", "包 %" PRIu32 " 无 WAIT/ACK，重发 DATA (%" PRIu32 "/%" PRIu32 ")",
+                       seq, send_i + 1U, kMaxDataSends);
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
     }
 
-    TickType_t pkt_elapsed = xTaskGetTickCount() - pkt_start;
-    DEBUG_DBG("OTA", "包 %" PRIu32 " 完成: elapsed=%" PRIu32 " ms, retries=%" PRIu32, seq,
-              (uint32_t)(pkt_elapsed * portTICK_PERIOD_MS), retry_count);
-
-    if (result != OTA_RESULT_OK) {
-        *out_result = result;
-        return true;  // 中止外层循环
-    }
-    return false;  // 继续下一包
+    DEBUG_ERR("OTA", "包 %" PRIu32 " 失败 (elapsed=%" PRIu32 " ms credit=%u type=0x%02X saw_wait=%d)",
+              seq,
+              (uint32_t)((xTaskGetTickCount() - pkt_start) * portTICK_PERIOD_MS),
+              (unsigned)SpiMaster::instance().remoteCredit(),
+              resp_type, (int)saw_wait);
+    *out_result = OTA_RESULT_ERR_TIMEOUT;
+    return true;
 }
 
 ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
@@ -1202,6 +1166,7 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
 
     uint8_t tx_buf[64] = {0};
     ota_result_t result = OTA_RESULT_OK;
+    TickType_t last_success_tick = xTaskGetTickCount();
 
     for (uint32_t seq = 0; seq < m_transferTotalPackets; seq++) {
         // 健康检查（每 OTA_PACKET_HEALTH_CHECK_INTERVAL 包 + 首末包）
@@ -1219,35 +1184,31 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
             return OTA_RESULT_ERR_USER_ABORT;
         }
 
-        // 准备单包：读 Flash + 加密 + 组装
+        // 停刷检测：自上一包成功 ACK 起超过 kStallTimeoutMs 则中止
+        if ((xTaskGetTickCount() - last_success_tick) >= pdMS_TO_TICKS(kStallTimeoutMs)) {
+            DEBUG_ERR("OTA", "10 秒无成功帧, 中止转发: seq=%" PRIu32 "/%" PRIu32, seq, m_transferTotalPackets);
+            return OTA_RESULT_ERR_TIMEOUT;
+        }
         size_t chunk_size = 0;
         result = prepareRelayPacket(seq, meta, tx_buf, &chunk_size);
         if (result != OTA_RESULT_OK) {
             return result;
         }
 
+        /* 先写入「正在发第 N 包」，前端 /system/status 能看到卡在哪 */
+        setRelaySeq(seq);
+
         // 发送单包并等待 ACK（内含重试循环）
         if (sendRelayPacketWithRetry(seq, tx_buf, chunk_size, &result)) {
+            DEBUG_ERR("OTA", "中止于包 %" PRIu32 "/%" PRIu32 " result=%d",
+                      seq, m_transferTotalPackets, (int)result);
             return result;  // 中止
         }
 
         setRelaySeq(seq + 1);
-        // 进度只写 relay_seq 供 /system/status；不打文字日志（前端进度条负责展示）。
-
-        // ★ 包间延迟：给 GD32 写 Flash + 让低优先级 httpd 能应答 /system/status。
-        //   ota_relay 优先级高于 wifi_ota：若不主动让出，前端只能看到 SIZE→完成，中间全跳过。
-        if (seq < m_transferTotalPackets - 1) {
-            uint32_t gap_ms = CONFIG_DCU_OTA_PACKET_INTERVAL_MS;
-            if (gap_ms < 1U) {
-                gap_ms = 1U;
-            }
-            /* 每 16 包额外让出 15ms，保证 status/logs 轮询有机会跑 */
-            if (((seq + 1U) % 16U) == 0U) {
-                gap_ms = (gap_ms > 15U) ? gap_ms : 15U;
-            }
-            vTaskDelay(pdMS_TO_TICKS(gap_ms));
-        }
+        last_success_tick = xTaskGetTickCount();
     }
+    DEBUG_INFO("OTA", "全部数据包已转发: %" PRIu32 " 包", m_transferTotalPackets);
     return result;
 }
 
@@ -1301,7 +1262,7 @@ ota_result_t OtaRelay::doSendFinishOta()
         logRespPayload("FINISH_OTA", resp_type, resp_payload, resp_len);
         if (err != ESP_OK) {
             DEBUG_WARN("OTA", "FINISH_OTA 传输失败, err=%d, retry=%" PRIu32 "/10", err, retry + 1);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
@@ -1310,7 +1271,7 @@ ota_result_t OtaRelay::doSendFinishOta()
                                             1000, 10, 8, OtaRelay::isFinishPlainAck);
         if (err != ESP_OK) {
             DEBUG_WARN("OTA", "FINISH_OTA poll 失败, err=%d, retry=%" PRIu32 "/10", err, retry + 1);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
@@ -1320,7 +1281,7 @@ ota_result_t OtaRelay::doSendFinishOta()
 
         if (resp_type == SPI_OTA_RSP_WAIT) {
             DEBUG_INFO("OTA", "FINISH_OTA 收到 WAIT, GD32 正在排空 Flash 缓冲, retry=%" PRIu32 "/10", retry + 1);
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
@@ -1328,13 +1289,13 @@ ota_result_t OtaRelay::doSendFinishOta()
         uint8_t err_code = 0;
         if (parseStructuredError(resp_payload, resp_len, &err_seq, &err_code)) {
             DEBUG_ERR("OTA", "FINISH_OTA 收到错误帧 err=0x%02X, retry=%" PRIu32 "/10", err_code, retry + 1);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
         DEBUG_WARN("OTA", "FINISH_OTA 响应异常, resp_type=0x%02X, resp_len=%zu, retry=%" PRIu32 "/10",
                    resp_type, resp_len, retry + 1);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     if (resp_type != SPI_OTA_RSP_ACK || !isFinishPlainAck(resp_payload, resp_len)) {
@@ -1351,8 +1312,24 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
     // ★ APP 存活验证
     setGd32AppAlive(false);
 
+    // GD32 刚跳转到新 APP，SPI v2 session_id 已重置为 0。
+    // 必须先 hello() 建立新 session，否则 appPing 的帧被 otaFindFrame
+    // 以 SESSION mismatch 拒绝（旧 session_id vs 新 APP session_id=0）。
+    bool session_established = false;
+
     for (uint32_t attempt = 0; attempt < 10; ++attempt) {
         vTaskDelay(pdMS_TO_TICKS(500));
+
+        if (!session_established) {
+            esp_err_t hr = SpiMaster::instance().hello(1500U, V2_ROLE_APP);
+            if (hr == ESP_OK) {
+                session_established = true;
+            } else {
+                DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/10)", attempt + 1);
+                continue;
+            }
+        }
+
         if (probeAndCacheAppAlive(timeout_ms)) {
             break;
         }

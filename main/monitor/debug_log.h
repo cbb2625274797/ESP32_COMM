@@ -99,13 +99,24 @@ private:
     //   m_uartInitialized 仅表示曾尝试初始化，m_uartAvailable 才是写日志的判据。
     bool m_uartAvailable = false;
 
+    /* 环形日志：OTA 中继期需保留关键 INFO，64×160≈10KB BSS。 */
     static constexpr int LOG_RING_SLOTS = 64;
-    static constexpr int LOG_RING_SIZE  = 256;
+    static constexpr int LOG_RING_SIZE  = 160;
     char  m_logRing[LOG_RING_SLOTS][LOG_RING_SIZE];
     int   m_logRingLens[LOG_RING_SLOTS];
     int   m_logRingHead  = 0;
     int   m_logRingCount = 0;
     SemaphoreHandle_t m_logRingMutex = NULL;
+
+    /* 堆门控（防 OTA 时 UDP/格式化抢 LWIP 堆）：
+     * free < kDropWarnFree → 非 OTA/SPI 只保留 ERR
+     * free < kDropInfoFree → 非 OTA/SPI 丢 INFO/DBG（OTA/SPI 的 INFO 仍进 ring）
+     * free < kSkipUdpFree  → 不 sendto（仍 UART+ring）
+     * free < kDrainMinFree → /logs 尽量仍返回 ring（降低门槛，避免“沉默失败”） */
+    static constexpr uint32_t kDropWarnFree = 6U * 1024U;
+    static constexpr uint32_t kDropInfoFree = 10U * 1024U;
+    static constexpr uint32_t kSkipUdpFree  = 10U * 1024U;
+    static constexpr uint32_t kDrainMinFree = 8U * 1024U;
 
     esp_err_t ensureUdpSocket();
     void ringPush(const char *data, int len);

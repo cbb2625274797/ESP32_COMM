@@ -213,14 +213,17 @@ esp_err_t Esp32OtaCore::write(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* sequential 模式写时可能触发扇区擦除，喂狗防 WDT */
+    /* sequential 模式写时可能触发扇区擦除（禁 cache），期间 WiFi 易饿死。
+     * 写后 yield 一次即可；写前再 yield 会无谓拖慢吞吐（httpd 侧另有堆感知 pacing）。 */
     (void)esp_task_wdt_reset();
     esp_err_t err = esp_ota_write(m_handle, data, len);
+    taskYIELD();
     if (err == ESP_OK) {
         m_received += len;
     } else {
-        DEBUG_ERR(TAG, "esp_ota_write 失败: %s (len=%u offset=%u)",
-                  esp_err_to_name(err), (unsigned)len, (unsigned)m_received);
+        DEBUG_ERR(TAG, "esp_ota_write 失败: %s (len=%u offset=%u free=%lu)",
+                  esp_err_to_name(err), (unsigned)len, (unsigned)m_received,
+                  (unsigned long)esp_get_free_heap_size());
     }
     return err;
 }
@@ -433,7 +436,7 @@ bool Esp32OtaCore::forceCleanup()
     if (!s_mutex) return false;
 
     // 在互斥保护下检查 s_occupied
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
     bool was_occupied = s_occupied;
     if (was_occupied) {
