@@ -43,12 +43,15 @@ typedef struct {
  * @param recv_buf 接收数据缓冲区（可为 nullptr）。
  * @param recv_max 接收缓冲区最大长度。
  * @param timeout_ms 超时时间（毫秒）。
- * @return 成功时返回接收数据长度，失败返回 -1。
+ * @param gd32_err_out 可选输出，GD32 返回的细分错误码（0xE0/0xE1/0xE2/0xE3/0xE4/0xE5）；
+ *                     仅在返回 -3 时有效，其它情况清零。可为 nullptr。
+ * @return 成功时返回接收数据长度，失败返回 -1/-2/-3。
  */
 int canFdSend(can_channel_t channel, uint32_t ext_id,
               const uint8_t *data, uint8_t dlc,
               uint8_t *recv_buf, uint8_t recv_max,
-              uint32_t timeout_ms);
+              uint32_t timeout_ms,
+              uint8_t *gd32_err_out = nullptr);
 
 // ============================================================
 // 不重复 ID 快照表（SPI 0xC3 协议配套）

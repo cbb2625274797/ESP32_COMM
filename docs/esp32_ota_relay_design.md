@@ -1,5 +1,13 @@
 # ESP32-C3FH4 OTA 中继架构设计
 
+> **⚠️ v1 已废弃**（2026-07-14 标注）
+>
+> 本文档描述的是 v1 OTA 中继设计（旧帧格式 0xEB/6B/CRC16、旧引脚 GPIO6-9、旧命令 0xF0-0xF7），
+> 与当前代码实现不符。当前 SPI 通信协议以 **`SPEC/spi_link_v2.md`** 为单一权威来源
+> （SPI Link v2：16B 头帧、SESSION/SEQ/CREDIT、5-wire SPI、HELLO 握手）。
+>
+> 本文档保留作历史参考，不再维护。所有新代码与文档改动请参照 SPEC。
+
 ## 1. 系统概述
 
 ```

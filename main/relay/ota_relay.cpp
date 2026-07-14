@@ -856,9 +856,9 @@ ota_result_t OtaRelay::doHandshakeReq(uint32_t attempts)
                        esp_err_to_name(hr), SpiMaster::instance().gd32Role());
         }
 
-        /* otaTransfer 已含延迟一拍两步法；再经 pollUntil 处理 WAIT/陈旧 ACK。 */
+        /* transact 已含延迟一拍两步法；再经 pollUntil 处理 WAIT/陈旧 ACK。 */
         const uint32_t total_timeout_ms = kHandshakeReqTimeoutMs + kHandshakePollTimeoutMs;
-        esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_REQ, payload, sizeof(payload),
+        esp_err_t err = SpiMaster::instance().transact(SPI_OTA_CMD_REQ, payload, sizeof(payload),
                                          &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
                                          total_timeout_ms);
         last_err = err;
@@ -906,7 +906,7 @@ ota_result_t OtaRelay::doChallengeAndAuth()
     DEBUG_INFO("OTA", "--- 认证步骤 1: 发送 CHALLENGE ---");
     DEBUG_INFO("OTA", "发送 nonce_server (16B), timestamp=0x%08" PRIX32, timestamp);
 
-    esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_REQ, m_nonceServer, 16,
+    esp_err_t err = SpiMaster::instance().transact(SPI_OTA_CMD_REQ, m_nonceServer, 16,
                                      &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 5000);
     logRespPayload("CHALLENGE", resp_type, resp_payload, resp_len);
     err = pollUntilExpectedAckShape("CHALLENGE", &resp_type, resp_payload,
@@ -937,7 +937,7 @@ ota_result_t OtaRelay::doChallengeAndAuth()
     DEBUG_INFO("OTA", "--- 认证步骤 2: 发送 SESSION_KEY/CONFIRM ---");
 
     resp_len = 0;
-    err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_REQ, encrypted_confirm, 16,
+    err = SpiMaster::instance().transact(SPI_OTA_CMD_REQ, encrypted_confirm, 16,
                            &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
     logRespPayload("CONFIRM", resp_type, resp_payload, resp_len);
     err = pollUntilExpectedAckShape("CONFIRM", &resp_type, resp_payload,
@@ -976,7 +976,7 @@ ota_result_t OtaRelay::doSendFirmwareSize(uint32_t size)
     size_payload[2] = (uint8_t)((size >> 16) & 0xFF);
     size_payload[3] = (uint8_t)((size >> 24) & 0xFF);
 
-    esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_DATA, size_payload, sizeof(size_payload),
+    esp_err_t err = SpiMaster::instance().transact(SPI_OTA_CMD_DATA, size_payload, sizeof(size_payload),
                                      &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
     logRespPayload("SEND_SIZE", resp_type, resp_payload, resp_len);
     /* GD32 收到 SIZE 后擦 Flash，先 WAIT 再 ACK(seq=0)；进度由前端读 status，不打过程 INFO */
@@ -1070,7 +1070,7 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
         } else {
             resp_len = 0;
             resp_type = 0;
-            esp_err_t err = SpiMaster::instance().otaTransfer(
+            esp_err_t err = SpiMaster::instance().transact(
                 SPI_OTA_CMD_DATA, tx_buf, 64,
                 &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1200);
             logRespPayload("DATA_PACKET", resp_type, resp_payload, resp_len);
@@ -1081,10 +1081,6 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
                 isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
                 SpiMaster::instance().confirmTxSeqAccepted();
                 m_transferFlashOffset += (uint32_t)chunk_size;
-                if (seq < 5U || (seq % 10U) == 0U || seq + 1U == m_transferTotalPackets) {
-                    DEBUG_INFO("OTA", "转发进度 %" PRIu32 "/%" PRIu32,
-                               seq + 1U, m_transferTotalPackets);
-                }
                 return false;
             }
         }
@@ -1110,10 +1106,6 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
                 if (isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
                     SpiMaster::instance().confirmTxSeqAccepted();
                     m_transferFlashOffset += (uint32_t)chunk_size;
-                    if (seq < 5U || (seq % 10U) == 0U || seq + 1U == m_transferTotalPackets) {
-                        DEBUG_INFO("OTA", "转发进度 %" PRIu32 "/%" PRIu32,
-                                   seq + 1U, m_transferTotalPackets);
-                    }
                     return false;
                 }
                 uint32_t err_seq = 0;
@@ -1256,7 +1248,7 @@ ota_result_t OtaRelay::doSendFinishOta()
         resp_len = 0;
         memset(resp_payload, 0, sizeof(resp_payload));
 
-        esp_err_t err = SpiMaster::instance().otaTransfer(SPI_OTA_CMD_DATA, finish_payload, sizeof(finish_payload),
+        esp_err_t err = SpiMaster::instance().transact(SPI_OTA_CMD_DATA, finish_payload, sizeof(finish_payload),
                                          &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
                                          CONFIG_DCU_OTA_FINISH_TIMEOUT_MS);
         logRespPayload("FINISH_OTA", resp_type, resp_payload, resp_len);
@@ -1317,15 +1309,18 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
     // 以 SESSION mismatch 拒绝（旧 session_id vs 新 APP session_id=0）。
     bool session_established = false;
 
-    for (uint32_t attempt = 0; attempt < 10; ++attempt) {
-        vTaskDelay(pdMS_TO_TICKS(500));
+    /* APP 完整初始化（含 EthercatSlave::init）需 5-6 秒，偶发 >10 秒。
+     * 增加重试次数到 20、缩短延迟到 300ms，总窗口 ~26 秒，
+     * APP 启动后最快 300ms 内检测到（原 500ms）。 */
+    for (uint32_t attempt = 0; attempt < 20; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(300));
 
         if (!session_established) {
             esp_err_t hr = SpiMaster::instance().hello(1500U, V2_ROLE_APP);
             if (hr == ESP_OK) {
                 session_established = true;
             } else {
-                DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/10)", attempt + 1);
+                DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
                 continue;
             }
         }
@@ -1333,7 +1328,7 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
         if (probeAndCacheAppAlive(timeout_ms)) {
             break;
         }
-        DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/10)", attempt + 1);
+        DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
     }
 
     if (!getGd32AppAlive()) {

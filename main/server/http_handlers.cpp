@@ -776,8 +776,9 @@ esp_err_t can_send_handler(httpd_req_t *req)
     cJSON_Delete(root);
 
     uint8_t resp_data[CAN_MAX_DLC] = {0};
+    uint8_t gd32_err = 0U;
     int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
-                                   resp_data, sizeof(resp_data), 2000);
+                             resp_data, sizeof(resp_data), 2000, &gd32_err);
 
     char resp[512];
     if (resp_len >= 0) {
@@ -790,7 +791,8 @@ esp_err_t can_send_handler(httpd_req_t *req)
             ch, (unsigned long)ext_id, tx_dlc, resp_len, resp_hex);
     } else {
         snprintf(resp, sizeof(resp),
-            "{\"status\": \"error\", \"code\": %d}", resp_len);
+            "{\"status\": \"error\", \"code\": %d, \"gd32_err\": %u}",
+            resp_len, (unsigned)gd32_err);
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -878,7 +880,7 @@ esp_err_t spi_send_handler(httpd_req_t *req)
 static constexpr uint32_t INTERNAL_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 /* 状态 JSON 用静态缓冲：OTA 后 largest free 常 <2KB，calloc(8KB) 会 500 "no memory"。 */
 static constexpr size_t SYSTEM_STATUS_JSON_CAP = 6144;
-static constexpr size_t CPU_TASK_SNAPSHOT_MAX = 16;
+static constexpr size_t CPU_TASK_SNAPSHOT_MAX = 32;
 static char s_status_json[SYSTEM_STATUS_JSON_CAP];
 static SemaphoreHandle_t s_status_json_mux = nullptr;
 static portMUX_TYPE s_status_json_init_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -974,6 +976,8 @@ static void sample_cpu_usage(CpuUsageSnapshot& result)
     UBaseType_t captured_count = uxTaskGetSystemState(tasks, task_count, &total_runtime);
     int64_t now_us = esp_timer_get_time();
     if (captured_count == 0 || captured_count > task_count) {
+        DEBUG_WARN("STATUS", "CPU stats: uxTaskGetSystemState 返回 0 (actual_tasks=%lu, buf_slots=%lu)",
+                   (unsigned long)uxTaskGetNumberOfTasks(), (unsigned long)task_count);
         free(tasks);
         return;
     }
@@ -1036,6 +1040,15 @@ static void sample_cpu_usage(CpuUsageSnapshot& result)
         result.sample_ms = (uint32_t)((now_us - previous_time_us) / 1000);
         result.idle_pct = std::min(100.0, (double)idle_delta * 100.0 / (double)total_delta);
         result.usage_pct = std::max(0.0, 100.0 - result.idle_pct);
+    }
+
+    if (!result.valid) {
+        DEBUG_DBG("STATUS", "CPU stats: valid=false had_prev=%d total=%lu prev_total=%lu "
+                  "can_compute=%d delta=%lu captured=%lu",
+                  (int)had_previous,
+                  (unsigned long)total_runtime, (unsigned long)previous_total,
+                  (int)can_compute, (unsigned long)total_delta,
+                  (unsigned long)captured_count);
     }
 
     free(previous_samples);
@@ -1236,34 +1249,36 @@ esp_err_t system_status_handler(httpd_req_t *req)
 
     len = append_cpu_status_json(resp, SYSTEM_STATUS_JSON_CAP, len, *cpu);
 
-    /* SPI Link v2 统计（SPEC §12.1）— linkStats 用 5ms 有界超时取 SPI 锁，
+    /* SPI Link v2 统计（SPEC §12.1）— linkStatus 内部用 5ms 有界超时取 SPI 锁，
      * OTA 中继期间拿不到锁时返回零值统计，绝不阻塞 /system/status 响应。 */
     {
-        SpiMaster::SpiLinkStats ls = SpiMaster::instance().linkStats();
+        SpiMaster::SpiLinkStatus ls = SpiMaster::instance().linkStatus();
         const char *role_str = "unknown";
-        switch (SpiMaster::instance().gd32Role()) {
+        switch (ls.gd32_role) {
             case 1: role_str = "app"; break;
             case 2: role_str = "boot"; break;
             default: break;
         }
         len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len,
-            ",\"spi_link\":{\"version\":2,\"gd32_role\":\"%s\",\"session_id\":\"0x%08lX\","
-            "\"v2_active\":%s,\"remote_credit\":%u,"
+            ",\"spi_link\":{\"version\":%u,\"gd32_role\":\"%s\",\"session_id\":\"0x%08lX\","
+            "\"v2_active\":%s,\"local_credit\":%u,\"remote_credit\":%u,"
             "\"crc_errors\":%lu,\"duplicate_requests\":%lu,\"seq_errors\":%lu,"
             "\"retries\":%lu,\"ready_timeouts\":%lu,\"rx_overruns\":%lu,"
             "\"resyncs\":%lu,\"max_resp_latency_us\":%lu}",
+            (unsigned)ls.version,
             role_str,
-            (unsigned long)SpiMaster::instance().sessionId(),
+            (unsigned long)ls.session_id,
             SpiMaster::instance().v2Active() ? "true" : "false",
-            (unsigned)SpiMaster::instance().remoteCredit(),
-            (unsigned long)ls.crc_errors,
-            (unsigned long)ls.duplicate_requests,
-            (unsigned long)ls.seq_errors,
-            (unsigned long)ls.retries,
-            (unsigned long)ls.ready_timeouts,
-            (unsigned long)ls.rx_overruns,
-            (unsigned long)ls.resyncs,
-            (unsigned long)ls.max_resp_latency_us);
+            (unsigned)ls.local_credit,
+            (unsigned)ls.remote_credit,
+            (unsigned long)ls.stats.crc_errors,
+            (unsigned long)ls.stats.duplicate_requests,
+            (unsigned long)ls.stats.seq_errors,
+            (unsigned long)ls.stats.retries,
+            (unsigned long)ls.stats.ready_timeouts,
+            (unsigned long)ls.stats.rx_overruns,
+            (unsigned long)ls.stats.resyncs,
+            (unsigned long)ls.stats.max_resp_latency_us);
     }
 
     // 前导逗号与前一块分隔；之前因 append_cpu_status_json 尾随逗号叠加

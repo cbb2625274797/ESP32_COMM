@@ -20,7 +20,8 @@ ESP32-C3FH4 OTA 中继固件，作为 **GD32E508VET6** 的 OTA 升级桥梁。�
 |------|------|
 | **芯片** | ESP32-C3FH4 (RISC-V, 单核, 160MHz) |
 | **Flash** | 4MB |
-| **SPI 引脚** | MOSI=GPIO5, MISO=GPIO7, SCLK=GPIO6, CS=GPIO4 |
+| **SPI 引脚** | MOSI=GPIO5, MISO=GPIO7, SCLK=GPIO6, CS=GPIO4, DATA_READY=GPIO10（GD32 PB6 开漏输出，ESP32 仅输入） |
+| **SPI 拓扑** | 5-wire SPI（4 线 SPI + 1 DATA_READY 通知线），SPI Link v2 协议（详见 `SPEC/spi_link_v2.md`） |
 | **SPI 速率** | 4MHz, Mode 0 |
 | **UART 调试** | TX=GPIO21, RX=GPIO20, 115200 baud |
 | **编译工具链** | ESP-IDF v6.0, riscv32-esp-elf |

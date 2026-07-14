@@ -4,11 +4,11 @@
 // 固件版本
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 43
-#define FW_VERSION_STRING "0.3.43"
+#define FW_VERSION_PATCH 44
+#define FW_VERSION_STRING "0.3.44"
 
 // 编译时间
-#define BUILD_TIME "2026-07-14 12:05:28"
+#define BUILD_TIME "2026-07-15 00:28:19"
 
 // Git 信息
-#define GIT_HASH "7678234"
+#define GIT_HASH "adb3386"

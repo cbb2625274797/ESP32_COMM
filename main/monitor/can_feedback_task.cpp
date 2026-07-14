@@ -65,15 +65,10 @@ static void taskLoop(void *)
             continue;
         }
 
-        /* 阻塞等待 GD32 按铃并读取一帧（超时则重试） */
-        esp_err_t ret = SpiMaster::instance().checkGd32Request(kWaitRingMs);
-        if (ret != ESP_OK) {
-            continue;
-        }
-
-        /* 取出 checkGd32Request 存入的 type/payload */
+        /* 阻塞等待 GD32 按铃事件（超时则重试） */
         if (!SpiMaster::instance().takeEvent(&ring_type, ring_payload,
-                                             sizeof(ring_payload), &ring_len)) {
+                                             sizeof(ring_payload), &ring_len,
+                                             kWaitRingMs)) {
             continue;
         }
 

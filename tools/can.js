@@ -185,6 +185,7 @@
     var messageMap = {};
     var comments = { messages: {}, signals: {} };
     var valueTables = {};
+    var sigDefaults = {};
     var nodeNames = [];
     var current = null;
 
@@ -234,6 +235,7 @@
           comment: '',
           valueType: 'int',
           enumMap: {},
+          defaultValue: null,
           multiplexRole: muxInfo.role,
           multiplexValue: muxInfo.value
         });
@@ -272,6 +274,15 @@
         if (signal) {
           signal.valueType = valTypeMatch[3] === '1' ? 'float' : valTypeMatch[3] === '2' ? 'double' : 'int';
         }
+        continue;
+      }
+
+      /* BA_ "GenSigDefaultValue" SG_ <msgId> <signalName> <value>;
+       * 注意该值是物理值（已应用 factor/offset），与 GenSigStartValue（raw）不同 */
+      var sigDefaultMatch = line.match(/^BA_\s+"GenSigDefaultValue"\s+SG_\s+(\d+)\s+([A-Za-z0-9_]+)\s+(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*;$/);
+      if (sigDefaultMatch) {
+        sigDefaults[sigDefaultMatch[1] + ':' + sigDefaultMatch[2]] = sigDefaultMatch[3];
+        continue;
       }
     }
 
@@ -280,6 +291,8 @@
       msg.signals.forEach(function (signal) {
         signal.comment = comments.signals[String(msg.idRaw) + ':' + signal.name] || '';
         signal.enumMap = valueTables[String(msg.idRaw) + ':' + signal.name] || {};
+        var dv = sigDefaults[String(msg.idRaw) + ':' + signal.name];
+        signal.defaultValue = (dv != null && Number.isFinite(Number(dv))) ? dv : null;
       });
     });
 
@@ -704,10 +717,10 @@
   }
 
   function getDefaultSignalValue(signal) {
-    var enumKeys = Object.keys(signal.enumMap || {});
-    if (enumKeys.length) return enumKeys[0];
-    if (Number.isFinite(signal.min)) return String(signal.min);
-    if (signal.factor === 0) return '0';
+    /* 优先使用 DBC 中 BA_ "GenSigDefaultValue" 声明的物理值，否则回退为 0 */
+    if (signal && signal.defaultValue != null && Number.isFinite(Number(signal.defaultValue))) {
+      return String(signal.defaultValue);
+    }
     return '0';
   }
 
@@ -1086,6 +1099,10 @@
     updateBatchUi();
     var channel = parseInt(el.defaultChannel.value, 10) || 0;
     var ok = 0, fail = 0;
+    /* BATCH 间隔：GD32 SPI 从机用 RBNE 中断逐字节接收，无 RX DMA，
+     * 连续高频 CS 事务易触发 RXORERR -> 帧字节丢失 -> CRC 失败 -> 0xEE。
+     * 30ms 间隔给 GD32 足够时间完成 onCsRelease 清理 + EXTI 重新待命。 */
+    var BATCH_INTERVAL_MS = 30;
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i];
       var msg = null;
@@ -1143,6 +1160,10 @@
           dataHex: dataHex,
           resultText: msg.name + ' · ' + err.message
         });
+      }
+      /* 帧间间隔，避免 GD32 SPI RXORERR（最后一帧不需要等） */
+      if (i < keys.length - 1) {
+        await new Promise(function (r) { setTimeout(r, BATCH_INTERVAL_MS); });
       }
     }
     state.batchInFlight = false;
@@ -1470,7 +1491,17 @@
   var CAN_SEND_ERR_DESC = {
     '-1': '参数错误（通道/ID/DLC 无效）',
     '-2': 'SPI 通信失败（ESP32 与 GD32 通信异常）',
-    '-3': 'GD32 CAN 总线拒绝（BUS_OFF / TEC 过高 / 邮箱满）',
+    '-3': 'GD32 CAN 总线拒绝',
+  };
+
+  var GD32_ERR_DESC = {
+    0xE0: 'payload 过短',
+    0xE1: '通道号非法',
+    0xE2: 'BUS_OFF（总线离线，检查接线/终端电阻/对端上电）',
+    0xE3: 'TEC 过高（错误计数 >96，对端 ACK 失败率高）',
+    0xE4: '邮箱满（3 个硬件邮箱全 PENDING，对端不 ACK）',
+    0xE5: '参数无效（通道未启用/DLC 越界）',
+    0xEE: 'SPI 帧解析失败（GD32 收到的帧 CRC/SOF 校验失败，通常是 SPI 字节丢失或 CS 时序冲突）'
   };
 
   function buildSendResponseText(result) {
@@ -1479,6 +1510,15 @@
     }
     var code = String(result.code);
     var desc = CAN_SEND_ERR_DESC[code] || '未知错误';
+    /* 用 GD32 细分错误码补充具体原因 */
+    if (result.gd32_err != null && result.gd32_err !== 0) {
+      var gd32Desc = GD32_ERR_DESC[result.gd32_err];
+      if (gd32Desc) {
+        desc = desc + ' · ' + gd32Desc;
+      } else {
+        desc = desc + ' · gd32_err=0x' + result.gd32_err.toString(16).toUpperCase();
+      }
+    }
     return '发送失败: ' + desc + ' (code=' + result.code + ')';
   }
 

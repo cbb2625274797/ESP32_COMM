@@ -13,7 +13,8 @@ constexpr uint8_t kSpiCanFrameType = 0xC0U;
 static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
                                const uint8_t *data, uint8_t dlc,
                                uint8_t *recv_buf, uint8_t recv_max,
-                               uint32_t timeout_ms)
+                               uint32_t timeout_ms,
+                               uint8_t *gd32_err_out)
 {
     uint8_t tx_buf[72];
     size_t tx_len = 0;
@@ -30,7 +31,7 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
 
     uint8_t resp_type = 0U;
     size_t resp_len = 0U;
-    /* 两步法：otaTransfer 发命令（丢弃延迟一拍的过期响应）+ otaPollResponse 读真实响应。
+    /* 两步法：transact 发命令（丢弃延迟一拍的过期响应）+ otaPollResponse 读真实响应。
      * CAN 帧非幂等，命令只发一次，不重发。 */
     esp_err_t ret = SpiMaster::instance().transact(
         kSpiCanFrameType,
@@ -40,17 +41,21 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
     if (ret != ESP_OK) {
         DEBUG_WARN("CAN", "CAN_SEND SPI失败: ch=%u id=0x%08lX err=%s",
                    (unsigned)channel, (unsigned long)ext_id, esp_err_to_name(ret));
+        if (gd32_err_out) *gd32_err_out = 0U;  /* SPI 失败时清零 */
         return -2;  /* SPI 通信失败 */
     }
     if (resp_type == SPI_OTA_RSP_ACK) {
         if (recv_buf == nullptr || recv_max == 0U) {
+            if (gd32_err_out) *gd32_err_out = 0U;
             return static_cast<int>(resp_len);
         }
         const size_t copied_len = (resp_len < recv_max) ? resp_len : recv_max;
+        if (gd32_err_out) *gd32_err_out = 0U;
         return static_cast<int>(copied_len);
     }
     /* resp_type == ERROR: 读取 GD32 返回的错误码 */
     uint8_t gd32_err = (resp_len > 0 && recv_buf) ? recv_buf[0] : 0xFF;
+    if (gd32_err_out) *gd32_err_out = gd32_err;  /* 透传细分错误码 */
     DEBUG_WARN("CAN", "CAN_SEND GD32拒绝: ch=%u id=0x%08lX resp=0x%02X err=0x%02X",
                (unsigned)channel, (unsigned long)ext_id, resp_type, gd32_err);
     return -3;  /* GD32 返回 ERROR */
@@ -73,16 +78,19 @@ static inline uint32_t readU32Le(const uint8_t *p) {
  * @brief 发送一帧 CANFD 数据，可选等待并读取响应。
  *        通过 SPI 协议帧发送给 GD32 APP，并读取 ACK/ERROR 响应。
  *        返回值: >=0 成功(接收数据长度), -1 参数错误, -2 SPI通信失败, -3 GD32拒绝。
+ *        gd32_err_out 在返回 -3 时输出 GD32 细分错误码，其它情况清零。
  */
 int canFdSend(can_channel_t channel, uint32_t ext_id,
               const uint8_t *data, uint8_t dlc,
               uint8_t *recv_buf, uint8_t recv_max,
-              uint32_t timeout_ms)
+              uint32_t timeout_ms,
+              uint8_t *gd32_err_out)
 {
     if (channel >= CAN_CHANNEL_MAX || dlc > CAN_MAX_DLC || !data) {
+        if (gd32_err_out) *gd32_err_out = 0U;
         return -1;
     }
-    return sendCanFrameOverSpi(channel, ext_id, data, dlc, recv_buf, recv_max, timeout_ms);
+    return sendCanFrameOverSpi(channel, ext_id, data, dlc, recv_buf, recv_max, timeout_ms, gd32_err_out);
 }
 
 /**

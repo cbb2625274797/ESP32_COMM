@@ -31,12 +31,8 @@
 #define SPI_READY_GPIO       (10)          // 线与 SPIready 握手引脚（开漏，GPIO10<->GD32 PB6）
 #define SPI_READY_TIMEOUT_MS (200)         // 等待 SPIready 上升沿超时（毫秒）
 #define SPI_OTA_FRAME_MAX     (256)          ///< SPI 同步帧最大字节数
-// ESP32 下拉 SPIready 后到拉 CS 之间的微秒延时（零延时起步，按需测算调大）
-#define SPI_READY_DRIVE_DELAY_US (0)
 
 // GD32 SPI 同步帧类型
-#define SPI_SYNC_SOF0         (0xA5)
-#define SPI_SYNC_SOF1         (0x5A)
 #define SPI_OTA_CMD_REQ       (0x01)
 #define SPI_OTA_CMD_DATA      (0x02)
 #define SPI_APP_ENTER_BOOT_CMD (0xB0)
@@ -79,19 +75,13 @@ public:
     // SPI OTA 协议
     // ============================================================
 
-    /** @brief 按 GD32 SPI OTA 协议执行一次请求 + 响应读取（延迟一拍两步法）。
-     *  内部等价于 otaSendAndPoll：首笔 CS 发请求（忽略旧响应），次笔 CS 收真实响应。 */
-    esp_err_t otaTransfer(uint8_t type, const uint8_t *payload, size_t payload_len,
-                          uint8_t *resp_type, uint8_t *resp_payload,
-                          size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
-
     /** @brief 仅执行 SPI OTA 响应读取事务，不重复发送请求帧。 */
     esp_err_t otaPollResponse(uint8_t *resp_type, uint8_t *resp_payload,
                               size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
 
     /** @brief ESP32→GD32 发送命令 + 轮询读取真实响应（两步法，原子持锁）。
      *
-     * 解决 GD32 "延迟一拍"协议：otaTransfer 首笔 CS 读到过期响应，
+     * 解决 GD32 "延迟一拍"协议：transact 首笔 CS 读到过期响应，
      * otaPollResponse 读取本笔命令的真实响应。命令只发送一次，不重发。
      * 适用于所有 ESP32→GD32 方向的命令（CAN 发送/模式切换/ID 快照等）。
      *
@@ -111,6 +101,9 @@ public:
 
     /** @brief 读取对端最新上报的 CREDIT（0 表示对端忙，应 POLL 等待而非重发）。 */
     uint8_t remoteCredit() const { return m_remoteCredit; }
+
+    /** @brief 读取本端剩余可接收 credit（SPEC §10.1，/system/status 展示用）。 */
+    uint8_t localCredit() const { return m_localCredit; }
 
     /**
      * @brief OTA 中继期间禁止 worker 按铃读。
@@ -136,8 +129,11 @@ public:
 
     /**
      * @brief L4 取出 GD32 EVENT 帧（worker 已读入事件队列）。
+     * @param timeout_ms  等待超时（ms）。0 = 非阻塞（原语义）。
+     * @return true 取到事件；false 队列空且超时未到达。
      */
-    bool takeEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len);
+    bool takeEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len,
+                   uint32_t timeout_ms = 0U);
 
     // ============================================================
     // SPI Link v2 链路层（阶段1：帧格式 + 状态成员就位）
@@ -155,6 +151,16 @@ public:
         uint32_t max_resp_latency_us;   ///< 最大响应延迟（微秒）
     };
 
+    /** @brief v2 完整链路状态（SPEC §10.1，会话/credit + 统计）。 */
+    struct SpiLinkStatus {
+        uint8_t  version;               ///< 协议版本（固定 2）
+        uint8_t  gd32_role;             ///< 0=unknown, 1=app, 2=boot
+        uint32_t session_id;            ///< 当前会话 ID
+        uint8_t  local_credit;          ///< 本端剩余 credit
+        uint8_t  remote_credit;         ///< 对端剩余 credit
+        SpiLinkStats stats;             ///< 8 个统计计数器
+    };
+
     /** @brief 当前会话 ID（0 = 未建立 session）。 */
     uint32_t sessionId() const { return m_sessionId; }
 
@@ -167,8 +173,8 @@ public:
     /** @brief 获取链路统计快照（线程安全，持锁读取）。 */
     SpiLinkStats linkStats();
 
-    /** @brief L4 链路状态（linkStats 别名）。 */
-    SpiLinkStats linkStatus() { return linkStats(); }
+    /** @brief 获取完整链路状态（SPEC §10.1，会话/credit + 统计）。 */
+    SpiLinkStatus linkStatus();
 
     /** @brief 发起 HELLO 握手建立 v2 session（SPEC §5.1）。
      *  生成随机非零 SESSION_ID，发送 LINK_HELLO，等待 HELLO_ACK。
@@ -191,34 +197,6 @@ public:
     esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version = nullptr);
 
     // ── CANFD 接口已迁移至 transport/canfd_bridge.h（M4 解耦）──
-
-    /**
-     * @brief 检查 GD32 是否有主动按铃请求，若有则发起读事务读取请求帧。
-     *
-     * GD32 下拉 SPIready 表示「我有请求帧要给你读」。此函数检测到该状态后
-     * 发起一次 SPI 读事务（发 dummy 字节，读回 GD32 准备的请求帧）。
-     * 读取成功后按帧 TYPE 交给上层处理（如 CAN feedback 轮询、重启请求等）。
-     *
-     * @param timeout_ms 等待 GD32 请求的超时（毫秒），0 表示不等待仅检查。
-     * @return ESP_OK 成功读到请求帧；ESP_ERR_NOT_FOUND 当前无请求；其余为错误码。
-     *
-     * @note 应在主循环或 OTA 空闲时周期调用，以响应 GD32 主动上报。
-     */
-    esp_err_t checkGd32Request(uint32_t timeout_ms = 0U);
-
-    /**
-     * @brief 取出最近一次 GD32 按铃请求帧（线程安全，取出后清空内部缓冲）。
-     *
-     * checkGd32Request() 成功读取一帧后将其 type/payload 存入内部缓冲，
-     * 上层调用本函数取出并消费。取出后缓冲清空，避免重复消费。
-     *
-     * @param[out] type    请求帧 TYPE（如 0xC1）。
-     * @param[out] payload 输出 payload 拷贝缓冲。
-     * @param[in]  max_len payload 缓冲最大长度。
-     * @param[out] len     实际 payload 长度。
-     * @return true 表示有数据被取出；false 表示当前无数据。
-     */
-    bool takeRingRx(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len);
 
 private:
     /**
@@ -248,7 +226,6 @@ private:
         MASTER_SENDING,       ///< ESP32 已下拉 SPIready，正在 CS#1 发送请求
         WAITING_RESPONSE,     ///< CS#1 完成，等待 GD32 释放 SPIready（上升沿唤醒）
         SERVING_GD32_RING,    ///< 响应 GD32 按铃，正在读 GD32 请求帧
-        WAITING_BOOT_READY,   ///< 方案A: 等待 Bootloader 就绪（LOW→HIGH 序列）
     };
 
     /**
@@ -258,15 +235,15 @@ private:
      * - 线 HIGH = 空闲（双方释放），可发起新事务
      * - 线 LOW = 忙碌（某方下拉占用），禁止发起新事务
      *
-     * ESP32 作为主动方（otaTransfer/appPing）：enterBusy() 占用线 → transferClocked → exitBusy() 释放线
-     * ESP32 作为按铃响应方（checkGd32Request）：同上，releaseReady 上升沿通知 GD32 完成
+     * ESP32 作为主动方（transact/appPing）：enterBusy() 占用线 → transferClocked → exitBusy() 释放线
+     * ESP32 作为按铃响应方（takeEvent）：同上
      */
     class SpiLinkState {
     public:
-        /** 进入忙碌态（driveReadyLow 前/后调用）。 */
+        /** 进入忙碌态。 */
         void enterBusy(HandshakeState hs) { m_hsState = hs; }
 
-        /** 退出忙碌态（releaseReady 后调用），回到 IDLE。 */
+        /** 退出忙碌态，回到 IDLE。 */
         void exitBusy() { m_hsState = HandshakeState::IDLE; }
 
         /** 当前是否空闲（可接受新按铃下降沿）。 */
@@ -380,10 +357,6 @@ private:
         SemaphoreHandle_t m_lock;
     };
 
-    /** @brief 下拉 SPIready（开漏驱动低）。 */
-    void driveReadyLow();
-    /** @brief 释放 SPIready（开漏高阻，靠上拉拉高）。 */
-    void releaseReady();
     /**
      * @brief 等 GD32 释放 SPIready（上升沿），中断驱动非忙等。
      *
@@ -461,7 +434,6 @@ private:
                                  uint8_t *resp_type, uint8_t *resp_payload,
                                  size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
     // OTA 帧工具（静态，无状态）
-    static uint32_t otaCrc32(const uint8_t *data, size_t len);
     static bool otaBuildFrame(uint8_t type, const uint8_t *payload, size_t payload_len,
                               uint8_t *out, size_t *out_len);
     static bool otaFindFrame(const uint8_t *buf, size_t buf_len,
