@@ -32,12 +32,10 @@
 
 // 日志级别
 typedef enum {
-    DEBUG_LOG_NONE  = 0,
     DEBUG_LOG_ERR   = 1,    // 错误
     DEBUG_LOG_WARN  = 2,    // 警告
     DEBUG_LOG_INFO  = 3,    // 信息
-    DEBUG_LOG_DBG   = 4,    // 调试
-    DEBUG_LOG_ALL   = 5     // 全部
+    DEBUG_LOG_DBG   = 4     // 调试
 } debug_log_level_t;
 
 /**

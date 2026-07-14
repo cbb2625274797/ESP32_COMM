@@ -106,12 +106,6 @@ bool SpiMaster::pushEvent(uint8_t type, const uint8_t *payload, size_t len)
     }
     m_eventHead = (uint8_t)((m_eventHead + 1U) % kEventSlots);
     m_eventCount++;
-    /* 兼容单槽 takeRingRx */
-    m_ringRxType = type;
-    m_ringRxLen = slot.len;
-    if (slot.len > 0U) {
-        memcpy(m_ringRxBuf, slot.data, slot.len);
-    }
     if (m_eventSem) {
         (void)xSemaphoreGive(m_eventSem);
     }
@@ -574,14 +568,7 @@ esp_err_t SpiMaster::readV2FrameVarlen(uint8_t *out_frame, size_t out_max, size_
     v2_header_t hdr;
     const uint8_t *pload = nullptr;
     if (!v2_parse_frame(out_frame, budget, &hdr, &pload)) {
-        bool all_ff = true;
-        for (size_t i = 0; i < 8U && i < budget; ++i) {
-            if (out_frame[i] != 0xFFU) {
-                all_ff = false;
-                break;
-            }
-        }
-        return all_ff ? ESP_ERR_INVALID_RESPONSE : ESP_ERR_INVALID_RESPONSE;
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     const size_t total = V2_HEADER_LEN + (size_t)hdr.payload_len + V2_CRC_LEN;
@@ -1160,18 +1147,6 @@ bool SpiMaster::takeEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_
             if (m_eventSem) {
                 (void)xSemaphoreTake(m_eventSem, 0);
             }
-            return true;
-        }
-        if (m_ringRxLen != 0U) {
-            /* 兼容单槽回落 */
-            if (type) { *type = m_ringRxType; }
-            size_t copy_len = (m_ringRxLen <= max_len) ? m_ringRxLen : max_len;
-            if (len) { *len = copy_len; }
-            if (payload && copy_len > 0U) {
-                memcpy(payload, m_ringRxBuf, copy_len);
-            }
-            m_ringRxLen = 0U;
-            m_ringRxType = 0U;
             return true;
         }
     }

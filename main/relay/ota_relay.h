@@ -398,6 +398,14 @@ private:
                                                uint8_t *out_k_session, uint8_t *out_uid);
     static bool aes128EcbEncrypt48Bytes(const uint8_t *key, const uint8_t *in, uint8_t *out);
     static void calculateCrc32WithKey(const uint8_t *key, const uint8_t *data48, uint8_t *output);
+    /** @brief 清理会话密钥/上下文/nonce/UID 运行时缓存（reset 与 doFinishAndVerify 共用）。 */
+    void clearSessionCryptoState();
+    ota_result_t sendAndWaitAckShape(const char *stage, uint8_t cmd,
+                                     const uint8_t *payload, size_t payload_len,
+                                     uint32_t transact_timeout_ms,
+                                     uint32_t poll_timeout_ms, uint32_t wait_rounds, uint32_t max_extra_polls,
+                                     uint8_t resp_payload[], size_t resp_max, size_t *resp_len,
+                                     bool (*matcher)(const uint8_t *, size_t));
 };
 
 #endif // OTA_RELAY_H

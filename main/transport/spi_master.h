@@ -271,11 +271,6 @@ private:
     /** 事件计数信号量（worker push / takeEvent pop）。 */
     SemaphoreHandle_t m_eventSem = NULL;
 
-    /** GD32 按铃请求帧缓冲区（兼容 takeRingRx 单槽）。 */
-    uint8_t m_ringRxBuf[SPI_OTA_FRAME_MAX] = {};
-    size_t  m_ringRxLen = 0;
-    uint8_t m_ringRxType = 0;
-
     // ── L4 多槽事件队列（worker 写入，业务 takeEvent 读出）──
     static constexpr uint8_t kEventSlots = 4U;
     struct EventSlot {

@@ -493,6 +493,18 @@ ota_result_t OtaRelay::forwardFirmware()
 }
 
 // ============================================================
+// 会话密钥/上下文清理（reset 与 doFinishAndVerify 共用）
+// ============================================================
+void OtaRelay::clearSessionCryptoState()
+{
+    Protocol::sessionKeyClear(&m_sessionCtx);
+    memset(&m_sessionCtx, 0, sizeof(session_ctx_t));
+    memset(m_kSession, 0, sizeof(m_kSession));
+    memset(m_nonceServer, 0, sizeof(m_nonceServer));
+    memset(m_gd32UidRuntime, 0, sizeof(m_gd32UidRuntime));
+}
+
+// ============================================================
 // 状态机复位
 // ============================================================
 void OtaRelay::reset()
@@ -506,11 +518,7 @@ void OtaRelay::reset()
     m_transferFlashOffset = 0;
     m_transferRetryCount = 0;
     m_transferDeadline = 0;
-    Protocol::sessionKeyClear(&m_sessionCtx);
-    memset(&m_sessionCtx, 0, sizeof(session_ctx_t));
-    memset(m_kSession, 0, sizeof(m_kSession));
-    memset(m_nonceServer, 0, sizeof(m_nonceServer));
-    memset(m_gd32UidRuntime, 0, sizeof(m_gd32UidRuntime));
+    clearSessionCryptoState();
     SpiMaster::instance().setSuppressRingService(false);
     DEBUG_INFO("OTA", "状态机已复位 → IDLE");
 }
@@ -890,10 +898,34 @@ ota_result_t OtaRelay::doHandshakeReq(uint32_t attempts)
     return OTA_RESULT_ERR_TIMEOUT;
 }
 
+/**
+ * @brief 统一 SPI 事务 + 轮询 ACK 形状的 helper（CHALLENGE / CONFIRM / SEND_SIZE 共用）。
+ * @return OTA_RESULT_OK 成功；OTA_RESULT_ERR_TIMEOUT 发送或轮询失败。
+ */
+ota_result_t OtaRelay::sendAndWaitAckShape(const char *stage, uint8_t cmd,
+                                           const uint8_t *payload, size_t payload_len,
+                                           uint32_t transact_timeout_ms,
+                                           uint32_t poll_timeout_ms, uint32_t wait_rounds, uint32_t max_extra_polls,
+                                           uint8_t resp_payload[], size_t resp_max, size_t *resp_len,
+                                           bool (*matcher)(const uint8_t *, size_t))
+{
+    uint8_t resp_type = 0;
+    esp_err_t err = SpiMaster::instance().transact(cmd, payload, payload_len,
+                                                   &resp_type, resp_payload, resp_max, resp_len, transact_timeout_ms);
+    logRespPayload(stage, resp_type, resp_payload, *resp_len);
+    err = pollUntilExpectedAckShape(stage, &resp_type, resp_payload, resp_max, resp_len,
+                                    poll_timeout_ms, wait_rounds, max_extra_polls, matcher);
+    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !matcher(resp_payload, *resp_len)) {
+        DEBUG_ERR("OTA", "%s 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu",
+                  stage, err, resp_type, *resp_len);
+        return OTA_RESULT_ERR_TIMEOUT;
+    }
+    return OTA_RESULT_OK;
+}
+
 /** @brief 协议子步骤：执行挑战认证（发送 nonce、验证响应、派生会话密钥、发送确认）。 */
 ota_result_t OtaRelay::doChallengeAndAuth()
 {
-    uint8_t resp_type = 0;
     uint8_t resp_payload[64] = {0};
     size_t resp_len = 0;
 
@@ -906,16 +938,12 @@ ota_result_t OtaRelay::doChallengeAndAuth()
     DEBUG_INFO("OTA", "--- 认证步骤 1: 发送 CHALLENGE ---");
     DEBUG_INFO("OTA", "发送 nonce_server (16B), timestamp=0x%08" PRIX32, timestamp);
 
-    esp_err_t err = SpiMaster::instance().transact(SPI_OTA_CMD_REQ, m_nonceServer, 16,
-                                     &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 5000);
-    logRespPayload("CHALLENGE", resp_type, resp_payload, resp_len);
-    err = pollUntilExpectedAckShape("CHALLENGE", &resp_type, resp_payload,
-                                        sizeof(resp_payload), &resp_len,
-                                        1000, 12, 8, OtaRelay::isChallengePayloadAck);
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !isChallengePayloadAck(resp_payload, resp_len)) {
-        DEBUG_ERR("OTA", "CHALLENGE 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
-        return OTA_RESULT_ERR_TIMEOUT;
-    }
+    ota_result_t res = sendAndWaitAckShape("CHALLENGE", SPI_OTA_CMD_REQ,
+                                           m_nonceServer, 16, 5000,
+                                           1000, 12, 8,
+                                           resp_payload, sizeof(resp_payload), &resp_len,
+                                           OtaRelay::isChallengePayloadAck);
+    if (res != OTA_RESULT_OK) return res;
 
     DEBUG_INFO("OTA", "已收到 GD32 握手数据包");
 
@@ -936,17 +964,12 @@ ota_result_t OtaRelay::doChallengeAndAuth()
 
     DEBUG_INFO("OTA", "--- 认证步骤 2: 发送 SESSION_KEY/CONFIRM ---");
 
-    resp_len = 0;
-    err = SpiMaster::instance().transact(SPI_OTA_CMD_REQ, encrypted_confirm, 16,
-                           &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
-    logRespPayload("CONFIRM", resp_type, resp_payload, resp_len);
-    err = pollUntilExpectedAckShape("CONFIRM", &resp_type, resp_payload,
-                                        sizeof(resp_payload), &resp_len,
-                                        1000, 8, 8, OtaRelay::isConfirmPlainAck);
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !isConfirmPlainAck(resp_payload, resp_len)) {
-        DEBUG_ERR("OTA", "SESSION_KEY/CONFIRM 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
-        return OTA_RESULT_ERR_TIMEOUT;
-    }
+    res = sendAndWaitAckShape("CONFIRM", SPI_OTA_CMD_REQ,
+                              encrypted_confirm, 16, 3000,
+                              1000, 8, 8,
+                              resp_payload, sizeof(resp_payload), &resp_len,
+                              OtaRelay::isConfirmPlainAck);
+    if (res != OTA_RESULT_OK) return res;
 
     {
         char hex[73] = {0};
@@ -964,7 +987,6 @@ ota_result_t OtaRelay::doChallengeAndAuth()
 /** @brief 协议子步骤：发送固件总大小给 GD32 并等待 seq=0 的确认。 */
 ota_result_t OtaRelay::doSendFirmwareSize(uint32_t size)
 {
-    uint8_t resp_type = 0;
     uint8_t resp_payload[32] = {0};
     size_t resp_len = 0;
 
@@ -976,20 +998,13 @@ ota_result_t OtaRelay::doSendFirmwareSize(uint32_t size)
     size_payload[2] = (uint8_t)((size >> 16) & 0xFF);
     size_payload[3] = (uint8_t)((size >> 24) & 0xFF);
 
-    esp_err_t err = SpiMaster::instance().transact(SPI_OTA_CMD_DATA, size_payload, sizeof(size_payload),
-                                     &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 3000);
-    logRespPayload("SEND_SIZE", resp_type, resp_payload, resp_len);
     /* GD32 收到 SIZE 后擦 Flash，先 WAIT 再 ACK(seq=0)；进度由前端读 status，不打过程 INFO */
-    err = pollUntilExpectedAckShape("SEND_SIZE", &resp_type, resp_payload,
-                                        sizeof(resp_payload), &resp_len,
-                                        /*poll_timeout_ms=*/500,
-                                        /*wait_rounds=*/120,
-                                        /*maxExtraPolls=*/40,
-                                        OtaRelay::isSizeSeq0Ack);
-    if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !isSizeSeq0Ack(resp_payload, resp_len)) {
-        DEBUG_ERR("OTA", "SEND_SIZE 失败, err=%d, resp_type=0x%02X, resp_len=%zu", err, resp_type, resp_len);
-        return OTA_RESULT_ERR_TIMEOUT;
-    }
+    ota_result_t res = sendAndWaitAckShape("SEND_SIZE", SPI_OTA_CMD_DATA,
+                                           size_payload, sizeof(size_payload), 3000,
+                                           500, 120, 40,
+                                           resp_payload, sizeof(resp_payload), &resp_len,
+                                           OtaRelay::isSizeSeq0Ack);
+    if (res != OTA_RESULT_OK) return res;
 
     SpiMaster::instance().confirmTxSeqAccepted();
     DEBUG_INFO("OTA", "大小协商完成: %" PRIu32 " 字节，GD32 已就绪收包", size);
@@ -1355,11 +1370,7 @@ ota_result_t OtaRelay::doFinishAndVerify()
     }
 
     // 会话密钥/上下文清理
-    Protocol::sessionKeyClear(&m_sessionCtx);
-    memset(&m_sessionCtx, 0, sizeof(session_ctx_t));
-    memset(m_kSession, 0, sizeof(m_kSession));
-    memset(m_nonceServer, 0, sizeof(m_nonceServer));
-    memset(m_gd32UidRuntime, 0, sizeof(m_gd32UidRuntime));
+    clearSessionCryptoState();
 
     // 元数据清理安静进行；等待/成功总结由 doWaitForAppAlive 统一输出
     Gd32FlashStore::instance().metaClear();

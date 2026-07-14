@@ -32,15 +32,6 @@ inline constexpr const char* WIFI_STA_PASSWORD = "q13362875622";   ///< STA 模�
 inline constexpr uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 30000;     ///< STA 连接超时（毫秒）
 inline constexpr uint8_t  WIFI_STA_MAX_RETRY = 5;  // 最大重连次数，超过后切换 AP 模式
 
-// STA 静态 IP
-inline constexpr uint8_t WIFI_STA_USE_STATIC_IP = 0;  // 先关闭静态 IP，使用 DHCP 排查连接问题
-
-// 静态 IP 配置（始终定义，由 WIFI_STA_USE_STATIC_IP 在运行时决定是否使用）
-inline constexpr const char* WIFI_STA_STATIC_IP      = "192.168.31.32";
-inline constexpr const char* WIFI_STA_STATIC_GW      = "192.168.31.1";
-inline constexpr const char* WIFI_STA_STATIC_NETMASK = "255.255.255.0";
-inline constexpr const char* WIFI_STA_STATIC_DNS     = "192.168.31.1";
-
 // ============================================================
 // WiFi AP 模式配置（设备当热点）
 // ============================================================
@@ -85,7 +76,6 @@ inline constexpr size_t  HEAP_WARNING_MIN   = 10240;               ///< 堆内�
 // ============================================================
 // 调试配置（UDP 日志）
 // ============================================================
-inline constexpr uint8_t  DEBUG_LOG_ENABLED = 1;                   ///< UDP 调试日志开关（1=启用）
 inline constexpr const char* DEBUG_LOG_IP   = "192.168.31.3";      ///< UDP 日志目标 IP
 inline constexpr uint16_t DEBUG_LOG_PORT   = 6666;                 ///< UDP 日志目标端口
 
@@ -107,7 +97,6 @@ inline constexpr uint8_t BLE_OTA_CTRL_ABORT_OTA     = 0xFB;         ///< BLE 控
 inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;             ///< BLE 数据通道：GD32 固件包标识
 inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;             ///< BLE 数据通道：ESP32 固件包标识
 inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;            ///< BLE 单包数据载荷大小（字节）
-inline constexpr size_t      BLE_OTA_PACKET_OVERHEAD = 11;           ///< BLE 包头+序号+校验开销（字节）
 // Reorder buffer 窗口大小（吸收 BLE 窗口内乱序到达的包，须 >= BLE_OTA_ACK_WINDOW）
 inline constexpr size_t      BLE_OTA_REORDER_WINDOW = 32;
 
@@ -123,12 +112,6 @@ inline constexpr uint8_t MASTER_KEY[] = {
 // SCRAMBLE_CONST 已移至 Protocol 类，运行时由硬件 RNG 随机生成
 inline constexpr size_t SCRAMBLE_CONST_LEN = 16;
 
-// GD32_CHIP_UID 仅保留为默认占位，运行时以握手包解出的芯片地址 UID 为准。
 inline constexpr uint32_t DEVICE_SERIAL_ADDR_LSB = 0x1FFFF7E8U; ///< GD32 设备序列号低字 Flash 地址
 inline constexpr uint32_t DEVICE_SERIAL_ADDR_MID = 0x1FFFF7ECU; ///< GD32 设备序列号中字 Flash 地址
 inline constexpr uint32_t DEVICE_SERIAL_ADDR_MSB = 0x1FFFF7F0U; ///< GD32 设备序列号高字 Flash 地址
-
-inline constexpr uint8_t GD32_CHIP_UID[] = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
-    0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B
-};

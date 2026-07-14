@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ESP32-C3FH4 OTA 中继 - 程序入口
  * 四个 FreeRTOS 任务：健康监控 / OTA Relay / WiFi Server / BLE GATT
  *
@@ -170,6 +170,48 @@ extern "C" void app_main(void)
 
     DEBUG_INFO("MAIN", "========================================");
     DEBUG_INFO("MAIN", "所有任务创建完成，OTA Relay 运行中");
+
+    // ★ 启动最后步骤：读取 GD32 APP 版本号
+    //   参考 OtaRelay::doWaitForAppAlive 刷写后读取逻辑：
+    //   先 hello() 建立 SPI v2 会话，再 probeGd32AppOnce 读取版本
+    //   GD32 APP 完整初始化需 5-6 秒，使用 20 次重试 × 300ms 窗口
+    {
+        DEBUG_INFO("MAIN", "启动 GD32 版本探测...");
+        gd32_version_t gd32_ver = {};
+        bool session_established = false;
+        bool gd32_ok = false;
+
+        for (uint32_t attempt = 0; attempt < 20; ++attempt) {
+            vTaskDelay(pdMS_TO_TICKS(300));
+
+            if (!session_established) {
+                esp_err_t hr = SpiMaster::instance().hello(1500U, V2_ROLE_APP);
+                if (hr == ESP_OK) {
+                    session_established = true;
+                } else {
+                    DEBUG_INFO("MAIN", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
+                    continue;
+                }
+            }
+
+            esp_err_t gd32_ret = OtaCoordinator::instance().probeGd32AppOnce(&gd32_ver, nullptr);
+            if (gd32_ret == ESP_OK) {
+                DEBUG_INFO("MAIN", "GD32 APP: v%d.%d.%d.%d (BOOT v%d.%d.%d.%d)",
+                           gd32_ver.app_major, gd32_ver.app_minor,
+                           gd32_ver.app_patch, gd32_ver.app_build,
+                           gd32_ver.boot_major, gd32_ver.boot_minor,
+                           gd32_ver.boot_patch, gd32_ver.boot_build);
+                gd32_ok = true;
+                break;
+            }
+            DEBUG_INFO("MAIN", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
+        }
+
+        if (!gd32_ok) {
+            DEBUG_WARN("MAIN", "GD32 APP 版本读取失败（OtaRelay 任务将重试）");
+        }
+    }
+
     DEBUG_INFO("MAIN", "调试日志输出: UDP(%s:%d) + UART0(GPIO21/TX, 115200)",
                DEBUG_LOG_IP, DEBUG_LOG_PORT);
     DEBUG_INFO("MAIN", "========================================");

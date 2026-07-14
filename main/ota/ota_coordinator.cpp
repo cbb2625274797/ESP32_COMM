@@ -530,13 +530,21 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
     return err;
 }
 
+// ★ 已持锁版本的 ESP32 状态切换 helper：设置 m_sysState 并打印一条 INFO 日志。
+//   供 notifyEsp32*Complete / notifyEsp32Rebooting 等锁内路径复用，避免重复样板代码。
+void OtaCoordinator::setEsp32StateLocked(ota_system_state_t s, const char *dbg_msg)
+{
+    m_sysState = s;
+    DEBUG_INFO(TAG, "%s", dbg_msg);
+}
+
 /** @brief 通知协调器：ESP32 固件接收完毕，状态转为 FINALIZING。 */
 void OtaCoordinator::notifyEsp32ReceiveComplete()
 {
     bool h = lock();
     if (h && m_sysState == OTA_SYS_ESP32_RECEIVING) {
-        m_sysState = OTA_SYS_ESP32_FINALIZING;
-        DEBUG_INFO(TAG, "ESP32 固件接收完毕, 系统状态 → ESP32_FINALIZING");
+        setEsp32StateLocked(OTA_SYS_ESP32_FINALIZING,
+                            "ESP32 固件接收完毕, 系统状态 → ESP32_FINALIZING");
     }
     unlock(h);
 }
@@ -546,8 +554,8 @@ void OtaCoordinator::notifyEsp32FinalizeComplete()
 {
     bool h = lock();
     if (h) {
-        m_sysState = OTA_SYS_ESP32_REBOOTING;
-        DEBUG_INFO(TAG, "ESP32 OTA 收尾完成, 系统状态 → ESP32_REBOOTING");
+        setEsp32StateLocked(OTA_SYS_ESP32_REBOOTING,
+                            "ESP32 OTA 收尾完成, 系统状态 → ESP32_REBOOTING");
     }
     unlock(h);
 }
@@ -557,8 +565,8 @@ void OtaCoordinator::notifyEsp32Rebooting()
 {
     bool h = lock();
     if (h) {
-        m_sysState = OTA_SYS_ESP32_REBOOTING;
-        DEBUG_INFO(TAG, "ESP32 即将重启, 系统状态 → ESP32_REBOOTING");
+        setEsp32StateLocked(OTA_SYS_ESP32_REBOOTING,
+                            "ESP32 即将重启, 系统状态 → ESP32_REBOOTING");
     }
     unlock(h);
 }

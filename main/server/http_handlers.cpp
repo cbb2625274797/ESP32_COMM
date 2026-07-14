@@ -25,7 +25,6 @@
 #include "esp32_ota_core.h"
 #include "ota_coordinator.h"
 #include "ota_relay.h"
-#include "ota_snapshot.h"
 #include "storage/gd32_flash_store.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
@@ -34,6 +33,25 @@
 #include "monitor/can_feedback_task.h"
 #include "monitor/task_stack_check.h"
 #include "ble_ota.h"
+
+static size_t parseHexToBytes(const char *hex, uint8_t *out, size_t max_out)
+{
+    size_t hex_len = strlen(hex);
+    size_t n = 0;
+    for (size_t i = 0; i + 1 < hex_len && n < max_out; i += 2) {
+        char byte_str[3] = { hex[i], hex[i + 1], 0 };
+        out[n++] = (uint8_t)strtol(byte_str, NULL, 16);
+    }
+    return n;
+}
+
+static void bytesToHexUpper(const uint8_t *in, size_t n, char *out)
+{
+    for (size_t i = 0; i < n; ++i) {
+        snprintf(out + i * 2, 3, "%02X", in[i]);
+    }
+    out[n * 2] = '\0';
+}
 
 void http_set_cors_headers(httpd_req_t *req)
 {
@@ -761,13 +779,7 @@ esp_err_t can_send_handler(httpd_req_t *req)
     uint8_t tx_dlc = 0;
 
     if (data_item && cJSON_IsString(data_item)) {
-        const char *hex_str = cJSON_GetStringValue(data_item);
-        size_t hex_len = strlen(hex_str);
-        for (size_t i = 0; i < hex_len / 2 && i < CAN_MAX_DLC; i++) {
-            char byte_str[3] = { hex_str[i * 2], hex_str[i * 2 + 1], '\0' };
-            tx_data[i] = (uint8_t)strtol(byte_str, NULL, 16);
-            tx_dlc++;
-        }
+        tx_dlc = (uint8_t)parseHexToBytes(cJSON_GetStringValue(data_item), tx_data, CAN_MAX_DLC);
     }
 
     if (tx_dlc == 0 && dlc > 0) {
@@ -783,9 +795,7 @@ esp_err_t can_send_handler(httpd_req_t *req)
     char resp[512];
     if (resp_len >= 0) {
         char resp_hex[CAN_MAX_DLC * 2 + 1] = {0};
-        for (int i = 0; i < resp_len; i++) {
-            sprintf(&resp_hex[i * 2], "%02X", resp_data[i]);
-        }
+        bytesToHexUpper(resp_data, (size_t)resp_len, resp_hex);
         snprintf(resp, sizeof(resp),
             "{\"status\": \"ok\", \"ch\": %d, \"id\": %lu, \"sent\": %d, \"recv_len\": %d, \"recv\": \"%s\"}",
             ch, (unsigned long)ext_id, tx_dlc, resp_len, resp_hex);
@@ -834,13 +844,7 @@ esp_err_t spi_send_handler(httpd_req_t *req)
     uint8_t payload_data[SPI_OTA_FRAME_MAX] = {0};
     size_t payload_len = 0;
     if (data_item && cJSON_IsString(data_item)) {
-        const char *hex_str = cJSON_GetStringValue(data_item);
-        size_t hex_len = strlen(hex_str);
-        for (size_t i = 0; i < hex_len / 2 && i < SPI_OTA_FRAME_MAX; i++) {
-            char byte_str[3] = { hex_str[i * 2], hex_str[i * 2 + 1], '\0' };
-            payload_data[i] = (uint8_t)strtol(byte_str, NULL, 16);
-            payload_len++;
-        }
+        payload_len = parseHexToBytes(cJSON_GetStringValue(data_item), payload_data, SPI_OTA_FRAME_MAX);
     }
 
     DEBUG_INFO("SPI", "WEB SPI: type=0x%02X, payload=%zu 字节",
@@ -857,9 +861,7 @@ esp_err_t spi_send_handler(httpd_req_t *req)
 
     if (spi_err == ESP_OK) {
         char resp_hex[SPI_OTA_FRAME_MAX * 2 + 1] = {0};
-        for (size_t i = 0; i < resp_len; i++) {
-            sprintf(&resp_hex[i * 2], "%02X", resp_payload[i]);
-        }
+        bytesToHexUpper(resp_payload, resp_len, resp_hex);
         snprintf(resp, sizeof(resp),
             "{\"status\": \"ok\", \"type\": \"%02X\", \"payload_len\": %zu, \"resp_type\": \"%02X\", \"resp_len\": %zu, \"recv\": \"%s\"}",
             frame_type, payload_len, resp_type, resp_len, resp_hex);

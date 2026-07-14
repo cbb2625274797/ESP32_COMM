@@ -33,6 +33,28 @@
 #include "http_handlers.h"
 
 
+// ----------------------------------------
+// 文件作用域 static helper
+// ----------------------------------------
+/**
+ * @brief 清除指定 NVS 命名空间下的全部键（erase_all + commit + close）。
+ *        纯函数，内部不打日志，由调用方负责日志输出。
+ * @param ns NVS 命名空间字符串（例如 "nvs.net80211"、"phy"）。
+ * @return ESP_OK 成功；否则返回 nvs_open 的错误码。
+ */
+static esp_err_t clearNvsNamespace(const char *ns)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(ns, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    nvs_erase_all(h);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
 
 // ============================================================
 /**
@@ -44,10 +66,6 @@ WifiOta& WifiOta::instance()
     static WifiOta inst;
     return inst;
 }
-
-/**
- * @brief 预先声明：为 STA 模式配置静态 IP、网关和子网掩码。
- */
 
 // ----------------------------------------
 // STA 后台重连任务（避免在系统事件回调中调用 esp_wifi_connect 死锁）
@@ -150,9 +168,6 @@ void WifiOta::wifiEventHandler(void* arg, esp_event_base_t event_base,
             inst.stateUnlock();
             // ★ M2: 推送 WiFi 连接状态给 HealthMonitor（解耦监控层主动查询）
             HealthMonitor::instance().setWifiConnected(true);
-            if (inst.m_staConnectedSem) {
-                xSemaphoreGive(inst.m_staConnectedSem);
-            }
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {
@@ -298,8 +313,6 @@ esp_err_t WifiOta::initSta()
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-    setStaticIp();
-
     // ★ 冷启动时在 wifi_start 前增加延迟
     // 长时间断电后首次上电，WiFi PHY 校准需要额外时间
     // esp_wifi_start() 内部会触发 PHY 初始化和校准
@@ -325,8 +338,8 @@ esp_err_t WifiOta::initSta()
  */
 esp_err_t WifiOta::waitStaConnected(char *ip_str, size_t ip_len)
 {
-    SemaphoreHandle_t wait_sem = WIFI_STA_USE_STATIC_IP ? WifiOta::instance().m_staConnectedSem : WifiOta::instance().m_staGotIpSem;
-    const char *wait_name = WIFI_STA_USE_STATIC_IP ? "STA_CONNECTED" : "STA_GOT_IP";
+    SemaphoreHandle_t wait_sem = WifiOta::instance().m_staGotIpSem;
+    const char *wait_name = "STA_GOT_IP";
 
     if (wait_sem == NULL) {
         DEBUG_ERR("WIFI", "%s 信号量未创建", wait_name);
@@ -366,37 +379,6 @@ esp_err_t WifiOta::waitStaConnected(char *ip_str, size_t ip_len)
 
     DEBUG_ERR("WIFI", "等待 %s 超时 (%d ms), 重连次数: %d", wait_name, WIFI_STA_CONNECT_TIMEOUT_MS, WifiOta::instance().getStaRetryCount());
     return ESP_ERR_TIMEOUT;
-}
-
-/**
- * @brief 设置 STA 静态 IP
- */
-void WifiOta::setStaticIp()
-{
-    if (WIFI_STA_USE_STATIC_IP) {
-        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (sta_netif) {
-            DEBUG_INFO("WIFI", "STA 使用静态 IP 模式，停止 DHCP Client");
-            ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
-
-            esp_netif_ip_info_t info;
-            memset(&info, 0, sizeof(info));
-            inet_pton(AF_INET, WIFI_STA_STATIC_IP, &info.ip);
-            inet_pton(AF_INET, WIFI_STA_STATIC_GW, &info.gw);
-            inet_pton(AF_INET, WIFI_STA_STATIC_NETMASK, &info.netmask);
-            ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &info));
-            DEBUG_INFO("WIFI", "静态 IP 已设置: %s", WIFI_STA_STATIC_IP);
-
-            // 设置 DNS
-            esp_netif_dns_info_t dns_info;
-            memset(&dns_info, 0, sizeof(dns_info));
-            inet_pton(AF_INET, WIFI_STA_STATIC_DNS, &dns_info.ip.u_addr.ip4.addr);
-            ESP_ERROR_CHECK(esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns_info));
-            DEBUG_INFO("WIFI", "DNS 已设置: %s", WIFI_STA_STATIC_DNS);
-        }
-    } else {
-        DEBUG_INFO("WIFI", "使用 DHCP 获取 IP");
-    }
 }
 
 // ----------------------------------------
@@ -587,23 +569,16 @@ bool WifiOta::earlyInit()
     // ★ 冷启动时强制清除 WiFi NVS 缓存，避免残留脏数据
     // 长时间断电后 NVS 中的 WiFi 配置缓存可能不一致
     if (WifiOta::instance().m_coldBoot) {
-        nvs_handle_t nvs_handle;
-        err = nvs_open("nvs.net80211", NVS_READWRITE, &nvs_handle);
+        // 清除 WiFi 驱动内部 NVS 缓存键
+        err = clearNvsNamespace("nvs.net80211");
         if (err == ESP_OK) {
-            // 清除 WiFi 驱动内部 NVS 缓存键
-            nvs_erase_all(nvs_handle);
-            nvs_commit(nvs_handle);
-            nvs_close(nvs_handle);
             DEBUG_DBG("WIFI", "冷启动: 已清除 WiFi NVS 缓存 (nvs.net80211)");
         } else {
             DEBUG_INFO("WIFI", "冷启动: 无 WiFi NVS 缓存分区，跳过清除");
         }
         // 同样清除 PHY 校准数据分区，强制下次全量校准
-        err = nvs_open("phy", NVS_READWRITE, &nvs_handle);
+        err = clearNvsNamespace("phy");
         if (err == ESP_OK) {
-            nvs_erase_all(nvs_handle);
-            nvs_commit(nvs_handle);
-            nvs_close(nvs_handle);
             DEBUG_DBG("WIFI", "冷启动: 已清除 PHY 校准缓存，将重新校准");
         }
     }
@@ -620,9 +595,8 @@ bool WifiOta::earlyInit()
         }
     }
 
-    WifiOta::instance().m_staConnectedSem = xSemaphoreCreateBinary();
     WifiOta::instance().m_staGotIpSem = xSemaphoreCreateBinary();
-    if (!WifiOta::instance().m_staConnectedSem || !WifiOta::instance().m_staGotIpSem) {
+    if (!WifiOta::instance().m_staGotIpSem) {
         DEBUG_ERR("WIFI", "创建信号量失败");
     }
 

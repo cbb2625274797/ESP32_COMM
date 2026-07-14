@@ -456,6 +456,16 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   };
 
   window.setConsoleMode = function (mode) {
+      // ★ 刷写进行中禁止切换连接模式：setConsoleMode → syncBleFileFromSelectedTarget →
+      //   notifyFileChange → updateFileInfo → finalizeFileInfo → setProgress(0) 会覆盖
+      //   进行中的 WiFi/BLE 上传进度（与 selectFlashTarget 同样的守卫策略）。
+      var bleBusy = window.bleOta && window.bleOta.isUploading && window.bleOta.isUploading();
+      if (window.isUploading || bleBusy) {
+        var active = bleBusy ? 'BLE' : ((window.activeUploadChip || 'OTA').toUpperCase());
+        if (typeof addLog === 'function') addLog('W', 'OTA', active + ' 刷写进行中，无法切换连接模式');
+        if (typeof showToast === 'function') showToast('当前有 ' + active + ' 任务在运行，请等待结束后再切换', 'error');
+        return;
+      }
     var isBle = mode === 'ble';
     window.connectionMode = isBle ? 'ble' : 'wifi';
     var wifiCards = document.getElementById('wifiModeCards');
@@ -672,6 +682,6 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   applySharedModeUi();
 })();
 </script>
-<script src="ble_ota.js?v=20260712e"></script>
+<script src="ble_ota.js?v=20260715a"></script>
 </body>
 </html>

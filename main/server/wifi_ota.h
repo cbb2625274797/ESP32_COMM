@@ -80,7 +80,6 @@ public:
     // ── 初始化/运行时状态（仅 OTA 任务访问，无需额外锁）──
     ota_wifi_mode_t m_wifiMode = OTA_WIFI_MODE_AP; ///< 当前 WiFi 工作模式
     bool m_coldBoot = false;                        ///< 是否为冷启动（首次上电）
-    SemaphoreHandle_t m_staConnectedSem = NULL;      ///< STA 连接成功信号量
     SemaphoreHandle_t m_staGotIpSem = NULL;           ///< STA 获取 IP 信号量
     TaskHandle_t m_reconnectTask = nullptr;           ///< STA 后台重连任务句柄
 
@@ -117,10 +116,6 @@ private:
      * @return ESP_OK 成功，其他失败。
      */
     esp_err_t initSta();
-    /**
-      * @brief 设置 STA 静态 IP、网关和子网掩码。
-     */
-    void setStaticIp();
     /**
       * @brief WiFi/IP 事件回调，处理连接、断开和 IP 获取。
      * @param arg 回调用户参数。

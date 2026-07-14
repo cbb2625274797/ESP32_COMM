@@ -107,6 +107,16 @@ static void esp32_reorder_free();
 static void ble_ota_data_worker_task(void *pvParameters);
 static void ble_gd32_relay_wait_task(void *pvParameters);
 
+// 清空 s_otaDataQueue 中的残留批次并释放其 data 指针。
+// 仅用于纯清理场景；带计数/日志的清理请保留内联实现。
+static void drainOtaDataQueue()
+{
+    BleOtaDataBatch stale;
+    while (xQueueReceive(s_otaDataQueue, &stale, 0) == pdTRUE) {
+        if (stale.data) free(stale.data);
+    }
+}
+
 // ============================================================
 /**
   * @brief 获取 BleOta 单例实例。
@@ -1683,10 +1693,7 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
 
         // ★ 断开时清空数据队列，丢弃属于旧会话的残留包
         if (s_otaDataQueue) {
-            BleOtaDataBatch stale;
-            while (xQueueReceive(s_otaDataQueue, &stale, 0) == pdTRUE) {
-                free(stale.data);
-            }
+            drainOtaDataQueue();
         }
 
         BleOta::instance().m_bleConnected = false;
@@ -2018,10 +2025,7 @@ esp_err_t BleOta::suspendStack()
     m_suspendedForWifiOta = true;
 
     if (s_otaDataQueue) {
-        BleOtaDataBatch drop;
-        while (xQueueReceive(s_otaDataQueue, &drop, 0) == pdTRUE) {
-            free(drop.data);
-        }
+        drainOtaDataQueue();
     }
 
     return ESP_OK;

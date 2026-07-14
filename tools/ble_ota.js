@@ -1088,7 +1088,11 @@
   async function syncSelectedFileFromInput() {
     // ★ 上传进行中禁止同步：window focus / file input change 事件会在上传期间
     //   触发本函数，若不拦截会通过 updateFileInfo 把进度条重置为"等待选择文件 0%"。
+    //   ★ 必须同时拦截 WiFi 通道上传 (app.js 全局 isUploading)：focus 事件不分通道，
+    //     WiFi 刷写时点击网页/切标签回来会触发本函数 → finalizeFileInfo → setProgress(0)，
+    //     把进度"闪一下"归零，直到下一次 XHR progress 事件才恢复。
     if (state.uploading || state.autoFlashing) return;
+    if (typeof isUploading !== 'undefined' && isUploading) return;
     // FSAPI 选择的文件以 selectedFileHandle 为准，不从 input 元素同步，避免切标签页回来误清空
     if (state.selectedFileHandle) return;
     const file = (els.firmwareFile && els.firmwareFile.files && els.firmwareFile.files[0]) || null;
@@ -1626,6 +1630,11 @@
       //   在上传期间调用本函数 → updateFileInfo → setProgress(0, ...) 覆盖上传进度。
       if (state.uploading || state.autoFlashing) {
         bleLog('FILE', '上传进行中，忽略外部 notifyFileChange', 'D');
+        return;
+      }
+      // ★ WiFi 通道上传期间同样拒绝：setConsoleMode('ble') 等外部触发会覆盖 WiFi 进度
+      if (typeof isUploading !== 'undefined' && isUploading) {
+        bleLog('FILE', 'WiFi 上传进行中，忽略外部 notifyFileChange', 'D');
         return;
       }
       if (file) {

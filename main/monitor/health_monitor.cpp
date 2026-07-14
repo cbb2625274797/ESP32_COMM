@@ -62,21 +62,6 @@ void HealthMonitor::init()
     }
 }
 
-/**
-  * @brief 反初始化：停止并删除温度监控定时器，回收 esp_timer 资源。
-  *        当前 HealthMonitor 任务为无限循环，无显式删除路径，
-  *        本方法预留给未来停用场景（如安全关机后停止监控）使用。
-  */
-void HealthMonitor::deinit()
-{
-    if (m_tempTimer != nullptr) {
-        esp_timer_stop(m_tempTimer);
-        esp_timer_delete(m_tempTimer);
-        m_tempTimer = nullptr;
-        DEBUG_INFO("HEALTH", "温度监控定时器已停止并删除");
-    }
-}
-
 // ============================================================
 // 线程安全的健康状态读写
 // ============================================================

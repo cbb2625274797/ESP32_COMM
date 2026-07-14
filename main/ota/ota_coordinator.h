@@ -476,6 +476,10 @@ private:
     //   并把状态机复位为 IDLE。abortCurrent / abortCurrentIfEpoch 共享此实现。
     void doAbortLocked();
 
+    // ★ 已持锁版本的 ESP32 状态切换 helper：设置 m_sysState 并打印一条 INFO 日志。
+    //   供 notifyEsp32*Complete / notifyEsp32Rebooting 等锁内路径复用，避免重复样板代码。
+    void setEsp32StateLocked(ota_system_state_t s, const char *dbg_msg);
+
     // 系统状态
     ota_system_state_t m_sysState = OTA_SYS_IDLE;
 
