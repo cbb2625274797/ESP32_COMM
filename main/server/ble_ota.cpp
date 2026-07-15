@@ -66,7 +66,8 @@
 
 // ── 数据队列：将 OTA 数据处理从 NimBLE host task 卸载到工作线程 ──
 // 避免 flash 操作（esp_ota_begin / esp_ota_write）阻塞 BLE 协议栈导致连接断开。
-#define BLE_OTA_DATA_QUEUE_LEN (BLE_OTA_ACK_WINDOW + 4)
+// 深度略大于窗口：seq=0 整分区预擦期间前端若仍误发，可多扛几批，减少“队列满丢包→重传风暴”。
+#define BLE_OTA_DATA_QUEUE_LEN (BLE_OTA_ACK_WINDOW * 2 + 8)
 
 struct BleOtaDataBatch {
     uint8_t *data;
@@ -83,7 +84,7 @@ struct BleEsp32FinishCtx {
     uint16_t session_id;
 };
 
-// RAII 包装：保证任务所有 return 路径自动释放 ctx，避免历史多次漏 free。
+// RAII 包装：保证任务所有 return 路径自动释放 ctx，避免漏 free。
 // 注意：若调用 restartEsp32()（内部 esp_restart 不返回），析构不会执行，
 // 但这是设备重启路径，资源由系统回收。
 struct BleFinishCtxDeleter {
@@ -236,13 +237,10 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 // ============================================================
 // WiFi 共存策略：BLE OTA 传输期间的处理
 //
-// 历史：曾在此处把 WiFi 切到 WIFI_PS_MAX_MODEM 以把空中时间让给 BLE。
-//   但 MAX_MODEM 下 STA 监听间隔被拉到极大，HTTP server 的 TCP 握手/数据包
-//   会大量丢失或延迟到超时 → BLE OTA 期间任何 WiFi 请求（包括互斥拒绝应返回的
-//   403）都到不了设备，前端 XHR 长时间无响应，表现为"Wifi 上传既不成功也不报错"。
-//
-// 现策略：不切换 WiFi 省电模式（保持 WIFI_PS_NONE），让 STA 全程可用，
+// 不切换 WiFi 省电模式（保持 WIFI_PS_NONE），让 STA 全程可用，
 //   协调器照常以 403 拒绝并发 OTA。ESP32-C3 coex 默认调度已能保证 BLE OTA 可用。
+//   （曾尝试切到 WIFI_PS_MAX_MODEM 让出空中时间，但 STA 监听间隔被拉到极大，
+//   HTTP server 的 TCP 握手/数据包大量丢失或超时，前端 XHR 长时间无响应。）
 //   仍保留 setBleOtaActive() 暂停 RSSI 轮询（避免 get_ap_info 的射频活动干扰 BLE）。
 // ============================================================
 static bool s_wifi_ps_boosted = false;
@@ -254,7 +252,7 @@ static void ble_ota_boost_wifi_ps()
 {
     if (s_wifi_ps_boosted) return;
     s_wifi_ps_boosted = true;
-    // ★ L1: 通过协调器通知 WiFi 层（替代直接调用 WifiOta）
+    // 通过协调器通知 WiFi 层
     OtaCoordinator::instance().notifyBleCoexStart();
     DEBUG_INFO(TAG, "BLE OTA 数据传输进行中：暂停 WiFi RSSI 轮询（保持 WIFI_PS_NONE，STA 仍可响应 HTTP）");
 }
@@ -266,7 +264,7 @@ static void ble_ota_restore_wifi_ps()
 {
     if (!s_wifi_ps_boosted) return;
     s_wifi_ps_boosted = false;
-    // ★ L1: 通过协调器通知 WiFi 层（替代直接调用 WifiOta）
+    // 通过协调器通知 WiFi 层
     OtaCoordinator::instance().notifyBleCoexEnd();
     DEBUG_INFO(TAG, "BLE OTA 数据传输结束：恢复 WiFi RSSI 轮询（GD32 中继仍可能进行中）");
 }
@@ -933,7 +931,7 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
             ctx->session_id = session_id;
             BaseType_t ok = xTaskCreate(ble_gd32_relay_wait_task,
                                         "ble_gd32_wait",
-                                        3072,
+                                        TASK_STACK_BLE_GD32_WAIT,
                                         ctx,
                                         5,
                                         NULL);
@@ -992,7 +990,7 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         BleOta::instance().m_esp32RebootPending = true;
         BaseType_t ok = xTaskCreate(ble_esp32_finish_and_reboot_task,
                                     "ble_ota_finish",
-                                    4096,
+                                    TASK_STACK_BLE_FINISH,
                                     finish_ctx,  // heap context; task 负责 free
                                     5,
                                     NULL);
@@ -1015,7 +1013,7 @@ static int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         BleOta::instance().m_esp32RebootPending = true;
         BaseType_t ok = xTaskCreate(ble_esp32_restart_task,
                                     "ble_ota_restart",
-                                    2048,
+                                    TASK_STACK_BLE_RESTART,
                                     NULL,
                                     5,
                                     NULL);
@@ -1223,17 +1221,25 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     // ACK 按累计连续进度触发，而不是按当前到达包的 seq 触发。缺口包到达后
     // reorder 可能一次 flush 到下个窗口边界，例如 seq=99 使 expected 直达128；
     // 此时必须立即 ACK 127，否则后续重复包都不产生 progress，前端只能超时。
+    //
+    // ★ seq=0 强制 ACK：begin 含整分区预擦，可能耗时数秒～数十秒。
+    //   前端必须等“首包已落盘”ACK 后再发窗口内其余包，否则队列满丢包→重传极慢。
     uint32_t completedPackets = (afterReceived + BLE_OTA_CHUNK_PAYLOAD - 1U) /
                                 BLE_OTA_CHUNK_PAYLOAD;
     bool reachedAckBoundary = completedPackets > 0U &&
                               (completedPackets % BLE_OTA_ACK_WINDOW) == 0U;
+    bool firstPacketReady = (seq == 0U) && progressMade;
     if (progressMade &&
         (reachedAckBoundary ||
          transferComplete ||
-         isLastPacket)) {
+         isLastPacket ||
+         firstPacketReady)) {
         if (isLastPacket || transferComplete) {
             DEBUG_INFO(TAG, "ESP32 尾包/完成检测: seq=%u data_len=%zu received=%u total=%" PRIu32,
                        seq, data_len, (unsigned int)afterReceived, total_size);
+        } else if (firstPacketReady) {
+            DEBUG_INFO(TAG, "ESP32 begin 就绪 ACK: seq=0 received=%u total=%" PRIu32,
+                       (unsigned)afterReceived, total_size);
         }
         uint16_t ackSeq = s_reorder.expected > 0U
                         ? (uint16_t)(s_reorder.expected - 1U)
@@ -1384,7 +1390,9 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     meta.stored_size = stored_size;
     meta.last_seq = seq;
     const bool transfer_complete = stored_size >= meta.total_size;
+    // seq=0：prepare 含整分区预擦，写完首包必须 ACK，前端才能继续发后续窗口
     const bool checkpoint =
+        (seq == 0U) ||
         ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U) ||
         transfer_complete ||
         (expected_payload < BLE_OTA_CHUNK_PAYLOAD);
@@ -1680,6 +1688,14 @@ static int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
             if (rc != 0) {
                 s_conn_fallback_requested = true;
                 ble_ota_request_conn_params(BleOta::instance().m_connHandle, true);
+            }
+            /* 优先 LE 2M PHY（空中速率约翻倍）；对端不支持则保持 1M，失败仅打日志 */
+            {
+                const uint8_t phy_mask = BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK;
+                int phy_rc = ble_gap_set_prefered_le_phy(
+                    BleOta::instance().m_connHandle, phy_mask, phy_mask,
+                    BLE_GAP_LE_PHY_CODED_ANY);
+                DEBUG_INFO(TAG, "请求 LE PHY 1M|2M: rc=%d", phy_rc);
             }
         } else {
             DEBUG_WARN(TAG, "BLE 连接失败: status=%d", event->connect.status);
@@ -2040,7 +2056,7 @@ esp_err_t BleOta::resumeStack()
     m_suspendedForWifiOta = false;
 
     if (!m_stackRunning) {
-        /* 仅当历史上曾 hard-deinit 过才需要完整 serverStart */
+        /* 仅当曾 hard-deinit 过才需要完整 serverStart */
         DEBUG_INFO(TAG, "WiFi OTA 结束：BLE 栈未运行，尝试 serverStart free=%lu",
                    (unsigned long)esp_get_free_heap_size());
         esp_err_t err = serverStart();
@@ -2125,7 +2141,7 @@ void BleOta::taskEntry(void *pvParameters)
     if (s_otaDataQueue) {
         BaseType_t wk_ok = xTaskCreate(ble_ota_data_worker_task,
                                        "ble_ota_worker",
-                                       4096,   // 峰值仅 ~1.9KB，4KB 留有充足余量
+                                       TASK_STACK_BLE_WORKER,  // 实测 peak~1.1KB，负载峰值曾~1.9KB
                                        NULL,
                                        10,     // 中等优先级，避免被 NimBLE host task 过度抢占
                                        NULL);

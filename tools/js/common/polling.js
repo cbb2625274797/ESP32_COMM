@@ -1,14 +1,13 @@
 /**
  * polling.js - 轮询状态 + Page Visibility 补偿 + ESP32 实时日志拉取
  *
- * 从 app.js 的「轮询状态」「Page Visibility 补偿」「ESP32 实时日志拉取 (增量)」段提取。
  * 递归 setTimeout 调度 /system/status + setInterval 调度 /logs，避免 setInterval 慢响应被 abort。
  *
  * 模块级状态（仅本模块使用，不导出）：
  *   statusTimerId / logsTimerId / statusAbortCtrl / statusPollInFlight / statusPollIntervalMs
- *   lastDiagTime / diagResult / uploadPollChip / lastLogTimestamp / pageVisible
+ *   uploadPollChip / lastLogTimestamp / pageVisible
  *
- * 共享状态（通过 window.* 引用，后续 app.js 拆分时会统一挂载）：
+ * 共享状态（通过 window.* 引用）：
  *   window.pollingPausedForUpload   — 上传期间暂停轮询标志
  *   window.consecutivePollFailures  — 连续轮询失败计数（connection.js 也写入）
  *   window.lastSysStateCode         — 上次成功的 sys_state_code（connection.js 写入）
@@ -21,7 +20,7 @@
  *   window.activeUploadChip         — 当前上传目标芯片
  *   window.currentOtaTarget         — 当前 OTA 目标
  *
- * 未拆分的 app.js 函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.getEspIp / window.getBaseUrl
  *   window.updateSystemStatusUi / window.updateEsp32StagesFromPhase
  *   window.applyRebootingRuntimeState / window.applyDisconnectedRuntimeState / window.applyUploadingRuntimeState
@@ -30,7 +29,7 @@
  */
 import { addLog } from './log.js';
 import { showToast } from './toast.js';
-import { updateConnectionUi } from './connection.js';
+import { updateConnectionUi, diagnoseNetwork } from './connection.js';
 
 // ==================== 轮询状态 ====================
 // 共享状态（初始化到 window，供 connection.js 等其他模块读写）
@@ -41,66 +40,32 @@ window.lastRelayState = 0;     // 上次成功的 relay_state
 // 模块级状态（仅本模块使用）
 var statusTimerId = null;
 var logsTimerId = null;
-var lastDiagTime = 0;       // 上次诊断时间
-var diagResult = '';        // 最近一次诊断结果
 var statusAbortCtrl = null;  // 当前 /system/status 请求的 AbortController（3s 超时用）
-var statusPollIntervalMs = 1000;  // 状态轮询目标间隔
+var statusPollIntervalMs = 1000;  // 状态轮询目标间隔（中继期可由 setStatusPollIntervalMs 降到 400ms）
 var statusPollInFlight = false;   // 是否正在请求 /system/status，防止重叠
 var pageVisible = !document.hidden;   // 页面可见性：切到后台/最小化/切标签会变 false
 var uploadPollChip = null; // 当前暂停轮询的上传目标，用于区分 WiFi/日志策略
 
-// 从设备 IP 推导网关 IP（取前三段 + .1）
-function getGatewayIp() {
-  var parts = window.getEspIp().split('.');
-  if (parts.length === 4) return parts[0] + '.' + parts[1] + '.' + parts[2] + '.1';
-  return '192.168.31.1';
+/**
+ * 调整 /system/status 目标间隔。GD32 中继期用 400ms 缩小「转发 N/M」相对设备日志的滞后；
+ * 结束后恢复 1000ms，避免常态堆/栈卡片过刷。
+ */
+export function setStatusPollIntervalMs(ms) {
+  var n = Number(ms);
+  if (!Number.isFinite(n) || n < 200) n = 1000;
+  if (n > 5000) n = 5000;
+  statusPollIntervalMs = n;
 }
-// 网络诊断：区分浏览器离线 / 网关不通 / 仅设备不通
-async function diagnoseNetwork() {
-  lastDiagTime = Date.now();
-  var result = [];
-  // 1) 浏览器是否在线
-  if (navigator.onLine === false) {
-    result.push('浏览器无网络连接');
-    diagResult = result.join('；');
-    return diagResult;
-  }
-  // 2) 尝试触达网关（超时 2s）
-  var gwIp = getGatewayIp();
-  var gwOk = false;
-  try {
-    await fetch('http://' + gwIp + '/', { mode: 'no-cors', signal: AbortSignal.timeout(2000) });
-    gwOk = true; // no-cors 模式下不抛异常即视为可达
-  } catch (_) {}
-  if (!gwOk) {
-    // 再试一次 favicon（有些路由器不响应 /）
-    try {
-      await fetch('http://' + gwIp + '/favicon.ico', { mode: 'no-cors', signal: AbortSignal.timeout(1500) });
-      gwOk = true;
-    } catch (_) {}
-  }
-  if (!gwOk) {
-    result.push('网关 ' + gwIp + ' 不可达（本地网络不通）');
-  } else {
-    result.push('网关 ' + gwIp + ' 可达');
-    // 3) 网关通但设备不通 → 设备自身问题
-    result.push('设备 ' + window.getEspIp() + ' 不响应（可能断电、重启中或 WiFi 断开）');
-  }
-  diagResult = result.join('；');
-  return diagResult;
-}
+
 /** @description 调度下一次 /system/status 轮询（递归 setTimeout）。
- *  上一次请求完成（或 3s 超时）后才调度下一次，避免 setInterval 把慢响应
- *  直接 abort 而导致堆/任务栈/CPU 等卡片刷新率不稳。
+ *  默认 delay = statusPollIntervalMs；pollStatus 完成后会按「固定周期」
+ *  传入 max(0, interval - 本轮耗时)，使 CPU 采样窗口 sample_ms ≈ interval，
+ *  而不是「完成后 + interval」（会稳定偏到 1100+ ms）。
+ *  仍保证 in-flight 不重叠，避免 setInterval 慢响应被 abort。
  */
 export function scheduleStatusPoll(delayMs) {
   if (statusTimerId) clearTimeout(statusTimerId);
-  // 中继期加快：进度条依赖 status.relay_seq，1s 间隔体感像卡死
   var interval = statusPollIntervalMs;
-  // 防御性守卫：window.OtaSessionState 可能尚未挂载（模块加载早期），此时不加速
-  if (window.OtaSessionState && window.otaSessionState === window.OtaSessionState.RELAYING) {
-    interval = Math.min(interval, 400);
-  }
   statusTimerId = setTimeout(function() {
     statusTimerId = null;
     pollStatus();
@@ -161,8 +126,9 @@ export async function pollStatus() {
   // 递归 setTimeout 调度，正常情况下不会重叠；做个保险避免并发请求
   if (statusPollInFlight) return;
   statusPollInFlight = true;
+  var pollStartedAt = Date.now();
   statusAbortCtrl = new AbortController();
-  var pollTimer = setTimeout(function() { try { statusAbortCtrl.abort(); } catch(_e) {} }, 3000);
+  var pollTimer = setTimeout(function() { try { statusAbortCtrl.abort(); } catch(_e) {} }, 5000);
   try {
     var resp = await fetch(window.getBaseUrl() + '/system/status', {
       signal: statusAbortCtrl.signal
@@ -287,7 +253,13 @@ export async function pollStatus() {
     }
   } finally {
     statusPollInFlight = false;
-    scheduleStatusPoll();
+    statusAbortCtrl = null;
+    /* 固定周期调度：interval 从本轮开始计时扣减请求耗时。
+     * 旧逻辑「完成后 + 1000ms」→ 窗口稳定 1100+；现 sample_ms 贴近 1000/400。
+     * 本轮超时/很慢时 delay=0，立即补下一轮，仍不重叠。 */
+    var elapsed = Date.now() - pollStartedAt;
+    var delay = Math.max(0, statusPollIntervalMs - elapsed);
+    scheduleStatusPoll(delay);
   }
 }
 // 注意：startPoll() 由入口模块（app.js / ble_ota.js）在所有模块加载完成后调用，
@@ -316,7 +288,7 @@ export async function pollLogs() {
   // ★ ESP32 上传期间也允许日志轮询
   try {
     var resp = await fetch(window.getBaseUrl() + '/logs', {
-      signal: AbortSignal.timeout(2000)
+      signal: AbortSignal.timeout(5000)
     });
     if (!resp.ok) return;
     var logs = await resp.json();
@@ -337,6 +309,18 @@ export async function pollLogs() {
           addLog('I', '系统', 'ESP32 已恢复在线（启动 banner 收到）');
           showToast('ESP32 已恢复在线', 'success');
           if (window.otaSessionState === window.OtaSessionState.REBOOTING) window.otaSessionTransition(window.OtaSessionState.DONE);
+        }
+        /*
+         * 设备已报「全部数据包已转发」时，立刻补 UI 100% 进度。
+         * status 轮询可能仍停在旧 relay_seq，否则会出现 FINISH 日志之后还刷 94%。
+         */
+        if (m[2] === 'OTA' && /全部数据包已转发/.test(m[3]) &&
+            typeof window.emitRelayProgress === 'function') {
+          var otaSnap = (window.latestSystemStatus && window.latestSystemStatus.ota) || {};
+          var tot = Number(otaSnap.relay_total_packets) || 0;
+          if (tot > 0) {
+            window.emitRelayProgress(tot, tot, { force100: true });
+          }
         }
       } else {
         addLog('I', 'ESP32', line.trimEnd());

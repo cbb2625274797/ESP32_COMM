@@ -189,6 +189,9 @@ export async function uploadFirmware() {
     bleLog('OTA', `开始写入 DATA_IN: build=${UI_BUILD}, target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`);
 
     const MAX_WINDOW_RETRIES = 3;
+    // 整分区预擦可长达数十秒；首包 ACK 超时必须覆盖 begin/erase
+    const BEGIN_READY_TIMEOUT_MS = 120000;
+    const WINDOW_ACK_TIMEOUT_MS = 8000;
     for (let windowStart = 0; windowStart < packetTotal; windowStart += BLE_OTA_ACK_WINDOW) {
       if (state.abortRequested) throw new Error('用户中止');
 
@@ -197,37 +200,50 @@ export async function uploadFirmware() {
       // Windows Web Bluetooth 同一时刻只允许一个 GATT 操作。逐包等待仅保证
       // 提交顺序；实际吞吐由设备请求的高速 BLE 连接参数决定。
       // ★ 不再在循环内 setProgress：进度完全由设备 ACK 后的 state.lastAckBytes 驱动
+      //
+      // ★ 首窗特殊流控：seq=0 触发设备 begin+整分区预擦（worker 线程，可阻塞很久）。
+      //   旧逻辑 sleep(200) 后立刻 withoutResponse 连发 → 队列满丢包 → 整窗重传，体感极慢。
+      //   现改为：seq=0 送达后等设备「首包落盘 ACK」再发 1..endSeq。
       for (let seq = windowStart; seq <= endSeq; seq++) {
-        // ★ 中止检查放在循环内：abortTask 可能在本窗口发送过程中触发
-        //   （windowStart 处的检查无法覆盖窗口中途的 abort）
         if (state.abortRequested) throw new Error('用户中止');
         const start = seq * payloadSize;
         const end = Math.min(start + payloadSize, totalSize);
         const payload = fileBytes.slice(start, end);
         const packet = buildPacket(seq, totalSize, payload, cfg.packetCmd);
 
-        // ★ seq=0 必须用 writeValueWithResponse（带响应）：
-        // seq=0 触发设备端 esp_ota_begin()（flash 擦除 + OTA 会话创建），
-        // 若用 writeValueWithoutResponse 在 BLE 链路层丢失，
-        // 设备永远不会启动 OTA 会话，后续所有包都被丢弃。
         if (seq === 0) {
           try {
             await state.dataInChar.writeValueWithResponse(packet);
-            bleLog('OTA', 'seq=0 已用 writeValueWithResponse 确认送达', 'I');
+            bleLog('OTA', 'seq=0 已用 writeValueWithResponse 确认送达，等待设备 begin/预擦完成…', 'I');
+            setBleStageText('设备预擦 Flash 中，请等待…');
           } catch (e) {
             bleLog('OTA', `seq=0 写入失败: ${e.message}`, 'E');
             throw new Error('seq=0 写入失败，OTA 会话无法启动: ' + e.message);
           }
-          // seq=0 写入后等待设备完成 esp_ota_begin()（flash 擦除较耗时）
-          await sleep(200);
-        } else {
-          await state.dataInChar.writeValueWithoutResponse(packet);
+          state.ackGeneration++;
+          const firstBytes = Math.min(payloadSize, totalSize);
+          try {
+            await waitForAck(cfg.packetCmd, 0, BEGIN_READY_TIMEOUT_MS, {
+              expectedTotalSize: totalSize,
+              payloadSize: payloadSize
+            });
+          } catch (e) {
+            throw new Error('等待设备 begin/预擦完成超时: ' + e.message);
+          }
+          if (state.lastAckBytes < firstBytes) {
+            throw new Error('设备 begin 就绪 ACK 字节不足: got=' + state.lastAckBytes + ' need=' + firstBytes);
+          }
+          bleLog('OTA', '设备 begin 就绪 (ackBytes=' + state.lastAckBytes + ')，继续发送窗口数据', 'I');
+          setBleStageText('正在写入 ' + packetTotal + ' 包数据...');
+          continue;
         }
+
+        await state.dataInChar.writeValueWithoutResponse(packet);
       }
 
       state.ackGeneration++;
       try {
-        await waitForAck(cfg.packetCmd, endSeq, 5000, { expectedTotalSize: totalSize, payloadSize });
+        await waitForAck(cfg.packetCmd, endSeq, WINDOW_ACK_TIMEOUT_MS, { expectedTotalSize: totalSize, payloadSize });
       } catch (e) {
         bleLog('OTA', `ACK 等待失败: ${e.message}，进入重试`, 'W');
       }
@@ -270,15 +286,23 @@ export async function uploadFirmware() {
           const end = Math.min(start + payloadSize, totalSize);
           const payload = fileBytes.slice(start, end);
           const packet = buildPacket(seq, totalSize, payload, cfg.packetCmd);
-          // ★ 重试路径中 seq=0 也必须用 writeValueWithResponse
+          // ★ 重试路径中 seq=0 也必须用 writeValueWithResponse，并等 begin 就绪 ACK
           if (seq === 0) {
             try {
               await state.dataInChar.writeValueWithResponse(packet);
-              bleLog('OTA', '重试 seq=0 已用 writeValueWithResponse 确认', 'I');
+              bleLog('OTA', '重试 seq=0 已送达，等待 begin 就绪 ACK…', 'I');
+              state.ackGeneration++;
+              try {
+                await waitForAck(cfg.packetCmd, 0, BEGIN_READY_TIMEOUT_MS, {
+                  expectedTotalSize: totalSize,
+                  payloadSize: payloadSize
+                });
+              } catch (e2) {
+                bleLog('OTA', '重试 seq=0 等待 begin ACK 失败: ' + e2.message, 'W');
+              }
             } catch (e) {
               bleLog('OTA', `重试 seq=0 写入失败: ${e.message}`, 'E');
             }
-            await sleep(200);
           } else {
             await state.dataInChar.writeValueWithoutResponse(packet);
           }
@@ -286,7 +310,7 @@ export async function uploadFirmware() {
 
         state.ackGeneration++;
         try {
-          await waitForAck(cfg.packetCmd, endSeq, 3000, { expectedTotalSize: totalSize, payloadSize });
+          await waitForAck(cfg.packetCmd, endSeq, WINDOW_ACK_TIMEOUT_MS, { expectedTotalSize: totalSize, payloadSize });
         } catch (e) {
           bleLog('OTA', `重试 ACK 等待失败: ${e.message}`, 'W');
         }

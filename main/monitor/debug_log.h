@@ -113,8 +113,8 @@ private:
      * free < kDrainMinFree → /logs 尽量仍返回 ring（降低门槛，避免“沉默失败”） */
     static constexpr uint32_t kDropWarnFree = 6U * 1024U;
     static constexpr uint32_t kDropInfoFree = 10U * 1024U;
-    static constexpr uint32_t kSkipUdpFree  = 10U * 1024U;
-    static constexpr uint32_t kDrainMinFree = 8U * 1024U;
+    static constexpr uint32_t kSkipUdpFree  = 6U * 1024U;   // ★ 修复：从 10KB 降至 6KB，sendto 本身不需大块堆
+    static constexpr uint32_t kDrainMinFree = 4U * 1024U;   // ★ 修复：从 8KB 降至 4KB，降低 /logs 返空的概率
 
     esp_err_t ensureUdpSocket();
     void ringPush(const char *data, int len);

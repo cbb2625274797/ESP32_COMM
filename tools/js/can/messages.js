@@ -1,8 +1,7 @@
 /**
  * messages.js - 报文列表管理（渲染、过滤、节点过滤、批量 UI）
  *
- * 从 tools/can.js 拆分。对应原 can.js 约 337~686 行（DBC 文件信息、报文过滤、
- * 节点过滤面板、报文列表渲染、报文选择/展开、批量 UI）。
+ * 包含：DBC 文件信息、报文过滤、节点过滤面板、报文列表渲染、报文选择/展开、批量 UI。
  *
  * 依赖：dbc.js（state/el/padHex/normalizeWhitespace/cssEscape）、
  *       common/utils.js（escapeHtml/formatBytes）、

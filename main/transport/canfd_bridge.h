@@ -1,7 +1,7 @@
 /*
- * canfd_bridge.h - CANFD 3通道通信桥接（M4: 从 SpiMaster 提取）
+ * canfd_bridge.h - CANFD 3通道通信桥接
  *
- * 封装 CANFD 帧格式构建 + SPI 传输，与 SpiMaster 的 OTA 协议职责解耦。
+ * 封装 CANFD 帧格式构建 + SPI 传输，与 SpiMaster 的 OTA 协议职责分离。
  * 通过 SpiMaster 的公共 SPI 接口完成底层传输。
  */
 #ifndef CANFD_BRIDGE_H

@@ -5,7 +5,7 @@
  *   begin → write*(N) → finalize / abort
  *
  * 统一以 WiFi 流程为基准：
- *   - esp_ota_begin 第二参数传 total_size
+ *   - begin：整分区预擦后 esp_ota_resume（写路径不再边写边擦）
  *   - SHA-256 在 finalize 时从 OTA 分区读回计算（不在上传期间增量计算）
  *   - finalize 顺序: 读回 SHA-256 → 比对前端 SHA → esp_ota_end → esp_ota_set_boot_partition → 可选重启
  *   - m_ended 标志位防止 esp_ota_end 成功后再次 esp_ota_abort 同一 handle
@@ -102,16 +102,15 @@ public:
     /** @brief 获取已接收的字节数。 */
     size_t getReceived() const { return m_received; }
 
-    // ── 分区互斥锁管理（M1: 从 ota_mutex.h 全局变量内聚到此类）──
+    // ── 分区互斥锁管理 ──
     /**
      * @brief 初始化 ESP32 OTA 分区互斥锁（在 app_main 中调用）。
-     *        替代旧的全局 g_esp32OtaMutex / g_esp32OtaOccupied。
      */
     static void initMutex();
 private:
     Esp32OtaCore() = default;
 
-    // ── 分区互斥锁（M1: 内聚自 ota_mutex.h）──
+    // ── 分区互斥锁 ──
     static SemaphoreHandle_t s_mutex;      ///< ESP32 OTA 分区互斥锁
     static volatile bool     s_occupied;   ///< 分区占用标志
     static bool acquireMutex(uint32_t timeout_ms);

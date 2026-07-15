@@ -1,7 +1,6 @@
 /**
  * upload-esp32.js - ESP32 本机 OTA 上传流程 + 完成升级
  *
- * 从 app.js 的「上传固件」「ESP32 OTA 完成升级」段提取。
  * 包含：startUpload 入口（处理 esp32 + gd32 共用互斥/重读逻辑）、
  *       XHR 上传、SHA 校验、verifyEsp32Firmware、restartEsp32。
  *
@@ -10,7 +9,7 @@
  *   window._esp32FileSha256 / window._gd32FileSha256 / window.activeXhr
  *   window.isUploading / window.uploadBtnOrigText / window.activeUploadChip
  *
- * 未拆分的函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.otaSessionActive / window.otaSessionTerminated / window.otaSessionReset
  *   window.otaSessionTransition / window.OtaSessionState / window.otaSessionTarget
  *   window.cleanupAfterOtaFailure / window.pausePollingForUpload
@@ -31,6 +30,7 @@ import {
   startUploadWaitHeartbeat
 } from './session.js';
 import { updateEsp32StagesFromPhase, switchStageFlow, setActivePhase, setProgress, markPhaseDone, cleanupAfterOtaFailure } from './progress.js';
+import { ensureFileShaCached } from './file-handle.js';
 
 function isOtaBusyError(status, detail) {
   var text = (detail || '').toLowerCase();
@@ -104,9 +104,13 @@ export async function startUpload(chip) {
         var otaChannelName = ota.channel_name || (otaChannel === 1 ? 'BLE' : 'WIFI');
         // ESP32 RECEIVING(5) 可由同一 WiFi 通道的新上传接管；后台/休眠可能让 /ota/update 没发出，
         // 若这里提前拦截，后端 beginEsp32OtaWithRetry 的同通道清理分支永远没有机会执行。
-        // ERROR(8) 也放行给后端清理底层 OTA 句柄；FINALIZING(6)/REBOOTING(7) 是不可逆忙态。
-        if (ssc === 5 && otaChannel === 1 && _pi < 3) continue;
-        var esp32Busy = (ssc === 6 || ssc === 7 || (ssc === 5 && otaChannel !== 0));
+        // ERROR(8) 放行给后端清理；REBOOTING(7) 不可逆。
+        // FINALIZING(6)：真收尾时后端会 403；SHA 失败后可能假占用（core 已空），
+        // status 自愈 / begin 残留清理需要请求触达设备，前端同通道不硬拦。
+        if ((ssc === 5 || ssc === 6) && otaChannel === 1 && _pi < 3) continue;
+        var esp32Busy = (ssc === 7 ||
+          (ssc === 6 && otaChannel !== 0) ||
+          (ssc === 5 && otaChannel !== 0));
         // GD32 STORING(1) 可由同一 WiFi 通道的新上传接管；RELAYING(3) 不可中断。
         var gd32Busy = (ssc === 3 || (ssc === 1 && otaChannel !== 0));
         if ((esp32Busy || gd32Busy)) {
@@ -183,31 +187,10 @@ export async function startUpload(chip) {
   showToast('开始上传固件到 ' + chip.toUpperCase(), 'success');
   try {
     var arrayBuffer = await file.arrayBuffer();
-    // 刷写时重新计算 SHA-256（ESP32 和 GD32 都算）
-    if (chip === 'esp32') {
-      try {
-        var hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
-        var hashArray = Array.from(new Uint8Array(hashBuffer));
-        var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
-        window._esp32FileSha256 = hashHex.toUpperCase();
-        var shaElem = document.getElementById('fileSha256Esp32');
-        if (shaElem) shaElem.textContent = window._esp32FileSha256;
-        addLog('I', '文件', '刷写前重新计算 SHA-256: ' + window._esp32FileSha256);
-      } catch (e) {
-        addLog('W', '文件', 'SHA-256 重新计算失败: ' + e.message);
-      }
-    } else if (chip === 'gd32') {
-      try {
-        var hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
-        var hashArray = Array.from(new Uint8Array(hashBuffer));
-        var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
-        window._gd32FileSha256 = hashHex.toUpperCase();
-        addLog('I', '文件', 'GD32 SHA-256: ' + window._gd32FileSha256);
-      } catch (e) {
-        addLog('W', '文件', 'GD32 SHA-256 重新计算失败: ' + e.message);
-        window._gd32FileSha256 = null;
-      }
-    }
+    // SHA-256：processFile 阶段已算好并缓存；这里若 handle.getFile() 拿回的
+    // fresh file meta 未变就直接复用（命中 30–100ms/MB 的计算）；
+    // 用户 rebuild 使 lastModified 变化时 ensureFileShaCached 自动 fallback 到重算。
+    await ensureFileShaCached(file, chip, arrayBuffer);
     var fileSize = file.size;
     var body, url = window.getBaseUrl() + '/ota/upload';
     if (chip === 'esp32') {

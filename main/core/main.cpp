@@ -14,6 +14,7 @@
 #include "esp_ota_ops.h"
 
 #include "monitor/health_monitor.h"
+#include "monitor/cpu_stats.h"
 #include "relay/ota_relay.h"
 #include "ota/ota_coordinator.h"
 #include "transport/spi_master.h"
@@ -33,7 +34,7 @@ extern "C" void app_main(void)
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
 
-    // ★ M1: ESP32 OTA 分区互斥锁内聚到 Esp32OtaCore（替代旧的全局变量）
+    // ESP32 OTA 分区互斥锁内聚到 Esp32OtaCore
     Esp32OtaCore::initMutex();
 
     // 初始化网络接口 + 事件循环（必须最早）
@@ -43,7 +44,7 @@ extern "C" void app_main(void)
     // 初始化调试日志（UART0 先就绪，UDP socket 延迟到首次发送时创建）
     DebugLog::instance().init();
 
-    // ★ WiFi 提前初始化（调度器启动前）
+    // WiFi 提前初始化（调度器启动前）
     bool wifi_sta_ok = WifiOta::instance().earlyInit();
 
     HealthMonitor::instance().init();
@@ -61,7 +62,7 @@ extern "C" void app_main(void)
     xRet = xTaskCreatePinnedToCore(
         HealthMonitor::taskEntry,
         "health_mon",
-        4096,
+        TASK_STACK_HEALTH_MON,
         NULL,
         configMAX_PRIORITIES - 4,
         NULL,
@@ -76,12 +77,15 @@ extern "C" void app_main(void)
         DEBUG_INFO("MAIN", "健康监控任务已创建");
     }
 
+    /* CPU 占用 1Hz 采样（非致命；失败时 /system/status 的 cpu.valid 保持 false） */
+    CpuStats::instance().start();
+
     Protocol::instance().init();
     DEBUG_INFO("MAIN", "协议层初始化完成");
 
-    // ★ 全局 OTA 协调器初始化（在 OTA task 创建前，确保 mutex 就绪）
+    // OTA 全局协调器初始化（在 OTA task 创建前，确保 mutex 就绪）
     OtaCoordinator::instance().init();
-    // ★ L1: 注册 BLE 射频共存监听器（WifiOta 实现 IBleCoexListener）
+    // 注册 BLE 射频共存监听器（WifiOta 实现 IBleCoexListener）
     OtaCoordinator::instance().setBleCoexListener(&WifiOta::instance());
     DEBUG_INFO("MAIN", "OTA 全局协调器已初始化");
 
@@ -96,7 +100,7 @@ extern "C" void app_main(void)
     xRet = xTaskCreatePinnedToCore(
         OtaRelay::taskEntry,
         "ota_relay",
-        6144,
+        TASK_STACK_OTA_RELAY,
         NULL,
         configMAX_PRIORITIES - 2,
         NULL,
@@ -115,7 +119,7 @@ extern "C" void app_main(void)
     xRet = xTaskCreatePinnedToCore(
         WifiOta::taskEntry,
         "wifi_ota",
-        8192,
+        TASK_STACK_WIFI_OTA,
         NULL,
         configMAX_PRIORITIES - 3,
         NULL,
@@ -134,7 +138,7 @@ extern "C" void app_main(void)
     xRet = xTaskCreatePinnedToCore(
         BleOta::taskEntry,
         "ble_ota",
-        4096,
+        TASK_STACK_BLE_OTA,
         NULL,
         configMAX_PRIORITIES - 3,
         NULL,
@@ -158,7 +162,7 @@ extern "C" void app_main(void)
         DEBUG_WARN("MAIN", "CAN 反馈轮询任务创建失败（非致命，OTA 不受影响）");
     }
 
-    // ★ OTA 回滚保护：标记当前固件有效
+    // OTA 回滚保护：标记当前固件有效
     // 启用 CONFIG_APP_ROLLBACK_ENABLE 后，新固件首次启动必须调用此函数
     // 若未调用就崩溃/重启，bootloader 会自动回退到上一个有效分区
     esp_err_t ota_valid_err = esp_ota_mark_app_valid_cancel_rollback();
@@ -171,8 +175,7 @@ extern "C" void app_main(void)
     DEBUG_INFO("MAIN", "========================================");
     DEBUG_INFO("MAIN", "所有任务创建完成，OTA Relay 运行中");
 
-    // ★ 启动最后步骤：读取 GD32 APP 版本号
-    //   参考 OtaRelay::doWaitForAppAlive 刷写后读取逻辑：
+    // 启动最后步骤：读取 GD32 APP 版本号
     //   先 hello() 建立 SPI v2 会话，再 probeGd32AppOnce 读取版本
     //   GD32 APP 完整初始化需 5-6 秒，使用 20 次重试 × 300ms 窗口
     {

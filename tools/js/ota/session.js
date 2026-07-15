@@ -1,8 +1,7 @@
 /**
  * session.js - 前端 OTA 会话状态机
  *
- * 从 app.js 的「全局状态」+「前端 OTA 会话状态机」段提取。
- * 统一管理一次 OTA 会话的完整生命周期，消除散布的布尔标志
+ * 统一管理一次 OTA 会话的完整生命周期，避免散布的布尔标志
  * (isUploading / currentOtaTarget / activeUploadChip / isEsp32Rebooting)
  * 在网络错误后被轮询错误覆盖、状态混乱的问题。
  *
@@ -20,7 +19,7 @@
  *   window.gd32CompleteAnnounced / window.relayWatchLastSeq / window.gd32RelaySessionLive
  *   window.lastSysStateCode / window.lastRelayState
  *
- * 未拆分的函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.stopRelayProgressWatch / window.setProgress / window.addLog
  */
 import { addLog } from '../common/log.js';

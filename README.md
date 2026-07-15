@@ -433,9 +433,8 @@ UDP socket 延迟创建（首次 `send()` 时才分配），WiFi 未连接时 `s
 | OTA | `OTA_BLOCK_SIZE` | 8192 | 读写块大小 |
 | OTA | `OTA_MAX_FIRMWARE_SIZE` | 216KB | GD32 固件上限 |
 | OTA | `GD32_OTA_PACKET_SIZE` | 48 | 每包载荷字节 |
-| OTA | `OTA_RESEND_RETRIES` | 10 | 单包最大重发次数 |
 | OTA | `OTA_PACKET_HEALTH_CHECK_INTERVAL` | 32 | 每 N 包健康检查 |
-| OTA | `OTA_PACKET_DELAY_MS` | 5 | 每包发送后延时(ms) |
+| OTA | 包间节奏 | CREDIT 背压 | `SpiMaster`：`remoteCredit==0` 时 wait/拒发，无固定包间 delay |
 | OTA | `OTA_WIFI_RSSI_CRITICAL` | -88 dBm | OTA 期间 RSSI 危险阈值 |
 | OTA | `OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS` | 15000 | OTA 前 RSSI 采样最大时效 |
 | 阈值 | `TEMP_WARNING` | 80°C | 温度警告阈值 |

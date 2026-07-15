@@ -166,7 +166,7 @@ void WifiOta::wifiEventHandler(void* arg, esp_event_base_t event_base,
             inst.setStaRetryCount(0);
             inst.setStaRetryExhausted(false);  // ★ 连接成功，重置耗尽标志
             inst.stateUnlock();
-            // ★ M2: 推送 WiFi 连接状态给 HealthMonitor（解耦监控层主动查询）
+            // 推送 WiFi 连接状态给 HealthMonitor
             HealthMonitor::instance().setWifiConnected(true);
             break;
 
@@ -177,7 +177,7 @@ void WifiOta::wifiEventHandler(void* arg, esp_event_base_t event_base,
             bool exhausted = inst.getStaRetryExhausted();
             int retryCount = inst.getStaRetryCount();
             inst.stateUnlock();
-            // ★ M2: 推送 WiFi 断开状态给 HealthMonitor
+            // 推送 WiFi 断开状态给 HealthMonitor
             HealthMonitor::instance().setWifiConnected(false);
 
             if (!exhausted) {
@@ -401,15 +401,17 @@ esp_err_t WifiOta::httpServerStart()
     config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
     /* LWIP_MAX_SOCKETS=12；HTTP 内部约 3 + UDP 日志 1 → 业务 socket 不宜过大。
-     * 上传期间前端必须停 status/logs（见 app.js pausePollingForUpload）。 */
-    config.max_open_sockets = 4;
-    /* 上传中途若再开 status 连接，LRU 会踢掉 /ota/upload → 浏览器卡在 100%。
-     * 关闭 LRU 踢连接：宁可新连接失败，也不拆正在写 Flash 的长传。 */
-    config.lru_purge_enable = false;
-    /* 1MB sequential 擦写时，httpd 在 write 阶段可能 >60s 不调 recv；
-     * 超时后 handler 内会重试，但过短会放大“卡 100%”观感。 */
-    config.recv_wait_timeout = 120;
-    config.send_wait_timeout = 60;
+     * 上传期间前端必须停 status/logs（见 app.js pausePollingForUpload）。
+     * ★ 修复：增加到 7，防止浏览器超时 abort 后旧连接占满所有槽位。 */
+    config.max_open_sockets = 7;
+    /* ★ 修复：启用 LRU 淘汰，当所有 socket 被占满时主动关闭最旧空闲连接。
+     * OTA 上传期间前端已暂停轮询（pausePollingForUpload），不会踢掉 upload 连接。
+     * 若仍担心极端情况，可在 ota_upload_handler 入口设置该 session 的更长超时。 */
+    config.lru_purge_enable = true;
+    /* ★ 修复：缩短超时，加速释放废弃连接。
+     * OTA 写 Flash 期间 handler 本身持有连接不会被超时踢（httpd 只在 idle 时检测）。 */
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
 
     DEBUG_INFO("WIFI", "=== 启动 HTTP OTA 服务器 ===");
     DEBUG_INFO("WIFI", "HTTP 服务器端口: %d", config.server_port);
@@ -508,7 +510,7 @@ bool WifiOta::isConnected()
 }
 
 // ============================================================
-// IBleCoexListener 接口实现（L1: 通过协调器接收 BLE 共存通知）
+// IBleCoexListener 接口实现
 // ============================================================
 void WifiOta::onBleOtaStart()
 {
@@ -603,7 +605,7 @@ bool WifiOta::earlyInit()
     // 创建后台重连任务：避免在系统事件任务中调用 esp_wifi_connect()/vTaskDelay 导致死锁
     if (WifiOta::instance().m_reconnectTask == nullptr) {
         BaseType_t ret = xTaskCreate(&WifiOta::reconnectTask, "wifi_reconnect",
-                                     4096, NULL, 5,
+                                     TASK_STACK_WIFI_RECONNECT, NULL, 5,
                                      &WifiOta::instance().m_reconnectTask);
         if (ret != pdPASS) {
             DEBUG_ERR("WIFI", "创建重连任务失败");

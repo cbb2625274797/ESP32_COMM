@@ -41,8 +41,6 @@
 #define SPI_OTA_RSP_WAIT      (0x81)
 #define SPI_OTA_RSP_ERROR     (0x82)
 
-// CANFD 类型已迁移至 transport/canfd_bridge.h（M4 解耦）
-
 // GD32 版本信息（从 APP PING 响应解析）
 typedef struct {
     uint16_t app_major;
@@ -121,14 +119,14 @@ public:
     void confirmTxSeqAccepted();
 
     /**
-     * @brief L4 统一请求入口：经 SPI worker 串行执行（send+poll）。
+     * @brief 统一请求入口：经 SPI worker 串行执行（send+poll）。
      */
     esp_err_t transact(uint8_t type, const uint8_t *payload, size_t payload_len,
                        uint8_t *resp_type, uint8_t *resp_payload,
                        size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
 
     /**
-     * @brief L4 取出 GD32 EVENT 帧（worker 已读入事件队列）。
+     * @brief 取出 GD32 EVENT 帧（worker 已读入事件队列）。
      * @param timeout_ms  等待超时（ms）。0 = 非阻塞（原语义）。
      * @return true 取到事件；false 队列空且超时未到达。
      */
@@ -195,8 +193,6 @@ public:
 
     /** @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。 */
     esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version = nullptr);
-
-    // ── CANFD 接口已迁移至 transport/canfd_bridge.h（M4 解耦）──
 
 private:
     /**
@@ -271,7 +267,7 @@ private:
     /** 事件计数信号量（worker push / takeEvent pop）。 */
     SemaphoreHandle_t m_eventSem = NULL;
 
-    // ── L4 多槽事件队列（worker 写入，业务 takeEvent 读出）──
+    // ── 多槽事件队列（worker 写入，业务 takeEvent 读出）──
     static constexpr uint8_t kEventSlots = 4U;
     struct EventSlot {
         uint8_t  type;
@@ -283,7 +279,7 @@ private:
     uint8_t m_eventTail = 0;
     uint8_t m_eventCount = 0;
 
-    // ── L4 作业提交（调用方栈上 Job + StaticSemaphore，worker 执行）──
+    // ── 作业提交（调用方栈上 Job + StaticSemaphore，worker 执行）──
     enum class JobKind : uint8_t {
         Transact = 0,
         Poll,
@@ -390,7 +386,7 @@ private:
                                    uint32_t timeout_ms, uint32_t trans_flags);
 
     /**
-     * @brief L3 变长读：同 CS 先读 16B Header，再按 LEN 读 payload+CRC。
+     * @brief 变长读：同 CS 先读 16B Header，再按 LEN 读 payload+CRC。
      * 调用者须已持锁；仅在 DATA_READY 已低（有数据）时调用，禁止盲读。
      * @param out_frame  完整帧输出（含头+payload+CRC）
      * @param out_max    输出缓冲容量

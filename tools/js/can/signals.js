@@ -1,8 +1,8 @@
 /**
  * signals.js - 信号编辑器渲染 + 信号编解码（raw ↔ physical）
  *
- * 从 tools/can.js 拆分。对应原 can.js 约 629~1028 行（信号行渲染、信号值存取、
- * 编码写入、浮点/整数/Motorola/Intel 位操作）及 761 行的 renderSelectedMessage shim。
+ * 包含：信号行渲染、信号值存取、编码写入、浮点/整数/Motorola/Intel 位操作、
+ * renderSelectedMessage shim。
  *
  * 依赖：dbc.js（state/el/padHex/bytesToHex/cssEscape/findSignal）、common/utils.js（escapeHtml）。
  */

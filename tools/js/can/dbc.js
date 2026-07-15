@@ -1,8 +1,7 @@
 /**
  * dbc.js - DBC 解析器 + 共享状态/元素缓存/基础工具
  *
- * 从 tools/can.js 拆分。对应原 can.js 约 4~21 行（state/el）、78~104 行（基础工具）、
- * 178~335 行（DBC 解析）、830~833 行（cssEscape）、1335~1352 行（readDbcText）。
+ * 包含：共享 state/el、基础工具、DBC 解析、cssEscape、readDbcText。
  *
  * 本模块是 can 子系统的基础层，不依赖其他 can 子模块；state/el 在此导出，
  * 供 messages/signals/send/feedback 共享（ES Module 的 live binding 保证引用一致）。

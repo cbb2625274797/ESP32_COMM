@@ -98,13 +98,13 @@ void OtaCoordinator::watchdogCheckLocked()
         return;  // 未超时
     }
 
-    // ★ 超时自愈：强制转 ERROR。
-    //   ERROR 不在任何 beginXxx() 的拒绝列表中，下次请求会自动从 ERROR 恢复。
-    //   清理由各子系统自行负责（abortCurrent 中会按 ERROR 不做实际清理，仅复位状态）。
-    DEBUG_ERR(TAG, "忙状态 %d 卡死超过 %" PRIu32 " ms，强制自愈 → ERROR",
+    // ★ 超时自愈：完整中止到 IDLE（释放 Esp32OtaCore / 中继 / GD32 meta 等）。
+    //   旧逻辑只标 ERROR 不清理子系统：若卡在 FINALIZING 且 core 已半释放，
+    //   前端仍长时间判“占用”；若 core 仍持互斥，ERROR 后 begin 还要靠 forceCleanup。
+    //   REBOOTING 本应已 esp_restart；超时则同样中止，避免永久卡死。
+    DEBUG_ERR(TAG, "忙状态 %d 卡死超过 %" PRIu32 " ms，强制中止 → IDLE",
               (int)m_sysState, (uint32_t)pdTICKS_TO_MS(kBusyWatchdogTicks));
-    m_sysState = OTA_SYS_ERROR;
-    m_busySinceTick = 0;
+    doAbortLocked();
 }
 
 // ============================================================
@@ -124,7 +124,7 @@ void OtaCoordinator::init()
     m_gd32StorageDone = false;
     m_busySinceTick = 0;
 
-    // ★ H4 解耦：注册协调器为 OtaRelay 的中继事件监听器
+    // 注册协调器为 OtaRelay 的中继事件监听器
     OtaRelay::setRelayListener(this);
 
     // ★ 重启恢复：如果 NVS 里有完整固件元数据，开机时立即进入 STORED 状态，
@@ -221,12 +221,27 @@ esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t 
         return err;
     }
 
-    // 3. 复位按需擦除水位（不在此处整段预擦）
-    //    旧实现在 prepare 阶段 erase 整包固件对应分区：HTTP 主线程阻塞数秒～数十秒，
-    //    期间不 httpd_req_recv → TCP 窗口塞满后浏览器进度先到 100%，再空等擦+写+SHA。
-    //    现改为 flashWriteChunk 内按扇区 ensureErased，边收边擦写，进度与真实处理对齐。
+    // 3. 整分区预擦（不再边写边擦）：prepare 阶段擦完 gd32_ota 分区，
+    //    收流时 flashWriteChunk 仅 write，吞吐更稳。会阻塞数秒～数十秒。
     Gd32FlashStore::instance().beginWriteSession();
-    DEBUG_INFO(TAG, "prepareGd32Storage: 按需擦除会话已复位 (fw=%" PRIu32 ")", total_size);
+    {
+        const esp_partition_t *gd32_part = Gd32FlashStore::instance().getPartition();
+        const uint32_t erase_bytes = gd32_part ? (uint32_t)gd32_part->size : 0U;
+        if (erase_bytes == 0U) {
+            DEBUG_ERR(TAG, "prepareGd32Storage: 找不到 gd32_ota 分区");
+            abortCurrent();
+            return ESP_ERR_NOT_FOUND;
+        }
+        DEBUG_INFO(TAG, "prepareGd32Storage: 整分区预擦 %u 字节 (fw=%" PRIu32 ")...",
+                   (unsigned)erase_bytes, total_size);
+        err = Gd32FlashStore::instance().erasePartition(erase_bytes);
+        if (err != ESP_OK) {
+            DEBUG_ERR(TAG, "prepareGd32Storage: 整分区预擦失败: %s", esp_err_to_name(err));
+            abortCurrent();
+            return err;
+        }
+        DEBUG_INFO(TAG, "prepareGd32Storage: 整分区预擦完成");
+    }
 
     // 4. 清空旧 meta + 写入初始 meta（total_size + stored_size=0 + last_seq=0）
     clearGd32Meta();
@@ -270,7 +285,7 @@ esp_err_t OtaCoordinator::finishGd32StorageAfterReceive()
 }
 
 // ============================================================
-// GD32 存储操作（传输层统一入口，解决 H3 绕过协调器问题）
+// GD32 存储操作（传输层统一入口）
 // ── 以下 8 个 wrapper 已 inline 化至 ota_coordinator.h，直接转发到
 //    Gd32FlashStore::instance()，消除跨 TU 调用开销。
 // ============================================================
@@ -394,7 +409,7 @@ void OtaCoordinator::notifyRelayComplete(bool success)
 }
 
 // ============================================================
-// IRelayListener 接口实现（H4: OtaRelay 通过接口回调通知协调器）
+// IRelayListener 接口实现
 // ============================================================
 /** @brief IRelayListener 回调：中继已开始，委托给 notifyRelayStarted()。 */
 void OtaCoordinator::onRelayStarted()
@@ -409,7 +424,7 @@ void OtaCoordinator::onRelayComplete(bool success)
 }
 
 // ============================================================
-// BLE 射频共存管理（L1: 消除 ble_ota → wifi_ota 直接依赖）
+// BLE 射频共存管理
 // ============================================================
 void OtaCoordinator::setBleCoexListener(IBleCoexListener *listener)
 {
@@ -443,7 +458,6 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
     // ★ 同类型重启：若上一次 ESP32 OTA 仍在接收中（RECEIVING）且来自同一通道，
     //   自动中止旧会话并重新开始。覆盖"上传完成后刷新网页再上传"场景。
     //   跨通道（BLE→WiFi 或 WiFi→BLE）仍拒绝，保持互斥。
-    //   FINALIZING/REBOOTING 是不可逆阶段，也拒绝。
     if (h && m_sysState == OTA_SYS_ESP32_RECEIVING) {
         if (m_otaChannel != channel) {
             DEBUG_WARN(TAG, "ESP32 OTA 接收中（通道=%d），拒绝跨通道请求（通道=%d）",
@@ -458,14 +472,23 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
         // epoch 将在下方 begin 成功后递增，自动使旧 handler 的清理代码失效
     }
 
-    // 系统忙检查：GD32 传输/中继进行中，或 ESP32 收尾/重启中，均拒绝。
-    //   ★ 必须显式拒绝 ESP32_FINALIZING/REBOOTING：
-    //     若放行，本调用会落到 Esp32OtaCore::begin 去抢全局互斥失败而返回 INVALID_STATE，
-    //     随后 beginEsp32OtaWithRetry 的 forceCleanup 会把另一通道的活跃会话
-    //     （esp_ota_abort + 释放互斥）误中止 → 两通道并发写同一 OTA 分区。
+    // ★ FINALIZING 残留自愈：SHA 不匹配时 core 已 abort，但旧固件可能未把协调器
+    //   复位到 IDLE。core 已空闲 ⇒ 协调器状态是假占用，允许清掉后开新会话。
+    //   core 仍 active ⇒ 真正在收尾，拒绝（不可 forceCleanup，防并发写分区）。
+    if (h && m_sysState == OTA_SYS_ESP32_FINALIZING) {
+        if (!Esp32OtaCore::instance().isActive()) {
+            DEBUG_WARN(TAG, "ESP32_FINALIZING 残留（core 已空闲），强制复位后允许新会话");
+            doAbortLocked();
+        } else {
+            DEBUG_WARN(TAG, "系统忙 (ESP32_FINALIZING, core 活跃)，拒绝 ESP32 OTA");
+            unlock(h);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
+    // 系统忙检查：GD32 传输/中继进行中，或 ESP32 重启中，均拒绝。
     if (h && (m_sysState == OTA_SYS_GD32_STORING ||
               m_sysState == OTA_SYS_GD32_RELAYING ||
-              m_sysState == OTA_SYS_ESP32_FINALIZING ||
               m_sysState == OTA_SYS_ESP32_REBOOTING)) {
         DEBUG_WARN(TAG, "系统忙 (state=%d, %s)，拒绝 ESP32 OTA",
                    (int)m_sysState, stateToString(m_sysState));
@@ -586,6 +609,13 @@ Esp32FinalizeResult OtaCoordinator::finalizeForReboot(const char *frontend_sha_h
                                               r.device_sha_hex);
     if (r.err == ESP_OK) {
         notifyEsp32FinalizeComplete();
+    } else {
+        // ★ SHA 不匹配 / end 失败：Esp32OtaCore 已 abort+释放互斥，但协调器若仍停在
+        //   ESP32_FINALIZING，WiFi 前端会一直被“设备 OTA 占用”拒绝（BLE 路径曾单独
+        //   补 abortCurrent；统一放到这里，WiFi/BLE 共用）。
+        DEBUG_ERR(TAG, "ESP32 finalize 失败: %s，复位协调器 → IDLE",
+                  esp_err_to_name(r.err));
+        abortCurrent();
     }
     return r;
 }
@@ -632,6 +662,26 @@ void OtaCoordinator::abortCurrent()
     wifiOtaResumeBleIfNeeded();
 }
 
+void OtaCoordinator::healOrphanStates()
+{
+    bool need_resume = false;
+    bool h = lock();
+    if (h) {
+        watchdogCheckLocked();
+        // finalize 失败后 core 已空、协调器仍 FINALIZING 的假占用：status 轮询即可自愈
+        if (m_sysState == OTA_SYS_ESP32_FINALIZING &&
+            !Esp32OtaCore::instance().isActive()) {
+            DEBUG_WARN(TAG, "status 路径发现 ESP32_FINALIZING 残留，自愈 → IDLE");
+            doAbortLocked();
+            need_resume = true;
+        }
+        unlock(h);
+    }
+    if (need_resume) {
+        wifiOtaResumeBleIfNeeded();
+    }
+}
+
 uint32_t OtaCoordinator::getOtaEpoch() const
 {
     bool h = lock();
@@ -665,7 +715,7 @@ bool OtaCoordinator::abortCurrentIfEpoch(uint32_t epoch)
 ota_system_state_t OtaCoordinator::getSystemState() const
 {
     // 对于纯读取，短暂加锁保证一致性
-    // ★ M1/L3: m_mutex 为 mutable + lock()/unlock() 为 const，无需 const_cast
+    // m_mutex 为 mutable + lock()/unlock() 为 const，无需 const_cast
     bool h = lock();
     ota_system_state_t s = m_sysState;
     unlock(h);
@@ -720,7 +770,7 @@ bool OtaCoordinator::getGd32AppAlive() const
 }
 
 // ============================================================
-// OTA 状态快照（PR1: 收口状态读取）
+// OTA 状态快照
 // ============================================================
 OtaSnapshot OtaCoordinator::getSnapshot() const
 {
@@ -754,7 +804,7 @@ OtaSnapshot OtaCoordinator::getSnapshot() const
 }
 
 // ============================================================
-// GD32 APP 探测（PR2: 从 /system/status 移出）
+// GD32 APP 探测
 // ============================================================
 // 注：本函数与 OtaRelay::probeAndCacheAppAlive 逻辑相似，但因依赖方向
 //     （OtaCoordinator → OtaRelay）不应调用 OtaRelay 的内部实现细节，

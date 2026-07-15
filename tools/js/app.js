@@ -12,11 +12,11 @@ import { showToast } from './common/toast.js';
 import { addLog, clearLogs, setLogFilter, toggleAutoScroll } from './common/log.js';
 import {
   updateConnectionUi, updateHealthUi, updateHeapAndTaskStatusUi,
-  testConnection, refreshSystemStatusNow
+  testConnection, refreshSystemStatusNow, diagnoseNetwork
 } from './common/connection.js';
 import {
   scheduleStatusPoll, startPolling, pausePollingForUpload,
-  resumePollingAfterUpload, pollStatus, pollLogs
+  resumePollingAfterUpload, pollStatus, pollLogs, setStatusPollIntervalMs
 } from './common/polling.js';
 
 import {
@@ -40,9 +40,12 @@ import {
 } from './ota/file-handle.js';
 import { sendSpiFrame, clearSpiFields, updateSpiHint } from './ota/spi.js';
 import { startUpload, verifyEsp32Firmware, restartEsp32 } from './ota/upload-esp32.js';
-import { triggerGd32Relay, markGd32OtaUiComplete, stopRelayProgressWatch, startRelayProgressWatch } from './ota/upload-gd32.js';
+import {
+  triggerGd32Relay, markGd32OtaUiComplete, stopRelayProgressWatch,
+  startRelayProgressWatch, emitRelayProgress, ensureRelayProgressComplete
+} from './ota/upload-gd32.js';
 
-// ==================== 工具函数（部分未拆分的辅助函数） ====================
+// ==================== 工具函数 ====================
 function formatPercent(value) {
   if (!Number.isFinite(value)) return '--';
   return value.toFixed(1).replace(/\.0$/, '') + '%';
@@ -178,6 +181,8 @@ window.triggerGd32Relay = triggerGd32Relay;
 window.markGd32OtaUiComplete = markGd32OtaUiComplete;
 window.stopRelayProgressWatch = stopRelayProgressWatch;
 window.startRelayProgressWatch = startRelayProgressWatch;
+window.emitRelayProgress = emitRelayProgress;
+window.ensureRelayProgressComplete = ensureRelayProgressComplete;
 
 // ==================== 挂载 common/* 函数到 window（供 polling.js 等通过 window.* 调用） ====================
 window.formatBytes = formatBytes;
@@ -196,11 +201,13 @@ window.updateHeapAndTaskStatusUi = updateHeapAndTaskStatusUi;
 window.testConnection = testConnection;
 window.refreshSystemStatusNow = refreshSystemStatusNow;
 window.scheduleStatusPoll = scheduleStatusPoll;
+window.setStatusPollIntervalMs = setStatusPollIntervalMs;
 window.startPolling = startPolling;
 window.pausePollingForUpload = pausePollingForUpload;
 window.resumePollingAfterUpload = resumePollingAfterUpload;
 window.pollStatus = pollStatus;
 window.pollLogs = pollLogs;
+window.diagnoseNetwork = diagnoseNetwork;
 
 // ==================== 挂载本入口的辅助函数到 window ====================
 window.getEspIp = getEspIp;

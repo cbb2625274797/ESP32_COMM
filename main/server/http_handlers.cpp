@@ -1,6 +1,5 @@
 /*
  * http_handlers.cpp - HTTP 请求处理器实现
- * 从 wifi_ota.cpp 提取的 HTTP handler 函数
  */
 #include <string.h>
 #include <stdarg.h>
@@ -28,6 +27,7 @@
 #include "storage/gd32_flash_store.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
+#include "monitor/cpu_stats.h"
 #include "spi_master.h"
 #include "canfd_bridge.h"
 #include "monitor/can_feedback_task.h"
@@ -208,7 +208,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     DEBUG_INFO("WIFI", "收到固件上传请求, 内容长度: %d 字节", req->content_len);
 
     esp_wifi_set_ps(WIFI_PS_NONE);
-    // ★ L1: WiFi OTA 开始时恢复 BLE 共存状态（通过协调器）
+    // WiFi OTA 开始时恢复 BLE 共存状态（通过协调器）
     OtaCoordinator::instance().notifyBleCoexEnd();
 
     char peek;
@@ -307,7 +307,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                 const uint32_t free_pre = esp_get_free_heap_size();
                 if (free_pre < 8192U) {
                     (void)esp_task_wdt_reset();
-                    vTaskDelay(pdMS_TO_TICKS(free_pre < 4096U ? 5U : 2U));
+                    vTaskDelay(pdMS_TO_TICKS(free_pre < 4096U ? 5U : 1));
                 }
             }
 
@@ -615,12 +615,10 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         valid[i] = getLatestCanFeedback(i, &results[i]);
     }
 
-    /* 估算缓冲大小：每通道 ~2KB (统计+ID条目) */
-    char *resp = (char *)calloc(1, 8192);
-    if (!resp) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
-        return ESP_FAIL;
-    }
+    /* ★ 修复：改用静态缓冲区，避免每次请求 malloc 8KB 加剧堆碎片化 */
+    static char s_feedback_json[8192];
+    char *resp = s_feedback_json;
+    memset(resp, 0, sizeof(s_feedback_json));
 
     char *p = resp;
     p += sprintf(p, "{\"channels\":[");
@@ -670,7 +668,6 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, (int)(p - resp));
-    free(resp);
     return ESP_OK;
 }
 
@@ -882,7 +879,6 @@ esp_err_t spi_send_handler(httpd_req_t *req)
 static constexpr uint32_t INTERNAL_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 /* 状态 JSON 用静态缓冲：OTA 后 largest free 常 <2KB，calloc(8KB) 会 500 "no memory"。 */
 static constexpr size_t SYSTEM_STATUS_JSON_CAP = 6144;
-static constexpr size_t CPU_TASK_SNAPSHOT_MAX = 32;
 static char s_status_json[SYSTEM_STATUS_JSON_CAP];
 static SemaphoreHandle_t s_status_json_mux = nullptr;
 static portMUX_TYPE s_status_json_init_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -897,167 +893,6 @@ static SemaphoreHandle_t statusJsonMutex(void)
         portEXIT_CRITICAL(&s_status_json_init_mux);
     }
     return s_status_json_mux;
-}
-
-struct CpuTaskSample {
-    UBaseType_t task_number;
-    configRUN_TIME_COUNTER_TYPE runtime;
-};
-
-struct CpuTaskMetric {
-    const char* name;
-    UBaseType_t task_number;
-    uint64_t runtime_delta;
-    double usage_pct;
-};
-
-struct CpuUsageSnapshot {
-    bool available;
-    bool valid;
-    uint32_t sample_ms;
-    double usage_pct;
-    double idle_pct;
-    CpuTaskMetric tasks[CPU_TASK_SNAPSHOT_MAX];
-    size_t task_count;
-};
-
-static portMUX_TYPE s_cpu_stats_mux = portMUX_INITIALIZER_UNLOCKED;
-static CpuTaskSample s_cpu_last_samples[CPU_TASK_SNAPSHOT_MAX];
-static size_t s_cpu_last_count = 0;
-static configRUN_TIME_COUNTER_TYPE s_cpu_last_total = 0;
-static int64_t s_cpu_last_time_us = 0;
-static bool s_cpu_has_last = false;
-
-static uint64_t runtime_delta(configRUN_TIME_COUNTER_TYPE current, configRUN_TIME_COUNTER_TYPE previous)
-{
-    return current >= previous ? (uint64_t)(current - previous) : 0U;
-}
-
-static bool task_name_is_idle(const char* name)
-{
-    return name && strncmp(name, "IDLE", 4) == 0;
-}
-
-static void reset_cpu_usage_baseline_locked(const TaskStatus_t* tasks, size_t task_count,
-                                            configRUN_TIME_COUNTER_TYPE total_runtime,
-                                            int64_t now_us)
-{
-    size_t copy_count = std::min(task_count, CPU_TASK_SNAPSHOT_MAX);
-    for (size_t i = 0; i < copy_count; ++i) {
-        s_cpu_last_samples[i].task_number = tasks[i].xTaskNumber;
-        s_cpu_last_samples[i].runtime = tasks[i].ulRunTimeCounter;
-    }
-    s_cpu_last_count = copy_count;
-    s_cpu_last_total = total_runtime;
-    s_cpu_last_time_us = now_us;
-    s_cpu_has_last = true;
-}
-
-// ★ 改为输出参数模式：CpuUsageSnapshot 608B + CpuTaskSample[24] 192B = 800B
-//   之前全在栈上，system_status_handler 又拷一份 608B → 叠加 1.4KB，
-//   加上 OtaSnapshot/TaskStackMetric/wifi_ap_record_t 约 2.3KB 栈消耗。
-//   HTTP 主线程上传 100% 后调用此 handler 时极易栈溢出。改堆分配。
-static void sample_cpu_usage(CpuUsageSnapshot& result)
-{
-    result = {};
-#if defined(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)
-    result.available = true;
-
-    UBaseType_t task_count = uxTaskGetNumberOfTasks();
-    if (task_count == 0) {
-        return;
-    }
-    task_count = std::min<UBaseType_t>(task_count + 2U, CPU_TASK_SNAPSHOT_MAX);
-
-    TaskStatus_t* tasks = (TaskStatus_t*)calloc(task_count, sizeof(TaskStatus_t));
-    if (!tasks) {
-        return;
-    }
-
-    configRUN_TIME_COUNTER_TYPE total_runtime = 0;
-    UBaseType_t captured_count = uxTaskGetSystemState(tasks, task_count, &total_runtime);
-    int64_t now_us = esp_timer_get_time();
-    if (captured_count == 0 || captured_count > task_count) {
-        DEBUG_WARN("STATUS", "CPU stats: uxTaskGetSystemState 返回 0 (actual_tasks=%lu, buf_slots=%lu)",
-                   (unsigned long)uxTaskGetNumberOfTasks(), (unsigned long)task_count);
-        free(tasks);
-        return;
-    }
-
-    // ★ previous_samples[24] = 192B，改堆分配减少栈压力
-    CpuTaskSample* previous_samples = (CpuTaskSample*)calloc(CPU_TASK_SNAPSHOT_MAX, sizeof(CpuTaskSample));
-    if (!previous_samples) {
-        free(tasks);
-        return;
-    }
-
-    size_t previous_count = 0;
-    configRUN_TIME_COUNTER_TYPE previous_total = 0;
-    int64_t previous_time_us = 0;
-    bool had_previous = false;
-
-    portENTER_CRITICAL(&s_cpu_stats_mux);
-    previous_count = s_cpu_last_count;
-    previous_total = s_cpu_last_total;
-    previous_time_us = s_cpu_last_time_us;
-    had_previous = s_cpu_has_last;
-    for (size_t i = 0; i < previous_count; ++i) {
-        previous_samples[i] = s_cpu_last_samples[i];
-    }
-    reset_cpu_usage_baseline_locked(tasks, captured_count, total_runtime, now_us);
-    portEXIT_CRITICAL(&s_cpu_stats_mux);
-
-    bool can_compute = had_previous && total_runtime >= previous_total && now_us > previous_time_us;
-    uint64_t total_delta = can_compute ? runtime_delta(total_runtime, previous_total) : 0U;
-    uint64_t idle_delta = 0U;
-    if (can_compute && total_delta > 0U) {
-        for (UBaseType_t i = 0; i < captured_count; ++i) {
-            configRUN_TIME_COUNTER_TYPE last_runtime = 0;
-            bool found_previous = false;
-            for (size_t j = 0; j < previous_count; ++j) {
-                if (previous_samples[j].task_number == tasks[i].xTaskNumber) {
-                    last_runtime = previous_samples[j].runtime;
-                    found_previous = true;
-                    break;
-                }
-            }
-            if (!found_previous) {
-                continue;
-            }
-            uint64_t delta = runtime_delta(tasks[i].ulRunTimeCounter, last_runtime);
-            double pct = (double)delta * 100.0 / (double)total_delta;
-            if (task_name_is_idle(tasks[i].pcTaskName)) {
-                idle_delta += delta;
-            }
-            if (result.task_count < CPU_TASK_SNAPSHOT_MAX) {
-                CpuTaskMetric& metric = result.tasks[result.task_count++];
-                metric.name = tasks[i].pcTaskName ? tasks[i].pcTaskName : "";
-                metric.task_number = tasks[i].xTaskNumber;
-                metric.runtime_delta = delta;
-                metric.usage_pct = pct;
-            }
-        }
-
-        result.valid = true;
-        result.sample_ms = (uint32_t)((now_us - previous_time_us) / 1000);
-        result.idle_pct = std::min(100.0, (double)idle_delta * 100.0 / (double)total_delta);
-        result.usage_pct = std::max(0.0, 100.0 - result.idle_pct);
-    }
-
-    if (!result.valid) {
-        DEBUG_DBG("STATUS", "CPU stats: valid=false had_prev=%d total=%lu prev_total=%lu "
-                  "can_compute=%d delta=%lu captured=%lu",
-                  (int)had_previous,
-                  (unsigned long)total_runtime, (unsigned long)previous_total,
-                  (int)can_compute, (unsigned long)total_delta,
-                  (unsigned long)captured_count);
-    }
-
-    free(previous_samples);
-    free(tasks);
-#else
-    result.available = false;
-#endif
 }
 
 static size_t get_task_stack_high_watermark_bytes(TaskHandle_t handle)
@@ -1089,6 +924,7 @@ static int append_jsonf(char* buf, size_t cap, int offset, const char* fmt, ...)
     return offset + (int)written;
 }
 
+/** 将 CpuStats 1Hz 快照写入 JSON（不在 HTTP 线程采样） */
 static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUsageSnapshot& cpu)
 {
     offset = append_jsonf(buf, cap, offset,
@@ -1168,7 +1004,9 @@ esp_err_t system_status_handler(httpd_req_t *req)
         connected = true;
     }
 
-    // ★ PR1: 一次性快照，替代散读 OtaCoordinator / OtaRelay 多个 getter
+    // 先自愈孤儿忙态（如 SHA 失败后卡在 ESP32_FINALIZING），再取快照给 UI
+    OtaCoordinator::instance().healOrphanStates();
+    // 一次性快照，替代散读 OtaCoordinator / OtaRelay 多个 getter
     OtaSnapshot snap = OtaCoordinator::instance().getSnapshot();
 
     size_t free_heap = esp_get_free_heap_size();
@@ -1190,20 +1028,17 @@ esp_err_t system_status_handler(httpd_req_t *req)
         }
     }
 
-    /* CPU 采样在堆上；失败则跳过（available=false），不再 500 */
+    /* CPU：只读 cpu_stats 任务的 1Hz 快照，禁止在 httpd 里 uxTaskGetSystemState */
     CpuUsageSnapshot cpu_local = {};
     CpuUsageSnapshot *cpu = &cpu_local;
     CpuUsageSnapshot *cpu_heap = nullptr;
-    if (largest_free_block >= (sizeof(CpuUsageSnapshot) + 1024U)) {
+    if (largest_free_block >= (sizeof(CpuUsageSnapshot) + 512U)) {
         cpu_heap = (CpuUsageSnapshot *)calloc(1, sizeof(CpuUsageSnapshot));
         if (cpu_heap) {
             cpu = cpu_heap;
-            sample_cpu_usage(*cpu);
         }
-    } else {
-        cpu_local.available = false;
-        cpu_local.valid = false;
     }
+    CpuStats::instance().getSnapshot(*cpu);
 
     char *resp = s_status_json;
     memset(resp, 0, SYSTEM_STATUS_JSON_CAP);
@@ -1309,11 +1144,10 @@ esp_err_t system_status_handler(httpd_req_t *req)
 }
 
 // ============================================================
-// GET /system/probe — GD32 APP 单次 SPI 探测（PR2）
+// GET /system/probe — GD32 APP 单次 SPI 探测
 // ============================================================
 /**
  * @brief 显式触发一次 GD32 APP 存活探测。
- *        从 system_status_handler 移出的副作用，改为独立端点。
  *        成功时更新 OtaRelay 缓存的 alive/version 并返回版本信息。
  */
 esp_err_t system_probe_handler(httpd_req_t *req)

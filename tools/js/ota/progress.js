@@ -1,13 +1,12 @@
 /**
  * progress.js - 折叠面板 + 刷写进度 + 阶段节点 UI
  *
- * 从 app.js 的「折叠面板」「刷写进度」段提取。
  * 操作 DOM: #esp32Stages / #gd32Stages / #stageStatusBar / #progressFill / #progressTxt / #progressPct
  *
  * 共享状态（通过 window.* 引用）：
  *   window.activePhase / window.currentOtaTarget / window.esp32OtaPhase
  *
- * 未拆分的函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.updateStagesFromRelayState / window.cleanupAfterOtaFailure
  *   window.resumePollingAfterUpload / window.addLog
  */

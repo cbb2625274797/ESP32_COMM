@@ -1,7 +1,7 @@
 /**
  * can.js - CAN 工具页面入口（ESM 组装层）
  *
- * 本文件对应原 tools/can.js 中未拆分到子模块的编排逻辑：
+ * CAN 页面的编排逻辑：
  *   - cacheElements：缓存 DOM 元素到 el（dbc.js 导出的共享 el 对象）
  *   - setConnectionState：CAN 页面专用连接状态更新（canConnPill 等元素）
  *   - testConnection：CAN 页面专用连接检测（GET /system/status，操作 el.connectionNote 等）

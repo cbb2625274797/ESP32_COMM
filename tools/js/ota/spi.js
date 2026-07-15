@@ -1,10 +1,9 @@
 /**
  * spi.js - SPI 帧构建与发送
  *
- * 从 app.js 的「SPI 发送」段提取。
  * 操作 DOM: #spiType / #spiData / #spiTimeout / #spiHint / #spiResp / #spiRespText
  *
- * 未拆分的函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.getBaseUrl / window.showToast / window.addLog
  */
 import { showToast } from '../common/toast.js';

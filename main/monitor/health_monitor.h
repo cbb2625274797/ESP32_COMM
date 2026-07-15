@@ -74,9 +74,9 @@ public:
     TaskHandle_t getTaskHandle() const { return m_taskHandle; }
 
     /**
-     * @brief 由 WiFi 事件回调推送连接状态（解耦 HealthMonitor → WifiOta 依赖）。
+     * @brief 由 WiFi 事件回调推送连接状态（避免 HealthMonitor → WifiOta 依赖）。
      *        WiFi 连接/断开时由 wifi_ota 事件处理器主动调用，
-     *        HealthMonitor 不再主动查询 WifiOta::isConnected()。
+     *        HealthMonitor 无需主动查询 WifiOta::isConnected()。
      * @param connected true=已连接，false=断开。
      */
     void setWifiConnected(bool connected);

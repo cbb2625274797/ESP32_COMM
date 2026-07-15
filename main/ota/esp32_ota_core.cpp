@@ -25,7 +25,7 @@
 #define TAG "OTA_CORE"
 
 // ============================================================
-// 分区互斥锁（M1: 内聚自 ota_mutex.h 全局变量）
+// 分区互斥锁
 // ============================================================
 SemaphoreHandle_t Esp32OtaCore::s_mutex = NULL;
 volatile bool Esp32OtaCore::s_occupied = false;
@@ -172,22 +172,57 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
         return beginCleanupAndReturn(ESP_FAIL);
     }
 
-    /* ★ 用 OTA_WITH_SEQUENTIAL_WRITES：边写边按扇区擦除，begin 几乎瞬时返回。
-     * 旧逻辑按 64KB 对齐预擦 ~1MB，会在 /ota/upload 开头阻塞几十秒～数分钟：
-     * 浏览器 upload 进度已到 100%，设备还在擦 Flash → 表现为“卡在 100% 很久才成功”。 */
-    DEBUG_INFO(TAG, "esp_ota_begin(SEQUENTIAL) 目标=%s size=%u free=%lu...",
-               m_partition->label, (unsigned)total_size,
+    /* ★ 整分区预擦（非 SEQUENTIAL 边写边擦）：
+     * 1) 扇区循环 erase + 喂狗/yield，避免 TASK_WDT 与 WiFi 饿死
+     * 2) esp_ota_resume(erase_size≠SEQUENTIAL) → need_erase=false，写路径纯 write
+     * 3) 显式 invalidate inactive slot（resume 不像 begin 那样自动做）
+     * 预擦会在 begin 阶段占用数秒～数十秒，之后收流写 Flash 更快更稳。 */
+    const size_t part_size = m_partition->size;
+    const size_t sector = m_partition->erase_size ? m_partition->erase_size : 4096U;
+    DEBUG_INFO(TAG, "整分区预擦: %s size=%u sector=%u free=%lu...",
+               m_partition->label, (unsigned)part_size, (unsigned)sector,
                (unsigned long)esp_get_free_heap_size());
     const int64_t t0 = esp_timer_get_time();
-    esp_err_t err = esp_ota_begin(m_partition, OTA_WITH_SEQUENTIAL_WRITES, &m_handle);
+    for (size_t off = 0; off < part_size; ) {
+        size_t chunk = sector;
+        if (off + chunk > part_size) {
+            chunk = part_size - off;
+        }
+        esp_err_t erase_err = esp_partition_erase_range(m_partition, off, chunk);
+        if (erase_err != ESP_OK) {
+            DEBUG_ERR(TAG, "整分区预擦失败 @%u: %s",
+                      (unsigned)off, esp_err_to_name(erase_err));
+            return beginCleanupAndReturn(erase_err);
+        }
+        off += chunk;
+        (void)esp_task_wdt_reset();
+        taskYIELD();
+    }
     const int64_t t1 = esp_timer_get_time();
+    DEBUG_INFO(TAG, "整分区预擦完成 耗时 %lld ms",
+               (long long)((t1 - t0) / 1000));
+
+#if defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE) || defined(CONFIG_APP_ROLLBACK_ENABLE)
+    {
+        esp_err_t inv = esp_ota_invalidate_inactive_ota_data_slot();
+        if (inv != ESP_OK && inv != ESP_ERR_NOT_SUPPORTED) {
+            DEBUG_WARN(TAG, "invalidate inactive OTA slot: %s（继续）",
+                       esp_err_to_name(inv));
+        }
+    }
+#endif
+
+    /* erase_size 传 0（≠ OTA_WITH_SEQUENTIAL_WRITES）→ 写时不再擦扇区 */
+    esp_err_t err = esp_ota_resume(m_partition, /*erase_size=*/0,
+                                   /*image_offset=*/0, &m_handle);
+    const int64_t t2 = esp_timer_get_time();
     if (err != ESP_OK) {
-        DEBUG_ERR(TAG, "esp_ota_begin 失败: %s (耗时 %lld ms)",
-                  esp_err_to_name(err), (long long)((t1 - t0) / 1000));
+        DEBUG_ERR(TAG, "esp_ota_resume 失败: %s (耗时 %lld ms)",
+                  esp_err_to_name(err), (long long)((t2 - t1) / 1000));
         return beginCleanupAndReturn(err);
     }
-    DEBUG_INFO(TAG, "esp_ota_begin 完成 耗时 %lld ms free=%lu",
-               (long long)((t1 - t0) / 1000),
+    DEBUG_INFO(TAG, "esp_ota_resume 完成 耗时 %lld ms free=%lu",
+               (long long)((t2 - t1) / 1000),
                (unsigned long)esp_get_free_heap_size());
 
     m_received = 0;
@@ -196,7 +231,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     m_ended = false;
     memset(m_sha256, 0, sizeof(m_sha256));
 
-    DEBUG_INFO(TAG, "ESP32 OTA 开始，目标分区: %s, 声明大小: %u 字节 (sequential erase)",
+    DEBUG_INFO(TAG, "ESP32 OTA 开始，目标分区: %s, 声明大小: %u 字节 (full-partition erase)",
                m_partition->label, (unsigned)total_size);
     return ESP_OK;
 }
@@ -213,11 +248,9 @@ esp_err_t Esp32OtaCore::write(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* sequential 模式写时可能触发扇区擦除（禁 cache），期间 WiFi 易饿死。
-     * 写后 yield 一次即可；写前再 yield 会无谓拖慢吞吐（httpd 侧另有堆感知 pacing）。 */
+    /* 整分区已预擦：此处为纯 write，不再扇区擦除。 */
     (void)esp_task_wdt_reset();
     esp_err_t err = esp_ota_write(m_handle, data, len);
-    taskYIELD();
     if (err == ESP_OK) {
         m_received += len;
     } else {

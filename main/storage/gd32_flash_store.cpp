@@ -136,7 +136,7 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
         return ESP_ERR_INVALID_SIZE;
     }
 
-    // 写入前按需擦除目标扇区（替代 prepare 阶段整段预擦）
+    // 正常路径：prepare 已整分区预擦；此处仅兜底（水位未覆盖时才擦）
     esp_err_t erase_err = ensureErasedForWrite(aligned_offset, aligned_len);
     if (erase_err != ESP_OK) {
         return erase_err;
@@ -457,7 +457,7 @@ esp_err_t Gd32FlashStore::metaVerifyChecksum()
 
     // 检查 checksum 是否全零（未计算过）
     // 注意：返回 INVALID_STATE 而非 ESP_OK，由调用方决定是否容忍。
-    // 历史上这里直接返回 OK 跳过校验，但 meta 被意外清零时会掩盖固件损坏。
+    // 若直接返回 OK 跳过校验，meta 被意外清零时会掩盖固件损坏。
     static const uint8_t kZeroSha[32] = {0};
     if (memcmp(meta.checksum, kZeroSha, sizeof(meta.checksum)) == 0) {
         DEBUG_WARN("OTA", "metaVerify: checksum 未计算，返回 INVALID_STATE（调用方决定容忍或失败）");

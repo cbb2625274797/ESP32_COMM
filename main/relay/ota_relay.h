@@ -63,15 +63,15 @@ typedef enum {
 } ota_result_t;
 
 // ============================================================
-// IRelayListener - 中继事件监听接口（解决 H4 双向耦合）
+// IRelayListener - 中继事件监听接口
 // ============================================================
 // OtaCoordinator 实现此接口并注册到 OtaRelay，
 // OtaRelay 通过接口回调通知协调器，不再直接 #include ota_coordinator.h。
-// 依赖方向变为单向：OtaCoordinator → OtaRelay（通过接口）。
+// 依赖方向为单向：OtaCoordinator → OtaRelay（通过接口）。
 /**
  * @brief 中继事件监听器接口。
  *        OtaCoordinator 实现此接口，OtaRelay 通过回调通知状态变更，
- *        消除 OtaRelay → OtaCoordinator 的直接依赖（解决 H4 双向耦合）。
+ *        避免 OtaRelay → OtaCoordinator 的直接依赖。
  */
 class IRelayListener {
 public:
@@ -181,7 +181,7 @@ public:
      */
     void reset();
 
-    // ── 中继事件监听器（解决 H4 双向耦合）──
+    // ── 中继事件监听器 ──
     /**
      * @brief 注册中继事件监听器（由 OtaCoordinator 在 init 时调用）。
      * @param listener 监听器指针，传 nullptr 取消注册。
@@ -193,7 +193,7 @@ public:
      */
     static IRelayListener* getRelayListener();
 
-    // ── 队列访问器（解决 M3: 封装 public static 成员）──
+    // ── 队列访问器 ──
     /**
      * @brief 获取事件分发队列句柄。
      *        外部模块（OtaCoordinator / BLE）通过 getter 访问，不再直接引用静态成员。
@@ -206,8 +206,6 @@ public:
      * @return resultQueue 句柄，未初始化时为 NULL。
      */
     static QueueHandle_t getResultQueue();
-
-    // ── Flash 操作已迁移至 Gd32FlashStore（storage/gd32_flash_store.h）──
 
     // ── 线程安全锁 ──
     static void initMutex();                  ///< 初始化状态互斥锁（taskEntry 首行调用）
@@ -239,11 +237,11 @@ public:
     static constexpr size_t GD32_CHALLENGE_RESPONSE_LEN = 36;
 
 private:
-    // ── 队列（M3: 由 getter 访问，外部不再直接引用）──
+    // ── 队列（由 getter 访问）──
     static QueueHandle_t dispatchQueue;       ///< 事件分发队列
     static QueueHandle_t resultQueue;         ///< 结果回传队列
 
-    // ── 状态成员（全部改 private，统一通过 public setter/getter 访问）──
+    // ── 状态成员（统一通过 public setter/getter 访问）──
     //   外部代码使用 getState()/getRelaySeq()/... 读取，setState()/setRelaySeq()/... 写入。
     //   内部代码：若已在 StateLockGuard 块内（reset/getSnapshot/启动探测），可直接访问；
     //             否则必须使用 setter/getter，禁止裸读写（消除数据竞争）。
@@ -252,7 +250,7 @@ private:
     static uint32_t relayTotalPackets;        ///< 本次中继总包数
     static volatile bool gd32AppAlive;        ///< GD32 APP 存活标志
     static gd32_version_t gd32Version;        ///< GD32 固件版本信息
-    static IRelayListener *s_relayListener;   ///< 中继事件监听器（解决 H4）
+    static IRelayListener *s_relayListener;   ///< 中继事件监听器
     static SemaphoreHandle_t s_stateMutex;    ///< 状态成员互斥锁（由 StateLockGuard 使用）
 
     // taskHandle 为 write-once-at-init 字段：仅 taskEntry 启动首行写入一次，
@@ -331,7 +329,7 @@ private:
     /**
      * @brief 发送单包并等待 ACK（doRelayPackets 子步骤）。
      *
-     * 内含重试循环，使用以下命名常量（与历史阈值保持一致）：
+     * 内含重试循环，使用以下命名常量：
      *   kMaxResendOnNack=10（ACK 失败/轮询耗尽重发上限）
      *   kMaxResendOnStructError=3（结构化错误重发上限）
      *

@@ -1,9 +1,8 @@
 /*
  * gd32_flash_store.h - GD32 OTA 固件 Flash 存储抽象层
  *
- * 从 OtaRelay 中剥离的 Flash 分区读写、NVS 元数据持久化和 SHA-256 校验职责。
- * 传输层（WiFi/BLE）和 OtaRelay 均通过本类操作 GD32 固件存储，
- * 不再由 OtaRelay 承担存储职责（解决 H1 职责超载）。
+ * 封装 Flash 分区读写、NVS 元数据持久化和 SHA-256 校验。
+ * 传输层（WiFi/BLE）和 OtaRelay 均通过本类操作 GD32 固件存储。
  *
  * 线程模型：
  *   - 通过 instance() 单例访问，NVS 元数据读写由内部 mutex 保护
@@ -72,8 +71,8 @@ public:
     esp_err_t erasePartition(uint32_t size);
 
     /**
-     * @brief 新一轮 GD32 固件写入会话开始时调用：复位按需擦除水位。
-     *        prepareGd32Storage 在开始收流前调用，避免整段预擦阻塞 HTTP/BLE 收包。
+     * @brief 新一轮 GD32 固件写入会话开始时调用：复位擦除水位。
+     *        prepareGd32Storage 随后会 erasePartition(整分区)。
      */
     void beginWriteSession();
 
@@ -153,9 +152,8 @@ private:
 
     const esp_partition_t *m_partition = nullptr; ///< gd32_ota 分区指针（懒初始化）
 
-    // ── 按需擦除水位：已保证 [0, m_erasedUpTo) 为擦除态（扇区对齐）──
-    //   收流时 flashWriteChunk 按写入范围推进擦除，替代上传前整段预擦。
-    //   这样 HTTP 主线程可边收边擦写，浏览器进度不会在“100% 发完”后空等整段擦除。
+    // ── 擦除水位：prepare 整分区预擦后 m_erasedUpTo==part->size；
+    //   flashWriteChunk 内 ensureErased 为安全兜底（水位已覆盖则立即返回）。
     static constexpr uint32_t kFlashSectorSize = 4096U;
     uint32_t m_erasedUpTo = 0;
     esp_err_t ensureErasedForWrite(uint32_t offset, size_t len);

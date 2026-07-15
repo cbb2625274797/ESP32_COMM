@@ -367,7 +367,8 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
     }
 
     /* UDP 通道：堆紧时跳过 sendto，避免申请 LWIP TX pbuf 与 HTTP 回包抢堆。
-     * WiFi 未连接时 sendto 失败也静默跳过。 */
+     * WiFi 未连接时 sendto 失败也静默跳过。
+     * ★ 修复：堆不足跳过时写一条告警到 ring buffer，让前端 /logs 可见。 */
     if (m_initialized && free_now >= kSkipUdpFree) {
         if (m_udpSock < 0) {
             ensureUdpSocket();
@@ -380,6 +381,16 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
             if (ret >= 0) {
                 udp_ret = ESP_OK;
             }
+        }
+    } else if (m_initialized) {
+        /* 堆不足导致 UDP 被跳过——通过 ring buffer 记录，避免上位机无法感知 */
+        static uint32_t s_lastUdpSkipWarnMs = 0;
+        uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        /* 限制告警频率：每 10 秒最多一条，避免刷屏 */
+        if ((now_ms - s_lastUdpSkipWarnMs) > 10000) {
+            s_lastUdpSkipWarnMs = now_ms;
+            static const char kUdpSkipMsg[] = "[W][LOG] UDP 发送已暂停: 堆内存不足\n";
+            ringPush(kUdpSkipMsg, sizeof(kUdpSkipMsg) - 1);
         }
     }
 

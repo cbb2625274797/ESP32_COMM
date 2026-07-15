@@ -44,22 +44,35 @@ inline constexpr uint8_t     WIFI_AP_MAX_CONNECT = 4;              ///< AP 模�
 // HTTP 服务器配置
 // ============================================================
 inline constexpr uint16_t HTTP_SERVER_PORT      = 80;              ///< HTTP 服务器监听端口
-inline constexpr uint32_t HTTP_SERVER_STACK_SIZE = 10240;          ///< HTTP 服务器任务栈大小（字节）
-// ★ 历史：6144 栈溢出；8192 在上传收尾仍紧。曾提到 12288 但 ESP32-C3 堆极紧
-//   （OTA 后 free~5KB、largest~1KB）。SHA context 已改 static，httpd 栈 10KB 折中。
-//   真·栈溢出钩子会 abort；卡 100% 更多是堆碎导致回包/后续分配失败。
+
+// ============================================================
+// 任务栈大小（字节）— 2026-07 按板端 task_stack 水位收敛
+// 规则：peak_used 实测 + 至少 ~1.5–2KB 余量；httpd 路径最重单独放宽。
+// 实测（空闲/常规）：http peak~5KB, wifi_ota~1.4KB, ota_relay~1KB,
+//   health~1.2KB, cpu_stats~2KB, ble*~1KB, reconnect~1KB。
+// ============================================================
+inline constexpr uint32_t HTTP_SERVER_STACK_SIZE   = 8192;  ///< httpd：原 10KB，peak~5KB → 8KB（余量~3KB）
+inline constexpr uint32_t TASK_STACK_WIFI_OTA      = 4096;  ///< wifi_ota 主循环：原 8KB，peak~1.4KB
+inline constexpr uint32_t TASK_STACK_OTA_RELAY     = 2560;  ///< ota_relay：2.5KB（实测 peak~1KB；完整 GD32 中继后再确认水位）
+inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 5120;  ///< spi_worker：无单独水位，6144→5120 小幅收
+inline constexpr uint32_t TASK_STACK_BLE_OTA       = 3072;  ///< ble_ota 主任务：peak~1KB
+inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 3072;  ///< ble_ota_worker：peak~1.1KB（负载峰值曾~1.9KB）
+inline constexpr uint32_t TASK_STACK_HEALTH_MON    = 3072;  ///< health_mon：peak~1.2KB
+inline constexpr uint32_t TASK_STACK_CPU_STATS     = 3072;  ///< cpu_stats：peak~2KB
+inline constexpr uint32_t TASK_STACK_WIFI_RECONNECT = 2560; ///< wifi_reconnect：peak~1KB
+inline constexpr uint32_t TASK_STACK_CAN_FB        = 3072;  ///< can_fb：1Hz 轮询
+inline constexpr uint32_t TASK_STACK_BLE_FINISH    = 4096;  ///< 按需：SHA finalize（保持）
+inline constexpr uint32_t TASK_STACK_BLE_GD32_WAIT = 3072;  ///< 按需：GD32 中继等待
+inline constexpr uint32_t TASK_STACK_BLE_RESTART   = 2048;  ///< 按需：延时重启
 
 // ============================================================
 // OTA 配置
 // ============================================================
-inline constexpr size_t  OTA_BLOCK_SIZE         = 2048;            ///< 上传接收块：2KB 降峰值堆（原 4/8KB）
+inline constexpr size_t  OTA_BLOCK_SIZE         = 2048;            ///< 上传接收块：2KB 降峰值 BSS/堆（s_ota_upload_recv 静态占用）
+// OTA_BLOCK_SIZE 演进：8KB(原)→2KB(压堆)→4KB(试吞吐)→2KB(2026-07 回退省 DRAM)。
+//   4KB 时 s_ota_upload_recv BSS +2KB，开机 free/largest 更紧；回退 2KB 优先保内存。
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB = 221184B = 0x35F90，固件大小上限
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
-inline constexpr uint32_t OTA_POLL_RETRIES      = 40;          // 每包 ACK 轮询次数
-inline constexpr uint32_t OTA_RESEND_RETRIES    = 10;           // 每包重发次数上限
-inline constexpr uint32_t OTA_PACKET_DELAY_MS   = 5;            // 每包发送后延时(ms)，给 GD32 处理时间
-inline constexpr uint32_t OTA_POST_SEND_DELAY_MS    = 3;        // 发送请求后首次轮询前的延迟(ms)，无 READY 拉低时防止读到 stale 数据
-inline constexpr uint32_t OTA_POLL_NO_FRAME_DELAY_MS = 8;       // 轮询未找到帧时的重试延迟(ms)，无 READY 拉低时需更长
 
 // ============================================================
 // 健康监控阈值

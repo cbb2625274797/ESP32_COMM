@@ -4,11 +4,19 @@ CONFIG_ESP_WIFI_TX_BA_WIN=6
 CONFIG_DCU_OTA_POLL_BACKOFF_MS=5
 CONFIG_DCU_OTA_FINISH_TIMEOUT_MS=10000
 
+# Flash mode DIO（锁定）：本板 PCB 实测 QIO 不可用。
+# 2026-07 尝试过 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y 加速 OTA，结果：
+#   开机 boot 日志 SPI Mode : QIO 看似正常，但 WiFi OTA 写 flash 后
+#   从分区读回计算 SHA-256 就与上传前 SHA 不一致（每次都不过），
+#   属于“能启动但数据不可靠”。推断：当前 flash 芯片/PCB 走线/WP+HOLD 不支持 QIO。
+# 不要再开 QIO，除非确认 flash 型号与硬件连接均兼容。
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
 # DCU SPI clock -- 4 MHz（GD32 SPI0 RX DMA 武装后可安全提速；8/12MHz 须零错误验证后再开）
 CONFIG_DCU_SPI_CLOCK_HZ=4000000
 
-# DCU OTA packet interval -- 给 GD32 主循环 AES/Flash drain 留时间（原 1ms 易在中后期卡死）
-CONFIG_DCU_OTA_PACKET_INTERVAL_MS=3
+# GD32 OTA 包间节奏：不用固定 PACKET_INTERVAL；依赖 SpiMaster CREDIT 背压
+# （flash 槽满时 CREDIT=0，等 CREDIT_UPDATE / 帧头 credit 恢复后再发）
 
 # LWIP: HTTP server max_open_sockets=4 + WiFi/LWIP 内部 ~3 + UDP debug log + 余量
 # 原值 7 与 httpd max_open_sockets=4 仅余 3 个 socket,一旦 handler 阻塞即 accept(EMFILE)
@@ -34,6 +42,14 @@ CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U32=y
 CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+
+# ── BLE / NimBLE 主机栈（set-target 会重生 sdkconfig，必须写在 defaults 里）──
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+# CONFIG_BT_BLUEDROID_ENABLED is not set
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
 
 # ── NimBLE: 禁用未使用的标准 GATT 服务（只保留自定义 OTA service）──
 # 每项 service 含 characteristic + descriptor + UUID 注册，合计约占 8-15 KB

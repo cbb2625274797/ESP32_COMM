@@ -1,7 +1,7 @@
 /**
  * toast.js - Toast 提示组件
  *
- * 从 app.js 提取的 showToast 函数，操作 DOM 元素 #toast / #toastIco / #toastMsg。
+ * showToast 函数，操作 DOM 元素 #toast / #toastIco / #toastMsg。
  * 支持 info / success / warning / error 类型，内置 5s 去重防抖。
  */
 /** @description 显示 Toast 提示消息，支持 info/success/warning/error 类型。 */

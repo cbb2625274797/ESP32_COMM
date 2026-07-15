@@ -1,14 +1,13 @@
 /**
  * file-handle.js - 文件处理 + Intel HEX → BIN 转换
  *
- * 从 app.js 的「文件处理」「Intel HEX → BIN 转换」「文件处理」段提取。
  * 包含：HEX 解析、文件选择、FSAPI、SHA-256 计算、文件信息 UI、清除。
  *
  * 共享状态（通过 window.* 引用）：
  *   window.esp32File / window.gd32File / window.esp32FileHandle / window.gd32FileHandle
  *   window._esp32FileSha256 / window._gd32FileSha256
  *
- * 未拆分的函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.updateUploadButtonLabel / window.showToast / window.addLog
  */
 import { formatBytes } from '../common/utils.js';
@@ -179,6 +178,73 @@ export async function convertHexFileToBin(file) {
   return { file: binFile, converted: true, baseAddr: result.baseAddr, endAddr: result.endAddr };
 }
 
+// ==================== SHA-256 缓存 ====================
+// 选文件时就把 SHA-256 算好并缓存（同时记录 file meta），上传前
+// 若 handle.getFile() 拿回的 fresh file meta 未变就直接复用，
+// 避免每次点上传都重算 30–80ms 的 crypto.subtle.digest。
+// 缓存 key：size + lastModified + name 三项均一致（lastModified 在
+// 文件 rebuild 后必变，是浏览器给的最可靠 rebuild 信号）。
+/**
+ * @description 计算 file 的 SHA-256 并写入缓存（sha + meta）。
+ *              GD32 UI 无 SHA 显示行；ESP32 同步更新 #fileSha256Esp32。
+ * @param {File} file 目标文件
+ * @param {'esp32'|'gd32'} chip 通道
+ * @param {ArrayBuffer=} optArrayBuffer 已读的 arrayBuffer（避免重复读取）
+ * @returns {Promise<string|null>} hex 大写 SHA，失败返回 null
+ */
+function _computeAndCacheFileSha(file, chip, optArrayBuffer) {
+  var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
+  var shaElem = document.getElementById('fileSha256' + suffix); // GD32 可能为 null
+  if (shaElem) shaElem.textContent = '计算中...';
+  var bufPromise = optArrayBuffer ? Promise.resolve(optArrayBuffer) : file.arrayBuffer();
+  return bufPromise.then(function(buf) {
+    return crypto.subtle.digest('SHA-256', buf);
+  }).then(function(hashBuffer) {
+    var hashArray = Array.from(new Uint8Array(hashBuffer));
+    var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('').toUpperCase();
+    if (shaElem) shaElem.textContent = hashHex;
+    var meta = { size: file.size, lastModified: file.lastModified, name: file.name };
+    if (chip === 'esp32') {
+      window._esp32FileSha256 = hashHex;
+      window._esp32FileShaMeta = meta;
+    } else {
+      window._gd32FileSha256 = hashHex;
+      window._gd32FileShaMeta = meta;
+    }
+    addLog('I', '文件', chip.toUpperCase() + ' 固件 SHA-256: ' + hashHex);
+    return hashHex;
+  }).catch(function(err) {
+    if (shaElem) shaElem.textContent = '计算失败: ' + err.message;
+    addLog('W', '文件', chip.toUpperCase() + ' SHA-256 计算失败: ' + err.message);
+    if (chip === 'esp32') { window._esp32FileSha256 = null; window._esp32FileShaMeta = null; }
+    else { window._gd32FileSha256 = null; window._gd32FileShaMeta = null; }
+    return null;
+  });
+}
+
+/**
+ * @description 确保 file 的 SHA-256 已在缓存中：命中直接返回，不命中则重算并缓存。
+ * @param {File} file 目标文件
+ * @param {'esp32'|'gd32'} chip 通道
+ * @param {ArrayBuffer=} optArrayBuffer 命中时不用，未命中时传入可避免重复读文件
+ * @returns {Promise<string|null>} hex 大写 SHA
+ */
+export function ensureFileShaCached(file, chip, optArrayBuffer) {
+  var cachedMeta = chip === 'esp32' ? window._esp32FileShaMeta : window._gd32FileShaMeta;
+  var cachedSha  = chip === 'esp32' ? window._esp32FileSha256  : window._gd32FileSha256;
+  if (cachedSha && cachedMeta &&
+      cachedMeta.size === file.size &&
+      cachedMeta.lastModified === file.lastModified &&
+      cachedMeta.name === file.name) {
+    // 命中：把 UI 上的 SHA 同步刷一下（幂等），避免其它代码误清
+    var shaElem = document.getElementById(chip === 'esp32' ? 'fileSha256Esp32' : 'fileSha256Gd32');
+    if (shaElem) shaElem.textContent = cachedSha;
+    addLog('I', '文件', chip.toUpperCase() + ' 复用已缓存 SHA-256（文件未变）');
+    return Promise.resolve(cachedSha);
+  }
+  return _computeAndCacheFileSha(file, chip, optArrayBuffer);
+}
+
 // ==================== 文件处理 ====================
 /** @description 处理用户选择的固件文件（HEX→BIN 转换、SHA-256 计算、文件校验）。 */
 export function processFile(file, chip) {
@@ -196,6 +262,7 @@ export function processFile(file, chip) {
         document.getElementById('fileType' + suffix).textContent = 'Binary(?)';
         document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
         window.updateUploadButtonLabel();
+        ensureFileShaCached(file, 'gd32');
         return;
       }
       window.gd32File = result.file;
@@ -208,6 +275,7 @@ export function processFile(file, chip) {
       document.getElementById('fileType' + suffix).textContent = 'Binary (HEX转换)';
       document.getElementById('fileSize' + suffix).textContent = formatBytes(result.file.size);
       window.updateUploadButtonLabel();
+      ensureFileShaCached(result.file, 'gd32');
     }).catch(function(err) {
       addLog('E', '文件', 'HEX 解析失败: ' + err.message);
       showToast('HEX 文件解析失败: ' + err.message, 'error');
@@ -228,32 +296,21 @@ export function processFile(file, chip) {
   window.updateUploadButtonLabel();
   addLog('I', '文件', chip.toUpperCase() + ' 已选择: ' + file.name + ' (' + formatBytes(file.size) + ')');
   showToast(chip.toUpperCase() + ' 文件已选择', 'success');
-  // ESP32 文件: 计算并显示 SHA-256
-  if (chip === 'esp32') {
-    var shaElem = document.getElementById('fileSha256' + suffix);
-    if (shaElem) {
-      shaElem.textContent = '计算中...';
-      file.arrayBuffer().then(function(buf) {
-        return crypto.subtle.digest('SHA-256', buf);
-      }).then(function(hashBuffer) {
-        var hashArray = Array.from(new Uint8Array(hashBuffer));
-        var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
-        shaElem.textContent = hashHex.toUpperCase();
-        // 存储到全局变量供上传时使用
-        window._esp32FileSha256 = hashHex.toUpperCase();
-        addLog('I', '文件', 'ESP32 固件 SHA-256: ' + hashHex.toUpperCase());
-      }).catch(function(err) {
-        shaElem.textContent = '计算失败: ' + err.message;
-      });
-    }
-  }
+  // 选文件时就把 SHA-256 算好并缓存（ESP32/GD32 都算），
+  // 上传时若文件未变 ensureFileShaCached 命中直接复用。
+  ensureFileShaCached(file, chip);
 }
 
 /** @description 清除已选固件文件并重置对应 UI 状态。 */
 export function clearFile(chip) {
   var suffix = chip === 'esp32' ? 'Esp32' : 'Gd32';
-  if (chip === 'esp32') { window.esp32File = null; window.esp32FileHandle = null; window._esp32FileSha256 = null; }
-  else { window.gd32File = null; window.gd32FileHandle = null; }
+  if (chip === 'esp32') {
+    window.esp32File = null; window.esp32FileHandle = null;
+    window._esp32FileSha256 = null; window._esp32FileShaMeta = null;
+  } else {
+    window.gd32File = null; window.gd32FileHandle = null;
+    window._gd32FileSha256 = null; window._gd32FileShaMeta = null;
+  }
   document.getElementById('fileInput' + suffix).value = '';
   document.getElementById('fileInfo' + suffix).classList.remove('show');
   var shaElem = document.getElementById('fileSha256' + suffix);

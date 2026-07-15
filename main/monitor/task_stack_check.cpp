@@ -8,6 +8,7 @@
 
 #include "app_config.h"
 #include "health_monitor.h"
+#include "cpu_stats.h"
 #include "ota_relay.h"
 #include "wifi_ota.h"
 #include "ble_ota.h"
@@ -24,22 +25,25 @@ size_t collectTaskStackMetrics(TaskStackMetric* out, size_t max)
         out[n++] = { "http_server", xTaskGetHandle("httpd"), HTTP_SERVER_STACK_SIZE };
     }
     if (n < max) {
-        out[n++] = { "health_mon", HealthMonitor::instance().getTaskHandle(), 4096 };
+        out[n++] = { "health_mon", HealthMonitor::instance().getTaskHandle(), TASK_STACK_HEALTH_MON };
     }
     if (n < max) {
-        out[n++] = { "ota_relay", OtaRelay::getTaskHandle(), 6144 };
+        out[n++] = { "cpu_stats", CpuStats::instance().getTaskHandle(), TASK_STACK_CPU_STATS };
     }
     if (n < max) {
-        out[n++] = { "wifi_ota", WifiOta::instance().getTaskHandle(), 8192 };
+        out[n++] = { "ota_relay", OtaRelay::getTaskHandle(), TASK_STACK_OTA_RELAY };
     }
     if (n < max) {
-        out[n++] = { "wifi_reconnect", WifiOta::instance().m_reconnectTask, 4096 };
+        out[n++] = { "wifi_ota", WifiOta::instance().getTaskHandle(), TASK_STACK_WIFI_OTA };
     }
     if (n < max) {
-        out[n++] = { "ble_ota", BleOta::instance().getTaskHandle(), 4096 };
+        out[n++] = { "wifi_reconnect", WifiOta::instance().m_reconnectTask, TASK_STACK_WIFI_RECONNECT };
     }
     if (n < max) {
-        out[n++] = { "ble_ota_worker", BleOta::instance().getWorkerTaskHandle(), 4096 };
+        out[n++] = { "ble_ota", BleOta::instance().getTaskHandle(), TASK_STACK_BLE_OTA };
+    }
+    if (n < max) {
+        out[n++] = { "ble_ota_worker", BleOta::instance().getWorkerTaskHandle(), TASK_STACK_BLE_WORKER };
     }
 
     return n;

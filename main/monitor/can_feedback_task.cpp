@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#include "app_config.h"
 #include "transport/canfd_bridge.h"
 #include "transport/spi_master.h"
 #include "monitor/debug_log.h"
@@ -130,7 +131,7 @@ bool startCanFeedbackTask()
     BaseType_t xRet = xTaskCreatePinnedToCore(
         taskLoop,
         "can_fb",
-        4096,
+        TASK_STACK_CAN_FB,
         nullptr,
         4,
         nullptr,

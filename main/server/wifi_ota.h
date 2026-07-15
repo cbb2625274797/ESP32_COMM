@@ -90,7 +90,7 @@ public:
     /** @brief BLE OTA 开始传输时调用，暂停 WiFi RSSI 轮询等射频活动。 */
     void setBleOtaActive(bool v) { m_bleOtaActive.store(v); }
 
-    // ── IBleCoexListener 接口实现（L1: 通过协调器接收 BLE 共存通知）──
+    // ── IBleCoexListener 接口实现 ──
     /** @brief BLE OTA 开始，暂停 WiFi RSSI 轮询。 */
     void onBleOtaStart() override;
     /** @brief BLE OTA 结束，恢复 WiFi 射频活动。 */

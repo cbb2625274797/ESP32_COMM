@@ -1,7 +1,6 @@
 /**
  * stages.js - OTA 阶段驱动 (真实状态)
  *
- * 从 app.js 的「OTA 阶段驱动 (真实状态)」段提取。
  * 将设备端 relay_state / sys_state 映射到 GD32 阶段节点 UI，
  * 并驱动 updateSystemStatusUi 综合 UI 更新。
  *
@@ -11,7 +10,7 @@
  *   window.gd32CompleteAnnounced / window.gd32RelaySessionLive
  *   window.lastSysStateCode / window.lastRelayState
  *
- * 未拆分的函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.updateHeapAndTaskStatusUi / window.updateConnectionUi / window.updateHealthUi
  *   window.updateStagesFromRelayState / window.setActivePhase / window.setProgress
  *   window.markGd32OtaUiComplete / window.cleanupAfterOtaFailure / window.otaSessionReset
@@ -234,6 +233,16 @@ export function updateSystemStatusUi(data) {
     if (isGd32Relaying || (rs >= 1 && rs <= 4)) {
       window.gd32RelaySessionLive = true;
     }
+    /* 包进度：进入 FINISHING/COMPLETE 时先补 100%，再走完成/收尾 UI */
+    if (window.gd32RelaySessionLive && relayTotal > 0 &&
+        (relaySeq >= relayTotal || rs >= 4 || isGd32Complete)) {
+      if (typeof window.emitRelayProgress === 'function') {
+        window.emitRelayProgress(relayTotal, relayTotal, { force100: true });
+      }
+    } else if (window.gd32RelaySessionLive && relayTotal > 0 && relaySeq > 0 &&
+               typeof window.emitRelayProgress === 'function') {
+      window.emitRelayProgress(relaySeq, relayTotal);
+    }
     if (window.gd32RelaySessionLive &&
         (isGd32Complete || rs === 5 ||
          (gd32AppAlive && relayTotal > 0 && relaySeq >= relayTotal && rs >= 3))) {
@@ -244,8 +253,14 @@ export function updateSystemStatusUi(data) {
       // HANDSHAKING
       setActivePhase('gd32Ota');
       setProgress(50, '握手与认证中...');
-    } else if (rs === 3 || (relayTotal > 0 && relaySeq > 0 && rs !== 5)) {
-      // TRANSFERRING
+    } else if (rs === 4) {
+      // FINISHING：转发已 100%，进度条进入收尾段（勿再落回中间百分比）
+      setActivePhase('gd32Ota');
+      if (!window.gd32CompleteAnnounced) {
+        setProgress(95, gd32AppAlive ? '收尾中…' : '收尾中，等待 APP 启动...');
+      }
+    } else if (rs === 3 || (relayTotal > 0 && relaySeq > 0 && rs !== 5 && rs !== 4)) {
+      // TRANSFERRING（不含 FINISHING）
       setActivePhase('gd32Ota');
       var relayOverall = 60 + Math.round(relayProgress * 0.30);
       var relayLabel = relayTotal > 0
@@ -258,11 +273,6 @@ export function updateSystemStatusUi(data) {
       setProgress(55, relayTotal > 0
         ? ('大小协商中（共 ' + relayTotal + ' 包）')
         : '固件大小协商中');
-    } else if (rs === 4) {
-      setActivePhase('gd32Ota');
-      if (!window.gd32CompleteAnnounced) {
-        setProgress(95, gd32AppAlive ? '收尾中…' : '收尾中，等待 APP 启动...');
-      }
     } else if (!window.gd32RelaySessionLive) {
       setActivePhase('gd32Ota');
       setProgress(48, '已触发中继，等待设备进入握手…');

@@ -21,7 +21,7 @@
 #include "esp_err.h"
 #include "app_config.h"        // OTA_MAX_FIRMWARE_SIZE / GD32_OTA_PACKET_SIZE（validateGd32Size 用）
 #include "storage/gd32_flash_store.h"
-#include "relay/ota_relay.h"   // IRelayListener 接口定义 + RelaySnapshot（H4 解耦）
+#include "relay/ota_relay.h"   // IRelayListener 接口定义 + RelaySnapshot
 
 // ============================================================
 // 系统级 OTA 状态枚举
@@ -47,7 +47,7 @@ typedef enum {
 } ota_channel_t;
 
 // ============================================================
-// OTA 系统全量只读快照（PR1: 收口状态读取）
+// OTA 系统全量只读快照
 // ============================================================
 /**
  * @brief OTA 系统全量只读快照。
@@ -64,11 +64,11 @@ struct OtaSnapshot {
 };
 
 // ============================================================
-// IBleCoexListener - BLE 射频共存通知接口（解决 L1 横向耦合）
+// IBleCoexListener - BLE 射频共存通知接口
 // ============================================================
 // WifiOta 实现此接口并注册到 OtaCoordinator，
 // BLE OTA 开始/结束时通过协调器通知 WiFi 层，
-// 消除 ble_ota → wifi_ota 的直接依赖。
+// 避免 ble_ota → wifi_ota 的直接依赖。
 /**
  * @brief BLE 射频共存监听器接口。
  *        BLE OTA 开始/结束时，协调器通过此接口通知 WiFi 层暂停/恢复射频活动。
@@ -124,8 +124,8 @@ public:
     esp_err_t beginGd32Storage(uint32_t total_size, ota_channel_t channel);
 
     /**
-     * @brief 统一 GD32 OTA 写入前准备：校验大小 + begin + 复位按需擦除水位 + 清空 meta + 写入初始 meta。
-     *        扇区擦除在 writeGd32Chunk/flashWriteChunk 内按写入范围推进（非整段预擦）。
+     * @brief 统一 GD32 OTA 写入前准备：校验大小 + begin + 整分区预擦 + 清空 meta + 写入初始 meta。
+     *        收流时 write 路径只写 Flash（ensureErased 仅作水位兜底）。
      *        WiFi/BLE 上传入口共用，任意步骤失败时内部 abortCurrent，调用方无需再清理。
      * @param total_size 固件总字节数。
      * @param channel 发起通道（WiFi/BLE）。
@@ -146,7 +146,7 @@ public:
      */
     esp_err_t finishGd32StorageAfterReceive();
 
-    // ── GD32 存储操作（传输层通过协调器操作 Flash，解决 H3 绕过问题）──
+    // ── GD32 存储操作（传输层通过协调器操作 Flash）──
     /**
      * @brief 向 GD32 Flash 分区写入固件数据块。
      *        传输层（WiFi/BLE）通过此接口写入，不再直接调用 Gd32FlashStore。
@@ -312,7 +312,9 @@ public:
     /**
      * @brief ESP32 OTA 收尾（统一封装 BLE/WiFi 两端重复的收尾序列）。
      *        步骤：notifyEsp32ReceiveComplete → Esp32OtaCore::finalize(reboot=false)
-     *        → 成功则 notifyEsp32FinalizeComplete。
+     *        → 成功则 notifyEsp32FinalizeComplete；
+     *        → 失败（SHA 不匹配 / end 失败等）则 abortCurrent() 复位到 IDLE，
+     *          避免协调器卡在 ESP32_FINALIZING 导致后续上传被假拒绝。
      *        不重启；调用方负责把 device_sha_hex 上报前端后再调 restartEsp32()。
      * @param frontend_sha_hex 前端 64 字符 hex SHA-256，nullptr 表示跳过比对。
      * @return Esp32FinalizeResult，err 为 ESP_OK/ESP_ERR_INVALID_VERSION/其他。
@@ -332,6 +334,14 @@ public:
      *        内部调用对应子系统的 abort/reset。
      */
     void abortCurrent();
+
+    /**
+     * @brief 自愈孤儿忙态（供 /system/status 等轮询路径调用）。
+     *        - 跑忙状态 watchdog（超时完整 abort → IDLE）
+     *        - ESP32_FINALIZING 但 Esp32OtaCore 已空闲：判定为 SHA 失败等残留，复位 IDLE
+     *        不影响真正正在 finalize（core.isActive()）的会话。
+     */
+    void healOrphanStates();
 
     /**
      * @brief 获取当前 OTA 会话的 epoch（代次）。
@@ -354,7 +364,7 @@ public:
 
     // ── 状态查询 ──
     /**
-     * @brief 一次性读取系统 OTA 全量状态快照（PR1: 收口状态读取）。
+     * @brief 一次性读取系统 OTA 全量状态快照。
      *        coordinator mutex + relay mutex 各取一次，
      *        供 /system/status 等只读接口消费。
      * @return 包含 sys_state、meta、relay 进度的完整快照。
@@ -362,7 +372,7 @@ public:
     OtaSnapshot getSnapshot() const;
 
     /**
-     * @brief 单次 SPI 探测 GD32 APP 是否存活（PR2: 从 status 移出）。
+     * @brief 单次 SPI 探测 GD32 APP 是否存活。
      *        成功时更新 OtaRelay 缓存的 alive/version，
      *        失败时清除 alive 标志。
      * @param out_version 输出版本信息，可为 nullptr。
@@ -421,7 +431,7 @@ public:
      */
     void reset();
 
-    // ── IRelayListener 接口实现（H4: OtaRelay 通过接口回调通知协调器）──
+    // ── IRelayListener 接口实现 ──
     /**
      * @brief IRelayListener 回调：中继已开始。
      *        由 OtaRelay task 在 forwardFirmware() 前通过 s_relayListener 调用。
@@ -435,7 +445,7 @@ public:
      */
     void onRelayComplete(bool success) override;
 
-    // ── BLE 射频共存管理（L1: 替代 ble_ota → wifi_ota 直接调用）──
+    // ── BLE 射频共存管理 ──
     /**
      * @brief 注册 BLE 共存监听器（由 main 在初始化时调用）。
      * @param listener WifiOta 实现的监听器指针，nullptr 取消注册。
@@ -498,10 +508,10 @@ private:
     // 仅在同类型活跃状态（ESP32_RECEIVING / GD32_STORING）下有意义。
     ota_channel_t m_otaChannel = OTA_CHANNEL_WIFI;
 
-    // 互斥锁（M1/L3: mutable 允许在 const 方法中加锁，消除 const_cast）
+    // 互斥锁（mutable 允许在 const 方法中加锁，无需 const_cast）
     mutable SemaphoreHandle_t m_mutex = nullptr;
 
-    // BLE 共存监听器（L1: 由 WifiOta 实现并注册）
+    // BLE 共存监听器（由 WifiOta 实现并注册）
     IBleCoexListener *m_bleCoexListener = nullptr;
     static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(100);
 

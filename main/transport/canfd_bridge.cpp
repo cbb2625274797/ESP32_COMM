@@ -1,5 +1,5 @@
 /*
- * canfd_bridge.cpp - CANFD 3通道通信桥接实现（M4: 从 SpiMaster 提取）
+ * canfd_bridge.cpp - CANFD 3通道通信桥接实现
  */
 #include <string.h>
 #include "canfd_bridge.h"

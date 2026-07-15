@@ -1,7 +1,7 @@
 /*
  * ota_relay.cpp - OTA 中继事件驱动状态机实现
  *
- * 将原 17 状态"声明式赋值"重构为 7 状态事件驱动架构：
+ * 7 状态事件驱动架构：
  *   - 每个协议阶段封装为一个状态 handler
  *   - processEvent() 根据当前状态分发事件
  *   - 状态转换显式通过 setState() 完成
@@ -24,8 +24,8 @@
 #include "protocol.h"
 #include "health_monitor.h"
 #include "monitor/debug_log.h"
-// ★ H4 解耦：OtaRelay 不再直接 #include "ota_coordinator.h"，
-//   通过 IRelayListener 接口回调通知协调器，依赖方向变为单向。
+// OtaRelay 不再直接 #include "ota_coordinator.h"，
+//   通过 IRelayListener 接口回调通知协调器，依赖方向为单向。
 
 // ============================================================
 // 公共拒绝事件判断（文件内工具）
@@ -42,10 +42,9 @@ static ota_result_t commonReject(relay_event_t e, bool allowHealth = false)
 }
 
 // ============================================================
-// doRelayPackets 重试阈值（与历史代码字面值保持一致，仅命名化）
+// doRelayPackets 重试阈值（仅命名化字面值）
 // ============================================================
-// 原代码中 retry_count 阈值：行 1015/1075/1084 用 10U，行 1032/1050 用 3U。
-// 含义：NACK/轮询耗尽属于"通信异常"，给予较多重试机会（10次）；
+// retry_count 阈值：NACK/轮询耗尽属于"通信异常"，给予较多重试机会（10次）；
 //       结构化错误属于"GD32 报告具体错误"，较少重试（3次）。
 static constexpr uint32_t kMaxResendOnNack        = 10U;  // ACK 失败/轮询耗尽重发上限
 static constexpr uint32_t kMaxResendOnStructError = 3U;   // 结构化错误重发上限
@@ -67,7 +66,7 @@ SemaphoreHandle_t OtaRelay::s_stateMutex = NULL;
 TaskHandle_t OtaRelay::taskHandle = NULL;
 IRelayListener *OtaRelay::s_relayListener = nullptr;
 
-// ── 中继事件监听器（解决 H4 双向耦合）──
+// ── 中继事件监听器 ──
 void OtaRelay::setRelayListener(IRelayListener *listener)
 {
     s_relayListener = listener;
@@ -78,7 +77,7 @@ IRelayListener* OtaRelay::getRelayListener()
     return s_relayListener;
 }
 
-// ── 队列访问器（M3: 封装 public static 成员）──
+// ── 队列访问器 ──
 QueueHandle_t OtaRelay::getDispatchQueue()
 {
     return dispatchQueue;
@@ -1415,7 +1414,7 @@ void OtaRelay::taskEntry(void *pvParameters)
         }
 
         DEBUG_INFO("OTA", "收到 OTA 调度信号: %" PRIu32 "，开始转发...", msg);
-        // ★ H4: 通过 IRelayListener 接口回调通知协调器（不再直接依赖 OtaCoordinator）
+        // 通过 IRelayListener 接口回调通知协调器
         IRelayListener *listener = getRelayListener();
         if (listener) listener->onRelayStarted();
         ota_result_t result = instance().forwardFirmware();
@@ -1432,7 +1431,7 @@ void OtaRelay::taskEntry(void *pvParameters)
             DEBUG_ERR("OTA", "OTA 转发失败，错误码: %d", result);
         }
         instance().reset();
-        // ★ H4: 通过 IRelayListener 接口回调通知协调器中继结束
+        // 通过 IRelayListener 接口回调通知协调器中继结束
         listener = getRelayListener();
         if (listener) listener->onRelayComplete(result == OTA_RESULT_OK);
     }

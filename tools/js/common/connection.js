@@ -1,17 +1,16 @@
 /**
  * connection.js - 连接管理 + 系统状态显示
  *
- * 从 app.js 的「连接管理」段 + testConnection / refreshSystemStatusNow 提取。
  * 操作 DOM 元素 #pillConn / #pillConnTxt / #connStatus / #connStatusTxt / #bConn 等。
  *
- * 共享状态（通过 window.* 引用，后续 app.js 拆分时会统一挂载）：
+ * 共享状态（通过 window.* 引用）：
  *   window.latestSystemStatus     — 最近一次 /system/status 响应
  *   window.lastSysStateCode       — 上次成功的 sys_state_code（polling.js 读取）
  *   window.lastRelayState         — 上次成功的 relay_state（polling.js 读取）
  *   window.consecutivePollFailures — 连续轮询失败计数（polling.js 读取）
  *
- * 未拆分的 app.js 函数（通过 window.* 引用）：
- *   window.getBaseUrl / window.updateSystemStatusUi / window.diagnoseNetwork / window.formatPercent
+ * 复用的函数（通过 window.* 引用）：
+ *   window.getBaseUrl / window.updateSystemStatusUi / window.formatPercent
  */
 import { formatBytes, formatTime, formatUptime, escapeHtml } from './utils.js';
 import { addLog } from './log.js';
@@ -51,15 +50,18 @@ export function updateHealthUi(healthCode, freeHeap) {
     mh.className = 'v ' + (healthCode === 0 ? 'ok' : healthCode === 1 ? 'warn' : 'err');
   }
 }
+/**
+ * 每次 pollStatus 成功后刷新堆/栈/CPU（固定周期约 1000ms，中继期 400ms；
+ * sample_ms 由设备两次采样墙钟差给出；WiFi 上传 ESP32 期间 pause 不刷）。
+ */
 export function updateHeapAndTaskStatusUi(data) {
   if (!data) return;
   var ota = data.ota || {};
-  var wifi = data.wifi || {};
-  var targetHost = window.getBaseUrl().replace(/^http:\/\//, '');
   var setText = function (id, value) {
     var el = document.getElementById(id);
     if (el) el.textContent = value;
   };
+
   // ---- 堆概况：已用 / 总计 + 占用条 ----
   function setFill(id, pct) {
     var el = document.getElementById(id);
@@ -85,10 +87,10 @@ export function updateHeapAndTaskStatusUi(data) {
     el.style.width = safePct + '%';
     el.className = 'heap-bar-fill cpu-fill' + (safePct >= 85 ? ' danger' : safePct >= 70 ? ' warn' : '');
   }
-  function updateCpuUsageUi(cpu) {
-    cpu = cpu || {};
+  function updateCpuUsageUi(cpuData) {
+    cpuData = cpuData || {};
     var taskList = document.getElementById('cpuTaskList');
-    if (!cpu.available) {
+    if (!cpuData.available) {
       setText('cpuUsageText', '未启用 FreeRTOS 统计');
       setText('cpuUsagePct', '--');
       setText('cpuIdlePct', '--');
@@ -98,7 +100,7 @@ export function updateHeapAndTaskStatusUi(data) {
       if (taskList) taskList.innerHTML = '<div class="status-empty">固件未启用 CPU runtime stats</div>';
       return;
     }
-    if (!cpu.valid) {
+    if (!cpuData.valid) {
       setText('cpuUsageText', '等待下一次采样...');
       setText('cpuUsagePct', '--');
       setText('cpuIdlePct', '--');
@@ -108,10 +110,10 @@ export function updateHeapAndTaskStatusUi(data) {
       if (taskList) taskList.innerHTML = '<div class="status-empty">首次刷新只建立基线，下一次刷新后显示 CPU 占用</div>';
       return;
     }
-    var usagePct = Number(cpu.usage_pct) || 0;
-    var idlePct = Number(cpu.idle_pct) || 0;
-    var sampleMs = Number(cpu.sample_ms) || 0;
-    var tasks = Array.isArray(cpu.tasks) ? cpu.tasks.slice() : [];
+    var usagePct = Number(cpuData.usage_pct) || 0;
+    var idlePct = Number(cpuData.idle_pct) || 0;
+    var sampleMs = Number(cpuData.sample_ms) || 0;
+    var tasks = Array.isArray(cpuData.tasks) ? cpuData.tasks.slice() : [];
     tasks.sort(function (a, b) {
       return (Number(b.usage_pct) || 0) - (Number(a.usage_pct) || 0);
     });
@@ -159,7 +161,6 @@ export function updateHeapAndTaskStatusUi(data) {
 
   setText('sOtaState', (ota.sys_state || '--') + (Number.isFinite(ota.sys_state_code) ? ' (' + ota.sys_state_code + ')' : ''));
   setText('sRelayState', Number.isFinite(ota.relay_state) ? String(ota.relay_state) : '--');
-  // 缓存最近一次成功的 sys_state_code / relay_state，供 pollStatus 失败时判断设备是否在忙
   if (Number.isFinite(ota.sys_state_code)) window.lastSysStateCode = ota.sys_state_code;
   if (Number.isFinite(ota.relay_state)) window.lastRelayState = ota.relay_state;
   var storedText = '--';
@@ -205,6 +206,45 @@ export function updateHeapAndTaskStatusUi(data) {
     statusJson.textContent = JSON.stringify(data, null, 2);
   }
 }
+/** 从设备 IP 推导网关 IP（取前三段 + .1） */
+function getGatewayIp() {
+  var parts = (window.getEspIp ? window.getEspIp() : '192.168.31.127').split('.');
+  if (parts.length === 4) return parts[0] + '.' + parts[1] + '.' + parts[2] + '.1';
+  return '192.168.31.1';
+}
+
+/**
+ * 网络诊断：区分浏览器离线 / 网关不通 / 仅设备不通。
+ * 放在 connection.js，避免与 polling.js 形成循环 import。
+ */
+export async function diagnoseNetwork() {
+  var result = [];
+  if (navigator.onLine === false) {
+    result.push('浏览器无网络连接');
+    return result.join('；');
+  }
+  var gwIp = getGatewayIp();
+  var gwOk = false;
+  try {
+    await fetch('http://' + gwIp + '/', { mode: 'no-cors', signal: AbortSignal.timeout(2000) });
+    gwOk = true;
+  } catch (_) {}
+  if (!gwOk) {
+    try {
+      await fetch('http://' + gwIp + '/favicon.ico', { mode: 'no-cors', signal: AbortSignal.timeout(1500) });
+      gwOk = true;
+    } catch (_) {}
+  }
+  if (!gwOk) {
+    result.push('网关 ' + gwIp + ' 不可达（本地网络不通）');
+  } else {
+    result.push('网关 ' + gwIp + ' 可达');
+    var espIp = window.getEspIp ? window.getEspIp() : '设备';
+    result.push('设备 ' + espIp + ' 不响应（可能断电、重启中或 WiFi 断开）');
+  }
+  return result.join('；');
+}
+
 /** @description 测试与 ESP32 的连接（GET /status）。 */
 export async function testConnection() {
   // 立即发一次请求检测
@@ -232,7 +272,7 @@ export async function testConnection() {
   } catch (e) {
     addLog('E', '连接', '连接失败: ' + e.message);
     // 连接失败时自动诊断
-    var diag = await window.diagnoseNetwork();
+    var diag = await diagnoseNetwork();
     addLog('W', '诊断', diag);
     showToast('无法连接: ' + diag, 'error');
   } finally {

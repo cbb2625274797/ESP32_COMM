@@ -1,7 +1,6 @@
 /**
  * upload-gd32.js - GD32 中继 OTA 触发 + relay 态跟踪
  *
- * 从 app.js 的「GD32 OTA 触发（带 SHA-256 校验，对齐 BLE 0xF7）」段提取。
  * 包含：relay 进度观察定时器、markGd32OtaUiComplete、triggerGd32Relay。
  *
  * 共享状态（通过 window.* 引用）：
@@ -9,7 +8,7 @@
  *   window.pollingPausedForUpload / window.statusPollIntervalMs
  *   window.otaSessionState / window.lastSysStateCode / window.lastRelayState
  *
- * 未拆分的函数（通过 window.* 引用）：
+ * 复用的函数（通过 window.* 引用）：
  *   window.otaSessionTransition / window.OtaSessionState / window.otaSessionActive
  *   window.markPhaseDone / window.setProgress / window.updateSystemStatusUi
  *   window.cleanupAfterOtaFailure / window.scheduleStatusPoll / window.pollLogs
@@ -26,16 +25,61 @@ import { markPhaseDone, setProgress } from './progress.js';
  * GD32 中继进度观察：以 /system/status 为唯一真相源。
  * 日志环只有 64 条，中继/擦除期间 INFO 会被挤掉，时间戳还是浏览器本地时间——
  * 绝不能用「最后一条日志停在 SEND_SIZE」判断卡死。
+ *
+ * 时序约定（避免「设备已 FINISH / 完成，UI 还在 94%」）：
+ *   1) 包进度变化先刷进度条 + 日志；
+ *   2) 一旦 rseq>=rtot 或 rs>=4(FINISHING)，先强制打出 100% 再进收尾/完成；
+ *   3) markGd32OtaUiComplete 前再兜底一次 100%。
  */
 let relayWatchTimerId = null;
-let relayWatchInFlight = false;
 window.gd32CompleteAnnounced = false;
 window.relayWatchLastSeq = -1;
 /** 本会话是否已观察到真实中继态（1~4），避免旧 relay_state=5 残留导致一点击就“完成” */
 window.gd32RelaySessionLive = false;
 
+/**
+ * 包进度变更时更新进度条并写一条「转发」日志（同 seq 不重复）。
+ * @param {number} rseq
+ * @param {number} rtot
+ * @param {{force100?: boolean}} [opts]
+ * @returns {boolean} 是否实际输出了进度
+ */
+export function emitRelayProgress(rseq, rtot, opts) {
+  opts = opts || {};
+  rseq = Number(rseq) || 0;
+  rtot = Number(rtot) || 0;
+  if (rtot <= 0) return false;
+  if (opts.force100 || rseq >= rtot) {
+    rseq = rtot;
+  }
+  if (rseq <= 0) return false;
+  if (rseq === window.relayWatchLastSeq) return false;
+  window.relayWatchLastSeq = rseq;
+  var pct = Math.min(100, Math.round(rseq * 100 / rtot));
+  setProgress(60 + Math.round(pct * 0.30),
+    '已转发 ' + rseq + ' / ' + rtot + ' 包 (' + pct + '%)');
+  addLog('I', 'OTA', '转发 ' + rseq + '/' + rtot + ' (' + pct + '%)');
+  return true;
+}
+
+/** 完成/收尾前：若尚未打出 100%，用 status 里的包数补一条 */
+export function ensureRelayProgressComplete() {
+  var data = window.latestSystemStatus;
+  var o = (data && data.ota) || {};
+  var rtot = Number(o.relay_total_packets) || 0;
+  var rseq = Number(o.relay_seq) || 0;
+  if (rtot <= 0) return;
+  /* FINISHING/DONE 时后端 seq 已到 total；status 滞后时也强制 100% */
+  if (rseq < rtot && (Number(o.relay_state) >= 4 || Number(o.sys_state_code) === 4)) {
+    rseq = rtot;
+  }
+  if (rseq >= rtot) {
+    emitRelayProgress(rtot, rtot, { force100: true });
+  }
+}
+
 export function markGd32OtaUiComplete(msg) {
-  // 已公告过：禁止再改 className / setProgress / toast，否则每 400ms 重触发动效会「疯狂跳 ✓」
+  // 已公告过：禁止再改 className / setProgress / toast，否则定时器重触发动效会「疯狂跳 ✓」
   if (window.gd32CompleteAnnounced) {
     return;
   }
@@ -44,6 +88,8 @@ export function markGd32OtaUiComplete(msg) {
       window.otaSessionState !== OtaSessionState.FAILED) {
     return;
   }
+  /* 先 100% 转发进度，再宣布刷写完成 —— 避免日志里「完成」早于「1089/1089」 */
+  ensureRelayProgressComplete();
   window.gd32CompleteAnnounced = true;
   stopRelayProgressWatch();
 
@@ -67,18 +113,25 @@ export function stopRelayProgressWatch() {
     clearInterval(relayWatchTimerId);
     relayWatchTimerId = null;
   }
-  relayWatchInFlight = false;
-  if (window.statusPollIntervalMs < 1000) {
-    window.statusPollIntervalMs = 1000;
+  /* 中继结束：恢复常态 1s status 轮询 */
+  if (typeof window.setStatusPollIntervalMs === 'function') {
+    window.setStatusPollIntervalMs(1000);
   }
 }
 
+/**
+ * 中继进度观察：只读 pollStatus 写入的 latestSystemStatus，不再另起 /system/status。
+ * 中继期 status 加速到 400ms，使「转发 N/M」更贴近设备真实进度。
+ */
 export function startRelayProgressWatch() {
   stopRelayProgressWatch();
   if (window.pollingPausedForUpload) {
     window.resumePollingAfterUpload();
   }
-  window.statusPollIntervalMs = 400;
+  /* 中继期加速 status，缩小 UI 进度相对设备日志的滞后 */
+  if (typeof window.setStatusPollIntervalMs === 'function') {
+    window.setStatusPollIntervalMs(400);
+  }
   window.scheduleStatusPoll(0);
   window.pollLogs();
   addLog('I', 'OTA', '跟踪中继进度：看进度条与 relay_seq（/system/status），勿只看日志');
@@ -92,46 +145,38 @@ export function startRelayProgressWatch() {
       }
       return;
     }
-    if (relayWatchInFlight) return;
-    relayWatchInFlight = true;
-    fetch(window.getBaseUrl() + '/system/status', { signal: AbortSignal.timeout(3000) })
-      .then(function (resp) { return resp.ok ? resp.json() : null; })
-      .then(function (data) {
-        if (!data) return;
-        try { window.updateSystemStatusUi(data); } catch (e) { /* ignore */ }
-        var o = data.ota || {};
-        var code = Number(o.sys_state_code);
-        var rstate = Number(o.relay_state);
-        var alive = !!o.gd32_app_alive;
-        var rseq = Number(o.relay_seq) || 0;
-        var rtot = Number(o.relay_total_packets) || 0;
-        if (rstate >= 1 && rstate <= 4) {
-          window.gd32RelaySessionLive = true;
-        }
-        if (window.gd32RelaySessionLive &&
-            (code === 4 || rstate === 5 ||
-             (alive && rtot > 0 && rseq >= rtot && rstate >= 3))) {
-          markGd32OtaUiComplete('GD32 刷写完成');
-          window.pollLogs();
-          return;
-        }
-        if (code === 8 || rstate === 255) {
-          stopRelayProgressWatch();
-          window.pollLogs();
-          return;
-        }
-        // 前端进度同步：包数变化时更新进度条（updateSystemStatusUi 已做）并写一条前端日志
-        // 后端不再打「转发进度」文字，只靠这里 + 进度条
-        if (rtot > 0 && rseq > 0 && rseq !== window.relayWatchLastSeq) {
-          window.relayWatchLastSeq = rseq;
-          var pct = Math.round(rseq * 100 / rtot);
-          setProgress(60 + Math.round(pct * 0.30),
-            '已转发 ' + rseq + ' / ' + rtot + ' 包 (' + pct + '%)');
-          addLog('I', 'OTA', '转发 ' + rseq + '/' + rtot + ' (' + pct + '%)');
-        }
-      })
-      .catch(function () { /* 下轮继续 */ })
-      .then(function () { relayWatchInFlight = false; });
+    var data = window.latestSystemStatus;
+    if (!data || !data.ota) return;
+    var o = data.ota || {};
+    var code = Number(o.sys_state_code);
+    var rstate = Number(o.relay_state);
+    var alive = !!o.gd32_app_alive;
+    var rseq = Number(o.relay_seq) || 0;
+    var rtot = Number(o.relay_total_packets) || 0;
+    if (rstate >= 1 && rstate <= 4) {
+      window.gd32RelaySessionLive = true;
+    }
+    if (code === 8 || rstate === 255) {
+      stopRelayProgressWatch();
+      window.pollLogs();
+      return;
+    }
+    /*
+     * 顺序：先刷包进度（含强制 100%），再判定完成。
+     * FINISHING/DONE 时若 status 滞后未到 total，仍按 total 打 100%。
+     */
+    var transferDone = rtot > 0 && (rseq >= rtot || rstate >= 4 || code === 4);
+    if (transferDone) {
+      emitRelayProgress(rtot, rtot, { force100: true });
+    } else if (rtot > 0 && rseq > 0) {
+      emitRelayProgress(rseq, rtot);
+    }
+    if (window.gd32RelaySessionLive &&
+        (code === 4 || rstate === 5 ||
+         (alive && rtot > 0 && rseq >= rtot && rstate >= 3))) {
+      markGd32OtaUiComplete('GD32 刷写完成');
+      window.pollLogs();
+    }
   }, 400);
 }
 

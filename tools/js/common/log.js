@@ -1,7 +1,7 @@
 /**
  * log.js - 日志系统（带去重 + 自动滚动）
  *
- * 从 app.js 提取的日志环形缓冲、去重、过滤、自动滚动逻辑。
+ * 日志环形缓冲、去重、过滤、自动滚动逻辑。
  * 操作 DOM 元素 #logScroll / #logCount / #autoScrollBtn / .log-filter。
  */
 import { formatTime } from './utils.js';

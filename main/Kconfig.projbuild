@@ -10,25 +10,17 @@ menu "DCU OTA Configuration"
             validated against actual wiring length/quality and GD32
             SPI slave timing.
 
-    config DCU_OTA_PACKET_INTERVAL_MS
-        int "Delay between GD32 OTA packets (ms)"
-        default 1
-        range 0 50
-        help
-            Idle delay inserted after each successfully acknowledged
-            firmware packet before sending the next one.
-            Lower value speeds up OTA, but if GD32 cannot finish
-            flash write / prepare next ACK in time, set it back.
-
     config DCU_OTA_POLL_BACKOFF_MS
         int "Polling backoff when GD32 is not ready (ms)"
         default 2
         range 0 50
         help
             Delay between SPI response polls when GD32 returns WAIT
-            or does not drive MISO yet. Lower value reduces per-packet
-            idle time and can significantly speed up OTA, but if GD32
-            cannot finish flash write before the next poll, increase it.
+            or does not drive MISO yet. Packet pacing uses SPI Link v2
+            CREDIT backpressure in SpiMaster (remoteCredit==0 → wait/
+            refuse TX), not a fixed inter-packet delay. Lower value
+            reduces poll idle time; increase if GD32 needs more time
+            between polls.
 
     config DCU_OTA_FINISH_TIMEOUT_MS
         int "Timeout for FINISH_OTA command (ms)"

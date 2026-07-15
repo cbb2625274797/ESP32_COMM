@@ -1,17 +1,16 @@
 /**
  * send.js - CAN 帧构建与发送（DBC 报文 / 原始帧 / 批量发送 / 发送历史）
  *
- * 从 tools/can.js 拆分。对应原 can.js 约 1030~1333 行（sendCanRequest、响应框、
- * 历史、批量/选中/手动发送、手动帧校验/重置/载入预览）及 1491~1523 行
- * （CAN_SEND_ERR_DESC / GD32_ERR_DESC / buildSendResponseText）。
+ * 包含：sendCanRequest、响应框、历史、批量/选中/手动发送、
+ * 手动帧校验/重置/载入预览、CAN_SEND_ERR_DESC / GD32_ERR_DESC / buildSendResponseText。
  *
  * 依赖：dbc.js（state/el/getBaseUrl/padHex/bytesToHex/parseNumericId）、
  *       common/toast.js（showToast）、common/utils.js（escapeHtml）、
  *       messages.js（updateBatchUi）、signals.js（ensureMessageDefaults/getSignalValueMap/
  *       getSelectedMessage/updateEncodedPreview/encodeMessageData）。
  *
- * 注意：formatTime 保留 can.js 本地实现（HH:MM:SS，不含毫秒），与 common/utils.js
- * 的 formatTime（含毫秒）不同，以保证发送历史时间戳输出与原版完全一致。
+ * 注意：formatTime 保留本地实现（HH:MM:SS，不含毫秒），与 common/utils.js
+ * 的 formatTime（含毫秒）不同，以保证发送历史时间戳输出格式一致。
  */
 import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js';
 import { escapeHtml as sanitizeHtml } from '../common/utils.js';
