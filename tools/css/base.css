@@ -1,0 +1,54 @@
+/* === base.css — 基础变量与容器 === */
+/* ===== ESP32 OTA 控制台 — 工业调试台风格 ===== */
+
+:root {
+  --bg-root: #090e15;
+  --bg-panel: #0f161f;
+  --bg-card: #141d28;
+  --bg-elevated: #1a2432;
+  --bg-input: #0d131b;
+  --border: #1d2a3a;
+  --border-focus: #22d3ee;
+  --text: #e2e8f0;
+  --text-dim: #7b8fa8;
+  --text-label: #5a6d82;
+  --accent: #22d3ee;
+  --accent-dim: rgba(34,211,238,.15);
+  --green: #22c55e;
+  --amber: #f59e0b;
+  --red: #ef4444;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --font: "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+  --font-mono: "SF Mono","Fira Code","Cascadia Code","Consolas",monospace;
+  --gap: 16px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg-root);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* subtle noise-grid background */
+body::before {
+  content: "";
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255,255,255,.015) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.015) 1px, transparent 1px);
+  background-size: 40px 40px;
+  mask-image: radial-gradient(ellipse at 50% 0%, black 40%, transparent 70%);
+}
+
+.container {
+  position: relative; z-index: 1;
+  max-width: 1480px; margin: 0 auto; padding: 24px 32px 40px;
+}

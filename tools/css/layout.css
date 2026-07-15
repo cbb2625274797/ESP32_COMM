@@ -1,0 +1,156 @@
+/* === layout.css — 头部/主布局/卡片/表单/按钮/连接状态 === */
+/* === HEADER — compact status bar === */
+.header-bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 20px; margin-bottom: 24px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  flex-wrap: wrap;
+}
+.header-brand {
+  display: flex; align-items: center; gap: 10px;
+  padding-right: 20px; border-right: 1px solid var(--border);
+  white-space: nowrap;
+}
+.header-brand .dot-mark {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-dim);
+  flex-shrink: 0;
+}
+.header-brand strong { font-size: 15px; font-weight: 700; }
+.header-status {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+}
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 500;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.pill .indicator {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+}
+.pill.online .indicator { background: var(--green); }
+.pill.offline .indicator { background: var(--red); }
+.pill.processing .indicator { background: var(--amber); animation: blink 1s infinite; }
+.pill.idle .indicator { background: var(--text-dim); }
+@keyframes blink { 50% { opacity: .35; } }
+
+/* === MAIN LAYOUT === */
+.main-layout {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  gap: var(--gap);
+  align-items: start;
+}
+
+/* === CARDS === */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.card + .card { margin-top: var(--gap); }
+.card-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px; font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.card-head .ico { font-size: 15px; }
+.card-head-btn {
+  margin-left: auto;
+  padding: 4px 10px;
+  position: relative;
+  z-index: 2;
+}
+.card-body { padding: 16px 18px; }
+.card.collapsed .card-body { display: none; }
+.card-head { cursor: pointer; }
+.card-head .collapse-arrow {
+  margin-left: auto; font-size: 10px; opacity: .45;
+  transition: transform .2s;
+}
+.card.collapsed .collapse-arrow { transform: rotate(-90deg); }
+
+/* === FORM ELEMENTS === */
+.form-row { margin-bottom: 14px; }
+.form-row:last-child { margin-bottom: 0; }
+.form-label {
+  display: block; font-size: 11px; color: var(--text-label);
+  text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px;
+}
+.input, select, textarea {
+  width: 100%; padding: 10px 12px; font-size: 13px; font-family: inherit;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  outline: none; transition: border-color .15s;
+}
+.input:focus, select:focus, textarea:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+select { cursor: pointer; }
+select option { background: var(--bg-panel); color: var(--text); }
+.input-group { display: flex; gap: 8px; }
+.input-group .input { flex: 1; }
+
+/* === BUTTONS === */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 9px 16px; border: none; border-radius: var(--radius-sm);
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: opacity .15s, transform .15s;
+  font-family: inherit; white-space: nowrap;
+}
+.btn:hover:not(:disabled) { transform: translateY(-1px); }
+.btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+.btn-primary { background: var(--accent); color: #07121c; }
+.btn-primary:hover:not(:disabled) { opacity: .88; }
+.btn-success { background: var(--green); color: #051a0c; }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-outline {
+  background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+.btn-outline:hover:not(:disabled) { background: var(--bg-elevated); color: var(--text); }
+.btn-ghost {
+  background: transparent; color: var(--text-dim);
+}
+.btn-ghost:hover:not(:disabled) { background: var(--bg-elevated); color: var(--text); }
+.btn-block { width: 100%; justify-content: center; }
+.btn-sm { padding: 6px 12px; font-size: 12px; }
+
+/* === CONNECTION STATUS ROW === */
+.conn-indicator {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; border-radius: var(--radius-sm);
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  font-size: 13px; font-weight: 500;
+}
+.conn-indicator .light {
+  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+}
+.conn-indicator.ok .light { background: var(--green); }
+.conn-indicator.err .light { background: var(--red); }
+.conn-indicator.warn .light { background: var(--amber); }
+
+.helper-note {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.helper-note.ok { border-color: rgba(34,197,94,.25); color: #b8f5cb; }
+.helper-note.warn { border-color: rgba(245,158,11,.25); color: #fbd38d; }
+.helper-note.err { border-color: rgba(239,68,68,.25); color: #fecaca; }
+.helper-note code { color: #d7fbff; font-family: var(--font-mono); }
