@@ -49,6 +49,14 @@ extern "C" void app_main(void)
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
 
+    /* 上电/欠压复位：先等电源与 GD32 侧负载稳定，再进 WiFi/SPI 重活 */
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+
     Esp32OtaCore::initMutex();
 
     ESP_ERROR_CHECK(esp_netif_init());

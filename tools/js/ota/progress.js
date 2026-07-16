@@ -72,12 +72,16 @@ export function updateEsp32StagesFromPhase(phase) {
     if (statusText) statusText.textContent = '待机';
     return;
   }
-  for (var i = 0; i < phase - 1 && i < 6; i++) {
-    if (all[i]) all[i].className = 'stage-node done';
-  }
-  if (phase >= 1 && phase <= 6) {
-    if (all[phase - 1]) all[phase - 1].className = 'stage-node live';
-    if (details[phase - 1]) details[phase - 1].textContent = esp32PhaseLabels[phase] || '';
+  /* phase=N：前 N-1 步 done；第 N 步进行中 live。
+   * phase=6（启动完成/已完成）是终态：全部 done（绿），最后一步不要 live（蓝）。 */
+  for (var i = 0; i < 6; i++) {
+    if (!all[i]) continue;
+    if (i < phase - 1) {
+      all[i].className = 'stage-node done';
+    } else if (i === phase - 1 && phase >= 1) {
+      all[i].className = (phase >= 6) ? 'stage-node done' : 'stage-node live';
+      if (details[i]) details[i].textContent = esp32PhaseLabels[phase] || '';
+    }
   }
   if (statusBar && statusText) {
     if (phase >= 6) {

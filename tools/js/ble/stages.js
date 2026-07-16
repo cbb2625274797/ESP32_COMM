@@ -26,11 +26,13 @@ export function resetBleStages() {
 
 export function setBleStage(stageNum, detail, barState) {
   // stageNum: 1-6, detail: sub-step text
+  // 终态 stageNum===6：全部 done（绿）；中间步当前为 live（蓝）
+  var finished = stageNum >= 6;
   for (var i = 0; i < bleStageIds.length; i++) {
     var el = document.getElementById(bleStageIds[i]);
     if (!el) continue;
     if (i + 1 < stageNum) el.className = 'stage-node done';
-    else if (i + 1 === stageNum) el.className = 'stage-node live';
+    else if (i + 1 === stageNum) el.className = finished ? 'stage-node done' : 'stage-node live';
     else el.className = 'stage-node';
   }
   // Set detail text
@@ -41,7 +43,8 @@ export function setBleStage(stageNum, detail, barState) {
   // Update status bar
   var bar = document.getElementById('stageStatusBar');
   if (bar) {
-    bar.className = 'stage-status-bar' + (barState ? ' ' + barState : (stageNum > 0 ? ' active' : ''));
+    var cls = barState || (finished ? 'ok' : (stageNum > 0 ? 'active' : ''));
+    bar.className = 'stage-status-bar' + (cls ? ' ' + cls : '');
   }
 }
 

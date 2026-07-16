@@ -22,7 +22,6 @@
 #include "esp_log.h"
 #include "esp_random.h"   // esp_random() for HELLO session_id
 #include "esp_intr_alloc.h"  // ESP_INTR_FLAG_IRAM
-
 #include "spi_master.h"
 #include "spi_link_v2.h"
 #include "app_config.h"
@@ -1229,7 +1228,28 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
      *   ESP_OK                    - 读到过期帧（正常，忽略）
      *   ESP_ERR_INVALID_RESPONSE  - 读到 0xFF（正常，延迟一拍）
      *   其他                      - SPI 真实错误 */
-    const uint32_t send_timeout = (timeout_ms > 500U) ? 500U : timeout_ms;
+    /* 将总超时切成 send + poll，禁止 poll 单独再给 500ms（短超时批量时会「失败卡很久」） */
+    uint32_t send_timeout = (timeout_ms > 500U) ? 500U : timeout_ms;
+    if (send_timeout == 0U) {
+        send_timeout = 1U;
+    }
+    /* 至少给 poll 留一点时间；总超时很短时 send/poll 各半 */
+    uint32_t poll_timeout;
+    if (timeout_ms > send_timeout) {
+        poll_timeout = timeout_ms - send_timeout;
+    } else if (timeout_ms >= 40U) {
+        send_timeout = timeout_ms / 2U;
+        if (send_timeout == 0U) {
+            send_timeout = 1U;
+        }
+        poll_timeout = timeout_ms - send_timeout;
+    } else {
+        poll_timeout = timeout_ms; /* 极短超时：发完立刻 poll，总预算仍受 deadline 约束 */
+    }
+    if (poll_timeout == 0U) {
+        poll_timeout = 1U;
+    }
+
     esp_err_t send_ret = otaTransferUnlocked(type, payload, payload_len,
                                              nullptr, nullptr, 0U, nullptr, send_timeout,
                                              /*expect_stale=*/true);
@@ -1237,15 +1257,10 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         return send_ret;
     }
 
-    /* 等 GD32 完成 onCsRelease；poll 内仅在 DATA_READY 低时变长读（不盲 CS）。 */
-    {
-        const TickType_t gap = (pdMS_TO_TICKS(1) > 0) ? pdMS_TO_TICKS(1) : 1;
-        vTaskDelay(gap);
-    }
+    /* 等 GD32 完成 onCsRelease 再 poll；5ms 兼顾「能发出」与批量节奏 */
+    vTaskDelay(pdMS_TO_TICKS(5));
 
     /* 步骤 2: 轮询读取真实响应（变长读，不重发命令） */
-    const uint32_t poll_timeout = (timeout_ms > send_timeout)
-                                  ? (timeout_ms - send_timeout) : 500U;
     return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, poll_timeout,
                                     /*expected_type=*/0xFFU);
 }

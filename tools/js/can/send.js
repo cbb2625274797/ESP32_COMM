@@ -12,12 +12,12 @@
  * 注意：formatTime 保留本地实现（HH:MM:SS，不含毫秒），与 common/utils.js
  * 的 formatTime（含毫秒）不同，以保证发送历史时间戳输出格式一致。
  */
-import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js?v=20260717t';
-import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717t';
-import { showToast } from '../common/toast.js?v=20260717t';
-import { updateBatchUi } from './messages.js?v=20260717t';
-import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js?v=20260717t';
-import { scheduleCanPersist } from './persist.js?v=20260717t';
+import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js?v=20260717w';
+import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717w';
+import { showToast } from '../common/toast.js?v=20260717w';
+import { updateBatchUi } from './messages.js?v=20260717w';
+import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js?v=20260717w';
+import { scheduleCanPersist } from './persist.js?v=20260717w';
 
 // ==================== 本地工具（保持与原 can.js 一致） ====================
 function formatTime(date) {
@@ -109,7 +109,18 @@ async function sendCanBatchRequest(channel, frames) {
   if (!json.results || !Array.isArray(json.results)) {
     throw new Error('批量响应缺少 results');
   }
-  return json.results;
+  /* 设备中途 fatal 会 skipped 剩余帧（少分配堆）；前端补齐等长 results */
+  var results = json.results.slice();
+  var need = frames.length - results.length;
+  if (need > 0) {
+    var pad = {
+      status: 'error',
+      code: (json.abort_code != null) ? json.abort_code : -2,
+      gd32_err: (json.abort_gd32_err != null) ? json.abort_gd32_err : 0
+    };
+    for (var p = 0; p < need; p++) results.push(pad);
+  }
+  return results;
 }
 
 // ==================== 响应框 ====================
@@ -161,12 +172,12 @@ export function renderHistory() {
 }
 
 // ==================== 批量发送 ====================
-/** 单批最多帧数（与设备 /can/send_batch 上限一致） */
-var BATCH_CHUNK = 48;
+/** 单批最多帧数（与设备 /can/send_batch 上限 128 对齐；一次 HTTP 连发，避免分块成“一阵一阵”） */
+var BATCH_CHUNK = 128;
 
 /**
  * @description 批量发送所有勾选的报文。
- * 优先一次 HTTP /can/send_batch 在设备侧紧接连发；失败则回退单帧紧接。
+ * 优先一次 HTTP /can/send_batch（设备侧帧间 5ms）；失败则回退单帧（无额外间隔）。
  * 批量过程中不重绘历史，结束后统一刷新。
  */
 export async function sendCheckedMessages() {

@@ -318,8 +318,8 @@ esp_err_t WifiOta::initSta()
     // esp_wifi_start() 内部会触发 PHY 初始化和校准
     // 如果校准未完成就启动射频，可能导致连接失败
     if (WifiOta::instance().m_coldBoot) {
-        DEBUG_INFO("WIFI", "冷启动: 等待 PHY 就绪...");
-        vTaskDelay(pdMS_TO_TICKS(500));
+        DEBUG_INFO("WIFI", "冷启动: wifi_start 前再等 300ms...");
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -533,12 +533,12 @@ void WifiOta::onBleOtaEnd()
  */
 bool WifiOta::earlyInit()
 {
-    DEBUG_INFO("WIFI", "=== WiFi 早期初始化 (调度器启动前) ===");
+    DEBUG_INFO("WIFI", "=== WiFi 早期初始化 ===");
 
-    // ★ 冷启动检测：判断是否为上电复位
+    // ★ 冷启动检测：判断是否为上电/欠压复位
     esp_reset_reason_t reset_reason = esp_reset_reason();
     WifiOta::instance().m_coldBoot = (reset_reason == ESP_RST_POWERON || reset_reason == ESP_RST_BROWNOUT);
-    
+
     DEBUG_INFO("WIFI", "复位原因: %d (%s), 冷启动: %s",
                reset_reason,
                (reset_reason == ESP_RST_POWERON) ? "POWER_ON" :
@@ -550,6 +550,13 @@ bool WifiOta::earlyInit()
                (reset_reason == ESP_RST_DEEPSLEEP) ? "DEEP_SLEEP" :
                "OTHER",
                WifiOta::instance().m_coldBoot ? "是" : "否");
+
+    /* 与 GD32/CAN 收发器同板上电时，电源上升沿慢 + 负载大。
+     * 若立刻清 PHY/开 WiFi 全量校准，易触发 brownout，表现为「上电起不来，拔插才好」。 */
+    if (WifiOta::instance().m_coldBoot) {
+        DEBUG_INFO("WIFI", "冷启动: 电源轨稳定等待 400ms（再做 NVS/WiFi）...");
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
 
     esp_err_t err = nvs_flash_init();
     bool nvs_erased = false;
@@ -569,20 +576,21 @@ bool WifiOta::earlyInit()
         DEBUG_INFO("WIFI", "NVS 初始化成功");
     }
 
-    // ★ 冷启动时强制清除 WiFi NVS 缓存，避免残留脏数据
-    // 长时间断电后 NVS 中的 WiFi 配置缓存可能不一致
+    // ★ 冷启动：只清 WiFi 连接缓存；勿在每次 POWERON 都清 PHY。
+    //   全量 PHY 校准电流大，与 GD32 同时上电易 brownout → 必须再插拔才能起来。
+    //   仅在欠压复位后清 PHY，避免校准脏数据死循环。
     if (WifiOta::instance().m_coldBoot) {
-        // 清除 WiFi 驱动内部 NVS 缓存键
         err = clearNvsNamespace("nvs.net80211");
         if (err == ESP_OK) {
             DEBUG_DBG("WIFI", "冷启动: 已清除 WiFi NVS 缓存 (nvs.net80211)");
         } else {
             DEBUG_INFO("WIFI", "冷启动: 无 WiFi NVS 缓存分区，跳过清除");
         }
-        // 同样清除 PHY 校准数据分区，强制下次全量校准
-        err = clearNvsNamespace("phy");
-        if (err == ESP_OK) {
-            DEBUG_DBG("WIFI", "冷启动: 已清除 PHY 校准缓存，将重新校准");
+        if (reset_reason == ESP_RST_BROWNOUT) {
+            err = clearNvsNamespace("phy");
+            if (err == ESP_OK) {
+                DEBUG_WARN("WIFI", "BROWNOUT 后: 已清除 PHY 校准，将重新校准");
+            }
         }
     }
 

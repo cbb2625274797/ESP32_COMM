@@ -224,7 +224,9 @@ void HealthMonitor::taskEntry(void *pvParameters)
             static TickType_t s_last_heap_warn = 0;
             TickType_t now = xTaskGetTickCount();
             const bool ota_busy = !OtaCoordinator::instance().isIdle();
-            const uint32_t interval_ms = ota_busy ? 15000U : 3000U;
+            /* 堆越紧越要少打日志（日志本身还要占堆/UDP） */
+            const uint32_t interval_ms = ota_busy ? 15000U
+                : (free_heap < 8192U ? 10000U : 3000U);
             /* OTA 中只在 free 极低（<4KB）时告警；空闲时维持 10KB 阈值 */
             const uint32_t warn_floor = ota_busy ? 4096U : (uint32_t)HEAP_WARNING_MIN;
             if (free_heap < warn_floor &&

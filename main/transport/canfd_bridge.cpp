@@ -64,8 +64,17 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
         &resp_type, spi_rx, spi_rx_max, &resp_len, timeout_ms);
 
     if (ret != ESP_OK) {
-        DEBUG_WARN("CAN", "CAN_SEND SPI失败: ch=%u id=0x%08lX err=%s",
-                   (unsigned)channel, (unsigned long)ext_id, esp_err_to_name(ret));
+        /* 批量失败时勿每帧打日志：UDP/格式化会把堆打穿 */
+        static uint32_t s_spi_fail_n = 0U;
+        static int s_last_spi_err = 0;
+        const int err_i = static_cast<int>(ret);
+        if (s_spi_fail_n == 0U || err_i != s_last_spi_err || (s_spi_fail_n % 32U) == 0U) {
+            DEBUG_WARN("CAN", "CAN_SEND SPI失败: ch=%u id=0x%08lX err=%s (x%lu)",
+                       (unsigned)channel, (unsigned long)ext_id, esp_err_to_name(ret),
+                       (unsigned long)(s_spi_fail_n + 1U));
+        }
+        s_last_spi_err = err_i;
+        ++s_spi_fail_n;
         if (gd32_err_out) {
             *gd32_err_out = 0U;
         }
@@ -87,8 +96,17 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
     if (gd32_err_out) {
         *gd32_err_out = gd32_err;
     }
-    DEBUG_WARN("CAN", "CAN_SEND GD32拒绝: ch=%u id=0x%08lX resp=0x%02X err=0x%02X",
-               (unsigned)channel, (unsigned long)ext_id, resp_type, gd32_err);
+    {
+        static uint32_t s_rej_n = 0U;
+        static uint8_t s_last_rej = 0xFFU;
+        if (s_rej_n == 0U || gd32_err != s_last_rej || (s_rej_n % 32U) == 0U) {
+            DEBUG_WARN("CAN", "CAN_SEND GD32拒绝: ch=%u id=0x%08lX resp=0x%02X err=0x%02X (x%lu)",
+                       (unsigned)channel, (unsigned long)ext_id, resp_type, gd32_err,
+                       (unsigned long)(s_rej_n + 1U));
+        }
+        s_last_rej = gd32_err;
+        ++s_rej_n;
+    }
     return -3;
 }
 

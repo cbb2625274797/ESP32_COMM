@@ -16,6 +16,7 @@
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_sys.h"
 #include "cJSON.h"
 
 #include "app_config.h"
@@ -837,26 +838,28 @@ esp_err_t can_send_handler(httpd_req_t *req)
  *
  * JSON: { "ch": 0, "frames": [ { "id": n, "dlc": n, "data": "HEX" }, ... ] }
  * 返回: { "status":"ok", "results":[ { "status":"ok"|"error", ... }, ... ] }
- * 帧间无人为延时；单帧 SPI 超时 400ms（批量优先吞吐）。
+ * 帧间 5ms；暂停 CAN 反馈，避免与批量 SPI 竞态导致偶发崩溃。
  */
 esp_err_t can_send_batch_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
 
-    constexpr int kMaxBody = 12288;
-    constexpr int kMaxFrames = 48;
-    constexpr uint32_t kPerFrameTimeoutMs = 400U;
+    /* 单次尽量装下整批，避免前端分块导致“一阵一阵” */
+    constexpr int kMaxBody = 49152;
+    constexpr int kMaxFrames = 128;
+    /* 成功路径通常 <20ms；失败路径不再拖到数百 ms */
+    constexpr uint32_t kPerFrameTimeoutMs = 80U;
+    constexpr uint32_t kInterFrameDelayMs = 5U;
 
     int content_len = req->content_len;
     if (content_len <= 0 || content_len > kMaxBody) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body 长度无效或过大");
-        return ESP_FAIL;
+        return http_send_json_error(req, "400 Bad Request", "bad_body",
+                                    "body 长度无效或过大");
     }
 
     char *buf = static_cast<char *>(malloc(static_cast<size_t>(content_len) + 1U));
     if (!buf) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存不足");
-        return ESP_FAIL;
+        return http_send_json_error(req, "500 Internal Server Error", "oom", "内存不足");
     }
 
     int received = 0;
@@ -864,8 +867,7 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
         int ret = httpd_req_recv(req, buf + received, content_len - received);
         if (ret <= 0) {
             free(buf);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "接收数据失败");
-            return ESP_FAIL;
+            return http_send_json_error(req, "400 Bad Request", "recv_fail", "接收数据失败");
         }
         received += ret;
     }
@@ -873,41 +875,71 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
 
     cJSON *root = cJSON_Parse(buf);
     free(buf);
+    buf = nullptr;
     if (!root) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON 解析失败");
-        return ESP_FAIL;
+        return http_send_json_error(req, "400 Bad Request", "json_parse", "JSON 解析失败");
     }
 
     cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
     cJSON *frames = cJSON_GetObjectItem(root, "frames");
     if (!ch_item || !cJSON_IsArray(frames)) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "需要 ch 与 frames 数组");
-        return ESP_FAIL;
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "需要 ch 与 frames 数组");
     }
 
     can_channel_t ch = static_cast<can_channel_t>(cJSON_GetNumberValue(ch_item));
     const int frame_count = cJSON_GetArraySize(frames);
     if (frame_count <= 0 || frame_count > kMaxFrames) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "frames 数量无效（1~48）");
-        return ESP_FAIL;
+        return http_send_json_error(req, "400 Bad Request", "bad_frames",
+                                    "frames 数量无效（1~128）");
     }
 
     cJSON *out_root = cJSON_CreateObject();
     cJSON *results = cJSON_CreateArray();
+    if (out_root == nullptr || results == nullptr) {
+        cJSON_Delete(out_root);
+        cJSON_Delete(results);
+        cJSON_Delete(root);
+        return http_send_json_error(req, "500 Internal Server Error", "oom", "JSON 分配失败");
+    }
     cJSON_AddStringToObject(out_root, "status", "ok");
     cJSON_AddItemToObject(out_root, "results", results);
 
+    /* 暂停 0xC1 反馈抢 SPI，降低 worker 竞态 / 长时间占线导致的 WDT 风险 */
+    pauseCanFeedbackTask(true);
+
+    auto fill_err = [](cJSON *item, int code, uint8_t gd32_err) {
+        if (!item) {
+            return;
+        }
+        cJSON_AddStringToObject(item, "status", "error");
+        cJSON_AddNumberToObject(item, "code", code);
+        cJSON_AddNumberToObject(item, "gd32_err", gd32_err);
+    };
+
+    /* 中途致命错误后不再逐帧 SPI 重试（否则每帧再等一整段超时） */
+    bool abort_rest = false;
+    int abort_code = -2;
+    uint8_t abort_gd32 = 0U;
+
     for (int i = 0; i < frame_count; i++) {
-        cJSON *fr = cJSON_GetArrayItem(frames, i);
+        (void)esp_task_wdt_reset();
+
         cJSON *item = cJSON_CreateObject();
+        if (item == nullptr) {
+            break;
+        }
         cJSON_AddItemToArray(results, item);
 
+        if (abort_rest) {
+            fill_err(item, abort_code, abort_gd32);
+            continue; /* 无 SPI、无帧间延时 */
+        }
+
+        cJSON *fr = cJSON_GetArrayItem(frames, i);
         if (!cJSON_IsObject(fr)) {
-            cJSON_AddStringToObject(item, "status", "error");
-            cJSON_AddNumberToObject(item, "code", -1);
-            cJSON_AddNumberToObject(item, "gd32_err", 0);
+            fill_err(item, -1, 0);
             continue;
         }
 
@@ -915,53 +947,88 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
         cJSON *data_item = cJSON_GetObjectItem(fr, "data");
         cJSON *dlc_item = cJSON_GetObjectItem(fr, "dlc");
         if (!id_item) {
-            cJSON_AddStringToObject(item, "status", "error");
-            cJSON_AddNumberToObject(item, "code", -1);
-            cJSON_AddNumberToObject(item, "gd32_err", 0);
+            fill_err(item, -1, 0);
             continue;
         }
 
         uint32_t ext_id = static_cast<uint32_t>(cJSON_GetNumberValue(id_item));
         uint8_t dlc = dlc_item ? static_cast<uint8_t>(cJSON_GetNumberValue(dlc_item)) : 0U;
-        uint8_t tx_data[CAN_MAX_DLC] = {0};
+        if (dlc > CAN_MAX_DLC) {
+            dlc = CAN_MAX_DLC;
+        }
+        uint8_t tx_data[CAN_MAX_DLC];
+        memset(tx_data, 0, sizeof(tx_data));
         uint8_t tx_dlc = 0U;
         if (data_item && cJSON_IsString(data_item)) {
-            tx_dlc = static_cast<uint8_t>(parseHexToBytes(cJSON_GetStringValue(data_item),
-                                                          tx_data, CAN_MAX_DLC));
+            const char *hex = cJSON_GetStringValue(data_item);
+            if (hex) {
+                tx_dlc = static_cast<uint8_t>(parseHexToBytes(hex, tx_data, CAN_MAX_DLC));
+            }
         }
         if (tx_dlc == 0U && dlc > 0U) {
-            tx_dlc = (dlc > CAN_MAX_DLC) ? CAN_MAX_DLC : dlc;
+            tx_dlc = dlc;
         }
 
-        uint8_t resp_data[CAN_MAX_DLC] = {0};
+        uint8_t resp_data[CAN_MAX_DLC];
+        memset(resp_data, 0, sizeof(resp_data));
         uint8_t gd32_err = 0U;
         int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
                                  resp_data, sizeof(resp_data), kPerFrameTimeoutMs, &gd32_err);
 
         if (resp_len >= 0) {
-            char resp_hex[CAN_MAX_DLC * 2 + 1] = {0};
-            bytesToHexUpper(resp_data, static_cast<size_t>(resp_len), resp_hex);
+            char resp_hex[CAN_MAX_DLC * 2 + 1];
+            memset(resp_hex, 0, sizeof(resp_hex));
+            const size_t copy_n = (static_cast<size_t>(resp_len) < sizeof(resp_data))
+                                      ? static_cast<size_t>(resp_len) : sizeof(resp_data);
+            bytesToHexUpper(resp_data, copy_n, resp_hex);
             cJSON_AddStringToObject(item, "status", "ok");
             cJSON_AddNumberToObject(item, "sent", tx_dlc);
-            cJSON_AddNumberToObject(item, "recv_len", resp_len);
+            cJSON_AddNumberToObject(item, "recv_len", static_cast<double>(copy_n));
             cJSON_AddStringToObject(item, "recv", resp_hex);
         } else {
-            cJSON_AddStringToObject(item, "status", "error");
-            cJSON_AddNumberToObject(item, "code", resp_len);
-            cJSON_AddNumberToObject(item, "gd32_err", gd32_err);
+            fill_err(item, resp_len, gd32_err);
+            /* SPI 失败 / BUS_OFF / TEC 过高：后面不再逐帧 SPI，也不再为每帧分配 cJSON */
+            const bool fatal_spi = (resp_len == -2);
+            const bool fatal_bus = (resp_len == -3) &&
+                                   (gd32_err == 0xE2U || gd32_err == 0xE3U);
+            if (fatal_spi || fatal_bus) {
+                abort_rest = true;
+                abort_code = resp_len;
+                abort_gd32 = gd32_err;
+                const int skipped = frame_count - i - 1;
+                if (skipped > 0) {
+                    cJSON_AddNumberToObject(out_root, "skipped", skipped);
+                    cJSON_AddNumberToObject(out_root, "abort_code", abort_code);
+                    cJSON_AddNumberToObject(out_root, "abort_gd32_err", abort_gd32);
+                }
+                break; /* 不再为剩余帧 CreateObject，避免堆被打穿 */
+            }
+        }
+
+        if (i + 1 < frame_count && !abort_rest) {
+            vTaskDelay(pdMS_TO_TICKS(kInterFrameDelayMs));
         }
     }
 
+    pauseCanFeedbackTask(false);
     cJSON_Delete(root);
+    root = nullptr;
+
     char *printed = cJSON_PrintUnformatted(out_root);
     cJSON_Delete(out_root);
+    out_root = nullptr;
     if (!printed) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON 输出失败");
+        /* 堆已紧时勿再走大段错误路径分配；给前端最小 JSON */
+        static const char kOom[] =
+            "{\"status\":\"error\",\"code\":\"json_print\",\"message\":\"JSON输出失败(堆不足)\"}";
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, kOom, HTTPD_RESP_USE_STRLEN);
         return ESP_FAIL;
     }
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, printed, strlen(printed));
+    httpd_resp_send(req, printed, HTTPD_RESP_USE_STRLEN);
     free(printed);
     return ESP_OK;
 }

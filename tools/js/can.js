@@ -20,7 +20,7 @@
 import {
   state, el, getBaseUrl, getDeviceIp, setDeviceIp, parseDbc, readDbcText, buildSummary,
   rebuildMergedDbc, makeDbcSourceId
-} from './can/dbc.js?v=20260717t';
+} from './can/dbc.js?v=20260717w';
 import {
   updateDbcFileInfo,
   filterMessages,
@@ -30,12 +30,12 @@ import {
   recomputeTransmitterFilterEmpty,
   updateNodeFilterLabel,
   updateBatchUi
-} from './can/messages.js?v=20260717t';
+} from './can/messages.js?v=20260717w';
 import {
   ensureMessageDefaults,
   renderSelectedMessage,
   updateEncodedPreview
-} from './can/signals.js?v=20260717t';
+} from './can/signals.js?v=20260717w';
 import {
   renderHistory,
   sendSelectedMessage,
@@ -44,15 +44,15 @@ import {
   sendManualFrame,
   resetManualFields,
   loadPreviewToManual
-} from './can/send.js?v=20260717t';
+} from './can/send.js?v=20260717w';
 import {
   scheduleCanPersist,
   loadCanSession,
   bindCanPersistLifecycle
-} from './can/persist.js?v=20260717t';
-import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js?v=20260717t';
-import { showToast } from './common/toast.js?v=20260717t';
-import { initCanMonitor } from './can_monitor.js?v=20260717t';
+} from './can/persist.js?v=20260717w';
+import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js?v=20260717w';
+import { showToast } from './common/toast.js?v=20260717w';
+import { initCanMonitor } from './can_monitor.js?v=20260717w';
 
 // ==================== 本地工具 ====================
 // 原 can.js 的 formatUptime 输出格式与 common/utils.js 略有差异（d>0 时只到 h），
