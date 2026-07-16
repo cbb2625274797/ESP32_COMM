@@ -20,7 +20,7 @@
 import {
   state, el, getBaseUrl, getDeviceIp, setDeviceIp, parseDbc, readDbcText, buildSummary,
   rebuildMergedDbc, makeDbcSourceId
-} from './can/dbc.js?v=20260717w';
+} from './can/dbc.js?v=20260717x';
 import {
   updateDbcFileInfo,
   filterMessages,
@@ -30,12 +30,11 @@ import {
   recomputeTransmitterFilterEmpty,
   updateNodeFilterLabel,
   updateBatchUi
-} from './can/messages.js?v=20260717w';
+} from './can/messages.js?v=20260717x';
 import {
   ensureMessageDefaults,
-  renderSelectedMessage,
   updateEncodedPreview
-} from './can/signals.js?v=20260717w';
+} from './can/signals.js?v=20260717x';
 import {
   renderHistory,
   sendSelectedMessage,
@@ -44,15 +43,15 @@ import {
   sendManualFrame,
   resetManualFields,
   loadPreviewToManual
-} from './can/send.js?v=20260717w';
+} from './can/send.js?v=20260717x';
 import {
   scheduleCanPersist,
   loadCanSession,
   bindCanPersistLifecycle
-} from './can/persist.js?v=20260717w';
-import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js?v=20260717w';
-import { showToast } from './common/toast.js?v=20260717w';
-import { initCanMonitor } from './can_monitor.js?v=20260717w';
+} from './can/persist.js?v=20260717x';
+import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js?v=20260717x';
+import { showToast } from './common/toast.js?v=20260717x';
+import { initCanMonitor } from './can_monitor.js?v=20260717x';
 
 // ==================== 本地工具 ====================
 // 原 can.js 的 formatUptime 输出格式与 common/utils.js 略有差异（d>0 时只到 h），
@@ -63,10 +62,10 @@ import { initCanMonitor } from './can_monitor.js?v=20260717w';
 function cacheElements() {
   [
     'toolIp', 'defaultChannel', 'manualChannel', 'manualId', 'manualDlc', 'manualData',
-    'dbcDropZone', 'dbcFileInput', 'dbcFileInfo', 'dbcFileName', 'dbcMessageCount',
+    'dbcDropZone', 'dbcFileInput', 'dbcFileInfo', 'dbcMessageCount',
     'dbcSignalCount', 'dbcNodeCount', 'dbcFileSize', 'dbcFileCount', 'dbcFileChips',
     'dbcSearch', 'dbcHint', 'clearDbcBtn',
-    'importDbcBtn', 'replaceDbcBtn',
+    'importDbcBtn',
     'messageList', 'sendSelectedBtn', 'generatedHex', 'generatedBytes', 'encodeHint',
     'dbcResp', 'dbcRespText', 'loadPreviewToRawBtn', 'manualHint', 'sendManualBtn',
     'resetManualBtn', 'manualResp', 'manualRespText', 'historyList', 'toast', 'toastIco',
@@ -149,11 +148,10 @@ function afterDbcSourcesChanged(opts) {
     if (opts.resetSelection || !state.selectedMessageKey) {
       selectMessage(state.dbc.messages[0].key);
     } else {
-      renderSelectedMessage();
       updateEncodedPreview();
     }
   } else {
-    renderSelectedMessage();
+    updateEncodedPreview();
   }
   if (el.dbcHint) {
     el.dbcHint.hidden = true;
@@ -268,7 +266,6 @@ function bindEvents() {
       if (el.manualChannel) el.manualChannel.value = el.defaultChannel.value;
       if (el.canChannelPill) el.canChannelPill.textContent = 'CH' + el.defaultChannel.value;
       renderMessageList();
-      renderSelectedMessage();
       updateEncodedPreview();
       scheduleCanPersist();
     });
@@ -277,7 +274,6 @@ function bindEvents() {
     if (el.dbcFileInput) el.dbcFileInput.click();
   }
   if (el.importDbcBtn) el.importDbcBtn.addEventListener('click', openDbcPicker);
-  if (el.replaceDbcBtn) el.replaceDbcBtn.addEventListener('click', openDbcPicker);
   if (el.dbcDropZone) {
     el.dbcDropZone.addEventListener('dragover', function (event) {
       event.preventDefault();
@@ -389,7 +385,7 @@ function init() {
       selectMessage(state.dbc.messages[0].key);
     }
   } else {
-    renderSelectedMessage();
+    updateEncodedPreview();
   }
   updateBatchUi();
   refreshManualHint();

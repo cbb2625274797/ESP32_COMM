@@ -1,17 +1,27 @@
 /*
  * ESP32-C3FH4 OTA 中继 - 程序入口
- * FreeRTOS 任务：健康监控 / OTA Relay / WiFi Server / BLE GATT / CAN 反馈
  *
- * 使用各模块单例初始化并创建任务；入口只做装配，不实现协议。
+ * 初始化顺序（每位成功后 SystemBoot::mark=1，末尾统一 report）：
+ *   1. 冷启动延时
+ *   2. netif / event_loop / debug_log
+ *   3. wifi earlyInit
+ *   4. health_mon + task
+ *   5. cpu_stats（可选）
+ *   6. protocol / ota_coord
+ *   7. spi init + L0 本机自检 → mark spi；HELLO 对端轻检 → mark can_link（非关键）
+ *   8. ota_relay / wifi_ota / ble_ota 任务
+ *   9. can_fb 任务（依赖 spi L0）
+ *  10. ota_mark_valid（可选）
+ *  11. SystemBoot::report()
  */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_chip_info.h"
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_ota_ops.h"
 
+#include "system_boot.h"
 #include "monitor/health_monitor.h"
 #include "monitor/cpu_stats.h"
 #include "relay/ota_relay.h"
@@ -25,31 +35,21 @@
 #include "ota/esp32_ota_core.h"
 #include "monitor/can_feedback_task.h"
 
-/**
- * @brief 创建关键任务；失败则打 ERR 并 ESP_ERROR_CHECK 触发重启。
- */
-static void createCriticalTask(TaskFunction_t entry, const char *name,
+/** @brief 创建关键任务；成功返回 true。 */
+static bool createCriticalTask(TaskFunction_t entry, const char *name,
                                uint32_t stack, UBaseType_t prio)
 {
-    BaseType_t xRet = xTaskCreatePinnedToCore(
-        entry, name, stack, NULL, prio, NULL, 0);
-    if (xRet != pdPASS) {
-        DEBUG_ERR("MAIN", "创建关键任务 %s 失败", name);
-        ESP_ERROR_CHECK(ESP_FAIL);
-    }
-    DEBUG_INFO("MAIN", "任务已创建: %s (prio=%u stack=%lu)",
-               name, (unsigned)prio, (unsigned long)stack);
+    return xTaskCreatePinnedToCore(entry, name, stack, NULL, prio, NULL, 0) == pdPASS;
 }
 
 /**
- * @brief 程序主入口：初始化组件并创建 FreeRTOS 任务。
+ * @brief 程序主入口：按模块初始化并汇总结果。
  */
 extern "C" void app_main(void)
 {
-    esp_chip_info_t chip_info;
-    esp_chip_info(&chip_info);
+    SystemBoot::reset();
 
-    /* 上电/欠压复位：先等电源与 GD32 侧负载稳定，再进 WiFi/SPI 重活 */
+    /* 上电/欠压复位后短延时再初始化子系统 */
     {
         esp_reset_reason_t rr = esp_reset_reason();
         if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
@@ -59,79 +59,86 @@ extern "C" void app_main(void)
 
     Esp32OtaCore::initMutex();
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    if (esp_netif_init() == ESP_OK) {
+        SystemBoot::mark(BOOT_NETIF);
+    }
+
+    if (esp_event_loop_create_default() == ESP_OK) {
+        SystemBoot::mark(BOOT_EVENT_LOOP);
+    }
 
     DebugLog::instance().init();
+    SystemBoot::mark(BOOT_DEBUG_LOG);
 
-    /* earlyInit：true=已启动 STA 连接流程；false=将走 AP（或 CONFIG 直选 AP） */
+    /* earlyInit：true=已启动 STA 连接流程；false=将走 AP */
     const bool wifi_early_started_sta = WifiOta::instance().earlyInit();
+    SystemBoot::mark(BOOT_WIFI_EARLY);
 
     HealthMonitor::instance().init();
-    DEBUG_INFO("MAIN", "健康监控状态已初始化");
-    DEBUG_INFO("MAIN", "========================================");
-    DEBUG_INFO("MAIN", "ESP32-C3 OTA Relay %s 启动", FW_VERSION);
-    DEBUG_INFO("MAIN", "Chip: %s, Rev %d", CONFIG_IDF_TARGET, chip_info.revision);
-    DEBUG_INFO("MAIN", "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
-    DEBUG_INFO("MAIN", "CPU Freq: %d MHz", CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
-    DEBUG_INFO("MAIN", "WiFi early: %s（最终 STA/AP 由 wifi_ota 任务确认）",
-               wifi_early_started_sta ? "STA 连接中" : "非 STA 优先/将切 AP");
-    DEBUG_INFO("MAIN", "========================================");
+    SystemBoot::mark(BOOT_HEALTH_MON);
 
-    /* 健康监控：温度/RSSI；缺失则运维盲区 → 关键 */
-    createCriticalTask(HealthMonitor::taskEntry, "health_mon",
-                       TASK_STACK_HEALTH_MON, configMAX_PRIORITIES - 4);
+    if (createCriticalTask(HealthMonitor::taskEntry, "health_mon",
+                           TASK_STACK_HEALTH_MON, configMAX_PRIORITIES - 4)) {
+        SystemBoot::mark(BOOT_HEALTH_TASK);
+    }
 
-    /* CPU 1Hz 采样：非致命 */
     CpuStats::instance().start();
+    SystemBoot::mark(BOOT_CPU_STATS);
 
     Protocol::instance().init();
-    DEBUG_INFO("MAIN", "协议层初始化完成");
+    SystemBoot::mark(BOOT_PROTOCOL);
 
     OtaCoordinator::instance().init();
     OtaCoordinator::instance().setBleCoexListener(&WifiOta::instance());
-    DEBUG_INFO("MAIN", "OTA 全局协调器已初始化");
+    SystemBoot::mark(BOOT_OTA_COORD);
 
-    /* SPI 是中继/CAN 反馈根基：失败则无法完成核心职责，按关键失败处理 */
+    bool spi_l0_ok = false;
     {
         esp_err_t ret = SpiMaster::instance().init();
-        if (ret != ESP_OK) {
-            DEBUG_ERR("MAIN", "SPI 总线初始化失败: %s", esp_err_to_name(ret));
-            ESP_ERROR_CHECK(ret);
-        }
-        DEBUG_INFO("MAIN", "SPI 总线初始化完成");
-    }
-
-    createCriticalTask(OtaRelay::taskEntry, "ota_relay",
-                       TASK_STACK_OTA_RELAY, configMAX_PRIORITIES - 2);
-
-    createCriticalTask(WifiOta::taskEntry, "wifi_ota",
-                       TASK_STACK_WIFI_OTA, configMAX_PRIORITIES - 3);
-
-    createCriticalTask(BleOta::taskEntry, "ble_ota",
-                       TASK_STACK_BLE_OTA, configMAX_PRIORITIES - 3);
-
-    if (startCanFeedbackTask()) {
-        DEBUG_INFO("MAIN", "CAN 反馈轮询任务已创建");
-    } else {
-        DEBUG_WARN("MAIN", "CAN 反馈轮询任务创建失败（非致命，OTA 不受影响）");
-    }
-
-    /* 任务就绪后尽快标记 app 有效，避免后续探测拖太久导致回滚窗口拉长 */
-    {
-        esp_err_t ota_valid_err = esp_ota_mark_app_valid_cancel_rollback();
-        if (ota_valid_err == ESP_OK) {
-            DEBUG_INFO("MAIN", "OTA 回滚保护: 当前固件已标记有效");
-        } else {
-            DEBUG_WARN("MAIN", "OTA 回滚保护: 标记失败 (%s)，可能非 OTA 启动",
-                       esp_err_to_name(ota_valid_err));
+        if (ret == ESP_OK && SpiMaster::instance().selfTestL0()) {
+            SystemBoot::mark(BOOT_SPI);
+            spi_l0_ok = true;
+            /* 对端轻检：GD32 可能仍在启动延时，失败不拉垮关键启动 */
+            if (SpiMaster::instance().selfTestPeerL0()) {
+                SystemBoot::mark(BOOT_CAN_LINK);
+            }
         }
     }
 
-    DEBUG_INFO("MAIN", "========================================");
-    DEBUG_INFO("MAIN", "所有任务创建完成，OTA Relay 运行中");
-    DEBUG_INFO("MAIN", "GD32 版本探测由 ota_relay 任务负责（hello+probe）");
-    DEBUG_INFO("MAIN", "调试日志输出: UDP(%s:%d) + UART0(GPIO21/TX, 115200)",
-               DEBUG_LOG_IP, DEBUG_LOG_PORT);
-    DEBUG_INFO("MAIN", "========================================");
+    if (createCriticalTask(OtaRelay::taskEntry, "ota_relay",
+                           TASK_STACK_OTA_RELAY, configMAX_PRIORITIES - 2)) {
+        SystemBoot::mark(BOOT_OTA_RELAY_TASK);
+    }
+
+    if (createCriticalTask(WifiOta::taskEntry, "wifi_ota",
+                           TASK_STACK_WIFI_OTA, configMAX_PRIORITIES - 3)) {
+        SystemBoot::mark(BOOT_WIFI_TASK);
+    }
+
+    if (createCriticalTask(BleOta::taskEntry, "ble_ota",
+                           TASK_STACK_BLE_OTA, configMAX_PRIORITIES - 3)) {
+        SystemBoot::mark(BOOT_BLE_TASK);
+    }
+
+    /* CAN 反馈依赖 SPI 本机 L0 */
+    if (spi_l0_ok && startCanFeedbackTask()) {
+        SystemBoot::mark(BOOT_CAN_FB_TASK);
+    }
+
+    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+        SystemBoot::mark(BOOT_OTA_VALID);
+    }
+
+    DEBUG_INFO("MAIN", "ESP32-C3 OTA Relay %s, heap=%lu, wifi_early=%s",
+               FW_VERSION,
+               (unsigned long)esp_get_free_heap_size(),
+               wifi_early_started_sta ? "STA" : "AP/other");
+
+    const bool critical_ok = SystemBoot::report();
+
+    if (!critical_ok) {
+        DEBUG_ERR("MAIN", "critical init FAIL, restart in 3s");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
+    }
 }

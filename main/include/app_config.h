@@ -56,7 +56,7 @@ inline constexpr uint32_t TASK_STACK_WIFI_OTA      = 4096;  ///< wifi_ota 主循
 inline constexpr uint32_t TASK_STACK_OTA_RELAY     = 2560;  ///< ota_relay：2.5KB（轻载 peak~1KB；转发时看 /system/status.task_stack）
 inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 5120;  ///< spi_worker：5KB（帧缓冲热路径；已纳入 task_stack 巡检）
 inline constexpr uint32_t TASK_STACK_BLE_OTA       = 3072;  ///< ble_ota 主任务：peak~1KB
-inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 3072;  ///< ble_ota_worker：peak~1.1KB（负载峰值曾~1.9KB）
+inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 3072;  ///< ble_ota_worker
 inline constexpr uint32_t TASK_STACK_HEALTH_MON    = 3072;  ///< health_mon：peak~1.2KB
 inline constexpr uint32_t TASK_STACK_CPU_STATS     = 3072;  ///< cpu_stats：peak~2KB
 inline constexpr uint32_t TASK_STACK_WIFI_RECONNECT = 2560; ///< wifi_reconnect：peak~1KB
@@ -134,7 +134,7 @@ inline constexpr size_t      BLE_OTA_ACK_WINDOW = 32;
 // Reorder buffer 窗口大小（吸收 BLE 窗口内乱序到达的包，须 >= BLE_OTA_ACK_WINDOW）
 inline constexpr size_t      BLE_OTA_REORDER_WINDOW = 32;
 // 数据队列深度：略大于窗口，seq=0 预擦期间多扛几批
-inline constexpr size_t      BLE_OTA_DATA_QUEUE_LEN = (BLE_OTA_ACK_WINDOW * 2 + 8);
+inline constexpr size_t      BLE_OTA_DATA_QUEUE_LEN = (BLE_OTA_ACK_WINDOW * 2 + 16);
 
 // ============================================================
 // 安全常量（需与 GD32 固件团队确认）

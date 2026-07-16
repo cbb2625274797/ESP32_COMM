@@ -49,11 +49,105 @@ export function updateHealthUi(healthCode, freeHeap) {
     mh.textContent = health;
     mh.className = 'v ' + (healthCode === 0 ? 'ok' : healthCode === 1 ? 'warn' : 'err');
   }
+  ensureHealthBootToggleBound();
 }
-/**
- * 每次 pollStatus 成功后刷新堆/栈/CPU（固定周期约 1000ms，中继期 400ms；
- * sample_ms 由设备两次采样墙钟差给出；WiFi 上传 ESP32 期间 pause 不刷）。
- */
+
+/** 健康状态 badge 点击展开/收起启动自检面板（只绑一次）。 */
+function ensureHealthBootToggleBound() {
+  var badge = document.getElementById('healthBadge');
+  var panel = document.getElementById('healthBootPanel');
+  if (!badge || !panel || badge.dataset.bootToggleBound === '1') return;
+  badge.dataset.bootToggleBound = '1';
+
+  function toggle() {
+    var open = panel.classList.contains('collapsed') || panel.hasAttribute('hidden');
+    if (open) {
+      panel.hidden = false;
+      panel.classList.remove('collapsed');
+      badge.classList.add('is-open');
+      badge.setAttribute('aria-expanded', 'true');
+    } else {
+      panel.hidden = true;
+      panel.classList.add('collapsed');
+      badge.classList.remove('is-open');
+      badge.setAttribute('aria-expanded', 'false');
+    }
+  }
+  badge.addEventListener('click', function (e) {
+    e.preventDefault();
+    toggle();
+  });
+  badge.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      toggle();
+    }
+  });
+}
+
+/** 启动自检内容（/system/status.boot）；挂在健康状态展开区，非常驻。 */
+function updateBootInitUi(data) {
+  var boot = data && data.boot ? data.boot : null;
+  var resultEl = document.getElementById('mBootResult');
+  var failedEl = document.getElementById('mBootFailed');
+  var listEl = document.getElementById('bootModuleList');
+  if (!boot) {
+    if (resultEl) {
+      resultEl.textContent = '--';
+      resultEl.className = 'health-boot-summary';
+    }
+    if (failedEl) {
+      failedEl.textContent = '--';
+      failedEl.className = '';
+    }
+    if (listEl) listEl.innerHTML = '';
+    return;
+  }
+
+  var criticalOk = !!boot.critical_ok;
+  var allOk = !!boot.all_ok;
+  var summary = boot.summary || (allOk ? 'OK (all modules)' : (criticalOk ? 'OK (critical)' : 'FAIL'));
+  var failed = (boot.failed && String(boot.failed).trim()) ? String(boot.failed) : '';
+  var tone = allOk ? 'ok' : (criticalOk ? 'warn' : 'err');
+
+  if (resultEl) {
+    resultEl.textContent = summary;
+    resultEl.className = 'health-boot-summary ' + tone;
+    resultEl.title = 'mask=0x' + (Number(boot.mask) || 0).toString(16);
+  }
+  if (failedEl) {
+    failedEl.textContent = failed || (allOk ? '无' : '--');
+    failedEl.className = failed ? tone : 'ok';
+  }
+
+  if (listEl) {
+    var modules = Array.isArray(boot.modules) ? boot.modules : [];
+    if (!modules.length) {
+      listEl.innerHTML = '';
+    } else {
+      listEl.innerHTML = modules.map(function (m) {
+        var ok = !!m.ok;
+        var critical = !!m.critical;
+        var cls = 'boot-mod ' + (ok ? 'ok' : (critical ? 'fail' : 'fail optional'));
+        var tip = (m.name || '') + (ok ? ' 成功' : ' 失败') + (critical ? ' · 关键' : ' · 非关键');
+        return '<span class="' + cls + '" title="' + escapeHtml(tip) + '">' +
+          '<span class="boot-mod-dot"></span>' +
+          escapeHtml(m.name || '?') +
+          '</span>';
+      }).join('');
+    }
+  }
+
+  if (!window._bootInitLogged) {
+    window._bootInitLogged = true;
+    var logLine = '启动自检: ' + summary + (failed ? ' · 失败/跳过: ' + failed : '');
+    try {
+      addLog(allOk ? 'I' : (criticalOk ? 'W' : 'E'), 'BOOT', logLine);
+    } catch (_) {}
+  }
+  ensureHealthBootToggleBound();
+}
+
 export function updateHeapAndTaskStatusUi(data) {
   if (!data) return;
   var ota = data.ota || {};
@@ -61,6 +155,8 @@ export function updateHeapAndTaskStatusUi(data) {
     var el = document.getElementById(id);
     if (el) el.textContent = value;
   };
+
+  updateBootInitUi(data);
 
   // ---- 堆概况：已用 / 总计 + 占用条 ----
   function setFill(id, pct) {

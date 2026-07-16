@@ -5,12 +5,12 @@
  *
  * 依赖：dbc.js（state/el/padHex/normalizeWhitespace/cssEscape）、
  *       common/utils.js（escapeHtml/formatBytes）、
- *       signals.js（renderInlineSignalGrid/ensureMessageDefaults/renderSelectedMessage/updateEncodedPreview）。
+ *       signals.js（renderInlineSignalGrid/ensureMessageDefaults/updateEncodedPreview）。
  */
-import { state, el, padHex, normalizeWhitespace, cssEscape } from './dbc.js?v=20260717v';
-import { escapeHtml as sanitizeHtml, formatBytes } from '../common/utils.js?v=20260717v';
-import { renderInlineSignalGrid, ensureMessageDefaults, renderSelectedMessage, updateEncodedPreview } from './signals.js?v=20260717v';
-import { scheduleCanPersist } from './persist.js?v=20260717v';
+import { state, el, padHex, normalizeWhitespace, cssEscape } from './dbc.js?v=20260717x';
+import { escapeHtml as sanitizeHtml, formatBytes } from '../common/utils.js?v=20260717x';
+import { renderInlineSignalGrid, ensureMessageDefaults, updateEncodedPreview } from './signals.js?v=20260717x';
+import { scheduleCanPersist } from './persist.js?v=20260717x';
 
 // ==================== DBC 文件信息 ====================
 /** @description 更新 DBC 文件信息卡片（文件名/报文数/信号数/节点数/大小）。 */
@@ -395,7 +395,6 @@ export function selectMessage(key) {
   state.selectedMessageKey = key;
   ensureMessageDefaults(msg);
   renderMessageList();
-  renderSelectedMessage();
   updateEncodedPreview();
   scheduleCanPersist();
 }

@@ -159,9 +159,39 @@ export function startRelayProgressWatch() {
     if (rstate >= 1 && rstate <= 4) {
       window.gd32RelaySessionLive = true;
     }
+    /* 中继失败：必须把前端会话从 RELAYING 拉到 FAILED，否则无法新开上传 */
     if (code === 8 || rstate === 255) {
       stopRelayProgressWatch();
       window.pollLogs();
+      if (window.otaSessionState === OtaSessionState.RELAYING ||
+          window.otaSessionState === OtaSessionState.UPLOADING) {
+        var failMsg = 'GD32 中继失败（relay_state=' + rstate +
+          ', sys=' + (o.sys_state || code) + ')';
+        if (typeof window.cleanupAfterOtaFailure === 'function') {
+          window.cleanupAfterOtaFailure(failMsg);
+        } else {
+          otaSessionTransition(OtaSessionState.FAILED, failMsg);
+        }
+      }
+      return;
+    }
+    /*
+     * ERROR 可能在 status 路径被软清为 IDLE，前端收不到 code=8。
+     * 本会话已见过真实中继，设备却已回 IDLE 且未宣布完成 → 按失败清理。
+     */
+    var idleAfterRelay = (code === 0 || code === 2) &&
+                         (rstate === 0 || rstate === 5) &&
+                         window.gd32RelaySessionLive &&
+                         !window.gd32CompleteAnnounced &&
+                         window.otaSessionState === OtaSessionState.RELAYING;
+    if (idleAfterRelay) {
+      stopRelayProgressWatch();
+      window.pollLogs();
+      if (typeof window.cleanupAfterOtaFailure === 'function') {
+        window.cleanupAfterOtaFailure('GD32 中继已结束但未成功（设备已回 IDLE）');
+      } else {
+        otaSessionTransition(OtaSessionState.FAILED, 'GD32 中继已结束但未成功');
+      }
       return;
     }
     /*

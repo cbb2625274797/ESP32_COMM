@@ -199,8 +199,10 @@ export function handleNotify(event) {
       updateProgressFromAck(state.activeTotalSize, state.activePacketTotal, state.lastAckBytes);
     }
 
-    const ackText = `[ACK] cmd=0x${ackCmd.toString(16).padStart(2, '0').toUpperCase()} seq=${ackSeq} bytes=${state.lastAckBytes} (${formatBytes(state.lastAckBytes)}) raw=${hex}`;
-    bleLog('ACK', ackText);
+    /* 传输期少打日志：整窗 ACK 频繁时 hex 刷屏拖慢 UI/主线程 */
+    if (!state.uploading || (ackSeq % 16) === 0 || ackSeq < 2) {
+      bleLog('ACK', `cmd=0x${ackCmd.toString(16).padStart(2, '0').toUpperCase()} seq=${ackSeq} bytes=${state.lastAckBytes} (${formatBytes(state.lastAckBytes)})`);
+    }
 
     // ★ 放宽匹配条件：只要 cmd 匹配 + generation 匹配 + 字节数足够，即接受 ACK
     // 不再要求 ackSeq >= expectedSeq，因为 ESP32 可能用较低的 seq 发送 ACK

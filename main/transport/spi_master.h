@@ -100,17 +100,13 @@ public:
     TaskHandle_t getWorkerTaskHandle() const { return m_workerTask; }
 
     /**
-     * @brief OTA 中继期间禁止 worker 按铃读。
-     *
-     * PB6 在 OTA 下也会因 WAIT/ACK 拉低。若 worker 在 job 间隙把 RESPONSE
-     * 当 EVENT 偷读，业务 poll 只能空等 → 约 10s 后 DATA 重发 → GD32 DUP-SEQ，
-     * 表现为刷写断断续续。中继开始设 true，结束/复位设 false。
+     * @brief OTA 中继期间禁止 worker 将 DATA_READY 当 EVENT 读取。
+     * 中继开始设 true，结束/复位设 false。
      */
     void setSuppressRingService(bool suppress);
 
     /**
-     * @brief OTA 业务层确认当前请求已成功（结构化 ACK 校验通过）。
-     * 在 SPI 头 ack_seq 偶发失配但仍接受业务 ACK 时补齐 m_txSeq，避免后续包卡死。
+     * @brief 业务层确认当前请求已成功时推进/对齐 m_txSeq。
      */
     void confirmTxSeqAccepted();
 
@@ -189,6 +185,17 @@ public:
 
     /** @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。 */
     esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version = nullptr);
+
+    /**
+     * @brief L0 本机自检（不依赖 GD32）：SPI 设备/互斥/worker/队列已就绪。
+     */
+    bool selfTestL0() const;
+
+    /**
+     * @brief L0 对端轻检：短超时 HELLO（role=any），确认 SPI 链路可达 GD32。
+     * @note  GD32 仍在启动延时中时可能失败，属非关键项。
+     */
+    bool selfTestPeerL0();
 
 private:
     /**

@@ -34,6 +34,7 @@
 #include "monitor/can_feedback_task.h"
 #include "monitor/task_stack_check.h"
 #include "ble_ota.h"
+#include "system_boot.h"
 
 static size_t parseHexToBytes(const char *hex, uint8_t *out, size_t max_out)
 {
@@ -641,7 +642,7 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         valid[i] = getLatestCanFeedback(i, &results[i]);
     }
 
-    /* ★ 修复：改用静态缓冲区，避免每次请求 malloc 8KB 加剧堆碎片化 */
+    /* 静态响应缓冲，减少频繁大块堆分配 */
     static char s_feedback_json[8192];
     char *resp = s_feedback_json;
     memset(resp, 0, sizeof(s_feedback_json));
@@ -837,17 +838,15 @@ esp_err_t can_send_handler(httpd_req_t *req)
  * @brief POST /can/send_batch — 同通道连续发送多帧，单次 HTTP 完成。
  *
  * JSON: { "ch": 0, "frames": [ { "id": n, "dlc": n, "data": "HEX" }, ... ] }
- * 返回: { "status":"ok", "results":[ { "status":"ok"|"error", ... }, ... ] }
- * 帧间 5ms；暂停 CAN 反馈，避免与批量 SPI 竞态导致偶发崩溃。
+ * 返回: { "status":"ok", "results":[ ... ], 可选 skipped/abort_* }
+ * 帧间间隔 kInterFrameDelayMs；批量期间暂停 CAN 反馈任务。
  */
 esp_err_t can_send_batch_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
 
-    /* 单次尽量装下整批，避免前端分块导致“一阵一阵” */
     constexpr int kMaxBody = 49152;
     constexpr int kMaxFrames = 128;
-    /* 成功路径通常 <20ms；失败路径不再拖到数百 ms */
     constexpr uint32_t kPerFrameTimeoutMs = 80U;
     constexpr uint32_t kInterFrameDelayMs = 5U;
 
@@ -906,7 +905,7 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
     cJSON_AddStringToObject(out_root, "status", "ok");
     cJSON_AddItemToObject(out_root, "results", results);
 
-    /* 暂停 0xC1 反馈抢 SPI，降低 worker 竞态 / 长时间占线导致的 WDT 风险 */
+    /* 批量发送期间暂停 CAN 反馈，独占 SPI 业务路径 */
     pauseCanFeedbackTask(true);
 
     auto fill_err = [](cJSON *item, int code, uint8_t gd32_err) {
@@ -918,11 +917,6 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(item, "gd32_err", gd32_err);
     };
 
-    /* 中途致命错误后不再逐帧 SPI 重试（否则每帧再等一整段超时） */
-    bool abort_rest = false;
-    int abort_code = -2;
-    uint8_t abort_gd32 = 0U;
-
     for (int i = 0; i < frame_count; i++) {
         (void)esp_task_wdt_reset();
 
@@ -931,11 +925,6 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
             break;
         }
         cJSON_AddItemToArray(results, item);
-
-        if (abort_rest) {
-            fill_err(item, abort_code, abort_gd32);
-            continue; /* 无 SPI、无帧间延时 */
-        }
 
         cJSON *fr = cJSON_GetArrayItem(frames, i);
         if (!cJSON_IsObject(fr)) {
@@ -987,25 +976,22 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
             cJSON_AddStringToObject(item, "recv", resp_hex);
         } else {
             fill_err(item, resp_len, gd32_err);
-            /* SPI 失败 / BUS_OFF / TEC 过高：后面不再逐帧 SPI，也不再为每帧分配 cJSON */
+            /* SPI 失败 / BUS_OFF / TEC 过高：中止剩余帧，由 skipped 字段告知前端 */
             const bool fatal_spi = (resp_len == -2);
             const bool fatal_bus = (resp_len == -3) &&
                                    (gd32_err == 0xE2U || gd32_err == 0xE3U);
             if (fatal_spi || fatal_bus) {
-                abort_rest = true;
-                abort_code = resp_len;
-                abort_gd32 = gd32_err;
                 const int skipped = frame_count - i - 1;
                 if (skipped > 0) {
                     cJSON_AddNumberToObject(out_root, "skipped", skipped);
-                    cJSON_AddNumberToObject(out_root, "abort_code", abort_code);
-                    cJSON_AddNumberToObject(out_root, "abort_gd32_err", abort_gd32);
+                    cJSON_AddNumberToObject(out_root, "abort_code", resp_len);
+                    cJSON_AddNumberToObject(out_root, "abort_gd32_err", gd32_err);
                 }
-                break; /* 不再为剩余帧 CreateObject，避免堆被打穿 */
+                break;
             }
         }
 
-        if (i + 1 < frame_count && !abort_rest) {
+        if (i + 1 < frame_count) {
             vTaskDelay(pdMS_TO_TICKS(kInterFrameDelayMs));
         }
     }
@@ -1018,9 +1004,8 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
     cJSON_Delete(out_root);
     out_root = nullptr;
     if (!printed) {
-        /* 堆已紧时勿再走大段错误路径分配；给前端最小 JSON */
         static const char kOom[] =
-            "{\"status\":\"error\",\"code\":\"json_print\",\"message\":\"JSON输出失败(堆不足)\"}";
+            "{\"status\":\"error\",\"code\":\"json_print\",\"message\":\"JSON输出失败\"}";
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, kOom, HTTPD_RESP_USE_STRLEN);
@@ -1104,7 +1089,8 @@ esp_err_t spi_send_handler(httpd_req_t *req)
 
 static constexpr uint32_t INTERNAL_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 /* 状态 JSON 用静态缓冲：OTA 后 largest free 常 <2KB，calloc(8KB) 会 500 "no memory"。 */
-static constexpr size_t SYSTEM_STATUS_JSON_CAP = 6144;
+/* 含 boot 模块列表与 CPU 任务；OTA 后 largest free 常偏紧，仍用静态缓冲避免 calloc */
+static constexpr size_t SYSTEM_STATUS_JSON_CAP = 7168;
 static char s_status_json[SYSTEM_STATUS_JSON_CAP];
 static SemaphoreHandle_t s_status_json_mux = nullptr;
 static portMUX_TYPE s_status_json_init_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -1343,6 +1329,9 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)ls.stats.resyncs,
             (unsigned long)ls.stats.max_resp_latency_us);
     }
+
+    /* 启动自检位图（与串口 BOOT report 同源） */
+    len = SystemBoot::appendStatusJson(resp, SYSTEM_STATUS_JSON_CAP, len);
 
     // 前导逗号与前一块分隔；之前因 append_cpu_status_json 尾随逗号叠加
     // 形成 "],," 导致前端 JSON.parse 报 "Expected double-quoted property name"

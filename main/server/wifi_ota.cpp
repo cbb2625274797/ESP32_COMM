@@ -313,12 +313,9 @@ esp_err_t WifiOta::initSta()
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-    // ★ 冷启动时在 wifi_start 前增加延迟
-    // 长时间断电后首次上电，WiFi PHY 校准需要额外时间
-    // esp_wifi_start() 内部会触发 PHY 初始化和校准
-    // 如果校准未完成就启动射频，可能导致连接失败
+    /* 冷启动时在 wifi_start 前短延时 */
     if (WifiOta::instance().m_coldBoot) {
-        DEBUG_INFO("WIFI", "冷启动: wifi_start 前再等 300ms...");
+        DEBUG_INFO("WIFI", "冷启动: wifi_start 前等待 300ms");
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 
@@ -400,16 +397,11 @@ esp_err_t WifiOta::httpServerStart()
     config.server_port = HTTP_SERVER_PORT;
     config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
-    /* LWIP_MAX_SOCKETS=12；HTTP 内部约 3 + UDP 日志 1 → 业务 socket 不宜过大。
-     * 上传期间前端必须停 status/logs（见 app.js pausePollingForUpload）。
-     * ★ 修复：增加到 7，防止浏览器超时 abort 后旧连接占满所有槽位。 */
+    /* LWIP_MAX_SOCKETS=12；HTTP 内部约占 3 + UDP 日志 1；业务连接上限 7 */
     config.max_open_sockets = 7;
-    /* ★ 修复：启用 LRU 淘汰，当所有 socket 被占满时主动关闭最旧空闲连接。
-     * OTA 上传期间前端已暂停轮询（pausePollingForUpload），不会踢掉 upload 连接。
-     * 若仍担心极端情况，可在 ota_upload_handler 入口设置该 session 的更长超时。 */
+    /* 满连接时淘汰最久未用的空闲 socket */
     config.lru_purge_enable = true;
-    /* ★ 修复：缩短超时，加速释放废弃连接。
-     * OTA 写 Flash 期间 handler 本身持有连接不会被超时踢（httpd 只在 idle 时检测）。 */
+    /* idle 收发超时（秒）；进行中的 handler 连接不受此 idle 检测踢掉 */
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
 
@@ -551,10 +543,9 @@ bool WifiOta::earlyInit()
                "OTHER",
                WifiOta::instance().m_coldBoot ? "是" : "否");
 
-    /* 与 GD32/CAN 收发器同板上电时，电源上升沿慢 + 负载大。
-     * 若立刻清 PHY/开 WiFi 全量校准，易触发 brownout，表现为「上电起不来，拔插才好」。 */
+    /* 冷启动：电源与外设上电完成后再初始化 NVS/WiFi */
     if (WifiOta::instance().m_coldBoot) {
-        DEBUG_INFO("WIFI", "冷启动: 电源轨稳定等待 400ms（再做 NVS/WiFi）...");
+        DEBUG_INFO("WIFI", "冷启动: 等待 400ms 后初始化 NVS/WiFi");
         vTaskDelay(pdMS_TO_TICKS(400));
     }
 
@@ -576,9 +567,7 @@ bool WifiOta::earlyInit()
         DEBUG_INFO("WIFI", "NVS 初始化成功");
     }
 
-    // ★ 冷启动：只清 WiFi 连接缓存；勿在每次 POWERON 都清 PHY。
-    //   全量 PHY 校准电流大，与 GD32 同时上电易 brownout → 必须再插拔才能起来。
-    //   仅在欠压复位后清 PHY，避免校准脏数据死循环。
+    /* 冷启动清理 WiFi 连接缓存；欠压复位后再清 PHY 强制重校准 */
     if (WifiOta::instance().m_coldBoot) {
         err = clearNvsNamespace("nvs.net80211");
         if (err == ESP_OK) {
@@ -589,7 +578,7 @@ bool WifiOta::earlyInit()
         if (reset_reason == ESP_RST_BROWNOUT) {
             err = clearNvsNamespace("phy");
             if (err == ESP_OK) {
-                DEBUG_WARN("WIFI", "BROWNOUT 后: 已清除 PHY 校准，将重新校准");
+                DEBUG_WARN("WIFI", "欠压复位后: 已清除 PHY 校准数据");
             }
         }
     }

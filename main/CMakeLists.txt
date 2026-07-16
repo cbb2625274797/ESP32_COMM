@@ -2,6 +2,7 @@
 idf_component_register(
     SRCS
         "core/main.cpp"                # 程序入口 (app_main)
+        "core/system_boot.cpp"         # 启动模块位图与汇总
         "ota/esp32_ota_core.cpp"       # ESP32 本机 OTA 核心（分区写入/SHA验证）
         "ota/ota_coordinator.cpp"      # OTA 多通道协调器（状态机/互斥）
         "relay/ota_relay.cpp"          # GD32 SPI OTA 中继状态机

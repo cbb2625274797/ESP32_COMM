@@ -1,9 +1,7 @@
 /*
- * esp32_ota_core.cpp - ESP32 本机 OTA 核心流程实现（WiFi / BLE 通道共用）
+ * esp32_ota_core.cpp - ESP32 本机 OTA 核心流程（WiFi / BLE 通道共用）
  *
- * 设计依据 WiFi 原流程（wifi_ota.cpp 旧实现），修复已知 bug:
- *   - 旧 wifi_ota.cpp:625 在 esp_ota_end 成功后又调 esp_ota_abort → 用 m_ended 标志避免
- *   - SHA 统一从分区读回计算，不在传输过程中做增量 SHA
+ * SHA-256 在写入完成后从 OTA 分区读回计算；finalize 用 m_ended 区分 end 与 abort。
  */
 #include <string.h>
 #include <ctype.h>

@@ -10,7 +10,7 @@ export const UUIDS = {
   version: 0x0004,
 };
 
-export const UI_BUILD = '2026-07-16-ble-begin-ready';
+export const UI_BUILD = '2026-07-18-ble-fix';
 export const BLE_OTA_NOTIFY_ACK = 0xA1;
 export const BLE_OTA_NOTIFY_FINISH = 0xB1;
 export const BLE_OTA_NOTIFY_SHA256 = 0xC1;

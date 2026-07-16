@@ -238,13 +238,7 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
 }
 
 // ============================================================
-// WiFi 共存策略：BLE OTA 传输期间的处理
-//
-// 不切换 WiFi 省电模式（保持 WIFI_PS_NONE），让 STA 全程可用，
-//   协调器照常以 403 拒绝并发 OTA。ESP32-C3 coex 默认调度已能保证 BLE OTA 可用。
-//   （曾尝试切到 WIFI_PS_MAX_MODEM 让出空中时间，但 STA 监听间隔被拉到极大，
-//   HTTP server 的 TCP 握手/数据包大量丢失或超时，前端 XHR 长时间无响应。）
-//   仍保留 setBleOtaActive() 暂停 RSSI 轮询（避免 get_ap_info 的射频活动干扰 BLE）。
+// BLE OTA 期间 WiFi 共存：保持 WIFI_PS_NONE；暂停 RSSI 轮询
 // ============================================================
 static bool s_wifi_ps_boosted = false;
 
@@ -365,24 +359,28 @@ static int ble_ota_request_conn_params(uint16_t conn_handle, bool windows_compat
 {
     struct ble_gap_upd_params params = {};
     if (windows_compatible) {
+        /* 15–20 ms：多数 Windows 主机可接受 */
         params.itvl_min = 12;
         params.itvl_max = 16;
         params.min_ce_len = 0;
         params.max_ce_len = 0;
     } else {
+        /* 7.5–15 ms：勿锁死 7.5，否则 Windows 常拒然后掉到更慢默认值 */
         params.itvl_min = 6;
-        params.itvl_max = 6;
+        params.itvl_max = 12;
         params.min_ce_len = 12;
-        params.max_ce_len = 12;
+        params.max_ce_len = 24;
     }
     params.latency = 0;
     params.supervision_timeout = 200;
 
     int rc = ble_gap_update_params(conn_handle, &params);
-    DEBUG_INFO(TAG, "请求 BLE 连接参数(%s): interval=%.1f..%.1fms rc=%d",
+    DEBUG_INFO(TAG, "请求 BLE 连接参数(%s): interval=%.1f..%.1fms ce=%u..%u rc=%d",
                windows_compatible ? "Windows兼容" : "高速",
                params.itvl_min * 1.25f,
                params.itvl_max * 1.25f,
+               (unsigned)params.min_ce_len,
+               (unsigned)params.max_ce_len,
                rc);
     return rc;
 }
@@ -646,6 +644,11 @@ static esp_err_t ble_esp32_ota_begin(size_t total_size)
     esp32_reorder_alloc();
     // ★ BLE OTA 开始：降低 WiFi 射频占用
     ble_ota_boost_wifi_ps();
+    /* 刷写前再要一次高速连接参数（连接时若未谈妥，此处补刀） */
+    if (BleOta::instance().m_bleConnected &&
+        BleOta::instance().m_connHandle != 0xFFFFU) {
+        (void)ble_ota_request_conn_params(BleOta::instance().m_connHandle, false);
+    }
     return ESP_OK;
 }
 
@@ -1317,6 +1320,10 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
             s_ble_gd32_meta.total_size = total_size;
             s_ble_gd32_meta_active = true;
             ble_ota_boost_wifi_ps();
+            if (BleOta::instance().m_bleConnected &&
+                BleOta::instance().m_connHandle != 0xFFFFU) {
+                (void)ble_ota_request_conn_params(BleOta::instance().m_connHandle, false);
+            }
         }
     }
 
@@ -2017,11 +2024,8 @@ esp_err_t BleOta::serverStart()
 esp_err_t BleOta::suspendStack()
 {
     /*
-     * ★ 软挂起 only（ESP32-C3 WiFi/BLE 共用射频）。
-     * 禁止在此调用 nimble_port_stop / deinit / controller_disable：
-     *   - 会从 httpd 任务阻塞甚至打挂 WiFi，表现为「一点击上传就失联」；
-     *   - C3 上 deinit BT 控制器与 WiFi 共存状态机冲突。
-     * 软挂起：停广播、断连、拒收新数据，NimBLE host 仍跑、WiFi 不受影响。
+     * ESP32-C3 WiFi/BLE 共用射频：此处仅软挂起（停广播、断连、拒收新数据），
+     * 不调用 nimble_port_stop / deinit / controller_disable。
      */
     if (m_suspendedForWifiOta) {
         DEBUG_DBG(TAG, "suspendStack: 已挂起，跳过");
@@ -2146,7 +2150,7 @@ void BleOta::taskEntry(void *pvParameters)
                                        "ble_ota_worker",
                                        TASK_STACK_BLE_WORKER,  // 实测 peak~1.1KB，负载峰值曾~1.9KB
                                        NULL,
-                                       10,     // 中等优先级，避免被 NimBLE host task 过度抢占
+                                       12,     // 略提高：尽快排空队列，减少 withoutResponse 连发丢包
                                        NULL);
         if (wk_ok != pdPASS) {
             DEBUG_ERR(TAG, "OTA 数据工作线程创建失败，BLE OTA 数据传输不可用");

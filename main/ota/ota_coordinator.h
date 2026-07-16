@@ -469,20 +469,14 @@ private:
     OtaCoordinator(const OtaCoordinator&) = delete;
     OtaCoordinator& operator=(const OtaCoordinator&) = delete;
 
-    // 线程安全辅助
-    // ★ lock() 返回是否成功 take；unlock(handle) 据此决定是否 give。
-    //   旧实现用共享 bool m_locked 记录 take 结果，多任务并发 lock() 时
-    //   超时方会把 m_locked 置 false，覆盖持锁方的 true，导致 unlock() 跳过 give，
-    //   mutex 永久死锁 → 后续 take 超时触发 vTaskPriorityDisinherit assert → PANIC。
+    // 线程安全：lock() 返回 take 是否成功；unlock(handle) 仅在成功时 give
     bool lock() const;
     void unlock(bool handle) const;
 
-    // ★ 卡死自愈检查：忙状态超时则 doAbortLocked → IDLE（不含 REBOOTING）。
-    //   必须在已持锁状态下调用。
+    // 忙状态超时检查（须已持锁）；超时则 doAbortLocked → IDLE
     void watchdogCheckLocked();
 
-    // ★ 已持锁版本的中止序列：根据当前 m_sysState 调用对应子模块的清理，
-    //   并把状态机复位为 IDLE。abortCurrent / abortCurrentIfEpoch 共享此实现。
+    // 已持锁中止：清理子系统并将状态复位为 IDLE
     void doAbortLocked();
 
     // ★ 已持锁版本的 ESP32 状态切换 helper：设置 m_sysState 并打印一条 INFO 日志。

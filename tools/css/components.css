@@ -122,6 +122,9 @@
   font-size: 20px; font-weight: 700; word-break: break-word;
 }
 .metric .v.highlight { color: var(--accent); }
+.metric .v.ok { color: var(--green); }
+.metric .v.warn { color: var(--amber); }
+.metric .v.err { color: var(--red); }
 
 .status-kv-grid {
   display: grid;
@@ -150,7 +153,134 @@
   word-break: break-word;
   font-family: var(--font-mono);
 }
-.status-section-title { margin-top: 14px; margin-bottom: 8px; font-size: 11px; color: var(--text-label); text-transform: uppercase; letter-spacing: .08em; }
+
+/* === 健康状态 → 启动自检（点击展开，非常驻） === */
+.badge-stat-click {
+  cursor: pointer;
+  user-select: none;
+  transition: border-color .15s ease, background .15s ease;
+}
+.badge-stat-click:hover,
+.badge-stat-click:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-elevated));
+}
+.badge-stat-click.is-open {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.health-boot-hint {
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-dim);
+  font-weight: 500;
+  margin-left: 2px;
+}
+.badge-stat-click.is-open .health-boot-hint {
+  color: var(--accent);
+}
+.health-boot-panel {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+.health-boot-panel.collapsed,
+.health-boot-panel[hidden] {
+  display: none;
+}
+.health-boot-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.health-boot-title {
+  font-size: 11px;
+  color: var(--text-label);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  font-weight: 600;
+}
+.health-boot-summary {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  text-align: right;
+}
+.health-boot-summary.ok { color: var(--green); }
+.health-boot-summary.warn { color: var(--amber); }
+.health-boot-summary.err { color: var(--red); }
+.health-boot-failed {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.health-boot-failed b {
+  color: var(--text);
+  font-weight: 600;
+}
+.health-boot-failed b.ok { color: var(--green); }
+.health-boot-failed b.warn { color: var(--amber); }
+.health-boot-failed b.err { color: var(--red); }
+
+/* === BOOT MODULE CHIPS (/system/status boot) === */
+.boot-module-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  min-height: 8px;
+}
+.boot-mod {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-root);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  line-height: 1.2;
+}
+.boot-mod .boot-mod-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex-shrink: 0;
+}
+.boot-mod.ok {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+}
+.boot-mod.ok .boot-mod-dot { background: var(--green); }
+.boot-mod.fail {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 35%, var(--border));
+}
+.boot-mod.fail .boot-mod-dot { background: var(--red); }
+.boot-mod.fail.optional {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 35%, var(--border));
+}
+.boot-mod.fail.optional .boot-mod-dot { background: var(--amber); }
+
+.status-section-title {
+  margin-top: 14px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--text-label);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  font-family: var(--font);
+  font-weight: 600;
+}
 
 /* ===== 堆概况 ===== */
 .heap-group {
@@ -179,6 +309,7 @@
   text-transform: uppercase;
   letter-spacing: 0.06em;
   margin-bottom: 10px;
+  font-family: var(--font);
 }
 
 .heap-bar-row {
@@ -196,6 +327,7 @@
   font-weight: 600;
   white-space: nowrap;
   color: var(--text);
+  font-family: var(--font);
 }
 
 /* 百分比数值与文案同一行；进度条单独占下一行 */
@@ -208,6 +340,7 @@
   text-align: right;
   font-variant-numeric: tabular-nums;
   color: var(--text-dim);
+  font-family: var(--font-mono);
 }
 
 .heap-bar-track {
@@ -255,6 +388,39 @@
   font-weight: 500;
   font-family: var(--font-mono);
   font-size: 11px;
+}
+
+/* 抽屉内数值/任务名/JSON 强制等宽，避免被其它样式冲掉 */
+.sys-drawer-body .heap-bar-pct,
+.sys-drawer-body .heap-detail-row b,
+.sys-drawer-body .status-task-name,
+.sys-drawer-body .status-task-ratio,
+.sys-drawer-body .status-task-meta b,
+.sys-drawer-body .status-json {
+  font-family: var(--font-mono);
+}
+.sys-drawer-body .status-section-title,
+.sys-drawer-body .heap-group-title,
+.sys-drawer-body .heap-bar-text {
+  font-family: var(--font);
+  color: inherit;
+}
+.sys-drawer-body .status-section-title {
+  color: var(--text-label);
+  font-size: 11px;
+  font-weight: 600;
+}
+.sys-drawer-body .heap-bar-text {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.sys-drawer-body .status-json {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .status-task-list {

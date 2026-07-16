@@ -1445,26 +1445,22 @@ ota_result_t OtaRelay::doSendFinishOta()
     return OTA_RESULT_OK;
 }
 
-/** @brief 协议子步骤：轮询等待 GD32 APP 存活（10 次重试）。 */
+/** @brief 协议子步骤：轮询等待 GD32 APP 存活。 */
 ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
 {
-    // ★ APP 存活验证
     setGd32AppAlive(false);
 
-    // GD32 刚跳转到新 APP，SPI v2 session_id 已重置为 0。
-    // 必须先 hello() 建立新 session，否则 appPing 的帧被 otaFindFrame
-    // 以 SESSION mismatch 拒绝（旧 session_id vs 新 APP session_id=0）。
-    bool session_established = false;
+    /* FINISH 后短暂安静，避免 jump/APP SPI arm 窗口被 HELLO 打乱（对齐既有 300ms 节拍）。 */
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    /* APP 完整初始化（含 EthercatSlave::init）需 5-6 秒，偶发 >10 秒。
-     * 增加重试次数到 20、缩短延迟到 300ms，总窗口 ~26 秒，
-     * APP 启动后最快 300ms 内检测到（原 500ms）。 */
+    /* APP 起机约数秒；HELLO 须 role=APP 再建 session，再 appPing。 */
+    bool session_established = false;
     for (uint32_t attempt = 0; attempt < 20; ++attempt) {
         vTaskDelay(pdMS_TO_TICKS(300));
 
         if (!session_established) {
             esp_err_t hr = SpiMaster::instance().hello(1500U, V2_ROLE_APP);
-            if (hr == ESP_OK) {
+            if (hr == ESP_OK && SpiMaster::instance().gd32Role() == V2_ROLE_APP) {
                 session_established = true;
             } else {
                 DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
@@ -1475,6 +1471,8 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
         if (probeAndCacheAppAlive(timeout_ms)) {
             break;
         }
+        /* PING 失败：清 session，下轮重 HELLO（避免 sticky 假会话） */
+        session_established = false;
         DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
     }
 
@@ -1484,7 +1482,6 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
         return OTA_RESULT_ERR_GD32;
     }
 
-    // 全流程唯一成功总结（版本来自 probe 写入的快照）
     gd32_version_t ver = getSnapshot().version;
     DEBUG_INFO("OTA", "GD32 OTA 完成: APP=v%d.%d.%d.%d, BOOT=v%d.%d.%d.%d",
                ver.app_major, ver.app_minor, ver.app_patch, ver.app_build,
@@ -1531,8 +1528,7 @@ void OtaRelay::taskEntry(void *pvParameters)
         return;
     }
 
-    /* 启动 GD32 探测（原 main.cpp 与此处双份；现统一在本任务）：
-     * APP 完整 init 约 5–6s；先 hello 建 v2 session，再 appPing。 */
+    /* 启动 GD32 探测：先 hello 建 v2 session，再 appPing。 */
     {
         DEBUG_INFO("OTA", "启动初始 GD32 探测 (hello+probe)...");
         bool session_ok = false;
@@ -1540,7 +1536,8 @@ void OtaRelay::taskEntry(void *pvParameters)
         for (uint32_t attempt = 0; attempt < 20U; ++attempt) {
             vTaskDelay(pdMS_TO_TICKS(300));
             if (!session_ok) {
-                if (SpiMaster::instance().hello(1500U, V2_ROLE_APP) == ESP_OK) {
+                if (SpiMaster::instance().hello(1500U, V2_ROLE_APP) == ESP_OK &&
+                    SpiMaster::instance().gd32Role() == V2_ROLE_APP) {
                     session_ok = true;
                 } else {
                     DEBUG_INFO("OTA", "等待 GD32 APP... (%" PRIu32 "/20)", attempt + 1U);
@@ -1551,6 +1548,7 @@ void OtaRelay::taskEntry(void *pvParameters)
                 alive = true;
                 break;
             }
+            session_ok = false;
             DEBUG_INFO("OTA", "等待 GD32 APP 存活... (%" PRIu32 "/20)", attempt + 1U);
         }
         if (!alive) {

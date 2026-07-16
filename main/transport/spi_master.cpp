@@ -295,7 +295,7 @@ esp_err_t SpiMaster::submitJob(Job &job)
         return job.result;
     }
 
-    /* 堆 Job + 动态 binary sem：避免调用方超时返回后栈上 Job/done 被 worker UAF。 */
+    /* 跨任务作业：堆上 Job + binary 完成信号量 */
     Job *heap_job = static_cast<Job *>(calloc(1, sizeof(Job)));
     if (heap_job == nullptr) {
         DEBUG_ERR("SPI", "submitJob: calloc failed kind=%u", (unsigned)job.kind);
@@ -519,8 +519,7 @@ esp_err_t SpiMaster::transferClockedFlags(const uint8_t *tx_buf, size_t tx_len,
     t.tx_buffer = tx_ptr;
     t.rx_buffer = (rx_len > 0U) ? rx_ptr : NULL;
 
-    /* 禁止 portMAX_DELAY：SPI 硬件/从机异常时 worker 会永久卡死，
-     * 表现即 OTA「转发进度 1/1117 后完全沉默」。所有等待必须有上界。 */
+    /* SPI 事务等待使用有界超时 */
     const uint32_t effective_ms = (timeout_ms == 0U) ? 500U
         : (timeout_ms < 50U ? 50U : timeout_ms);
     const TickType_t queue_wait = pdMS_TO_TICKS(effective_ms);
@@ -544,7 +543,7 @@ esp_err_t SpiMaster::transferClockedFlags(const uint8_t *tx_buf, size_t tx_len,
     ret = spi_device_get_trans_result(m_spiDevice, &ret_trans, result_wait);
     if (ret != ESP_OK) {
         /* 再给一次有界抢救（最多 1s），清掉可能残留的 in-flight 事务。
-         * 旧代码用 portMAX_DELAY —— GD32 不响应时 SPI worker 永久死锁。 */
+         * 使用有界超时，避免对端无响应时 worker 永久阻塞。 */
         DEBUG_WARN("SPI", "spi_device_get_trans_result timeout: %s len=%u, bounded retry 1s",
                    esp_err_to_name(ret), (unsigned)(total_len * 8U));
         ret = spi_device_get_trans_result(m_spiDevice, &ret_trans, pdMS_TO_TICKS(1000));
@@ -740,10 +739,7 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
  */
 esp_err_t SpiMaster::init()
 {
-    // ★ 修复：先创建 mutex，再使用 LockGuard。
-    //   旧代码在 LockGuard 构造时 m_mutex 仍为 NULL，
-    //   虽然 LockGuard 会跳过 NULL take/give，但在极端情况下
-    //   其他任务可能在 mutex 创建后立即尝试 take，产生竞态。
+    /* 先创建互斥锁，再进入临界区 */
     if (!m_mutex) {
         m_mutex = xSemaphoreCreateMutex();
         if (m_mutex == NULL) {
@@ -840,9 +836,7 @@ esp_err_t SpiMaster::init()
     m_stats = SpiLinkStats{};
     m_eventHead = m_eventTail = m_eventCount = 0;
 
-    /* job 队列 + 事件信号量 + SPI worker。
-     * worker 启动后可能立刻抢 m_mutex；init 持锁时 worker 会阻塞在 LockGuard，
-     * init 返回释放锁后 worker 继续 —— 不会死锁。 */
+    /* 创建 job 队列、事件信号量与 SPI worker（init 仍持 m_mutex） */
     if (m_jobQueue == nullptr) {
         m_jobQueue = xQueueCreate(kJobQueueLen, sizeof(Job *));
         if (m_jobQueue == nullptr) {
@@ -869,6 +863,24 @@ esp_err_t SpiMaster::init()
     m_spiTaskHandle = m_workerTask;
 
     return ESP_OK;
+}
+
+bool SpiMaster::selfTestL0() const
+{
+    return (m_spiDevice != nullptr) && (m_mutex != nullptr) &&
+           (m_workerTask != nullptr) && (m_jobQueue != nullptr);
+}
+
+bool SpiMaster::selfTestPeerL0()
+{
+    /* 短超时、最多 2 次；不拉长整体启动 */
+    for (uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+        if (hello(600U, 0U) == ESP_OK) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
 }
 
 // ============================================================
@@ -1228,12 +1240,11 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
      *   ESP_OK                    - 读到过期帧（正常，忽略）
      *   ESP_ERR_INVALID_RESPONSE  - 读到 0xFF（正常，延迟一拍）
      *   其他                      - SPI 真实错误 */
-    /* 将总超时切成 send + poll，禁止 poll 单独再给 500ms（短超时批量时会「失败卡很久」） */
+    /* 总超时在 send 与 poll 之间分配，二者之和不超过 timeout_ms */
     uint32_t send_timeout = (timeout_ms > 500U) ? 500U : timeout_ms;
     if (send_timeout == 0U) {
         send_timeout = 1U;
     }
-    /* 至少给 poll 留一点时间；总超时很短时 send/poll 各半 */
     uint32_t poll_timeout;
     if (timeout_ms > send_timeout) {
         poll_timeout = timeout_ms - send_timeout;
@@ -1244,7 +1255,7 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         }
         poll_timeout = timeout_ms - send_timeout;
     } else {
-        poll_timeout = timeout_ms; /* 极短超时：发完立刻 poll，总预算仍受 deadline 约束 */
+        poll_timeout = timeout_ms;
     }
     if (poll_timeout == 0U) {
         poll_timeout = 1U;
@@ -1257,7 +1268,7 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         return send_ret;
     }
 
-    /* 等 GD32 完成 onCsRelease 再 poll；5ms 兼顾「能发出」与批量节奏 */
+    /* CS 释放后短延时，再 poll 应答 */
     vTaskDelay(pdMS_TO_TICKS(5));
 
     /* 步骤 2: 轮询读取真实响应（变长读，不重发命令） */
@@ -1707,18 +1718,11 @@ esp_err_t SpiMaster::hello(uint32_t timeout_ms, uint8_t role_hint)
         }
 
         m_gd32Role = pload[4];
-        m_localCredit = pload[5];
-        m_remoteCredit = hdr.credit;
+        /* payload[5]/hdr.credit 均为对端 credit_max → 写入 m_remoteCredit。
+         * 勿写入 m_localCredit（本端 RX 窗口，init 为 8）。 */
+        m_remoteCredit = (pload[5] != 0U) ? pload[5] : hdr.credit;
         m_v2Active = true;
         m_stats.resyncs++;
-        if (role_hint == 0U || m_gd32Role == role_hint || m_gd32Role == V2_ROLE_BOOT) {
-            DEBUG_INFO("SPI", "HELLO success: session=0x%08lX role=%u credit=%u attempt=%lu",
-                       (unsigned long)m_sessionId, m_gd32Role, m_localCredit,
-                       (unsigned long)attempt);
-        } else {
-            DEBUG_DBG("SPI", "HELLO ok role=%u (want hint=%u) attempt=%lu",
-                      m_gd32Role, role_hint, (unsigned long)attempt);
-        }
         return ESP_OK;
     }
 

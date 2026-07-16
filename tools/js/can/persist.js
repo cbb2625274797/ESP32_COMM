@@ -6,7 +6,7 @@
  *
  * 依赖：dbc.js（state/el/parseDbc/rebuildMergedDbc）
  */
-import { state, el, parseDbc, rebuildMergedDbc } from './dbc.js?v=20260717v';
+import { state, el, parseDbc, rebuildMergedDbc } from './dbc.js?v=20260717x';
 
 var LS_KEY = 'dcu_can_session_v1';
 var MAX_HISTORY = 200;
@@ -133,17 +133,6 @@ export function scheduleCanPersist() {
     saveTimer = null;
     saveCanSessionNow();
   }, SAVE_DEBOUNCE_MS);
-}
-
-/** @description 清空持久化（全部清除 DBC 时）。 */
-export function clearCanSessionPersist() {
-  if (saveTimer) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
-  }
-  try {
-    localStorage.removeItem(LS_KEY);
-  } catch (_) {}
 }
 
 /**

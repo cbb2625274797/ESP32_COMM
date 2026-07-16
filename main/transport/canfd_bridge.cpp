@@ -64,7 +64,7 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
         &resp_type, spi_rx, spi_rx_max, &resp_len, timeout_ms);
 
     if (ret != ESP_OK) {
-        /* 批量失败时勿每帧打日志：UDP/格式化会把堆打穿 */
+        /* 同类错误节流日志，降低高频失败时的日志开销 */
         static uint32_t s_spi_fail_n = 0U;
         static int s_last_spi_err = 0;
         const int err_i = static_cast<int>(ret);

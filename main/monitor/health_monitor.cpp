@@ -220,14 +220,12 @@ void HealthMonitor::taskEntry(void *pvParameters)
 
         uint32_t free_heap = esp_get_free_heap_size();
         if (free_heap < HEAP_WARNING_MIN) {
-            /* WiFi OTA 收流时 TCP 窗口 + httpd 会把 free 压到 5~10KB，属预期，勿当故障刷屏。 */
+            /* 堆告警节流：OTA 期间阈值更低、间隔更长 */
             static TickType_t s_last_heap_warn = 0;
             TickType_t now = xTaskGetTickCount();
             const bool ota_busy = !OtaCoordinator::instance().isIdle();
-            /* 堆越紧越要少打日志（日志本身还要占堆/UDP） */
             const uint32_t interval_ms = ota_busy ? 15000U
                 : (free_heap < 8192U ? 10000U : 3000U);
-            /* OTA 中只在 free 极低（<4KB）时告警；空闲时维持 10KB 阈值 */
             const uint32_t warn_floor = ota_busy ? 4096U : (uint32_t)HEAP_WARNING_MIN;
             if (free_heap < warn_floor &&
                 (now - s_last_heap_warn) >= pdMS_TO_TICKS(interval_ms)) {

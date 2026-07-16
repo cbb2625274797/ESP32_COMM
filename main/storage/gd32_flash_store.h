@@ -158,15 +158,13 @@ private:
     uint32_t m_erasedUpTo = 0;
     esp_err_t ensureErasedForWrite(uint32_t offset, size_t len);
 
-    // ── NVS 互斥锁（保护元数据读-改-写原子性）──
-    //   lockNvs 返回是否成功 take；unlockNvs(handle) 据此决定是否 give，
-    //   参考 OtaCoordinator::lock/unlock 模式（避免共享 bool 被并发覆盖导致死锁）。
+    // NVS 互斥：lockNvs 返回 take 是否成功；unlockNvs(handle) 仅成功时 give
     SemaphoreHandle_t m_nvsMutex = nullptr;
     bool lockNvs(uint32_t timeout_ms);
     void unlockNvs(bool handle);
     static constexpr uint32_t kNvsLockTimeoutMs = 100; ///< NVS 加锁超时（ms）
 
-    // 已持锁版本：由持锁的公开方法或 metaUpdate 调用，不再自行加锁，避免递归 take 死锁
+    // 已持锁版本（调用方已持 m_nvsMutex）
     esp_err_t metaLoadLocked(ota_meta_t *meta);
     esp_err_t metaSaveLocked(const ota_meta_t *meta);
 };

@@ -208,7 +208,13 @@ export function updateSystemStatusUi(data) {
   var displayRelayState = isGd32Complete ? 5 : (isGd32Relaying && rs === 0 ? 1 : rs);
   if (window.currentOtaTarget !== 'esp32') { updateStagesFromRelayState(displayRelayState); }
 
-  if (isGd32Error && (window.currentOtaTarget === 'gd32' || window.otaSessionTarget === 'gd32')) {
+  /* 本会话正在 GD32 路径（含仅 RELAYING 而 target 被清的情况） */
+  var gd32Session =
+    window.otaSessionState === OtaSessionState.RELAYING ||
+    window.currentOtaTarget === 'gd32' ||
+    window.otaSessionTarget === 'gd32';
+
+  if (isGd32Error && gd32Session) {
     var failDetail = 'GD32 OTA 失败';
     if (relayTotal > 0) {
       failDetail += '（已转发 ' + relaySeq + '/' + relayTotal +
@@ -218,6 +224,7 @@ export function updateSystemStatusUi(data) {
     }
     window.cleanupAfterOtaFailure(failDetail);
     window.pollLogs();
+    return;
   } else if (isGd32Error) {
     // 非当前 OTA 会话的错误：仅标记阶段指示器，不触发完整清理
     updateStagesFromRelayState(255);
@@ -232,6 +239,23 @@ export function updateSystemStatusUi(data) {
      * 禁止一进 RELAYING 就吃掉上一次的 rs=5 / app_alive。 */
     if (isGd32Relaying || (rs >= 1 && rs <= 4)) {
       window.gd32RelaySessionLive = true;
+    }
+    /*
+     * 设备侧 ERROR 常被 status 软清为 IDLE，前端收不到 code=8。
+     * 已见真实中继、设备已回 IDLE、且未宣布完成 → 按失败收尾，释放会话。
+     */
+    var deviceIdleAfterRelay =
+      (sysStateCode === 0 || sysStateCode === 2) &&
+      (rs === 0 || rs === 5) &&
+      window.gd32RelaySessionLive &&
+      !window.gd32CompleteAnnounced;
+    if (deviceIdleAfterRelay) {
+      window.cleanupAfterOtaFailure(
+        'GD32 中继已结束但未成功（设备已回 IDLE' +
+        (relayTotal > 0 ? '，已转发 ' + relaySeq + '/' + relayTotal : '') + '）'
+      );
+      window.pollLogs();
+      return;
     }
     /* 包进度：进入 FINISHING/COMPLETE 时先补 100%，再走完成/收尾 UI */
     if (window.gd32RelaySessionLive && relayTotal > 0 &&

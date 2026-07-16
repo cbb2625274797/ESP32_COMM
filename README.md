@@ -291,7 +291,7 @@ ESP32 通过 SPI 转发 CAN 帧到 GD32（GD32 端驱动外部 CAN 收发器）�
 | IP 分配 | DHCP（可切换静态 IP 192.168.31.32）|
 | 国家码 | CN（允许信道 1-13）|
 
-**冷启动优化**: 复位原因为 POWERON/BROWNOUT 时：电源轨稳定等待 + 仅清 WiFi 连接缓存；**仅 BROWNOUT 后**才清 PHY 强制重校准（避免每次上电全量 RF 校准与 GD32 抢电流导致起不来、需再插拔）。`wifi_start` 前另有短延迟。BOD 阈值略放宽（LVL5）。
+**冷启动**: POWERON/BROWNOUT 时做短延时后初始化；清 WiFi 连接缓存；欠压复位后清 PHY 重校准；BOD 档位 LVL5。
 
 ### mDNS 发现
 

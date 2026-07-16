@@ -21,6 +21,7 @@
 #include "transport/spi_master.h"
 #include "monitor/debug_log.h"
 #include "monitor/can_feedback_task.h"
+#include "esp_system.h"
 
 #include <string.h>
 
@@ -55,6 +56,17 @@ static void publish(uint8_t ch, const can_feedback_result_t &fb)
 static void taskLoop(void *)
 {
     DEBUG_INFO(kTag, "CAN 反馈被动监听任务启动 (GD32 主动推送, 0xC1)");
+
+    /* 冷启动延后开始监听，错开上电初始化窗口 */
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
+            constexpr uint32_t kCanFbDeferMs = 1500U;
+            DEBUG_INFO(kTag, "冷启动: %lu ms 后开始 CAN 反馈监听",
+                       (unsigned long)kCanFbDeferMs);
+            vTaskDelay(pdMS_TO_TICKS(kCanFbDeferMs));
+        }
+    }
 
     uint8_t  ring_type = 0U;
     uint8_t  ring_payload[kRingPayloadMax] = {};

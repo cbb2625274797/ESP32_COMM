@@ -58,6 +58,31 @@ export async function startUpload(chip) {
   if (!file) return;
   // ★ 状态机守卫：用统一的会话活跃判断替代裸 isUploading。
   //   FAILED/DONE 会话需要先复位才能发起新上传（下方 otaSessionReset）。
+  //   RELAYING 可能因 ERROR 被设备软清为 IDLE 而前端未收尾，先探测再决定。
+  if (otaSessionActive()) {
+    var busyState = window.otaSessionState;
+    if (busyState === OtaSessionState.RELAYING || busyState === OtaSessionState.VERIFYING) {
+      try {
+        var staleProbe = await fetch(window.getBaseUrl() + '/system/status', {
+          signal: AbortSignal.timeout(2000)
+        });
+        if (staleProbe.ok) {
+          var staleSt = await staleProbe.json();
+          var so = staleSt.ota || {};
+          var ssc0 = Number.isFinite(so.sys_state_code) ? so.sys_state_code : -1;
+          var rs0 = Number.isFinite(so.relay_state) ? so.relay_state : -1;
+          /* 设备已空闲/完成/错误残留：前端会话是陈旧活跃态，强制清掉 */
+          var deviceFree = (ssc0 === 0 || ssc0 === 2 || ssc0 === 4 || ssc0 === 8) &&
+                           (rs0 === 0 || rs0 === 5 || rs0 === 255 || rs0 < 0);
+          if (deviceFree) {
+            addLog('W', '上传', '检测到陈旧会话 ' + busyState +
+              '（设备已 ' + (so.sys_state || ssc0) + '），自动清理后继续');
+            otaSessionReset();
+          }
+        }
+      } catch (_) { /* 探测失败则仍按占用拒绝 */ }
+    }
+  }
   if (otaSessionActive()) {
     var busyChip = (window.otaSessionTarget || window.activeUploadChip || window.flashTarget || chip || 'ota').toUpperCase();
     addLog('W', '上传', '已有 ' + busyChip + ' OTA 会话进行中 (' + window.otaSessionState + ')，拒绝新的 ' + chip.toUpperCase() + ' 上传');
@@ -70,11 +95,7 @@ export async function startUpload(chip) {
   window.otaSessionTarget = chip;
 
   window.pausePollingForUpload();
-  // ★ 必须先抢锁再 await：守卫同步设置，await 期间重复点击才能被拦下。
-  //   旧实现把 isUploading 设在 await handle.getFile() 之后 → 用户在 BLE 期间
-  //   狂点 WiFi 上传按钮时，多个 startUpload 都能通过守卫，最终并发 xhr.send，
-  //   设备端互斥被绕过、403 路径走漏。
-  // ★ 状态机：进入 UPLOADING 态（内部同步 isUploading = true）
+  /* 先进入 UPLOADING（同步 isUploading），再 await 读文件，防止重复提交 */
   otaSessionTransition(OtaSessionState.UPLOADING);
   window.activeUploadChip = chip;
   /* 新上传：清掉上次完成标志，避免立刻被 status 残留判成“又完成了” */

@@ -9,11 +9,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 OTA 中继控制台</title>
-<link rel="stylesheet" href="css/base.css?v=20260716q">
-<link rel="stylesheet" href="css/layout.css?v=20260716q">
-<link rel="stylesheet" href="css/components.css?v=20260716q">
-<link rel="stylesheet" href="css/can.css?v=20260716q">
-<link rel="stylesheet" href="css/responsive.css?v=20260716q">
+<link rel="stylesheet" href="css/base.css?v=20260718b">
+<link rel="stylesheet" href="css/layout.css?v=20260718b">
+<link rel="stylesheet" href="css/components.css?v=20260718b">
+<link rel="stylesheet" href="css/can.css?v=20260718b">
+<link rel="stylesheet" href="css/responsive.css?v=20260718b">
 </head>
 <body>
 <div class="container">
@@ -244,9 +244,11 @@
               <div class="v err" id="bConn">离线</div>
               <div class="k">连接状态</div>
             </div>
-            <div class="badge-stat">
+            <div class="badge-stat badge-stat-click" id="healthBadge"
+                 role="button" tabindex="0" title="点击查看启动自检"
+                 aria-expanded="false" aria-controls="healthBootPanel">
               <div class="v" id="mHealth">--</div>
-              <div class="k">健康状态</div>
+              <div class="k">健康状态 <span class="health-boot-hint">▾ 自检</span></div>
             </div>
             <div class="badge-stat">
               <div class="v err" id="connBadge">offline</div>
@@ -256,6 +258,15 @@
               <div class="v" id="gattState" style="font-size:16px;">未就绪</div>
               <div class="k">GATT 状态</div>
             </div>
+          </div>
+          <!-- 启动自检：点健康状态展开，默认折叠 -->
+          <div class="health-boot-panel collapsed" id="healthBootPanel" hidden>
+            <div class="health-boot-head">
+              <span class="health-boot-title">启动自检</span>
+              <span class="health-boot-summary" id="mBootResult">--</span>
+            </div>
+            <div class="health-boot-failed">失败/跳过：<b id="mBootFailed">--</b></div>
+            <div class="boot-module-list" id="bootModuleList" aria-label="启动模块列表"></div>
           </div>
         </div>
       </div>
@@ -425,8 +436,8 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script type="module" src="js/app.js?v=20260716q"></script>
-<script type="module" src="js/ota/console-mode.js?v=20260716q"></script>
-<script type="module" src="js/ble_ota.js?v=20260716q"></script>
+<script type="module" src="js/app.js?v=20260718b"></script>
+<script type="module" src="js/ota/console-mode.js?v=20260718b"></script>
+<script type="module" src="js/ble_ota.js?v=20260718d"></script>
 </body>
 </html>

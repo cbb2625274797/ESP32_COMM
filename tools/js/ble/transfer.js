@@ -238,6 +238,7 @@ export async function uploadFirmware() {
           continue;
         }
 
+        /* Windows WebBT 同时只允许一个 GATT 操作，必须逐包 await，禁止 Promise.all 并发写 */
         await state.dataInChar.writeValueWithoutResponse(packet);
       }
 

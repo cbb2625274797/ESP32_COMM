@@ -1,14 +1,13 @@
 /**
  * signals.js - 信号编辑器渲染 + 信号编解码（raw ↔ physical）
  *
- * 包含：信号行渲染、信号值存取、编码写入、浮点/整数/Motorola/Intel 位操作、
- * renderSelectedMessage shim。
+ * 包含：行内信号表格、信号值存取、编码写入、浮点/整数/Motorola/Intel 位操作。
  *
  * 依赖：dbc.js（state/el/padHex/bytesToHex/cssEscape/findSignal）、common/utils.js（escapeHtml）。
  */
-import { state, el, padHex, bytesToHex, cssEscape, findSignal } from './dbc.js?v=20260717v';
-import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717v';
-import { scheduleCanPersist } from './persist.js?v=20260717v';
+import { state, el, padHex, bytesToHex, cssEscape, findSignal } from './dbc.js?v=20260717x';
+import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717x';
+import { scheduleCanPersist } from './persist.js?v=20260717x';
 
 // ==================== 信号值存取 ====================
 /** @description 确保报文有 signalValues bag，并为每个信号填充默认值。返回 bag。 */
@@ -80,15 +79,6 @@ export function getActiveSignals(message) {
     return signal.multiplexRole === 'value' && Number.isFinite(currentValue) && signal.multiplexValue === currentValue;
   });
 }
-
-// ==================== 旧版 shim ====================
-/**
- * @description 旧版"顶部独立信号编辑面板"的兼容 shim。
- *              该面板已移除，信号编辑现在通过报文行展开完成；
- *              仍被 selectMessage、handleDbcFile、clearDbc、handleSignalInputEvent 调用，
- *              保留空函数以避免修改所有调用方。
- */
-export function renderSelectedMessage() {}
 
 // ==================== 信号行渲染 ====================
 /** @description 在报文展开行内渲染信号表格（inline grid）。 */
@@ -178,7 +168,6 @@ function handleSignalInputEvent(evt) {
   setSignalValue(message, name, input.value);
   var signal = findSignal(message, name);
   if (signal && signal.multiplexRole === 'mux') {
-    if (key === state.selectedMessageKey) renderSelectedMessage();
     var inlineGrid = document.querySelector('.message-row-expand[data-key="' + cssEscape(key) + '"] .signal-table-host');
     if (inlineGrid) renderInlineSignalGrid(message, inlineGrid);
   }

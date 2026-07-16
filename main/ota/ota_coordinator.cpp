@@ -49,10 +49,7 @@ OtaCoordinator& OtaCoordinator::instance()
 // ============================================================
 bool OtaCoordinator::lock() const
 {
-    // ★ 修复: 返回 take 结果，由调用方传回 unlock()。
-    //   旧实现用成员 bool m_locked 记录 take 结果，多任务并发 lock() 时
-    //   超时方会把 m_locked 置 false，覆盖持锁方的 true，导致 unlock() 跳过 give，
-    //   mutex 永久死锁 → 后续 take 超时触发 vTaskPriorityDisinherit assert → PANIC。
+    /* 返回 take 是否成功；调用方须把该值传给 unlock() */
     if (!m_mutex) return false;
     bool ok = (xSemaphoreTake(m_mutex, kLockTimeout) == pdTRUE);
     if (!ok) {
@@ -64,7 +61,7 @@ bool OtaCoordinator::lock() const
 
 void OtaCoordinator::unlock(bool handle) const
 {
-    // ★ 修复: 仅在对应的 lock() 成功 take 时才 give。
+    /* 仅当对应 lock() 成功时 give */
     if (handle && m_mutex) {
         xSemaphoreGive(m_mutex);
     }
@@ -97,11 +94,7 @@ void OtaCoordinator::watchdogCheckLocked()
         return;  // 未超时
     }
 
-    // ★ 超时自愈：完整中止到 IDLE（释放 Esp32OtaCore / 中继 / GD32 meta 等）。
-    //   旧逻辑只标 ERROR 不清理子系统：若卡在 FINALIZING 且 core 已半释放，
-    //   前端仍长时间判“占用”；若 core 仍持互斥，ERROR 后 begin 还要靠 forceCleanup。
-    //   REBOOTING 本应已 esp_restart；超时则同样中止，避免永久卡死。
-    DEBUG_ERR(TAG, "忙状态 %d 卡死超过 %" PRIu32 " ms，强制中止 → IDLE",
+    DEBUG_ERR(TAG, "忙状态 %d 超过 %" PRIu32 " ms，强制中止 → IDLE",
               (int)m_sysState, (uint32_t)pdTICKS_TO_MS(kBusyWatchdogTicks));
     doAbortLocked();
 }
@@ -580,9 +573,7 @@ Esp32FinalizeResult OtaCoordinator::finalizeForReboot(const char *frontend_sha_h
     if (r.err == ESP_OK) {
         notifyEsp32FinalizeComplete();
     } else {
-        // ★ SHA 不匹配 / end 失败：Esp32OtaCore 已 abort+释放互斥，但协调器若仍停在
-        //   ESP32_FINALIZING，WiFi 前端会一直被“设备 OTA 占用”拒绝（BLE 路径曾单独
-        //   补 abortCurrent；统一放到这里，WiFi/BLE 共用）。
+        /* finalize 失败：复位协调器到 IDLE */
         DEBUG_ERR(TAG, "ESP32 finalize 失败: %s，复位协调器 → IDLE",
                   esp_err_to_name(r.err));
         abortCurrent();
@@ -758,17 +749,12 @@ OtaSnapshot OtaCoordinator::getSnapshot() const
 {
     OtaSnapshot snap{};
 
-    // ── coordinator 自身状态（一次 mutex，避免二次加锁导致快照不一致）──
-    // 持锁时一次性取 m_sysState，并调不加锁的 stateToString()
-    //   就地转字符串。旧实现释放锁后再调 stateToString(getSystemState()) 二次加锁，
-    //   两次取值之间状态可能变化，导致 snap.sys_state 与 snap.sys_state_str
-    //   描述不同时刻状态。
+    /* 持锁一次读取状态并生成字符串，保证快照字段一致 */
     bool h = lock();
     if (h) {
         snap.sys_state = m_sysState;
         snap.channel = m_otaChannel;
         snap.storage_done = m_gd32StorageDone;
-        // 就地把状态枚举转字符串，与 sys_state 来自同一时刻
         snap.sys_state_str = stateToString(snap.sys_state);
         unlock(h);
     } else {
