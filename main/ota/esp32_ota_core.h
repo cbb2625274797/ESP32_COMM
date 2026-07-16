@@ -5,7 +5,7 @@
  *   begin → write*(N) → finalize / abort
  *
  * 统一以 WiFi 流程为基准：
- *   - begin：整分区预擦后 esp_ota_resume（写路径不再边写边擦）
+ *   - begin：esp_ota_begin(OTA_WITH_SEQUENTIAL_WRITES) 边写边擦（避免 HTTP 头卡预擦）
  *   - SHA-256 在 finalize 时从 OTA 分区读回计算（不在上传期间增量计算）
  *   - finalize 顺序: 读回 SHA-256 → 比对前端 SHA → esp_ota_end → esp_ota_set_boot_partition → 可选重启
  *   - m_ended 标志位防止 esp_ota_end 成功后再次 esp_ota_abort 同一 handle

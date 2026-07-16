@@ -32,7 +32,7 @@
 //   避免 5 秒巡检刷屏。health_mon 任务从不被 OTA 暂停，DEBUG_ERR 经 UDP/UART
 //   直发，不受 OTA 门控抑制。
 static constexpr float STACK_WARN_RATIO = 0.20f;   ///< 剩余水位告警阈值（栈大小比例）
-static constexpr size_t STACK_TASK_MAX = 8;        ///< 受监控任务上限
+static constexpr size_t STACK_TASK_MAX = 12;       ///< 受监控任务上限（含 spi_worker 等）
 static bool s_stackWarned[STACK_TASK_MAX] = {};    ///< 各任务是否已告警（去重）
 
 // ============================================================

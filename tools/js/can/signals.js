@@ -6,8 +6,9 @@
  *
  * 依赖：dbc.js（state/el/padHex/bytesToHex/cssEscape/findSignal）、common/utils.js（escapeHtml）。
  */
-import { state, el, padHex, bytesToHex, cssEscape, findSignal } from './dbc.js';
-import { escapeHtml as sanitizeHtml } from '../common/utils.js';
+import { state, el, padHex, bytesToHex, cssEscape, findSignal } from './dbc.js?v=20260717t';
+import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717t';
+import { scheduleCanPersist } from './persist.js?v=20260717t';
 
 // ==================== 信号值存取 ====================
 /** @description 确保报文有 signalValues bag，并为每个信号填充默认值。返回 bag。 */
@@ -182,6 +183,7 @@ function handleSignalInputEvent(evt) {
     if (inlineGrid) renderInlineSignalGrid(message, inlineGrid);
   }
   if (key === state.selectedMessageKey) updateEncodedPreview();
+  scheduleCanPersist();
 }
 
 function bindSignalInputs(container, message) {
@@ -240,10 +242,21 @@ function renderByteStrip(bytes) {
 // ==================== 信号编解码（raw ↔ physical） ====================
 /** @description 将报文 + 信号值编码为 Uint8Array。 */
 export function encodeMessageData(message, signalValues) {
-  var bytes = new Uint8Array(message.dlc);
+  var dlc = message && message.dlc != null ? Number(message.dlc) : 0;
+  if (!Number.isFinite(dlc) || dlc < 0) dlc = 0;
+  if (dlc > 64) dlc = 64;
+  /* DLC=0：无数据区（如 CANFD_BOOT），不写信号，直接空帧 */
+  if (dlc === 0) {
+    return new Uint8Array(0);
+  }
+  var bytes = new Uint8Array(dlc);
   var activeSignals = getActiveSignals(message);
   for (var i = 0; i < activeSignals.length; i++) {
     var signal = activeSignals[i];
+    /* 信号完全落在 DLC 外则跳过，避免把空帧/定义异常拖成批量失败 */
+    if (!signalFitsInDlc(signal, dlc)) {
+      continue;
+    }
     var parsed = parseSignalInput(signal, signalValues[signal.name]);
     if (signal.valueType === 'float' || signal.valueType === 'double') {
       writeFloatSignal(bytes, signal, parsed.numeric);
@@ -252,6 +265,19 @@ export function encodeMessageData(message, signalValues) {
     }
   }
   return bytes;
+}
+
+/** @description 粗判信号位域是否至少有一部分落在 dlc 字节内（越界整段则跳过）。 */
+function signalFitsInDlc(signal, dlc) {
+  if (!signal || dlc <= 0) return false;
+  var maxBit = dlc * 8 - 1;
+  if (signal.byteOrder === 'little') {
+    var end = signal.startBit + signal.length - 1;
+    return signal.startBit >= 0 && signal.startBit <= maxBit && end <= maxBit;
+  }
+  /* Motorola：用起始位所在字节粗判；更严的检查仍在 setBitByIndex */
+  var startByte = Math.floor(signal.startBit / 8);
+  return startByte >= 0 && startByte < dlc && signal.length > 0;
 }
 
 function parseSignalInput(signal, inputValue) {
@@ -377,7 +403,8 @@ function setBitByIndex(bytes, bitIndex, bitValue) {
   var byteIndex = Math.floor(bitIndex / 8);
   var bitInByte = bitIndex % 8;
   if (byteIndex < 0 || byteIndex >= bytes.length) {
-    throw new Error('信号写入越界，bit=' + bitIndex);
+    throw new Error('信号写入越界，bit=' + bitIndex +
+      '（缓冲区 ' + bytes.length + ' 字节 / DLC=' + bytes.length + '）');
   }
   if (bitValue) bytes[byteIndex] |= (1 << bitInByte);
   else bytes[byteIndex] &= ~(1 << bitInByte);

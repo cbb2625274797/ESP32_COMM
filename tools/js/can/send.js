@@ -12,11 +12,12 @@
  * 注意：formatTime 保留本地实现（HH:MM:SS，不含毫秒），与 common/utils.js
  * 的 formatTime（含毫秒）不同，以保证发送历史时间戳输出格式一致。
  */
-import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js';
-import { escapeHtml as sanitizeHtml } from '../common/utils.js';
-import { showToast } from '../common/toast.js';
-import { updateBatchUi } from './messages.js';
-import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js';
+import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js?v=20260717t';
+import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717t';
+import { showToast } from '../common/toast.js?v=20260717t';
+import { updateBatchUi } from './messages.js?v=20260717t';
+import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js?v=20260717t';
+import { scheduleCanPersist } from './persist.js?v=20260717t';
 
 // ==================== 本地工具（保持与原 can.js 一致） ====================
 function formatTime(date) {
@@ -84,6 +85,33 @@ async function sendCanRequest(payload) {
   return json;
 }
 
+/**
+ * @description 一次 HTTP 连续发送多帧（设备 /can/send_batch）。
+ * @returns {Promise<object[]>} 与 frames 等长的 results
+ */
+async function sendCanBatchRequest(channel, frames) {
+  var resp = await fetch(getBaseUrl() + '/can/send_batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ch: channel, frames: frames }),
+    signal: AbortSignal.timeout(Math.max(15000, frames.length * 500))
+  });
+  var text = await resp.text();
+  var json = {};
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (err) {
+    throw new Error('批量响应不是合法 JSON: ' + text);
+  }
+  if (!resp.ok) {
+    throw new Error('HTTP ' + resp.status + ': ' + (json.message || text || '批量请求失败'));
+  }
+  if (!json.results || !Array.isArray(json.results)) {
+    throw new Error('批量响应缺少 results');
+  }
+  return json.results;
+}
+
 // ==================== 响应框 ====================
 function updateResponseBox(box, textEl, result, mode) {
   if (!box || !textEl) return;
@@ -99,13 +127,20 @@ function updateResponseBox(box, textEl, result, mode) {
 }
 
 // ==================== 发送历史 ====================
-function addHistoryEntry(entry) {
+/**
+ * @param {object} entry
+ * @param {{ silent?: boolean }} [opts] silent=true 时不立刻重绘/落盘（批量用）
+ */
+function addHistoryEntry(entry, opts) {
   state.history.unshift(entry);
-  if (state.history.length > 20) state.history.length = 20;
+  /* 批量发送会快速产生大量条目，上限放宽便于回看 */
+  if (state.history.length > 200) state.history.length = 200;
+  if (opts && opts.silent) return;
   renderHistory();
+  scheduleCanPersist();
 }
 
-/** @description 渲染发送历史列表。 */
+/** @description 渲染发送历史列表（单行紧凑：状态|时间|CH·ID·DLC|HEX|结果）。 */
 export function renderHistory() {
   if (!el.historyList) return;
   if (!state.history.length) {
@@ -113,24 +148,27 @@ export function renderHistory() {
     return;
   }
   el.historyList.innerHTML = state.history.map(function (item) {
+    var meta = 'CH' + item.channel + ' · ' + item.idHex + ' · DLC ' + item.dlc;
     return '' +
-      '<div class="history-item">' +
-      '<div class="history-item-top">' +
+      '<div class="history-item history-item-row' + (item.ok ? '' : ' is-err') + '">' +
       '<span class="history-item-tag ' + (item.ok ? 'ok' : 'err') + '">' + sanitizeHtml(item.mode) + '</span>' +
       '<span class="history-item-time">' + sanitizeHtml(item.time) + '</span>' +
-      '</div>' +
-      '<div class="history-item-main">' +
-      '<b>CH' + sanitizeHtml(item.channel) + '</b> · ' +
-      sanitizeHtml(item.idHex) + ' · DLC ' + sanitizeHtml(item.dlc) +
-      '</div>' +
-      '<div class="history-item-hex">' + sanitizeHtml(item.dataHex || '--') + '</div>' +
-      '<div class="history-item-foot">' + sanitizeHtml(item.resultText) + '</div>' +
+      '<span class="history-item-main" title="' + sanitizeHtml(meta) + '">' + sanitizeHtml(meta) + '</span>' +
+      '<span class="history-item-hex" title="' + sanitizeHtml(item.dataHex || '') + '">' + sanitizeHtml(item.dataHex || '--') + '</span>' +
+      '<span class="history-item-foot" title="' + sanitizeHtml(item.resultText || '') + '">' + sanitizeHtml(item.resultText) + '</span>' +
       '</div>';
   }).join('');
 }
 
 // ==================== 批量发送 ====================
-/** @description 批量发送所有勾选的报文（30ms 帧间间隔防 GD32 SPI RXORERR）。 */
+/** 单批最多帧数（与设备 /can/send_batch 上限一致） */
+var BATCH_CHUNK = 48;
+
+/**
+ * @description 批量发送所有勾选的报文。
+ * 优先一次 HTTP /can/send_batch 在设备侧紧接连发；失败则回退单帧紧接。
+ * 批量过程中不重绘历史，结束后统一刷新。
+ */
 export async function sendCheckedMessages() {
   if (!state.dbc) { showToast('请先导入 DBC', 'warning'); return; }
   var keys = Object.keys(state.checkedKeys);
@@ -140,10 +178,10 @@ export async function sendCheckedMessages() {
   updateBatchUi();
   var channel = parseInt(el.defaultChannel.value, 10) || 0;
   var ok = 0, fail = 0;
-  /* BATCH 间隔：GD32 SPI 从机用 RBNE 中断逐字节接收，无 RX DMA，
-   * 连续高频 CS 事务易触发 RXORERR -> 帧字节丢失 -> CRC 失败 -> 0xEE。
-   * 30ms 间隔给 GD32 足够时间完成 onCsRelease 清理 + EXTI 重新待命。 */
-  var BATCH_INTERVAL_MS = 30;
+  var silent = { silent: true };
+
+  /* 先全部编码，避免发到一半才因编码失败打断节奏 */
+  var prepared = [];
   for (var i = 0; i < keys.length; i++) {
     var key = keys[i];
     var msg = null;
@@ -166,47 +204,100 @@ export async function sendCheckedMessages() {
         idHex: idHex,
         dlc: msg.dlc,
         dataHex: '',
-        resultText: '编码失败: ' + err.message
-      });
+        resultText: msg.name + ' · 编码失败: ' + err.message
+      }, silent);
       continue;
     }
     var dataHex = bytesToHex(dataBytes);
-    try {
-      var result = await sendCanRequest({
-        ch: channel,
-        id: msg.id,
-        dlc: msg.dlc,
-        data: dataHex
-      });
-      if (result.status === 'ok') ok++; else fail++;
-      addHistoryEntry({
-        time: formatTime(new Date()),
-        mode: 'BATCH',
-        ok: result.status === 'ok',
-        channel: channel,
-        idHex: idHex,
-        dlc: msg.dlc,
-        dataHex: dataHex,
-        resultText: msg.name + ' · ' + buildSendResponseText(result)
-      });
-    } catch (err) {
-      fail++;
-      addHistoryEntry({
-        time: formatTime(new Date()),
-        mode: 'BATCH',
-        ok: false,
-        channel: channel,
-        idHex: idHex,
-        dlc: msg.dlc,
-        dataHex: dataHex,
-        resultText: msg.name + ' · ' + err.message
-      });
+    var dlc = (typeof msg.dlc === 'number') ? msg.dlc : dataBytes.length;
+    prepared.push({
+      msg: msg,
+      idHex: idHex,
+      dlc: dlc,
+      dataHex: dataHex,
+      frame: { id: msg.id, dlc: dlc, data: dataHex }
+    });
+  }
+
+  /* 分块批量接口；不支持时整段回退为无间隔单帧 */
+  var useBatchApi = true;
+  for (var off = 0; off < prepared.length; ) {
+    var chunk = prepared.slice(off, off + BATCH_CHUNK);
+    off += chunk.length;
+    var frames = chunk.map(function (p) { return p.frame; });
+    var results = null;
+
+    if (useBatchApi) {
+      try {
+        results = await sendCanBatchRequest(channel, frames);
+        if (results.length !== chunk.length) {
+          throw new Error('results 长度不匹配');
+        }
+      } catch (err) {
+        useBatchApi = false;
+        results = null;
+        /* 本 chunk 改单帧紧接 */
+      }
     }
-    /* 帧间间隔，避免 GD32 SPI RXORERR（最后一帧不需要等） */
-    if (i < keys.length - 1) {
-      await new Promise(function (r) { setTimeout(r, BATCH_INTERVAL_MS); });
+
+    if (results) {
+      for (var r = 0; r < chunk.length; r++) {
+        var item = chunk[r];
+        var result = results[r] || { status: 'error', code: -3 };
+        if (result.status === 'ok') ok++; else fail++;
+        addHistoryEntry({
+          time: formatTime(new Date()),
+          mode: 'BATCH',
+          ok: result.status === 'ok',
+          channel: channel,
+          idHex: item.idHex,
+          dlc: item.dlc,
+          dataHex: item.dataHex || '',
+          resultText: item.msg.name + ' · ' + buildSendResponseText(result)
+        }, silent);
+      }
+      continue;
+    }
+
+    /* 回退：逐帧 HTTP，帧间无 sleep、无重试 */
+    for (var s = 0; s < chunk.length; s++) {
+      var one = chunk[s];
+      try {
+        var oneResult = await sendCanRequest({
+          ch: channel,
+          id: one.frame.id,
+          dlc: one.frame.dlc,
+          data: one.frame.data
+        });
+        if (oneResult.status === 'ok') ok++; else fail++;
+        addHistoryEntry({
+          time: formatTime(new Date()),
+          mode: 'BATCH',
+          ok: oneResult.status === 'ok',
+          channel: channel,
+          idHex: one.idHex,
+          dlc: one.dlc,
+          dataHex: one.dataHex || '',
+          resultText: one.msg.name + ' · ' + buildSendResponseText(oneResult)
+        }, silent);
+      } catch (err) {
+        fail++;
+        addHistoryEntry({
+          time: formatTime(new Date()),
+          mode: 'BATCH',
+          ok: false,
+          channel: channel,
+          idHex: one.idHex,
+          dlc: one.dlc,
+          dataHex: one.dataHex || '',
+          resultText: one.msg.name + ' · ' + err.message
+        }, silent);
+      }
     }
   }
+
+  renderHistory();
+  scheduleCanPersist();
   state.batchInFlight = false;
   updateBatchUi();
   var tone = fail === 0 ? 'success' : (ok === 0 ? 'error' : 'warning');

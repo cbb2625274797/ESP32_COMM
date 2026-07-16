@@ -5,6 +5,8 @@
  *   - health_monitor 巡检主动告警（低水位时 DEBUG_ERR，突破 OTA 门控）
  *   - http_handlers /system/status 被动报告（前端每秒轮询展示）
  * 两处复用同一份任务表，避免散落维护。
+ *
+ * 表内含转发关键：ota_relay、spi_worker（帧缓冲热路径）。
  */
 #pragma once
 

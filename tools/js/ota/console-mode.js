@@ -5,12 +5,20 @@
  * - 覆盖 app.js 中的 switchStageFlow，支持 BLE 阶段流程
  * - 提供 setConsoleMode / selectFlashTarget 等供 HTML onclick 调用
  * - 维护共享固件文件状态 (sharedFirmwareFiles) 并在 WiFi/BLE 间同步
+ * - 页面刷新后恢复上次升级目标与固件选择
  *
  * 依赖：app.js (通过 window.* 或 bare 引用) 提供 switchStageFlow、
  * handleFileSelect、clearFile、pickFileViaFSAPI、addLog、showToast、setActivePhase 等。
  */
+import {
+  restorePersistedFirmwareSelection,
+  persistFlashTarget,
+  loadPersistedFlashTarget
+} from './file-handle.js';
+
 window.connectionMode = window.connectionMode || 'wifi';
-window.flashTarget = window.flashTarget || 'esp32';
+/* 刷新后优先用上次目标，避免默认回到 ESP32 丢掉 GD32 选择上下文 */
+window.flashTarget = loadPersistedFlashTarget() || window.flashTarget || 'esp32';
 window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   esp32: { file: null, handle: null },
   gd32: { file: null, handle: null }
@@ -84,6 +92,7 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
         return;
       }
     window.flashTarget = target === 'gd32' ? 'gd32' : 'esp32';
+    persistFlashTarget(window.flashTarget);
     applySharedModeUi();
     syncBleFileFromSelectedTarget();
     if (window.connectionMode === 'ble') {
@@ -102,18 +111,21 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   window.handleSharedFileSelect = function (event, chip) {
     var file = event && event.target && event.target.files && event.target.files[0] ? event.target.files[0] : null;
     if (file) {
+      /* 传统 input 无持久 handle，刷新后无法自动恢复该次选择 */
       window.sharedFirmwareFiles[chip] = { file: file, handle: null };
     }
     if (typeof window.handleFileSelect === 'function') {
       window.handleFileSelect(event, chip);
     }
     window.flashTarget = chip === 'gd32' ? 'gd32' : 'esp32';
+    persistFlashTarget(window.flashTarget);
     applySharedModeUi();
     setTimeout(syncBleFileFromSelectedTarget, 0);
   };
 
   window.pickSharedFirmware = function (chip) {
     window.flashTarget = chip === 'gd32' ? 'gd32' : 'esp32';
+    persistFlashTarget(window.flashTarget);
     applySharedModeUi();
     if (window.showOpenFilePicker && typeof window.pickFileViaFSAPI === 'function') {
       var nativePicker = window.showOpenFilePicker;
@@ -260,14 +272,11 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
   };
 
   applySharedModeUi();
+  /* 刷新后恢复上次固件与目标（FSAPI handle + localStorage 目标） */
+  restorePersistedFirmwareSelection().then(function () {
+    if (typeof window.switchStageFlow === 'function' && window.connectionMode !== 'ble') {
+      window.switchStageFlow(window.flashTarget || 'esp32');
+    }
+  }).catch(function () {});
 })();
-
-// 暴露给 HTML onclick 调用的函数（ES Module 迁移：模块作用域不再自动成为全局变量）
-window.setConsoleMode = setConsoleMode;
-window.selectFlashTarget = selectFlashTarget;
-window.handleSharedFileSelect = handleSharedFileSelect;
-window.pickSharedFirmware = pickSharedFirmware;
-window.clearSharedFirmware = clearSharedFirmware;
-window.setBleFirmwareInputFile = setBleFirmwareInputFile;
-window.syncBleFileFromSelectedTarget = syncBleFileFromSelectedTarget;
-window.applySharedModeUi = applySharedModeUi;
+/* HTML onclick 用的 API 已在 IIFE 内挂到 window.*，无需再二次赋值 */

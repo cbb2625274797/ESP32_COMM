@@ -446,6 +446,7 @@ esp_err_t WifiOta::httpServerStart()
         {"/system/status", HTTP_GET,  system_status_handler},
         {"/system/probe",  HTTP_GET,  system_probe_handler},
         {"/can/send",      HTTP_POST, can_send_handler},
+        {"/can/send_batch", HTTP_POST, can_send_batch_handler},
         {"/can/feedback",  HTTP_GET,  can_feedback_handler},
         {"/can/mode",      HTTP_GET,  can_mode_handler},
         {"/can/mode",      HTTP_POST, can_mode_handler},
@@ -468,7 +469,7 @@ esp_err_t WifiOta::httpServerStart()
         httpd_register_uri_handler(WifiOta::instance().m_httpServer, &opts_uri);
     }
 
-    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /restart, /logs, /system/status, /system/probe, /can/send, /spi/send, /can/feedback, /can/mode");
+    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /restart, /logs, /system/status, /system/probe, /can/send, /can/send_batch, /spi/send, /can/feedback, /can/mode");
 
     return ESP_OK;
 }

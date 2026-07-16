@@ -53,8 +53,8 @@ inline constexpr uint16_t HTTP_SERVER_PORT      = 80;              ///< HTTP 服
 // ============================================================
 inline constexpr uint32_t HTTP_SERVER_STACK_SIZE   = 8192;  ///< httpd：原 10KB，peak~5KB → 8KB（余量~3KB）
 inline constexpr uint32_t TASK_STACK_WIFI_OTA      = 4096;  ///< wifi_ota 主循环：原 8KB，peak~1.4KB
-inline constexpr uint32_t TASK_STACK_OTA_RELAY     = 2560;  ///< ota_relay：2.5KB（实测 peak~1KB；完整 GD32 中继后再确认水位）
-inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 5120;  ///< spi_worker：无单独水位，6144→5120 小幅收
+inline constexpr uint32_t TASK_STACK_OTA_RELAY     = 2560;  ///< ota_relay：2.5KB（轻载 peak~1KB；转发时看 /system/status.task_stack）
+inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 5120;  ///< spi_worker：5KB（帧缓冲热路径；已纳入 task_stack 巡检）
 inline constexpr uint32_t TASK_STACK_BLE_OTA       = 3072;  ///< ble_ota 主任务：peak~1KB
 inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 3072;  ///< ble_ota_worker：peak~1.1KB（负载峰值曾~1.9KB）
 inline constexpr uint32_t TASK_STACK_HEALTH_MON    = 3072;  ///< health_mon：peak~1.2KB
@@ -93,6 +93,25 @@ inline constexpr const char* DEBUG_LOG_IP   = "192.168.31.3";      ///< UDP 日�
 inline constexpr uint16_t DEBUG_LOG_PORT   = 6666;                 ///< UDP 日志目标端口
 
 // ============================================================
+// SPI 主机（ESP32 ↔ GD32）可调参数
+// 协议帧格式见 spi_link_v2.h；引脚与超时集中在此便于板级调整
+// ============================================================
+inline constexpr int      SPI_MASTER_CS_GPIO     = 4;     ///< CS 片选 GPIO
+inline constexpr int      SPI_READY_GPIO         = 10;    ///< DATA_READY 通知线 GPIO（↔ GD32 PB6）
+inline constexpr int      SPI_MODE               = 0;     ///< CPOL=0 CPHA=0
+inline constexpr int      SPI_QUEUE_SIZE         = 4;     ///< SPI 事务队列深度
+inline constexpr size_t   SPI_OTA_FRAME_MAX      = 256;   ///< 单 CS 最大帧长（APP 满缓冲）
+inline constexpr size_t   SPI_BOOT_TX_BUF_SIZE   = 128;   ///< BOOT TX DMA 满缓冲（读预算用）
+inline constexpr size_t   SPI_APP_TX_BUF_SIZE    = 256;   ///< APP TX DMA 满缓冲（读预算用）
+
+// ============================================================
+// OTA 协调器
+// ============================================================
+inline constexpr uint32_t OTA_COORD_LOCK_TIMEOUT_MS   = 100;  ///< 协调器 mutex 超时（ms）
+/** 忙状态自愈：须 > 中继转发预算上限（约 120s）+ 握手/SIZE 余量。 */
+inline constexpr uint32_t OTA_COORD_BUSY_WATCHDOG_MS  = 150000;
+
+// ============================================================
 // BLE OTA 配置
 // ============================================================
 inline constexpr const char* BLE_DEVICE_NAME    = "ESP32-OTA-RELAY"; ///< BLE 广播设备名
@@ -110,8 +129,12 @@ inline constexpr uint8_t BLE_OTA_CTRL_ABORT_OTA     = 0xFB;         ///< BLE 控
 inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;             ///< BLE 数据通道：GD32 固件包标识
 inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;             ///< BLE 数据通道：ESP32 固件包标识
 inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;            ///< BLE 单包数据载荷大小（字节）
+// 滑动 ACK 窗口（须与前端 tools/js/ble/constants.js BLE_OTA_ACK_WINDOW 保持一致）
+inline constexpr size_t      BLE_OTA_ACK_WINDOW = 32;
 // Reorder buffer 窗口大小（吸收 BLE 窗口内乱序到达的包，须 >= BLE_OTA_ACK_WINDOW）
 inline constexpr size_t      BLE_OTA_REORDER_WINDOW = 32;
+// 数据队列深度：略大于窗口，seq=0 预擦期间多扛几批
+inline constexpr size_t      BLE_OTA_DATA_QUEUE_LEN = (BLE_OTA_ACK_WINDOW * 2 + 8);
 
 // ============================================================
 // 安全常量（需与 GD32 固件团队确认）

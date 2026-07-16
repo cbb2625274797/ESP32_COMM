@@ -25,7 +25,7 @@
  *   window.updateSystemStatusUi / window.updateEsp32StagesFromPhase
  *   window.applyRebootingRuntimeState / window.applyDisconnectedRuntimeState / window.applyUploadingRuntimeState
  *   window.otaSessionActive / window.otaSessionTransition / window.otaSessionReset
- *   window.updateUploadButtonLabel / window.updateSpiHint
+ *   window.updateUploadButtonLabel
  */
 import { addLog } from './log.js';
 import { showToast } from './toast.js';
@@ -140,13 +140,18 @@ export async function pollStatus() {
         window.consecutivePollFailures = 0;
         addLog('I', '系统', '设备已恢复在线，轮询恢复正常');
         showToast('设备已恢复在线', 'success');
-        // 设备离线后恢复在线，清理残留的 OTA 会话状态
-        if (window.otaSessionState !== window.OtaSessionState.IDLE) {
+        // 仅清理终态残留。禁止对活跃会话 otaSessionReset：
+        //   旧逻辑任意非 IDLE 都 reset -> 中继中一次 status 超时恢复后会把 RELAYING
+        //   清成 IDLE，UI 不再跟踪；REBOOTING 被清掉后永远进不了启动完成。
+        var ssRec = window.otaSessionState;
+        if (ssRec === window.OtaSessionState.FAILED ||
+            ssRec === window.OtaSessionState.DONE) {
           window.otaSessionReset();
-          addLog('I', '系统', '已清理 OTA 会话状态');
+          addLog('I', '系统', '已清理终态 OTA 会话残留');
         }
       }
-      if (window.isEsp32Rebooting) {
+      if (window.isEsp32Rebooting ||
+          window.otaSessionState === window.OtaSessionState.REBOOTING) {
         var rbElapsed = Math.round((Date.now() - window.rebootStartTime) / 1000);
         if (!window.rebootObservedDown && rbElapsed < 10) {
           // pre-reboot 窗口：后端发响应后约 1s 才 esp_restart，期间设备仍响应轮询
@@ -161,7 +166,12 @@ export async function pollStatus() {
           addLog('I', '系统', 'ESP32 已恢复在线');
           showToast('ESP32 已恢复在线', 'success');
           // ★ 状态机：ESP32 重启完成 → DONE
-          if (window.otaSessionState === window.OtaSessionState.REBOOTING) window.otaSessionTransition(window.OtaSessionState.DONE);
+          if (window.otaSessionState === window.OtaSessionState.REBOOTING) {
+            window.otaSessionTransition(window.OtaSessionState.DONE);
+          }
+          if (typeof window.updateUploadButtonLabel === 'function') {
+            window.updateUploadButtonLabel();
+          }
         }
       }
       try { window.updateSystemStatusUi(data); } catch (e2) { console.warn('updateSystemStatusUi 异常:', e2); }
@@ -225,11 +235,16 @@ export async function pollStatus() {
       window.rebootObservedDown = true;  // 确认设备已下线（正在重启）
       var elapsed = Math.round((Date.now() - window.rebootStartTime) / 1000);
       if (elapsed > 60) {
-        window.otaSessionTransition(window.OtaSessionState.FAILED, 'ESP32 重启超时');
-        window.isEsp32Rebooting = false;
-        window.rebootObservedDown = false;
+        // ★ 统一走 cleanupAfterOtaFailure：清 xhr/定时器/按钮/阶段，避免只改 state 留下假死 UI
         addLog('E', '系统', 'ESP32 重启超时，设备未恢复');
         showToast('ESP32 重启超时，请检查设备', 'error');
+        if (typeof window.cleanupAfterOtaFailure === 'function') {
+          window.cleanupAfterOtaFailure('ESP32 重启超时');
+        } else {
+          window.otaSessionTransition(window.OtaSessionState.FAILED, 'ESP32 重启超时');
+          window.isEsp32Rebooting = false;
+          window.rebootObservedDown = false;
+        }
         updateConnectionUi(false, '未连接');
         window.applyDisconnectedRuntimeState();
       } else {
@@ -302,13 +317,19 @@ export async function pollLogs() {
         //   esp_restart() 是硬件复位，不保证 TCP FIN/RST；靠轮询超时/网络错误判断
         //   "已下线"不可靠。设备启动后会推 [I][MAIN] ESP32-C3 OTA Relay v1.0 启动，
         //   收到这行即说明设备已重启回来，直接推进到阶段 6（启动完成）。
-        if (window.isEsp32Rebooting && m[2] === 'MAIN' && /OTA Relay v1\.0 启动/.test(m[3])) {
+        /* 与 main 启动 banner 对齐：ESP32-C3 OTA Relay <FW_VERSION> 启动（勿写死 v1.0） */
+        if (window.isEsp32Rebooting && m[2] === 'MAIN' && /OTA Relay .*启动/.test(m[3])) {
           window.isEsp32Rebooting = false;
           window.rebootObservedDown = false;
           window.updateEsp32StagesFromPhase(6);  // 启动完成
           addLog('I', '系统', 'ESP32 已恢复在线（启动 banner 收到）');
           showToast('ESP32 已恢复在线', 'success');
-          if (window.otaSessionState === window.OtaSessionState.REBOOTING) window.otaSessionTransition(window.OtaSessionState.DONE);
+          if (window.otaSessionState === window.OtaSessionState.REBOOTING) {
+            window.otaSessionTransition(window.OtaSessionState.DONE);
+          }
+          if (typeof window.updateUploadButtonLabel === 'function') {
+            window.updateUploadButtonLabel();
+          }
         }
         /*
          * 设备已报「全部数据包已转发」时，立刻补 UI 100% 进度。
@@ -331,7 +352,6 @@ export async function pollLogs() {
 setTimeout(function () {
   window.updateUploadButtonLabel();
   addLog('I', '系统', '控制台初始化完成，等待固件文件...');
-  window.updateSpiHint();
   // IP 输入变化时清零失败计数并立即刷新状态
   var ipInput = document.getElementById('espIp');
   if (ipInput) {

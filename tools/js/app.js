@@ -36,9 +36,8 @@ import {
 import {
   handleFileSelect, pickFileViaFSAPI, setupDropZone,
   parseIntelHex, isIntelHexText, convertHexFileToBin,
-  processFile, clearFile
+  processFile, clearFile, resumePersistedFirmwareWithGesture
 } from './ota/file-handle.js';
-import { sendSpiFrame, clearSpiFields, updateSpiHint } from './ota/spi.js';
 import { startUpload, verifyEsp32Firmware, restartEsp32 } from './ota/upload-esp32.js';
 import {
   triggerGd32Relay, markGd32OtaUiComplete, stopRelayProgressWatch,
@@ -69,7 +68,14 @@ function isOtaBusyError(status, detail) {
     text.indexOf('系统忙') >= 0;
 }
 function getEspIp() {
-  return document.getElementById('espIp').value.trim() || '192.168.31.127';
+  var el = document.getElementById('espIp');
+  var ip = el && el.value ? el.value.trim() : '';
+  if (!ip) {
+    try { ip = (localStorage.getItem('dcu_esp_ip') || '').trim(); } catch (_) {}
+  }
+  if (!ip) ip = '192.168.31.127';
+  try { localStorage.setItem('dcu_esp_ip', ip); } catch (_) {}
+  return ip;
 }
 function getBaseUrl() {
   return 'http://' + getEspIp();
@@ -77,8 +83,11 @@ function getBaseUrl() {
 function updateUploadButtonLabel() {
   var esp32Btn = document.getElementById('uploadEsp32Btn');
   var gd32Btn = document.getElementById('uploadGd32Btn');
-  if (esp32Btn) esp32Btn.disabled = !window.esp32File || window.isUploading;
-  if (gd32Btn) gd32Btn.disabled = !window.gd32File || window.isUploading;
+  /* 仅 XHR 上传期禁用（isUploading）。校验/中继/重启期允许按钮恢复可点，
+   * startUpload 用 otaSessionActive() 拒绝并发会话。 */
+  var xhrBusy = !!window.isUploading;
+  if (esp32Btn) esp32Btn.disabled = !window.esp32File || xhrBusy;
+  if (gd32Btn) gd32Btn.disabled = !window.gd32File || xhrBusy;
 }
 function resetStageFlow() {
   ['s1', 's2', 's3', 's4', 's5', 's6'].forEach(function (id) {
@@ -163,15 +172,12 @@ window.updateSystemStatusUi = updateSystemStatusUi;
 
 window.handleFileSelect = handleFileSelect;
 window.pickFileViaFSAPI = pickFileViaFSAPI;
+window.resumePersistedFirmwareWithGesture = resumePersistedFirmwareWithGesture;
 window.parseIntelHex = parseIntelHex;
 window.isIntelHexText = isIntelHexText;
 window.convertHexFileToBin = convertHexFileToBin;
 window.processFile = processFile;
 window.clearFile = clearFile;
-
-window.sendSpiFrame = sendSpiFrame;
-window.clearSpiFields = clearSpiFields;
-window.updateSpiHint = updateSpiHint;
 
 window.startUpload = startUpload;
 window.verifyEsp32Firmware = verifyEsp32Firmware;
@@ -223,10 +229,6 @@ window.isOtaBusyError = isOtaBusyError;
 // ==================== 顶层副作用（原 app.js 末尾的初始化） ====================
 setupDropZone('uploadZoneEsp32', 'esp32');
 setupDropZone('uploadZoneGd32', 'gd32');
-var spiTypeEl = document.getElementById('spiType');
-var spiDataEl = document.getElementById('spiData');
-if (spiTypeEl) spiTypeEl.addEventListener('input', updateSpiHint);
-if (spiDataEl) spiDataEl.addEventListener('input', updateSpiHint);
 
 // 启动轮询（必须在所有模块加载完成、window.OtaSessionState 已挂载后调用，
 //   否则 polling.js 的 scheduleStatusPoll 会因 window.OtaSessionState 未定义而抛 TypeError）
@@ -235,7 +237,12 @@ startPolling();
 // IP 输入变化时清零失败计数并立即刷新状态
 var ipInput = document.getElementById('espIp');
 if (ipInput) {
+  try {
+    var savedIp = localStorage.getItem('dcu_esp_ip');
+    if (savedIp && savedIp.trim()) ipInput.value = savedIp.trim();
+  } catch (_) {}
   ipInput.addEventListener('change', function () {
+    try { localStorage.setItem('dcu_esp_ip', ipInput.value.trim() || '192.168.31.127'); } catch (_) {}
     window.consecutivePollFailures = 0;
     addLog('I', '系统', 'IP 已修改，重新启动轮询...');
     if (!window.statusPollInFlight) {
@@ -248,5 +255,4 @@ if (ipInput) {
 setTimeout(function () {
   updateUploadButtonLabel();
   addLog('I', '系统', '控制台初始化完成，等待固件文件...');
-  updateSpiHint();
 }, 500);

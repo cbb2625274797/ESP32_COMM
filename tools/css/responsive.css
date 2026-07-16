@@ -2,6 +2,16 @@
 /* === RESPONSIVE === */
 @media (max-width: 1100px) {
   .main-layout { grid-template-columns: 1fr; }
+  .sys-drawer {
+    --sys-drawer-panel-w: min(340px, calc(100vw - 40px));
+    --sys-drawer-peek: 32px;
+    top: 64px;
+    height: calc(100vh - 72px);
+    max-height: calc(100vh - 72px);
+  }
+  .can-monitor-drawer {
+    --sys-drawer-panel-w: min(400px, calc(100vw - 40px));
+  }
   .badge-grid { grid-template-columns: repeat(2, 1fr); }
   .can-toolbar-grid,
   .can-toolbar-foot,
@@ -13,6 +23,14 @@
 }
 @media (max-width: 640px) {
   .container { padding: 16px; }
+  .sys-drawer {
+    --sys-drawer-panel-w: calc(100vw - 36px);
+    --sys-drawer-peek: 28px;
+    top: 56px;
+    height: calc(100vh - 60px);
+    max-height: calc(100vh - 60px);
+  }
+  .sys-drawer-rail-text { font-size: 11px; }
   .header-bar { flex-direction: column; align-items: flex-start; }
   .badge-grid, .metric-grid { grid-template-columns: 1fr; }
   .status-kv-grid, .status-task-meta { grid-template-columns: 1fr; }
@@ -27,10 +45,21 @@
     align-items: flex-start;
   }
   .can-selection-bar,
-  .can-selection-actions,
-  .history-item-top {
+  .can-selection-actions {
     flex-direction: column;
     align-items: flex-start;
+  }
+  .can-msg-toolbar {
+    flex-wrap: wrap;
+  }
+  .history-item-row {
+    grid-template-columns: auto 56px minmax(0, 1fr);
+    grid-template-rows: auto auto;
+  }
+  .history-item-hex,
+  .history-item-foot {
+    grid-column: 1 / -1;
+    text-align: left;
   }
   .can-title {
     font-size: 22px;
@@ -38,9 +67,11 @@
   .can-frame-hex {
     font-size: 15px;
   }
+  /* 禁止再强制 980px 最小宽，避免报文/信号表横向滑动 */
   .message-table,
   .signal-table {
-    min-width: 980px;
+    min-width: 0;
+    max-width: 100%;
   }
 }
 

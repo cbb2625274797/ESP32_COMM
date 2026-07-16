@@ -4,12 +4,10 @@
  *
  * SpiMaster 类封装 SPI 总线初始化、CANFD 通信和 SPI OTA 协议。
  *
- * 握手架构（线与 SPIready，GPIO10<->GD32 PB6 开漏单线）：
- * - 空闲态线 HIGH（双方释放，靠上拉）。
- * - ESP32 主动发起：下拉 SPIready -> 立刻 CS 发请求 -> CS 释放后保持下拉，
- *   GD32 在 onCsRelease() ISR 内完成帧处理+响应装载后释放 SPIready（高），
- *   ESP32 GPIO 上升沿中断唤醒后发起 CS#2 读响应。
- * - GD32 主动按铃：下拉 SPIready -> ESP32 下降沿中断唤醒后发起读事务。
+ * 握手架构（v2 DATA_READY，GPIO10 ← GD32 PB6 开漏）：
+ * - PB6 仅由 GD32 驱动：低 = 有待读数据，高 = 队列空。ESP32 只输入、不拉线。
+ * - 帧同步/许可在帧内 SEQ/ACK_SEQ/CREDIT；CS 本身即互斥，TX 前不再等 HIGH。
+ * - GD32 有数据：拉低 DATA_READY → ESP32 下降沿/轮询 → CS 读响应。
  */
 #ifndef SPI_MASTER_H
 #define SPI_MASTER_H
@@ -22,21 +20,16 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "spi_link_v2.h"
+#include "app_config.h"  /* SPI_MASTER_CS_GPIO / SPI_READY_GPIO / SPI_OTA_FRAME_MAX 等 */
 
-// SPI 配置常量
-#define SPI_MASTER_CS_GPIO    (4)           // CS 片选引脚
-#define SPI_CLOCK_HZ          CONFIG_DCU_SPI_CLOCK_HZ  // 默认 4MHz，可在 menuconfig 手动提速
-#define SPI_MODE              (0)           // CPOL=0, CPHA=0
-#define SPI_QUEUE_SIZE        (4)           ///< SPI 事务队列深度
-#define SPI_READY_GPIO       (10)          // 线与 SPIready 握手引脚（开漏，GPIO10<->GD32 PB6）
-#define SPI_READY_TIMEOUT_MS (200)         // 等待 SPIready 上升沿超时（毫秒）
-#define SPI_OTA_FRAME_MAX     (256)          ///< SPI 同步帧最大字节数
+// SPI 时钟来自 menuconfig；其余可调项在 app_config.h
+#define SPI_CLOCK_HZ          CONFIG_DCU_SPI_CLOCK_HZ
 
-// GD32 SPI 同步帧类型
+// GD32 SPI 业务 TYPE（与 SpiDefs / v2 TYPE 字段一致）
 #define SPI_OTA_CMD_REQ       (0x01)
 #define SPI_OTA_CMD_DATA      (0x02)
 #define SPI_APP_ENTER_BOOT_CMD (0xB0)
-#define SPI_APP_ENTER_BOOT_ACK_OK (0xB5)  // GD32 APP 固件须同步修改 ACK 字节为 0xB5
+#define SPI_APP_ENTER_BOOT_ACK_OK (0xB5)
 #define SPI_OTA_RSP_ACK       (0x80)
 #define SPI_OTA_RSP_WAIT      (0x81)
 #define SPI_OTA_RSP_ERROR     (0x82)
@@ -102,6 +95,9 @@ public:
 
     /** @brief 读取本端剩余可接收 credit（SPEC §10.1，/system/status 展示用）。 */
     uint8_t localCredit() const { return m_localCredit; }
+
+    /** @brief SPI worker 任务句柄（栈水位 /system/status 与 health 巡检用）。 */
+    TaskHandle_t getWorkerTaskHandle() const { return m_workerTask; }
 
     /**
      * @brief OTA 中继期间禁止 worker 按铃读。
@@ -215,24 +211,20 @@ private:
     spi_device_handle_t m_spiDevice = NULL;
     SemaphoreHandle_t m_mutex = NULL;
 
-    // ── 线与 SPIready 握手状态机 ──
-    /** 握手状态机枚举。 */
+    // ── 本端事务态（非 PB6 电平门控；PB6 仅 DATA_READY 通知）──
+    /** 本端 SPI 事务状态：仅用于 acceptRing（忙时不接按铃）。 */
     enum class HandshakeState : uint8_t {
-        IDLE = 0,             ///< 空闲，线 HIGH
-        MASTER_SENDING,       ///< ESP32 已下拉 SPIready，正在 CS#1 发送请求
-        WAITING_RESPONSE,     ///< CS#1 完成，等待 GD32 释放 SPIready（上升沿唤醒）
-        SERVING_GD32_RING,    ///< 响应 GD32 按铃，正在读 GD32 请求帧
+        IDLE = 0,             ///< 空闲，可接受 GD32 按铃
+        MASTER_SENDING,       ///< 主机正在 CS 发送
+        WAITING_RESPONSE,     ///< 主机正在 poll/读响应
+        SERVING_GD32_RING,    ///< 正在读 GD32 EVENT
     };
 
     /**
-     * @brief SPI 链路状态机：封装握手状态 + 完成信号逻辑。
+     * @brief 本端事务占用标记（v2）。
      *
-     * 线状态语义（对齐 OTA）：
-     * - 线 HIGH = 空闲（双方释放），可发起新事务
-     * - 线 LOW = 忙碌（某方下拉占用），禁止发起新事务
-     *
-     * ESP32 作为主动方（transact/appPing）：enterBusy() 占用线 → transferClocked → exitBusy() 释放线
-     * ESP32 作为按铃响应方（takeEvent）：同上
+     * DATA_READY（PB6）由 GD32 独占：低=有待读，高=队列空。
+     * 本状态机只表示 ESP32 是否正占用 SPI 总线，避免与按铃读并发。
      */
     class SpiLinkState {
     public:
@@ -279,7 +271,7 @@ private:
     uint8_t m_eventTail = 0;
     uint8_t m_eventCount = 0;
 
-    // ── 作业提交（调用方栈上 Job + StaticSemaphore，worker 执行）──
+    // ── 作业提交（跨任务：堆 Job + binary done；worker 串行执行）──
     enum class JobKind : uint8_t {
         Transact = 0,
         Poll,
@@ -287,7 +279,6 @@ private:
         EnterBoot,
         Ping,
         WaitBoot,
-        ServiceRing,
     };
     struct Job {
         JobKind kind = JobKind::Transact;
@@ -305,12 +296,18 @@ private:
         gd32_version_t *out_version = nullptr;
         esp_err_t result = ESP_FAIL;
         SemaphoreHandle_t done = nullptr;
+        /** submitJob 堆分配的 Job：超时放弃后由 worker 释放，成功路径由提交方释放。 */
+        bool heap_allocated = false;
+        volatile bool finished = false;   ///< worker 已 execute + give
+        volatile bool abandoned = false;  ///< 提交方已超时返回，worker 负责 free
     };
     static constexpr UBaseType_t kJobQueueLen = 6;
 
     bool onWorker() const;
     esp_err_t submitJob(Job &job);
     void executeJob(Job &job);
+    /** @brief worker 完成堆 Job 后的生命周期收尾（give done + 可能 free）。 */
+    void finishHeapJob(Job *job);
     static void workerEntry(void *arg);
     void workerLoop();
     esp_err_t serviceRingOnce();
@@ -348,18 +345,6 @@ private:
         SemaphoreHandle_t m_lock;
     };
 
-    /**
-     * @brief 等 GD32 释放 SPIready（上升沿），中断驱动非忙等。
-     *
-     * 调用前须将 m_linkState 置为 WAITING_RESPONSE（enterBusy），ISR 上升沿检测到该状态
-     * 后发 0x02 通知唤醒本任务。GD32 写 Flash 期间保持 PB6 低，本函数阻塞，
-     * 写完拉高 → 唤醒 → 继续，自然避免 overrun。
-     *
-     * @param timeout_ms 超时(毫秒)，0 表示不等待。
-     * @return ESP_OK 线已高；ESP_ERR_TIMEOUT 超时。
-     */
-    esp_err_t waitSpiReady(uint32_t timeout_ms);
-
     /** @brief GPIO 边沿中断回调（注册到 ESP-IDF GPIO ISR 服务）。 */
     static void IRAM_ATTR onReadyEdgeISR(void *arg);
 
@@ -386,12 +371,12 @@ private:
                                    uint32_t timeout_ms, uint32_t trans_flags);
 
     /**
-     * @brief 变长读：同 CS 先读 16B Header，再按 LEN 读 payload+CRC。
-     * 调用者须已持锁；仅在 DATA_READY 已低（有数据）时调用，禁止盲读。
+     * @brief 读一帧响应：单 CS 固定时钟预算（BOOT=128 / APP=256），再 v2_parse 截真实长度。
+     * 调用者须已持锁。不用两段 KEEP_ACTIVE（Boot 中途断 CS 会清 pending → 全 0xFF）。
      * @param out_frame  完整帧输出（含头+payload+CRC）
      * @param out_max    输出缓冲容量
      * @param out_len    实际帧长
-     * @param timeout_ms 单段 SPI 超时
+     * @param timeout_ms 单次 SPI 超时
      */
     esp_err_t readV2FrameVarlen(uint8_t *out_frame, size_t out_max, size_t *out_len,
                                 uint32_t timeout_ms);
@@ -417,13 +402,6 @@ private:
                                   size_t resp_max, size_t *resp_len, uint32_t timeout_ms,
                                   bool expect_stale = false);
 
-    /** @brief 带重试退避的事务（SPEC §9.2）。
-     *  同序号重试最多 3 次，退避 10/30/90ms；
-     *  3 次失败后 HELLO 重同步，再试 1 次。
-     *  调用者须已持有锁。 */
-    esp_err_t transactWithRetry(uint8_t type, const uint8_t *payload, size_t payload_len,
-                                 uint8_t *resp_type, uint8_t *resp_payload,
-                                 size_t resp_max, size_t *resp_len, uint32_t timeout_ms);
     // OTA 帧工具（静态，无状态）
     static bool otaBuildFrame(uint8_t type, const uint8_t *payload, size_t payload_len,
                               uint8_t *out, size_t *out_len);

@@ -114,6 +114,7 @@ esp_err_t Gd32FlashStore::ensureErasedForWrite(uint32_t offset, size_t len)
         addr += chunk;
         m_erasedUpTo = addr;
         (void)esp_task_wdt_reset();
+        taskYIELD(); /* 长时间兜底擦时让 WiFi/LWIP 有机会跑 */
     }
     return ESP_OK;
 }
@@ -121,6 +122,13 @@ esp_err_t Gd32FlashStore::ensureErasedForWrite(uint32_t offset, size_t len)
 /** @brief 向 gd32_ota 分区写入数据块，自动处理非 4 字节对齐的读写。 */
 esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, size_t len)
 {
+    if (len == 0U) {
+        return ESP_OK;
+    }
+    if (data == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     const esp_partition_t *part = getPartition();
     if (!part) return ESP_ERR_NOT_FOUND;
 
@@ -136,7 +144,7 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
         return ESP_ERR_INVALID_SIZE;
     }
 
-    // 正常路径：prepare 已整分区预擦；此处仅兜底（水位未覆盖时才擦）
+    // 按需擦除目标扇区（与收流交织；prepare 不再整区预擦）
     esp_err_t erase_err = ensureErasedForWrite(aligned_offset, aligned_len);
     if (erase_err != ESP_OK) {
         return erase_err;
@@ -192,8 +200,22 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
 /** @brief 从 gd32_ota 分区读取数据块。 */
 esp_err_t Gd32FlashStore::flashReadChunk(uint32_t offset, uint8_t *data, size_t len)
 {
+    if (len == 0U) {
+        return ESP_OK;
+    }
+    if (data == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     const esp_partition_t *part = getPartition();
     if (!part) return ESP_ERR_NOT_FOUND;
+
+    /* 防坏 meta / 错误 offset 读越界 */
+    if (offset >= part->size || len > (size_t)(part->size - offset)) {
+        DEBUG_ERR("OTA", "flashReadChunk越界: offset=%" PRIu32 " len=%zu part=%" PRIu32,
+                  offset, len, part->size);
+        return ESP_ERR_INVALID_SIZE;
+    }
     return esp_partition_read(part, offset, data, len);
 }
 
@@ -206,7 +228,7 @@ esp_err_t Gd32FlashStore::erasePartition(uint32_t size)
         DEBUG_ERR("OTA", "erasePartition: size=%" PRIu32 " > partition=%" PRIu32, size, part->size);
         return ESP_ERR_INVALID_SIZE;
     }
-    // 按扇区擦除并喂狗，避免大块 erase 长时间占住调用任务
+    // 按扇区擦除并喂狗/yield，避免大块 erase 长时间占住调用任务饿死 WiFi
     uint32_t done = 0;
     while (done < size) {
         uint32_t chunk = kFlashSectorSize;
@@ -215,6 +237,8 @@ esp_err_t Gd32FlashStore::erasePartition(uint32_t size)
         }
         esp_err_t err = esp_partition_erase_range(part, done, chunk);
         if (err != ESP_OK) {
+            DEBUG_ERR("OTA", "erasePartition: erase @%" PRIu32 " len=%" PRIu32 " failed: %s",
+                      done, chunk, esp_err_to_name(err));
             return err;
         }
         done += chunk;
@@ -222,6 +246,7 @@ esp_err_t Gd32FlashStore::erasePartition(uint32_t size)
             m_erasedUpTo = done;
         }
         (void)esp_task_wdt_reset();
+        taskYIELD();
     }
     return ESP_OK;
 }

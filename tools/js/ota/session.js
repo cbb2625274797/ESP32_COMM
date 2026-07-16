@@ -123,14 +123,32 @@ export function otaSessionTransition(newState, reason) {
   } else if (newState === OtaSessionState.UPLOADING) {
     otaFailReason = '';
   }
-  // 同步旧标志（渐进式迁移）：UPLOADING 对应 isUploading=true
-  if (newState === OtaSessionState.UPLOADING) window.isUploading = true;
-  else if (newState === OtaSessionState.IDLE ||
-           newState === OtaSessionState.DONE ||
-           newState === OtaSessionState.FAILED) window.isUploading = false;
+  // isUploading 仅表示 XHR 上传中；VERIFYING/RELAYING/REBOOTING 必须清掉，
+  // 否则 updateUploadButtonLabel 会把「上传并升级」一直 disabled。
+  window.isUploading = (newState === OtaSessionState.UPLOADING);
   // REBOOTING 复用 isEsp32Rebooting（pollStatus 重启检测依赖）
-  if (newState === OtaSessionState.REBOOTING) window.isEsp32Rebooting = true;
-  else if (newState !== OtaSessionState.VERIFYING) window.isEsp32Rebooting = false;
+  // VERIFYING 保持 isEsp32Rebooting=false；FAILED/IDLE/DONE 必须清掉，避免 residual 假「重启中」
+  if (newState === OtaSessionState.REBOOTING) {
+    window.isEsp32Rebooting = true;
+  } else if (newState === OtaSessionState.VERIFYING) {
+    /* 校验阶段不改 reboot 标志 */
+  } else {
+    window.isEsp32Rebooting = false;
+  }
+  if (prev !== newState && typeof addLog === 'function') {
+    addLog('D', 'OTA', '会话 ' + prev + ' → ' + newState +
+      (reason ? ' (' + reason + ')' : ''));
+  }
+  // 终态/离开上传态后刷新按钮（避免卡在 disabled）
+  if (typeof window.updateUploadButtonLabel === 'function' &&
+      (newState === OtaSessionState.IDLE ||
+       newState === OtaSessionState.DONE ||
+       newState === OtaSessionState.FAILED ||
+       newState === OtaSessionState.VERIFYING ||
+       newState === OtaSessionState.RELAYING ||
+       newState === OtaSessionState.REBOOTING)) {
+    window.updateUploadButtonLabel();
+  }
 }
 
 /**

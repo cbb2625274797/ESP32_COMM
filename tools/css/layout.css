@@ -46,6 +46,91 @@
   align-items: start;
 }
 
+/* === 右侧滑出抽屉：堆与任务栈 ===
+ * 总宽 = peek 把手 + 面板；默认 translateX(面板宽) 只露把手，hover 整板探出 */
+.sys-drawer {
+  --sys-drawer-panel-w: min(380px, calc(100vw - 48px));
+  --sys-drawer-peek: 36px;
+  position: fixed;
+  top: 72px;
+  right: 0;
+  z-index: 80;
+  width: calc(var(--sys-drawer-panel-w) + var(--sys-drawer-peek));
+  height: calc(100vh - 88px);
+  max-height: calc(100vh - 88px);
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  transform: translateX(var(--sys-drawer-panel-w));
+  transition: transform .28s cubic-bezier(.22, 1, .36, 1);
+  filter: drop-shadow(-6px 0 18px rgba(0, 0, 0, .35));
+}
+.sys-drawer:hover,
+.sys-drawer:focus-within {
+  transform: translateX(0);
+}
+/* 平时露出的竖条把手 */
+.sys-drawer-rail {
+  flex: 0 0 var(--sys-drawer-peek);
+  width: var(--sys-drawer-peek);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 4px;
+  background: linear-gradient(180deg, #1a2a3a 0%, var(--bg-card) 100%);
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: var(--radius) 0 0 var(--radius);
+  cursor: default;
+}
+.sys-drawer-rail-ico {
+  font-size: 16px;
+  line-height: 1;
+}
+.sys-drawer-rail-text {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .12em;
+  color: var(--text-dim);
+  text-transform: none;
+}
+.sys-drawer:hover .sys-drawer-rail-text,
+.sys-drawer:focus-within .sys-drawer-rail-text {
+  color: var(--accent);
+}
+.sys-drawer-panel {
+  flex: 1 1 var(--sys-drawer-panel-w);
+  width: var(--sys-drawer-panel-w);
+  min-width: 0;
+  height: 100%;
+  margin: 0 !important;
+  display: flex;
+  flex-direction: column;
+  border-radius: 0;
+  overflow: hidden;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: none;
+  border-right: none;
+}
+.sys-drawer-head {
+  cursor: default;
+  flex-shrink: 0;
+}
+.sys-drawer-head .card-head-btn {
+  margin-left: auto;
+}
+.sys-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 /* === CARDS === */
 .card {
   background: var(--bg-card);

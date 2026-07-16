@@ -70,4 +70,12 @@ private:
     configRUN_TIME_COUNTER_TYPE m_lastTotal = 0;
     int64_t m_lastTimeUs = 0;
     bool m_hasLast = false;
+
+    /** uxTaskGetSystemState 目标缓冲（固定、免每拍 calloc） */
+    TaskStatus_t m_taskStatusBuf[CPU_TASK_SNAPSHOT_MAX] = {};
+
+    /** 任务数截断 WARN 节流（tick） */
+    TickType_t m_lastTruncWarnTick = 0;
+    /** 运行时计数回绕 WARN 节流（tick） */
+    TickType_t m_lastWrapWarnTick = 0;
 };

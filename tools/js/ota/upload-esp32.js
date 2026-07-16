@@ -242,21 +242,10 @@ export async function startUpload(chip) {
     });
     // 1MB+ 固件：服务端写 Flash 可能较久；禁止无限挂起无反馈
     xhr.timeout = 300000;
-    xhr.addEventListener('timeout', function () {
-      stopUploadWaitHeartbeat();
-      if (window.activeXhr) {
-        cleanupAfterOtaFailure('上传超时（设备未在 5 分钟内响应）');
-        showToast('上传超时：设备可能忙或连接被踢，请重试', 'error');
-      }
-    });
     xhr.addEventListener('load', function () {
       stopUploadWaitHeartbeat();
-      window.isUploading = false;
-      window.activeXhr = null;
-      window.resumePollingAfterUpload();
-      uploadBtn.disabled = false;
-      uploadBtn.textContent = window.uploadBtnOrigText;
-      window.updateUploadButtonLabel();
+      /* 成功路径摘掉 activeXhr；失败路径留给 cleanupAfterOtaFailure 统一摘掉并 abort 幂等 */
+      if (window.activeXhr === xhr) window.activeXhr = null;
       if (xhr.status === 200) {
         /* 校验 body：避免空响应/网关误 200 被当成上传成功 */
         var bodyTxt = (xhr.responseText || '').trim();
@@ -273,6 +262,11 @@ export async function startUpload(chip) {
           cleanupAfterOtaFailure('响应异常');
           return;
         }
+        /* 成功：恢复轮询/按钮（会话仍 VERIFYING/RELAYING，isUploading 由 transition 清） */
+        window.resumePollingAfterUpload();
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = window.uploadBtnOrigText;
+        window.updateUploadButtonLabel();
         // 成功路径只打一条「上传完成」日志，避免 [上传]+[OTA] 语义重复
         if (chip === 'esp32') {
           addLog('I', 'OTA', '上传完成，开始 SHA-256 校验…');
@@ -308,16 +302,25 @@ export async function startUpload(chip) {
     });
     xhr.addEventListener('error', function () {
       stopUploadWaitHeartbeat();
-      if (window.activeXhr) {
-        cleanupAfterOtaFailure('网络错误');
+      // cleanup 会先摘 activeXhr 再 abort；仅当本 xhr 仍是活动请求或会话仍在 UPLOADING 时清理
+      if (window.activeXhr === xhr || window.otaSessionState === OtaSessionState.UPLOADING) {
         showToast('上传过程发生网络错误', 'error');
+        cleanupAfterOtaFailure('网络错误');
       }
     });
     xhr.addEventListener('abort', function () {
       stopUploadWaitHeartbeat();
-      if (window.activeXhr) {
-        cleanupAfterOtaFailure('已中止');
+      // clearOtaSessionResiduals 先置 activeXhr=null 再 abort → 此处勿二次 cleanup
+      if (window.activeXhr === xhr) {
         showToast('上传已中止', 'error');
+        cleanupAfterOtaFailure('已中止');
+      }
+    });
+    xhr.addEventListener('timeout', function () {
+      stopUploadWaitHeartbeat();
+      if (window.activeXhr === xhr || window.otaSessionState === OtaSessionState.UPLOADING) {
+        showToast('上传超时：设备可能忙或连接被踢，请重试', 'error');
+        cleanupAfterOtaFailure('上传超时（设备未在 5 分钟内响应）');
       }
     });
     xhr.open('POST', url);
@@ -331,6 +334,126 @@ export async function startUpload(chip) {
 
 // ==================== ESP32 OTA 完成升级 ====================
 // 一次调用完成：校验 SHA-256 → 设置启动分区 → 自动重启（无需确认按钮）
+//
+// 竞态说明（易误报“应用失败”）：
+//   1) finalize 成功 → 回 JSON ok → 100ms 后 esp_restart
+//   2) 响应丢失 / 浏览器只收到半截 / 请求迟到打到已重启的新固件
+//      → 正文可能是明文或 JSON 的 "OTA not started"
+//   3) 此时 /system/status 已是 IDLE，uptime 往往很小
+// 旧逻辑：resp.json() 抛错 → 探测到 IDLE → cleanupAfterOtaFailure
+// 正确：上传已成功的 VERIFYING 会话里，优先按「已应用并重启」推进 REBOOTING。
+
+/** @description 进入 ESP32 重启等待（校验成功或推断已应用）。 */
+function enterEsp32RebootingUi(reason, opts) {
+  opts = opts || {};
+  var resultEl = document.getElementById('sviResult');
+  if (resultEl && !opts.keepResult) {
+    resultEl.textContent = opts.resultText || '已应用，等待重启';
+    resultEl.className = 'svi-val ok';
+  }
+  addLog('I', 'OTA', reason || '设备重启中…');
+  showToast(opts.toast || '设备重启中…', 'success');
+  updateEsp32StagesFromPhase(4);
+  updateEsp32StagesFromPhase(5);
+  window.rebootObservedDown = !!opts.observedDown;
+  window.rebootStartTime = Date.now();
+  otaSessionTransition(OtaSessionState.REBOOTING);
+}
+
+/**
+ * /ota/update 结果不明确时探测设备真实状态。
+ * @param {string} detail 原始错误摘要
+ * @param {{notStarted?: boolean}} flags
+ */
+async function resolveEsp32VerifyAmbiguous(detail, flags) {
+  flags = flags || {};
+  addLog('W', 'OTA', '应用结果不明确: ' + (detail || 'unknown') + '，探测设备状态…');
+
+  var sawOffline = false;
+  var delays = [0, 800, 1500, 2500, 4000];
+  for (var i = 0; i < delays.length; i++) {
+    if (delays[i] > 0) {
+      await new Promise(function (r) { setTimeout(r, delays[i]); });
+    }
+    try {
+      var probe = await fetch(window.getBaseUrl() + '/system/status', {
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!probe.ok) {
+        sawOffline = true;
+        continue;
+      }
+      var st = await probe.json();
+      var o = st.ota || {};
+      var ssc = Number.isFinite(o.sys_state_code) ? o.sys_state_code : -1;
+      var uptime = Number(st.uptime_sec);
+      if (!Number.isFinite(uptime)) uptime = -1;
+
+      // 7=REBOOTING
+      if (ssc === 7) {
+        enterEsp32RebootingUi('探测到设备 REBOOTING，按重启中处理', {
+          toast: '设备正在重启…',
+          observedDown: false
+        });
+        return;
+      }
+      // 5=RECEIVING / 6=FINALIZING：仍在收尾，再等几轮
+      if (ssc === 5 || ssc === 6) {
+        addLog('I', 'OTA', '设备仍在 ESP32 OTA (sys=' + ssc + ')，继续等待…');
+        continue;
+      }
+      // IDLE/其它：上传本会话已成功过；短 uptime 或曾离线 → 几乎一定是已 finalize 并重启
+      // 「OTA not started」在 VERIFYING 上下文下同理（新固件无会话）。
+      var freshBoot = uptime >= 0 && uptime < 120;
+      if (flags.notStarted || freshBoot || sawOffline) {
+        enterEsp32RebootingUi(
+          flags.notStarted
+            ? ('设备回报 OTA not started（uptime=' + uptime +
+               's）— 上传已完成，按已应用并重启处理')
+            : ('探测到设备已在线 (sys=' + ssc + ', uptime=' + uptime +
+               's) — 按已应用并重启处理'),
+          {
+            toast: '固件可能已应用，等待启动完成…',
+            observedDown: sawOffline,
+            resultText: '已应用（响应未完整返回，按重启完成确认）'
+          }
+        );
+        return;
+      }
+      // 长 uptime + IDLE 且非 notStarted：更像请求失败、设备从未进入 finalize
+      addLog('E', 'OTA', '应用请求失败且设备非重启态 (sys=' + ssc +
+        ', uptime=' + uptime + 's): ' + (detail || ''));
+      var resultElFail = document.getElementById('sviResult');
+      if (resultElFail) {
+        resultElFail.textContent = '✗ 请求失败: ' + (detail || 'unknown');
+        resultElFail.className = 'svi-val err';
+      }
+      showToast('应用请求失败: ' + (detail || 'unknown'), 'error');
+      cleanupAfterOtaFailure('应用请求失败');
+      return;
+    } catch (_probeErr) {
+      sawOffline = true;
+    }
+  }
+
+  // 多轮无响应，或一直停在 FINALIZING
+  if (sawOffline) {
+    enterEsp32RebootingUi('设备无响应，按重启中观察（可能 TCP 被 esp_restart 掐断）', {
+      toast: '设备无响应，等待重启恢复…',
+      observedDown: true,
+      resultText: '等待设备重启…'
+    });
+    return;
+  }
+  addLog('E', 'OTA', '应用阶段设备长时间仍忙或状态不明: ' + (detail || ''));
+  var resultElBusy = document.getElementById('sviResult');
+  if (resultElBusy) {
+    resultElBusy.textContent = '✗ 请求中断，设备仍忙';
+    resultElBusy.className = 'svi-val err';
+  }
+  cleanupAfterOtaFailure('应用请求中断（设备仍忙）');
+}
+
 /** @description 验证 ESP32 固件 SHA-256 是否与设备端计算值一致。 */
 export async function verifyEsp32Firmware() {
   updateEsp32StagesFromPhase(3);  // 校验中
@@ -356,9 +479,29 @@ export async function verifyEsp32Firmware() {
       signal: AbortSignal.timeout(120000)
     });
 
-    var data = await resp.json();
+    // 禁止裸 resp.json()：失败体可能是 httpd 明文或半截响应
+    var bodyTxt = '';
+    try {
+      bodyTxt = await resp.text();
+    } catch (te) {
+      await resolveEsp32VerifyAmbiguous('读取响应失败: ' + te.message, {});
+      return;
+    }
+    var data = null;
+    if (bodyTxt && bodyTxt.trim()) {
+      try {
+        data = JSON.parse(bodyTxt);
+      } catch (_pe) {
+        data = null;
+      }
+    }
 
-    if (data.status === 'ok') {
+    var notStarted =
+      (data && (data.code === 'ota_not_started' ||
+        /OTA not started/i.test(String(data.message || '')))) ||
+      /OTA not started/i.test(bodyTxt || '');
+
+    if (resp.ok && data && data.status === 'ok') {
       addLog('I', 'OTA', '设备端 SHA-256: ' + (data.sha256 || '-'));
       if (data.sha256) {
         var deviceSha = document.getElementById('sviDeviceSha');
@@ -374,32 +517,49 @@ export async function verifyEsp32Firmware() {
           resultEl.className = 'svi-val ok';
         }
       }
-      // 服务器已设置启动分区并自动重启，前端直接进入重启等待状态
-      addLog('I', 'OTA', 'SHA-256 校验通过，设备自动重启中...');
-      showToast('校验通过，设备重启中...', 'success');
-      updateEsp32StagesFromPhase(4);  // 应用固件
-      window.rebootObservedDown = false;    // 重置：尚未观察到设备实际下线
-      updateEsp32StagesFromPhase(5);  // 重启中
-      window.rebootStartTime = Date.now();
-      // ★ 状态机：校验通过 → 进入 REBOOTING（内部同步 isEsp32Rebooting = true）
-      otaSessionTransition(OtaSessionState.REBOOTING);
-    } else {
-      var detail = data.message || (data.device ? '不匹配' : '未知错误');
+      enterEsp32RebootingUi('SHA-256 校验通过，设备自动重启中...', {
+        toast: '校验通过，设备重启中...',
+        keepResult: true,
+        observedDown: false
+      });
+      return;
+    }
+
+    // SHA 明确不匹配
+    if (data && (data.status === 'error' || !resp.ok) &&
+        /mismatch|不匹配/i.test(String(data.message || bodyTxt || ''))) {
+      var detail = data.message || 'SHA-256 不匹配';
       addLog('E', 'OTA', '校验失败: ' + detail);
       showToast('校验失败: ' + detail, 'error');
-      var resultEl = document.getElementById('sviResult');
-      if (resultEl) { resultEl.textContent = '✗ ' + detail; resultEl.className = 'svi-val err'; }
+      if (data.device) {
+        var dSha = document.getElementById('sviDeviceSha');
+        if (dSha) dSha.textContent = data.device;
+      }
+      var resultElMm = document.getElementById('sviResult');
+      if (resultElMm) {
+        resultElMm.textContent = '✗ ' + detail;
+        resultElMm.className = 'svi-val err';
+      }
       cleanupAfterOtaFailure('校验失败');
+      return;
     }
+
+    // 迟到请求打到已重启固件 / 非 JSON 响应：勿当硬失败
+    if (notStarted) {
+      await resolveEsp32VerifyAmbiguous(
+        bodyTxt.slice(0, 120) || 'OTA not started',
+        { notStarted: true }
+      );
+      return;
+    }
+
+    var failDetail = (data && data.message) ||
+      formatHttpErrorDetail(bodyTxt) ||
+      ('HTTP ' + resp.status);
+    await resolveEsp32VerifyAmbiguous(failDetail, {});
   } catch (e) {
-    // fetch 异常仅代表请求未完成，不能推断设备已重启：
-    // 设备可能仍在 finalize（SHA 计算耗时）、可能已崩溃、可能网络抖动。
-    // 如实报告失败，由 pollStatus 探测设备真实状态。
-    addLog('E', 'OTA', '应用请求失败: ' + e.message + '（设备状态未知，等待轮询探测）');
-    showToast('应用请求失败: ' + e.message, 'error');
-    var resultEl = document.getElementById('sviResult');
-    if (resultEl) { resultEl.textContent = '✗ 请求失败: ' + e.message; resultEl.className = 'svi-val err'; }
-    cleanupAfterOtaFailure('应用请求失败');
+    // fetch 异常 ≠ 一定失败：finalize 成功后 esp_restart 会掐断 TCP
+    await resolveEsp32VerifyAmbiguous(e && e.message ? e.message : String(e), {});
   }
 }
 

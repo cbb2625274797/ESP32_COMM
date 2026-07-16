@@ -207,6 +207,14 @@ public:
      */
     static QueueHandle_t getResultQueue();
 
+    /**
+     * @brief 探测 GD32 APP 存活并缓存版本（公开，供 OtaCoordinator / 启动探测共用）。
+     * @param timeout_ms appPing 超时（毫秒）。
+     * @param out_uptime 可选，输出 GD32 uptime（秒）。
+     * @return true 探测成功，false 失败。
+     */
+    static bool probeAndCacheAppAlive(uint32_t timeout_ms, uint32_t *out_uptime = nullptr);
+
     // ── 线程安全锁 ──
     static void initMutex();                  ///< 初始化状态互斥锁（taskEntry 首行调用）
     static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(50); ///< 锁获取超时时间
@@ -320,26 +328,39 @@ private:
     /**
      * @brief 准备单包：读 Flash + 组装 tx_buf + 加密 + CRC（doRelayPackets 子步骤）。
      * @param seq 当前包序号。
+     * @param flash_offset 本包在 gd32_ota 分区中的起始偏移（不依赖 m_transferFlashOffset，便于预组下一包）。
      * @param meta 固件元数据（用于计算末包 chunk_size）。
      * @param tx_buf 输出缓冲区（64 字节）。
-     * @param out_chunk_size 输出本包有效字节数（用于 sendRelayPacketWithRetry 推进 offset）。
+     * @param out_chunk_size 输出本包有效字节数。
      * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_STORAGE 读 Flash 失败，OTA_RESULT_ERR_AUTH 加密失败。
      */
-    ota_result_t prepareRelayPacket(uint32_t seq, const ota_meta_t &meta, uint8_t tx_buf[64], size_t *out_chunk_size);
+    ota_result_t prepareRelayPacket(uint32_t seq, uint32_t flash_offset, const ota_meta_t &meta,
+                                    uint8_t tx_buf[64], size_t *out_chunk_size);
+
+    /** 等 ACK 期间可选预组下一包（与 GD32 处理重叠，隐藏本端 Flash/AES 延迟）。 */
+    struct NextPacketPrep {
+        uint32_t next_seq = 0;
+        uint32_t next_flash_offset = 0;
+        const ota_meta_t *meta = nullptr;
+        uint8_t *buf = nullptr;       ///< 64 字节
+        size_t *chunk_size = nullptr;
+        bool *ready = nullptr;
+    };
+
     /**
      * @brief 发送单包并等待 ACK（doRelayPackets 子步骤）。
      *
-     * 内含重试循环，使用以下命名常量：
-     *   kMaxResendOnNack=10（ACK 失败/轮询耗尽重发上限）
-     *   kMaxResendOnStructError=3（结构化错误重发上限）
+     * 见 WAIT 后只 poll 不重发 DATA。可选 next_prep：在等 ACK 的 poll 间隙预组下一包。
      *
      * @param seq 当前包序号。
      * @param tx_buf 已组装好的 64 字节发送缓冲区。
      * @param chunk_size 本包有效字节数（成功时用于推进 m_transferFlashOffset）。
      * @param[out] out_result 失败时写入错误码（OK 时不修改）。
+     * @param next_prep 可选；非空则在 poll 循环内至多预组一次下一包。
      * @return true 应中止外层循环（result 已设）；false 继续下一包。
      */
-    bool sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], size_t chunk_size, ota_result_t *out_result);
+    bool sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], size_t chunk_size,
+                                  ota_result_t *out_result, NextPacketPrep *next_prep = nullptr);
     /**
      * @brief 发送结束指令并验证 APP 存活（顺序调用 doSendFinishOta + doWaitForAppAlive）.
      * @return OTA_RESULT_OK 成功，负值表示错误。
@@ -361,20 +382,11 @@ private:
     uint32_t m_transferTotalPackets = 0;
     uint32_t m_transferCurrentSeq = 0;
     uint32_t m_transferFlashOffset = 0;
-    uint32_t m_transferRetryCount = 0;
     TickType_t m_transferDeadline = 0;
 
     // ── 加密/工具方法（不变）──
     static int aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, uint8_t *out);
     static void logRespPayload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len);
-    /**
-     * @brief 探测 GD32 APP 存活并缓存版本（统一 OtaRelay 内部探测逻辑）.
-     *        成功打印版本号，失败打印 warning。
-     * @param timeout_ms appPing 超时（毫秒）。
-     * @param out_uptime 可选，输出 GD32 uptime（秒）。
-     * @return true 探测成功，false 失败。
-     */
-    static bool probeAndCacheAppAlive(uint32_t timeout_ms, uint32_t *out_uptime = nullptr);
     esp_err_t waitUntilNotWait(const char *stage, uint8_t *resp_type,
                                uint8_t *resp_payload, size_t resp_max,
                                size_t *resp_len, uint32_t timeout_ms,

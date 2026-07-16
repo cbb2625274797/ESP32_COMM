@@ -218,24 +218,30 @@ ESP32_COMM/
 
 ## 通信协议
 
-### SPI OTA 帧格式（底层传输）
+### SPI Link v2 帧格式（底层传输，唯一现行）
 
-`esp32_ota_core.cpp` 中的 `otaBuildFrame` / `otaParseFrame`：
+真相源：`spi_link/spi_link_v2.h` · ESP32 `SpiMaster::otaBuildFrame` / `otaFindFrame`：
 
 ```
-| SOF(0xA5, 1B) | TYPE(1B) | LEN(2B LE) | PAYLOAD(LEN) | CRC8(1B) |
+| SOF0 0xA5 | SOF1 0x5A | VER 0x02 | FLAGS | SESSION 4B LE | TX_SEQ | ACK_SEQ | CREDIT | TYPE | LEN 2B LE | RSV 2B | PAYLOAD | CRC32 4B LE |
 ```
+
+- 开销 `V2_OVERHEAD=20`（Header 16 + CRC32 4，MPEG-2 无反射）
+- APP 缓冲 256 → 最大 payload **236**；BOOT 缓冲 128 → 最大 payload **108**
+- ESP32 读预算：`spiRespReadBudget()` 按 HELLO role → APP=256 / BOOT=128
+- **无 v1 CRC8 路径**
 
 | TYPE | 名称 | 用途 |
 |------|------|------|
+| 0x00 | LINK_HELLO | 建链 / HELLO_ACK |
 | 0x01 | OTA_CMD_REQ | OTA 请求帧 |
 | 0x02 | OTA_CMD_DATA | OTA 数据帧 |
 | 0x03 | OTA_CMD_CANCEL | 取消 OTA |
-| 0xB0 | APP_ENTER_BOOT_CMD | 通知 GD32 APP 进入 Bootloader |
-| 0xB5 | APP_ENTER_BOOT_ACK_OK | GD32 APP 确认进入 Bootloader |
-| 0x80 | RSP_ACK | 响应：数据就绪 |
+| 0xB0 | ENTER_BOOT | 通知 GD32 APP 进入 Bootloader（应答 TYPE 亦 0xB0，payload 0xB5） |
+| 0x80 | RSP_ACK | 响应：成功 |
 | 0x81 | RSP_WAIT | 响应：GD32 忙，请等待 |
 | 0x82 | RSP_ERROR | 响应：错误 |
+| 0xC0~C3 | CAN 业务 | 发送 / 反馈 / 模式 / ID 快照 |
 
 ### CANFD 3 通道 SPI 协议
 

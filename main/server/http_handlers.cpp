@@ -53,6 +53,36 @@ static void bytesToHexUpper(const uint8_t *in, size_t n, char *out)
     out[n * 2] = '\0';
 }
 
+/**
+ * @brief 统一 JSON 错误响应（避免前端 resp.json() 被 httpd 明文坑）。
+ * @param http_status 如 "400 Bad Request" / "403 Forbidden" / "500 Internal Server Error"
+ * @param code        机器可读错误码（snake_case）
+ * @param message     人类可读说明（勿含未转义双引号）
+ */
+static esp_err_t http_send_json_error(httpd_req_t *req, const char *http_status,
+                                      const char *code, const char *message)
+{
+    char body[320];
+    snprintf(body, sizeof(body),
+             "{\"status\":\"error\",\"code\":\"%s\",\"message\":\"%s\"}",
+             code ? code : "error",
+             message ? message : "error");
+    httpd_resp_set_status(req, http_status ? http_status : "500 Internal Server Error");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+}
+
+/** @brief OTA 收流：堆紧时让 LWIP 回收，再 httpd_req_recv。 */
+static void otaUploadPaceIfHeapTight(void)
+{
+    const uint32_t free_pre = esp_get_free_heap_size();
+    if (free_pre < 8192U) {
+        (void)esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(free_pre < 4096U ? 5U : 1U));
+    }
+}
+
 void http_set_cors_headers(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -74,8 +104,9 @@ esp_err_t esp32_ota_update_handler(httpd_req_t *req)
     http_set_cors_headers(req);
     Esp32OtaCore &core = Esp32OtaCore::instance();
     if (!core.isActive()) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "OTA not started");
-        return ESP_FAIL;
+        /* 常见场景：finalize 已成功并重启 → 新固件无 OTA 会话 → 迟到的 /ota/update。 */
+        return http_send_json_error(req, "400 Bad Request",
+                                    "ota_not_started", "OTA not started");
     }
 
     char frontend_sha_hex[65] = {0};
@@ -114,8 +145,8 @@ esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         esp_err_t sha_err = core.computeDeviceSha(device_sha_hex);
         if (sha_err != ESP_OK) {
             DEBUG_ERR("OTA", "verify-only: SHA 计算失败: %s", esp_err_to_name(sha_err));
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(sha_err));
-            return ESP_FAIL;
+            return http_send_json_error(req, "500 Internal Server Error",
+                                        "sha_compute_failed", esp_err_to_name(sha_err));
         }
         char ok_resp[256] = {0};
         snprintf(ok_resp, sizeof(ok_resp),
@@ -153,7 +184,8 @@ esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, err_resp, strlen(err_resp));
     } else {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(fr.err));
+        return http_send_json_error(req, "500 Internal Server Error",
+                                    "finalize_failed", esp_err_to_name(fr.err));
     }
     return ESP_FAIL;
 }
@@ -214,8 +246,8 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     char peek;
     int peek_ret = httpd_req_recv(req, &peek, 1);
     if (peek_ret <= 0) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "接收失败");
-        return ESP_FAIL;
+        return http_send_json_error(req, "500 Internal Server Error",
+                                    "recv_failed", "receive failed");
     }
 
     bool is_esp32_ota = false;
@@ -257,8 +289,8 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
 
     if (is_esp32_ota) {
         if (total_size == 0) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing total_size");
-            return ESP_FAIL;
+            return http_send_json_error(req, "400 Bad Request",
+                                        "missing_total_size", "missing total_size");
         }
 
         /* ESP32 路径不再需要 pre_read（JSON 已消费，固件从流继续读） */
@@ -267,11 +299,11 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         esp_err_t err = OtaCoordinator::instance().beginEsp32OtaWithRetry(total_size, OTA_CHANNEL_WIFI);
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
-                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "ESP32 OTA occupied by another channel");
-            } else {
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+                return http_send_json_error(req, "403 Forbidden",
+                    "ota_occupied", "ESP32 OTA occupied by another channel");
             }
-            return ESP_FAIL;
+            return http_send_json_error(req, "500 Internal Server Error",
+                                        "ota_begin_failed", "OTA begin failed");
         }
 
         Esp32OtaCore &core = Esp32OtaCore::instance();
@@ -290,9 +322,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                        ? (req->content_len - json_header_len) : 0);
 
         /* 浏览器 upload 进度到 100% 只表示 TCP 发完；设备仍在 recv+Flash。
-         * Flash 扇区擦除期间 cache 暂停，必须让 WiFi/LWIP 有机会跑，否则 TCP 卡死。
-         * C3 上 WiFi+BLE 双栈堆极紧：free 过低时 pbuf 申请失败 → 半路卡住/超时。
-         * 因此 pacing 按 free heap 自适应，而不是固定每 N 块 delay。 */
+         * sequential 擦写期间仍需让 LWIP 有机会跑；堆紧时 pacing。 */
         const int64_t t_recv0 = esp_timer_get_time();
         uint32_t write_chunks = 0U;
 
@@ -302,14 +332,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                 to_read = OTA_BLOCK_SIZE;
             }
 
-            /* 堆过紧时先让 LWIP 回收 TCP 窗口，再 recv，避免 pbuf 分配失败 */
-            {
-                const uint32_t free_pre = esp_get_free_heap_size();
-                if (free_pre < 8192U) {
-                    (void)esp_task_wdt_reset();
-                    vTaskDelay(pdMS_TO_TICKS(free_pre < 4096U ? 5U : 1));
-                }
-            }
+            otaUploadPaceIfHeapTight();
 
             int ret = httpd_req_recv(req, (char *)fw_buf, to_read);
             if (ret <= 0) {
@@ -317,8 +340,8 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                           ret, (unsigned)total_received, req->content_len,
                           (unsigned long)esp_get_free_heap_size());
                 OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTP recv failed");
-                return ESP_FAIL;
+                return http_send_json_error(req, "500 Internal Server Error",
+                                            "http_recv_failed", "HTTP recv failed");
             }
 
             err = core.write(fw_buf, (size_t)ret);
@@ -327,8 +350,8 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                           esp_err_to_name(err), (unsigned)total_firmware_written,
                           (unsigned long)esp_get_free_heap_size());
                 OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
-                return ESP_FAIL;
+                return http_send_json_error(req, "500 Internal Server Error",
+                                            "ota_write_failed", "OTA write failed");
             }
 
             total_firmware_written += (size_t)ret;
@@ -389,18 +412,16 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     if (prep_err == ESP_ERR_INVALID_SIZE) {
         DEBUG_ERR("WIFI", "firmware size invalid: valid=%u max=%u",
                   (unsigned)gd32_valid_size, (unsigned)OTA_MAX_FIRMWARE_SIZE);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "firmware too large or alignment overflow");
-        return ESP_FAIL;
+        return http_send_json_error(req, "500 Internal Server Error",
+            "firmware_too_large", "firmware too large or alignment overflow");
     } else if (prep_err == ESP_ERR_INVALID_STATE) {
         DEBUG_ERR("WIFI", "GD32 OTA 协调器拒绝存储（系统忙）");
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "system busy with another OTA operation");
-        return ESP_FAIL;
+        return http_send_json_error(req, "403 Forbidden",
+            "system_busy", "system busy with another OTA operation");
     } else if (prep_err != ESP_OK) {
         DEBUG_ERR("WIFI", "GD32 OTA 准备失败: %s", esp_err_to_name(prep_err));
-        char err_msg[96];
-        snprintf(err_msg, sizeof(err_msg), "prepare gd32_ota failed: %s", esp_err_to_name(prep_err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, err_msg);
-        return ESP_FAIL;
+        return http_send_json_error(req, "500 Internal Server Error",
+            "prepare_failed", esp_err_to_name(prep_err));
     }
 
     // ★ 捕获当前 epoch，用于失败清理时检查会话是否仍属于本 handler
@@ -426,10 +447,9 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
             if (err != ESP_OK) {
                 DEBUG_ERR("WIFI", "GD32 first chunk write failed: len=%d err=%s",
                           first_chunk_len, esp_err_to_name(err));
-                // ★ 首块写入失败：用 abortCurrentIfEpoch 避免误中止新会话
                 OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
-                return ESP_FAIL;
+                return http_send_json_error(req, "500 Internal Server Error",
+                                            "gd32_write_failed", "write gd32_ota failed");
             }
             received = first_chunk_len;
             gd32_offset += (uint32_t)first_chunk_len;
@@ -443,24 +463,24 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         size_t to_read = req->content_len - received;
         if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
 
+        otaUploadPaceIfHeapTight();
+
         int ret = httpd_req_recv(req, (char *)buf, to_read);
         if (ret <= 0) {
             DEBUG_ERR("WIFI", "GD32 upload interrupted: received=%d expected=%d",
                       received, req->content_len);
-            // ★ 客户端断开（刷新网页/关浏览器/网络掉）：用 abortCurrentIfEpoch 避免误中止新会话
             OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "upload interrupted");
-            return ESP_FAIL;
+            return http_send_json_error(req, "500 Internal Server Error",
+                                        "upload_interrupted", "upload interrupted");
         }
 
         esp_err_t err = OtaCoordinator::instance().writeGd32Chunk(gd32_offset, buf, (size_t)ret);
         if (err != ESP_OK) {
             DEBUG_ERR("WIFI", "GD32 write failed: offset=%u len=%d err=%s",
                       (unsigned)gd32_offset, ret, esp_err_to_name(err));
-            // ★ 写入失败：同上，用 abortCurrentIfEpoch
             OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write gd32_ota failed");
-            return ESP_FAIL;
+            return http_send_json_error(req, "500 Internal Server Error",
+                                        "gd32_write_failed", "write gd32_ota failed");
         }
 
         received += ret;
@@ -481,7 +501,13 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         // 与 BLE 共用 finishGd32StorageAfterReceive：complete + SHA
         esp_err_t sha_err = OtaCoordinator::instance().finishGd32StorageAfterReceive();
         if (sha_err != ESP_OK) {
-            DEBUG_ERR("WIFI", "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
+            /* 存盘已完成，仍回 status=ok；relay 阶段会再比前端 SHA。
+             * 此处必须醒目告警，避免只当 INFO 被忽略。 */
+            DEBUG_WARN("WIFI",
+                       "GD32 上传完成但 SHA-256 预计算失败: %s（仍返回 stored ok，/ota/relay 将再校验）",
+                       esp_err_to_name(sha_err));
+            DEBUG_ERR("WIFI", "GD32 finishGd32StorageAfterReceive failed: %s",
+                      esp_err_to_name(sha_err));
         }
     }
 
@@ -512,8 +538,8 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     ota_meta_t meta;
     memset(&meta, 0, sizeof(meta));
     if (OtaCoordinator::instance().loadGd32Meta(&meta) != ESP_OK || meta.total_size == 0 || meta.stored_size < meta.total_size) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "firmware not fully stored");
-        return ESP_FAIL;
+        return http_send_json_error(req, "400 Bad Request",
+                                    "firmware_not_stored", "firmware not fully stored");
     }
 
     char frontend_sha_hex[65] = {0};
@@ -535,9 +561,8 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         }
     }
     if (frontend_sha_hex[0] == '\0') {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-            "missing sha256 in body (frontend SHA-256 required)");
-        return ESP_FAIL;
+        return http_send_json_error(req, "400 Bad Request",
+            "missing_sha256", "missing sha256 in body (frontend SHA-256 required)");
     }
 
     uint8_t frontend_sha[32] = {0};
@@ -562,15 +587,15 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         httpd_resp_send(req, err_resp, strlen(err_resp));
         return ESP_FAIL;
     } else if (verify_err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SHA compute failed");
-        return ESP_FAIL;
+        return http_send_json_error(req, "500 Internal Server Error",
+                                    "sha_compute_failed", "SHA compute failed");
     }
 
     esp_err_t trigger_err = OtaCoordinator::instance().triggerGd32Relay();
     if (trigger_err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+        return http_send_json_error(req, "400 Bad Request",
+            "relay_trigger_failed",
             "relay trigger failed - system busy or firmware not ready");
-        return ESP_FAIL;
     }
 
     char resp[256];
@@ -807,6 +832,140 @@ esp_err_t can_send_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * @brief POST /can/send_batch — 同通道连续发送多帧，单次 HTTP 完成。
+ *
+ * JSON: { "ch": 0, "frames": [ { "id": n, "dlc": n, "data": "HEX" }, ... ] }
+ * 返回: { "status":"ok", "results":[ { "status":"ok"|"error", ... }, ... ] }
+ * 帧间无人为延时；单帧 SPI 超时 400ms（批量优先吞吐）。
+ */
+esp_err_t can_send_batch_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    constexpr int kMaxBody = 12288;
+    constexpr int kMaxFrames = 48;
+    constexpr uint32_t kPerFrameTimeoutMs = 400U;
+
+    int content_len = req->content_len;
+    if (content_len <= 0 || content_len > kMaxBody) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body 长度无效或过大");
+        return ESP_FAIL;
+    }
+
+    char *buf = static_cast<char *>(malloc(static_cast<size_t>(content_len) + 1U));
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存不足");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < content_len) {
+        int ret = httpd_req_recv(req, buf + received, content_len - received);
+        if (ret <= 0) {
+            free(buf);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "接收数据失败");
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    buf[received] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON 解析失败");
+        return ESP_FAIL;
+    }
+
+    cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
+    cJSON *frames = cJSON_GetObjectItem(root, "frames");
+    if (!ch_item || !cJSON_IsArray(frames)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "需要 ch 与 frames 数组");
+        return ESP_FAIL;
+    }
+
+    can_channel_t ch = static_cast<can_channel_t>(cJSON_GetNumberValue(ch_item));
+    const int frame_count = cJSON_GetArraySize(frames);
+    if (frame_count <= 0 || frame_count > kMaxFrames) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "frames 数量无效（1~48）");
+        return ESP_FAIL;
+    }
+
+    cJSON *out_root = cJSON_CreateObject();
+    cJSON *results = cJSON_CreateArray();
+    cJSON_AddStringToObject(out_root, "status", "ok");
+    cJSON_AddItemToObject(out_root, "results", results);
+
+    for (int i = 0; i < frame_count; i++) {
+        cJSON *fr = cJSON_GetArrayItem(frames, i);
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddItemToArray(results, item);
+
+        if (!cJSON_IsObject(fr)) {
+            cJSON_AddStringToObject(item, "status", "error");
+            cJSON_AddNumberToObject(item, "code", -1);
+            cJSON_AddNumberToObject(item, "gd32_err", 0);
+            continue;
+        }
+
+        cJSON *id_item = cJSON_GetObjectItem(fr, "id");
+        cJSON *data_item = cJSON_GetObjectItem(fr, "data");
+        cJSON *dlc_item = cJSON_GetObjectItem(fr, "dlc");
+        if (!id_item) {
+            cJSON_AddStringToObject(item, "status", "error");
+            cJSON_AddNumberToObject(item, "code", -1);
+            cJSON_AddNumberToObject(item, "gd32_err", 0);
+            continue;
+        }
+
+        uint32_t ext_id = static_cast<uint32_t>(cJSON_GetNumberValue(id_item));
+        uint8_t dlc = dlc_item ? static_cast<uint8_t>(cJSON_GetNumberValue(dlc_item)) : 0U;
+        uint8_t tx_data[CAN_MAX_DLC] = {0};
+        uint8_t tx_dlc = 0U;
+        if (data_item && cJSON_IsString(data_item)) {
+            tx_dlc = static_cast<uint8_t>(parseHexToBytes(cJSON_GetStringValue(data_item),
+                                                          tx_data, CAN_MAX_DLC));
+        }
+        if (tx_dlc == 0U && dlc > 0U) {
+            tx_dlc = (dlc > CAN_MAX_DLC) ? CAN_MAX_DLC : dlc;
+        }
+
+        uint8_t resp_data[CAN_MAX_DLC] = {0};
+        uint8_t gd32_err = 0U;
+        int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
+                                 resp_data, sizeof(resp_data), kPerFrameTimeoutMs, &gd32_err);
+
+        if (resp_len >= 0) {
+            char resp_hex[CAN_MAX_DLC * 2 + 1] = {0};
+            bytesToHexUpper(resp_data, static_cast<size_t>(resp_len), resp_hex);
+            cJSON_AddStringToObject(item, "status", "ok");
+            cJSON_AddNumberToObject(item, "sent", tx_dlc);
+            cJSON_AddNumberToObject(item, "recv_len", resp_len);
+            cJSON_AddStringToObject(item, "recv", resp_hex);
+        } else {
+            cJSON_AddStringToObject(item, "status", "error");
+            cJSON_AddNumberToObject(item, "code", resp_len);
+            cJSON_AddNumberToObject(item, "gd32_err", gd32_err);
+        }
+    }
+
+    cJSON_Delete(root);
+    char *printed = cJSON_PrintUnformatted(out_root);
+    cJSON_Delete(out_root);
+    if (!printed) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON 输出失败");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, printed, strlen(printed));
+    free(printed);
+    return ESP_OK;
+}
+
 esp_err_t spi_send_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
@@ -1019,8 +1178,8 @@ esp_err_t system_status_handler(httpd_req_t *req)
     size_t default_heap_total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
     // 任务栈指标复用 health_monitor 共享的任务表（collectTaskStackMetrics），
     //   避免与巡检逻辑两地维护；http_server 在本 handler 上下文中，句柄即当前任务。
-    TaskStackMetric task_metrics[8];
-    size_t task_metrics_count = collectTaskStackMetrics(task_metrics, 8);
+    TaskStackMetric task_metrics[12];
+    size_t task_metrics_count = collectTaskStackMetrics(task_metrics, 12);
     // http_server 行的句柄在 httpd 线程中取当前任务更准确
     for (size_t i = 0; i < task_metrics_count; ++i) {
         if (strcmp(task_metrics[i].name, "http_server") == 0) {

@@ -49,8 +49,8 @@ static ota_result_t commonReject(relay_event_t e, bool allowHealth = false)
 static constexpr uint32_t kMaxResendOnNack        = 10U;  // ACK 失败/轮询耗尽重发上限
 static constexpr uint32_t kMaxResendOnStructError = 3U;   // 结构化错误重发上限
 static constexpr uint32_t kLastPacketAckSeq        = 0xF0F0F0F0U;  // 末包 ACK 序号约定
-// 10 秒无成功帧停刷：跨包级别的背压/卡死检测，比单包 15s 超时更早触发。
-static constexpr uint32_t kStallTimeoutMs = 8000U;
+// 10 秒无成功帧停刷：跨包级别的背压/卡死检测，比单包 kAckWaitMs 更早触发。
+static constexpr uint32_t kStallTimeoutMs = 10000U;
 
 // ============================================================
 // 静态成员定义
@@ -315,7 +315,6 @@ ota_result_t OtaRelay::handleSizeNeg(relay_event_t event, const uint8_t *payload
     m_transferTotalPackets = (meta.total_size + GD32_OTA_PACKET_SIZE - 1U) / GD32_OTA_PACKET_SIZE;
     m_transferCurrentSeq = 0;
     m_transferFlashOffset = 0;
-    m_transferRetryCount = 0;
     /* total 提前写入，前端可显示「共 N 包」；seq 保持 0 直到真正开始转发 */
     setRelayTotalPackets(m_transferTotalPackets);
     setRelaySeq(0);
@@ -452,13 +451,29 @@ ota_result_t OtaRelay::forwardFirmware()
     /* 中继全程禁止 worker 把 OTA ACK/WAIT 当 EVENT 偷读 */
     SpiMaster::instance().setSuppressRingService(true);
 
-    // 固件完整性校验
+    /* 完整性门控（避免与 /ota/relay·BLE 触发前的 verifyGd32Firmware 二次全盘 SHA）：
+     * - meta 必须完整 stored≥total
+     * - checksum 非全零：触发路径已 finalize+比对，此处信任 meta，跳过再扫 Flash
+     * - checksum 全零：兜底做 metaVerifyChecksum（或 finalize 后再比） */
+    if (meta.total_size == 0U || meta.stored_size < meta.total_size) {
+        DEBUG_ERR("OTA", "固件未完整存储 stored=%" PRIu32 " total=%" PRIu32,
+                  meta.stored_size, meta.total_size);
+        reset();
+        return OTA_RESULT_ERR_STORAGE;
+    }
     {
-        esp_err_t verify_err = Gd32FlashStore::instance().metaVerifyChecksum();
-        if (verify_err != ESP_OK) {
-            DEBUG_ERR("OTA", "固件完整性校验失败，中止转发");
-            reset();
-            return OTA_RESULT_ERR_CRC;
+        static const uint8_t kZeroSha[32] = {0};
+        if (memcmp(meta.checksum, kZeroSha, sizeof(meta.checksum)) == 0) {
+            DEBUG_WARN("OTA", "meta.checksum 为空，中继前补做全盘 SHA 校验");
+            esp_err_t verify_err = Gd32FlashStore::instance().metaVerifyChecksum();
+            if (verify_err != ESP_OK) {
+                DEBUG_ERR("OTA", "固件完整性校验失败，中止转发");
+                reset();
+                return OTA_RESULT_ERR_CRC;
+            }
+        } else {
+            DEBUG_INFO("OTA", "跳过二次全盘 SHA（meta.checksum 已就绪，%" PRIu32 " B）",
+                       meta.total_size);
         }
     }
 
@@ -496,11 +511,22 @@ ota_result_t OtaRelay::forwardFirmware()
 // ============================================================
 void OtaRelay::clearSessionCryptoState()
 {
+    /* 抗优化清零：避免编译器去掉「无读回」的敏感缓冲擦除 */
+    auto wipe = [](void *p, size_t n) {
+        if (p == nullptr || n == 0U) {
+            return;
+        }
+        volatile uint8_t *v = static_cast<volatile uint8_t *>(p);
+        while (n > 0U) {
+            *v++ = 0;
+            --n;
+        }
+    };
     Protocol::sessionKeyClear(&m_sessionCtx);
-    memset(&m_sessionCtx, 0, sizeof(session_ctx_t));
-    memset(m_kSession, 0, sizeof(m_kSession));
-    memset(m_nonceServer, 0, sizeof(m_nonceServer));
-    memset(m_gd32UidRuntime, 0, sizeof(m_gd32UidRuntime));
+    wipe(&m_sessionCtx, sizeof(m_sessionCtx));
+    wipe(m_kSession, sizeof(m_kSession));
+    wipe(m_nonceServer, sizeof(m_nonceServer));
+    wipe(m_gd32UidRuntime, sizeof(m_gd32UidRuntime));
 }
 
 // ============================================================
@@ -515,7 +541,6 @@ void OtaRelay::reset()
     m_transferTotalPackets = 0;
     m_transferCurrentSeq = 0;
     m_transferFlashOffset = 0;
-    m_transferRetryCount = 0;
     m_transferDeadline = 0;
     clearSessionCryptoState();
     SpiMaster::instance().setSuppressRingService(false);
@@ -567,10 +592,19 @@ int OtaRelay::aes128EcbEncryptBlockLocal(const uint8_t *key, const uint8_t *in, 
  */
 void OtaRelay::logRespPayload(const char *stage, uint8_t resp_type, const uint8_t *payload, size_t len)
 {
+    /* 默认 logLevel=INFO 时 DBG 不输出；勿先建 hex[193] 白占 ota_relay 栈 */
+    if (DebugLog::instance().getLogLevel() < DEBUG_LOG_DBG) {
+        return;
+    }
     char hex[193] = {0};
     size_t n = (len > 32U) ? 32U : len;
-    for (size_t i = 0; i < n; ++i)
-        snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", payload[i]);
+    if (payload) {
+        for (size_t i = 0; i < n; ++i) {
+            snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", payload[i]);
+        }
+    } else {
+        n = 0;
+    }
     DEBUG_DBG("OTA", "%s resp: type=0x%02X len=%u payload[%u]=%s%s",
               stage, resp_type, (unsigned)len, (unsigned)n,
               n > 0 ? hex : "<empty>", len > n ? "..." : "");
@@ -763,8 +797,23 @@ bool OtaRelay::parseAndVerifyChallengePayload(const uint8_t *resp_payload, size_
  */
 bool OtaRelay::aes128EcbEncrypt48Bytes(const uint8_t *key, const uint8_t *in, uint8_t *out)
 {
-    for (int i = 0; i < 3; ++i)
-        if (aes128EcbEncryptBlockLocal(key, in + i * 16, out + i * 16) != 0) return false;
+    /* 单次 init/setkey 加密 3 块，避免每块重建 AES 上下文（转发热路径） */
+    if (!key || !in || !out) {
+        return false;
+    }
+    esp_aes_context ctx;
+    esp_aes_init(&ctx);
+    if (esp_aes_setkey(&ctx, key, 128) != 0) {
+        esp_aes_free(&ctx);
+        return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (esp_aes_crypt_ecb(&ctx, ESP_AES_ENCRYPT, in + i * 16, out + i * 16) != 0) {
+            esp_aes_free(&ctx);
+            return false;
+        }
+    }
+    esp_aes_free(&ctx);
     return true;
 }
 
@@ -1011,22 +1060,34 @@ ota_result_t OtaRelay::doSendFirmwareSize(uint32_t size)
 }
 
 /**
- * @brief 协议子步骤：逐包转发固件数据给 GD32。
- * 流程：从 Flash 读取 → AES 加密 → SPI 发送 → 等待 ACK → 失败则重发。
- * 每 OTA_PACKET_HEALTH_CHECK_INTERVAL 包执行一次健康检查。
+ * @brief 准备单包：读 Flash → AES → 填 64B tx_buf。
+ * flash_offset 显式传入，便于在等 ACK 时预组下一包（不推进 m_transferFlashOffset）。
  */
-ota_result_t OtaRelay::prepareRelayPacket(uint32_t seq, const ota_meta_t &meta, uint8_t tx_buf[64], size_t *out_chunk_size)
+ota_result_t OtaRelay::prepareRelayPacket(uint32_t seq, uint32_t flash_offset, const ota_meta_t &meta,
+                                          uint8_t tx_buf[64], size_t *out_chunk_size)
 {
-    uint8_t plain48[GD32_OTA_PACKET_SIZE];
-    memset(plain48, 0xFF, sizeof(plain48));
-    size_t chunk_size = GD32_OTA_PACKET_SIZE;
-    if (seq == m_transferTotalPackets - 1) {
-        chunk_size = meta.total_size - (seq * GD32_OTA_PACKET_SIZE);
+    if (!tx_buf) {
+        return OTA_RESULT_ERR_STORAGE;
     }
 
-    esp_err_t err = Gd32FlashStore::instance().flashReadChunk(m_transferFlashOffset, plain48, chunk_size);
+    size_t chunk_size = GD32_OTA_PACKET_SIZE;
+    if (seq + 1U >= m_transferTotalPackets) {
+        const uint32_t done = seq * GD32_OTA_PACKET_SIZE;
+        if (done >= meta.total_size) {
+            return OTA_RESULT_ERR_STORAGE;
+        }
+        chunk_size = meta.total_size - done;
+    }
+
+    uint8_t plain48[GD32_OTA_PACKET_SIZE];
+    /* 仅末包需要 0xFF 填充；满包直接读满 48B */
+    if (chunk_size < GD32_OTA_PACKET_SIZE) {
+        memset(plain48, 0xFF, sizeof(plain48));
+    }
+
+    esp_err_t err = Gd32FlashStore::instance().flashReadChunk(flash_offset, plain48, chunk_size);
     if (err != ESP_OK) {
-        DEBUG_ERR("OTA", "Flash 读取失败, offset=%" PRIu32 ", err=%d", m_transferFlashOffset, err);
+        DEBUG_ERR("OTA", "Flash 读取失败, offset=%" PRIu32 ", err=%d", flash_offset, err);
         return OTA_RESULT_ERR_STORAGE;
     }
 
@@ -1042,7 +1103,7 @@ ota_result_t OtaRelay::prepareRelayPacket(uint32_t seq, const ota_meta_t &meta, 
         return OTA_RESULT_ERR_AUTH;
     }
 
-    uint32_t if_end = (seq == m_transferTotalPackets - 1) ? 0xFFFFFFFFU : 0x00000000U;
+    const uint32_t if_end = (seq + 1U >= m_transferTotalPackets) ? 0xFFFFFFFFU : 0x00000000U;
     tx_buf[56] = (uint8_t)(if_end & 0xFFU);
     tx_buf[57] = (uint8_t)((if_end >> 8) & 0xFFU);
     tx_buf[58] = (uint8_t)((if_end >> 16) & 0xFFU);
@@ -1053,12 +1114,15 @@ ota_result_t OtaRelay::prepareRelayPacket(uint32_t seq, const ota_meta_t &meta, 
               seq, (unsigned)chunk_size, if_end,
               tx_buf[60], tx_buf[61], tx_buf[62], tx_buf[63]);
 
-    m_transferCurrentSeq = seq;
-    if (out_chunk_size) *out_chunk_size = chunk_size;
+    /* 不在此写 m_transferCurrentSeq：预组下一包时不应污染“当前发送序号” */
+    if (out_chunk_size) {
+        *out_chunk_size = chunk_size;
+    }
     return OTA_RESULT_OK;
 }
 
-bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], size_t chunk_size, ota_result_t *out_result)
+bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], size_t chunk_size,
+                                        ota_result_t *out_result, NextPacketPrep *next_prep)
 {
     uint8_t resp_type = 0;
     uint8_t resp_payload[32] = {0};
@@ -1069,18 +1133,37 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
      * - GD32 ISR 收 DATA 后立刻回 WAIT，主循环 AES/Flash 后再 ACK。
      * - 一旦见过 WAIT，说明包已进从机；再发 DATA = DUP-SEQ，只会反复 WAIT。
      * - 因此：见 WAIT 后只 poll；仅「完全无响应」才允许重发 DATA。
+     * - 等 ACK 期间可预组下一包（与从机处理重叠）。
      */
     constexpr uint32_t kMaxDataSends = 3U;
     constexpr uint32_t kAckWaitMs = 6000U;   /* 单次发送后等 ACK 上限（覆盖 GD32 增量 drain） */
-    constexpr uint32_t kPollSliceMs = 80U;
+    constexpr uint32_t kPollSliceMs = 50U;   /* 略紧：DATA_READY 驱动，缩短空切片 */
 
     TickType_t pkt_start = xTaskGetTickCount();
     bool saw_wait = false;
 
+    auto maybe_prep_next = [&]() {
+        if (!next_prep || !next_prep->ready || *next_prep->ready) {
+            return;
+        }
+        if (!next_prep->meta || !next_prep->buf || !next_prep->chunk_size) {
+            return;
+        }
+        if (next_prep->next_seq >= m_transferTotalPackets) {
+            return;
+        }
+        ota_result_t pr = prepareRelayPacket(next_prep->next_seq, next_prep->next_flash_offset,
+                                             *next_prep->meta, next_prep->buf, next_prep->chunk_size);
+        if (pr == OTA_RESULT_OK) {
+            *next_prep->ready = true;
+        }
+        /* 预组失败不致命：外层会再 prepare */
+    };
+
     for (uint32_t send_i = 0; send_i < kMaxDataSends; ++send_i) {
         /* 已见 WAIT：禁止再发 DATA，只延长 poll */
         if (saw_wait && send_i > 0U) {
-            DEBUG_INFO("OTA", "包 %" PRIu32 " 已见 WAIT，继续 poll 不重发", seq);
+            DEBUG_DBG("OTA", "包 %" PRIu32 " 已见 WAIT，继续 poll 不重发", seq);
         } else {
             resp_len = 0;
             resp_type = 0;
@@ -1090,6 +1173,8 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
             logRespPayload("DATA_PACKET", resp_type, resp_payload, resp_len);
             if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
                 saw_wait = true;
+                /* 从机已收下本包，立刻利用等待时间预组下一包 */
+                maybe_prep_next();
             }
             if (err == ESP_OK && resp_type == SPI_OTA_RSP_ACK &&
                 isStructuredAckWithSeq(resp_payload, resp_len, expected_ack)) {
@@ -1108,6 +1193,9 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
                            (unsigned)SpiMaster::instance().remoteCredit());
                 last_hb = xTaskGetTickCount();
             }
+
+            /* 优先在 poll 间隙预组，再读 SPI（READY 未拉时也能吃掉 Flash/AES 时间） */
+            maybe_prep_next();
 
             esp_err_t err = SpiMaster::instance().otaPollResponse(
                 &resp_type, resp_payload, sizeof(resp_payload), &resp_len, kPollSliceMs);
@@ -1132,6 +1220,10 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
                         return true;
                     }
                     saw_wait = false; /* 允许带错误码的重发 */
+                    /* 结构化错误后下一包内容可能变化，丢弃预组 */
+                    if (next_prep && next_prep->ready) {
+                        *next_prep->ready = false;
+                    }
                     break;
                 }
                 /* 陈旧 ACK，继续 poll */
@@ -1143,7 +1235,6 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
             if (send_i + 1U >= kMaxDataSends) {
                 break;
             }
-            /* 把下一轮当作「只 poll」：send_i 增加但 saw_wait 使跳过 transfer */
             continue;
         }
         if (send_i + 1U < kMaxDataSends) {
@@ -1170,13 +1261,28 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
         return OTA_RESULT_ERR_STORAGE;
     }
 
-    uint8_t tx_buf[64] = {0};
-    ota_result_t result = OTA_RESULT_OK;
+    /* 双缓冲：当前发送槽 + 预组槽（等 ACK 时填充） */
+    uint8_t tx_slot[2][64] = {};
+    size_t chunk_slot[2] = {0, 0};
+    int cur = 0;
+    bool next_ready = false;
+    size_t next_chunk = 0;
+
+    uint32_t flash_off = 0;
+    m_transferFlashOffset = 0;
+
+    ota_result_t result = prepareRelayPacket(0, flash_off, meta, tx_slot[cur], &chunk_slot[cur]);
+    if (result != OTA_RESULT_OK) {
+        return result;
+    }
+
     TickType_t last_success_tick = xTaskGetTickCount();
+    /* 进度：首包 / 每 8 包 / 末包更新，减 status 锁竞争 */
+    constexpr uint32_t kSeqReportMask = 7U;
 
     for (uint32_t seq = 0; seq < m_transferTotalPackets; seq++) {
-        // 健康检查（每 OTA_PACKET_HEALTH_CHECK_INTERVAL 包 + 首末包）
-        if ((seq % OTA_PACKET_HEALTH_CHECK_INTERVAL) == 0 || seq == 0 || seq == m_transferTotalPackets - 1) {
+        if ((seq % OTA_PACKET_HEALTH_CHECK_INTERVAL) == 0 ||
+            seq == 0 || seq + 1U >= m_transferTotalPackets) {
             health_status_t health = HealthMonitor::instance().checkBeforeOtaRelay();
             if (health == HEALTH_MON_SHUTDOWN || health == HEALTH_MON_CRITICAL) {
                 DEBUG_ERR("OTA", "健康检查危险，中止 OTA");
@@ -1184,38 +1290,65 @@ ota_result_t OtaRelay::doRelayPackets(TickType_t deadline_tick)
             }
         }
 
-        // 全局超时检查
         if (deadline_tick != 0 && xTaskGetTickCount() >= deadline_tick) {
-            DEBUG_ERR("OTA", "全局超时: 包 %" PRIu32 "/%" PRIu32 " 已超限，中止转发", seq, m_transferTotalPackets);
-            return OTA_RESULT_ERR_USER_ABORT;
-        }
-
-        // 停刷检测：自上一包成功 ACK 起超过 kStallTimeoutMs 则中止
-        if ((xTaskGetTickCount() - last_success_tick) >= pdMS_TO_TICKS(kStallTimeoutMs)) {
-            DEBUG_ERR("OTA", "10 秒无成功帧, 中止转发: seq=%" PRIu32 "/%" PRIu32, seq, m_transferTotalPackets);
+            DEBUG_ERR("OTA", "全局超时: 包 %" PRIu32 "/%" PRIu32 " 已超限，中止转发",
+                      seq, m_transferTotalPackets);
             return OTA_RESULT_ERR_TIMEOUT;
         }
-        size_t chunk_size = 0;
-        result = prepareRelayPacket(seq, meta, tx_buf, &chunk_size);
-        if (result != OTA_RESULT_OK) {
+
+        if ((xTaskGetTickCount() - last_success_tick) >= pdMS_TO_TICKS(kStallTimeoutMs)) {
+            DEBUG_ERR("OTA", "%" PRIu32 " ms 无成功帧, 中止转发: seq=%" PRIu32 "/%" PRIu32,
+                      kStallTimeoutMs, seq, m_transferTotalPackets);
+            return OTA_RESULT_ERR_TIMEOUT;
+        }
+
+        /* 当前包必须已在 cur 槽；若预组未命中则现场准备 */
+        if (seq > 0U) {
+            if (next_ready) {
+                cur ^= 1;
+                chunk_slot[cur] = next_chunk;
+                next_ready = false;
+            } else {
+                result = prepareRelayPacket(seq, flash_off, meta, tx_slot[cur], &chunk_slot[cur]);
+                if (result != OTA_RESULT_OK) {
+                    return result;
+                }
+            }
+        }
+
+        m_transferCurrentSeq = seq;
+        if ((seq & kSeqReportMask) == 0U || seq + 1U >= m_transferTotalPackets) {
+            setRelaySeq(seq);
+        }
+
+        NextPacketPrep prep{};
+        const int prep_idx = cur ^ 1;
+        prep.next_seq = seq + 1U;
+        prep.next_flash_offset = flash_off + (uint32_t)chunk_slot[cur];
+        prep.meta = &meta;
+        prep.buf = tx_slot[prep_idx];
+        prep.chunk_size = &next_chunk;
+        prep.ready = &next_ready;
+        NextPacketPrep *prep_arg = (seq + 1U < m_transferTotalPackets) ? &prep : nullptr;
+
+        if (sendRelayPacketWithRetry(seq, tx_slot[cur], chunk_slot[cur], &result, prep_arg)) {
+            DEBUG_ERR("OTA", "中止于包 %" PRIu32 "/%" PRIu32 " result=%d",
+                      seq, m_transferTotalPackets, (int)result);
             return result;
         }
 
-        /* 先写入「正在发第 N 包」，前端 /system/status 能看到卡在哪 */
-        setRelaySeq(seq);
+        flash_off += (uint32_t)chunk_slot[cur];
+        /* 与 sendRelayPacketWithRetry 内累加对齐（绝对赋值，防漂移） */
+        m_transferFlashOffset = flash_off;
 
-        // 发送单包并等待 ACK（内含重试循环）
-        if (sendRelayPacketWithRetry(seq, tx_buf, chunk_size, &result)) {
-            DEBUG_ERR("OTA", "中止于包 %" PRIu32 "/%" PRIu32 " result=%d",
-                      seq, m_transferTotalPackets, (int)result);
-            return result;  // 中止
+        if ((seq & kSeqReportMask) == 0U || seq + 1U >= m_transferTotalPackets) {
+            setRelaySeq(seq + 1U);
         }
-
-        setRelaySeq(seq + 1);
         last_success_tick = xTaskGetTickCount();
     }
+    setRelaySeq(m_transferTotalPackets);
     DEBUG_INFO("OTA", "全部数据包已转发: %" PRIu32 " 包", m_transferTotalPackets);
-    return result;
+    return OTA_RESULT_OK;
 }
 
 // ============================================================
@@ -1398,12 +1531,31 @@ void OtaRelay::taskEntry(void *pvParameters)
         return;
     }
 
-    // ★ 启动时初始 GD32 探测：读取 GD32 APP 版本号与存活状态
-    //   GD32 APP 启动需要一定时间，给其 3 秒准备窗口后发起探测
+    /* 启动 GD32 探测（原 main.cpp 与此处双份；现统一在本任务）：
+     * APP 完整 init 约 5–6s；先 hello 建 v2 session，再 appPing。 */
     {
-        DEBUG_INFO("OTA", "启动初始 GD32 探测...");
-        vTaskDelay(pdMS_TO_TICKS(3000));  // 等待 GD32 APP 就绪
-        probeAndCacheAppAlive(2000);
+        DEBUG_INFO("OTA", "启动初始 GD32 探测 (hello+probe)...");
+        bool session_ok = false;
+        bool alive = false;
+        for (uint32_t attempt = 0; attempt < 20U; ++attempt) {
+            vTaskDelay(pdMS_TO_TICKS(300));
+            if (!session_ok) {
+                if (SpiMaster::instance().hello(1500U, V2_ROLE_APP) == ESP_OK) {
+                    session_ok = true;
+                } else {
+                    DEBUG_INFO("OTA", "等待 GD32 APP... (%" PRIu32 "/20)", attempt + 1U);
+                    continue;
+                }
+            }
+            if (probeAndCacheAppAlive(2000)) {
+                alive = true;
+                break;
+            }
+            DEBUG_INFO("OTA", "等待 GD32 APP 存活... (%" PRIu32 "/20)", attempt + 1U);
+        }
+        if (!alive) {
+            DEBUG_WARN("OTA", "启动 GD32 探测未成功（中继前仍可再 hello）");
+        }
     }
 
     while (1) {
@@ -1425,10 +1577,12 @@ void OtaRelay::taskEntry(void *pvParameters)
         if (result == OTA_RESULT_OK) {
             // 成功日志已在 doWaitForAppAlive 输出，此处不再重复
             vTaskDelay(pdMS_TO_TICKS(3000));
+        } else if (result == OTA_RESULT_ERR_TIMEOUT) {
+            DEBUG_ERR("OTA", "OTA 超时中止 (TIMEOUT=%d，含全局预算/停刷/单包)", (int)result);
         } else if (result == OTA_RESULT_ERR_USER_ABORT) {
-            DEBUG_ERR("OTA", "OTA 全局超时中止 (OTA_RESULT_ERR_USER_ABORT=%d)", result);
+            DEBUG_ERR("OTA", "OTA 用户中止 (USER_ABORT=%d)", (int)result);
         } else {
-            DEBUG_ERR("OTA", "OTA 转发失败，错误码: %d", result);
+            DEBUG_ERR("OTA", "OTA 转发失败，错误码: %d", (int)result);
         }
         instance().reset();
         // 通过 IRelayListener 接口回调通知协调器中继结束

@@ -8,8 +8,11 @@
  *
  * 注意：当前 tools/WebUI 日志面板走的是 HTTP /logs，
  * 不是直接监听 UDP 6666。
- * 
+ *
  * UART0: TX=GPIO21, RX=GPIO20, 115200 波特率
+ *
+ * 线程模型：DEBUG_* / log() / send() 仅允许在任务上下文调用
+ * （内部使用 portMAX_DELAY 互斥锁，禁止 ISR）。
  */
 #ifndef DEBUG_LOG_H
 #define DEBUG_LOG_H
@@ -23,7 +26,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-// 调试日志配置（DEBUG_LOG_IP/PORT/ENABLED 已在 app_config.h 中定义）
+// 调试日志配置（DEBUG_LOG_IP/PORT 在 app_config.h）
 
 // UART0 调试配置
 #define UART_DEBUG_TX_GPIO   21     ///< UART0 TX GPIO 引脚号
@@ -46,13 +49,9 @@ typedef enum {
  */
 class DebugLog {
 public:
-    /**
-      * @brief 获取 DebugLog 单例实例。
-     * @return DebugLog 引用。
-     */
     static DebugLog& instance();
 
-    /** @brief 初始化日志系统，包括 UART 输出、UDP 目标和内部缓冲区。 */
+    /** @brief 初始化日志系统（UART + ring；UDP socket 延迟创建）。 */
     esp_err_t init();
 
     /** @brief 初始化 UART0 调试串口。 */
@@ -61,10 +60,10 @@ public:
     /** @brief 通过 UART0 直接发送一段原始字节数据。 */
     esp_err_t uartSend(const uint8_t *data, size_t len);
 
-    /** @brief 发送原始日志数据到底层输出通道。 */
+    /** @brief 发送原始日志数据到底层输出通道（任务上下文）。 */
     esp_err_t send(const uint8_t *data, size_t len);
 
-    /** @brief 按日志级别与标签格式化输出一条日志。 */
+    /** @brief 按日志级别与标签格式化输出一条日志（任务上下文）。 */
     void log(debug_log_level_t level, const char *tag, const char *fmt, ...);
 
     /** @brief 获取当前环形日志缓冲区中的日志条数。 */
@@ -74,14 +73,14 @@ public:
     bool ringPopOldest(char *out, size_t out_size, int *out_len);
 
     /**
-     * @brief 将环形缓冲区所有日志导出为 JSON 数组字符串。
+     * @brief 将环形缓冲区日志导出为 JSON 数组字符串。
      * @param out_len 输出 JSON 字符串长度。
-     * @return 动态分配的 JSON 字符串，调用者须 free()。
+     * @return 动态分配的 JSON 字符串，调用者须 free()；失败返回 NULL。
      */
     char* ringDrainJson(int *out_len);
 
-    /** @brief 当前日志级别（运行时可改）。 */
-    debug_log_level_t logLevel = DEBUG_LOG_INFO;
+    void setLogLevel(debug_log_level_t level) { m_logLevel = level; }
+    debug_log_level_t getLogLevel() const { return m_logLevel; }
 
 private:
     DebugLog() = default;
@@ -90,40 +89,59 @@ private:
     DebugLog& operator=(const DebugLog&) = delete;
 
     int m_udpSock = -1;
-    struct sockaddr_in m_debugAddr;
+    struct sockaddr_in m_debugAddr = {};
     bool m_initialized = false;
     bool m_uartInitialized = false;
-    // 记录 UART 是否真正可用（uartInit 失败时为 false，跳过 uart_write_bytes）。
-    //   m_uartInitialized 仅表示曾尝试初始化，m_uartAvailable 才是写日志的判据。
+    /** uartInit 成功后才为 true；send() 据此跳过 uart_write_bytes */
     bool m_uartAvailable = false;
+    debug_log_level_t m_logLevel = DEBUG_LOG_INFO;
 
     /* 环形日志：OTA 中继期需保留关键 INFO，64×160≈10KB BSS。 */
     static constexpr int LOG_RING_SLOTS = 64;
     static constexpr int LOG_RING_SIZE  = 160;
-    char  m_logRing[LOG_RING_SLOTS][LOG_RING_SIZE];
-    int   m_logRingLens[LOG_RING_SLOTS];
+    /** 单次 /logs drain 上限（与 SLOTS 更接近，减 burst 滞后） */
+    static constexpr int LOG_DRAIN_MAX  = 48;
+    char  m_logRing[LOG_RING_SLOTS][LOG_RING_SIZE] = {};
+    int   m_logRingLens[LOG_RING_SLOTS] = {};
     int   m_logRingHead  = 0;
     int   m_logRingCount = 0;
-    SemaphoreHandle_t m_logRingMutex = NULL;
+    SemaphoreHandle_t m_logRingMutex = nullptr;
 
     /* 堆门控（防 OTA 时 UDP/格式化抢 LWIP 堆）：
-     * free < kDropWarnFree → 非 OTA/SPI 只保留 ERR
-     * free < kDropInfoFree → 非 OTA/SPI 丢 INFO/DBG（OTA/SPI 的 INFO 仍进 ring）
+     * ERR/WARN 永不因堆门控丢弃
+     * free < kDropInfoFree → 非 keep-alive 丢 INFO/DBG；keep-alive 保留 INFO
+     * free < kDropWarnFree → 全局丢 DBG
      * free < kSkipUdpFree  → 不 sendto（仍 UART+ring）
-     * free < kDrainMinFree → /logs 尽量仍返回 ring（降低门槛，避免“沉默失败”） */
+     * free < kDrainMinFree → /logs 返 "[]" 避免大块 malloc
+     * keep-alive tag：OTA 前缀、SPI、WIFI */
     static constexpr uint32_t kDropWarnFree = 6U * 1024U;
     static constexpr uint32_t kDropInfoFree = 10U * 1024U;
-    static constexpr uint32_t kSkipUdpFree  = 6U * 1024U;   // ★ 修复：从 10KB 降至 6KB，sendto 本身不需大块堆
-    static constexpr uint32_t kDrainMinFree = 4U * 1024U;   // ★ 修复：从 8KB 降至 4KB，降低 /logs 返空的概率
+    static constexpr uint32_t kSkipUdpFree  = 6U * 1024U;
+    static constexpr uint32_t kDrainMinFree = 4U * 1024U;
+
+    /** UDP 跳过/失败告警节流与 socket 重建 */
+    TickType_t m_lastUdpSkipWarnTick = 0;
+    TickType_t m_lastUdpFailWarnTick = 0;
+    uint8_t m_udpFailStreak = 0;
+    portMUX_TYPE m_udpMux = portMUX_INITIALIZER_UNLOCKED;
 
     esp_err_t ensureUdpSocket();
+    void closeUdpSocket();
+    bool udpNetifHasIp() const;
     void ringPush(const char *data, int len);
+    void ringPushLocked(const char *data, int len);
+    bool ringPopOldestLocked(char *out, size_t out_size, int *out_len);
+    int  ringPeekDrainMetaLocked(int max_n, int *total_raw_len) const;
+
+    static bool isKeepAliveTag(const char *tag);
+    static char *allocEmptyJson(int *out_len);
+    static int jsonEscapeAppend(char *buf, int pos, int capacity, const char *src, int src_len);
 };
 
-// 便捷宏 — 直接调用单例方法
-#define DEBUG_ERR(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_ERR,   tag, fmt, ##__VA_ARGS__) ///< 错误级别日志宏
-#define DEBUG_WARN(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_WARN,  tag, fmt, ##__VA_ARGS__) ///< 警告级别日志宏
-#define DEBUG_INFO(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_INFO,  tag, fmt, ##__VA_ARGS__) ///< 信息级别日志宏
-#define DEBUG_DBG(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_DBG,   tag, fmt, ##__VA_ARGS__) ///< 调试级别日志宏
+// 便捷宏 — 直接调用单例方法（禁止在 ISR 中使用）
+#define DEBUG_ERR(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_ERR,   tag, fmt, ##__VA_ARGS__)
+#define DEBUG_WARN(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_WARN,  tag, fmt, ##__VA_ARGS__)
+#define DEBUG_INFO(tag, fmt, ...)  DebugLog::instance().log(DEBUG_LOG_INFO,  tag, fmt, ##__VA_ARGS__)
+#define DEBUG_DBG(tag, fmt, ...)   DebugLog::instance().log(DEBUG_LOG_DBG,   tag, fmt, ##__VA_ARGS__)
 
 #endif // DEBUG_LOG_H

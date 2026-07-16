@@ -56,9 +56,9 @@ export function emitRelayProgress(rseq, rtot, opts) {
   if (rseq === window.relayWatchLastSeq) return false;
   window.relayWatchLastSeq = rseq;
   var pct = Math.min(100, Math.round(rseq * 100 / rtot));
+  /* 进度只走进度条/阶段文案，不写调试日志（避免 ring/网页刷屏） */
   setProgress(60 + Math.round(pct * 0.30),
     '已转发 ' + rseq + ' / ' + rtot + ' 包 (' + pct + '%)');
-  addLog('I', 'OTA', '转发 ' + rseq + '/' + rtot + ' (' + pct + '%)');
   return true;
 }
 
@@ -103,6 +103,9 @@ export function markGd32OtaUiComplete(msg) {
   if (window.otaSessionState === OtaSessionState.RELAYING ||
       window.otaSessionState === OtaSessionState.FAILED) {
     otaSessionTransition(OtaSessionState.DONE);
+  }
+  if (typeof window.updateUploadButtonLabel === 'function') {
+    window.updateUploadButtonLabel();
   }
   addLog('I', 'OTA', msg || 'GD32 刷写完成');
   showToast(msg || 'GD32 刷写完成', 'success');

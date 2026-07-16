@@ -124,7 +124,8 @@ public:
     esp_err_t beginGd32Storage(uint32_t total_size, ota_channel_t channel);
 
     /**
-     * @brief 统一 GD32 OTA 写入前准备：校验大小 + begin + 整分区预擦 + 清空 meta + 写入初始 meta。
+     * @brief 统一 GD32 OTA 写入前准备：校验大小 + begin + 复位擦除水位 + 清空 meta + 写入初始 meta。
+     *        扇区擦除由 flashWriteChunk/ensureErasedForWrite 按需进行（避免 HTTP 头卡整区预擦）。
      *        收流时 write 路径只写 Flash（ensureErased 仅作水位兜底）。
      *        WiFi/BLE 上传入口共用，任意步骤失败时内部 abortCurrent，调用方无需再清理。
      * @param total_size 固件总字节数。
@@ -337,9 +338,9 @@ public:
 
     /**
      * @brief 自愈孤儿忙态（供 /system/status 等轮询路径调用）。
-     *        - 跑忙状态 watchdog（超时完整 abort → IDLE）
-     *        - ESP32_FINALIZING 但 Esp32OtaCore 已空闲：判定为 SHA 失败等残留，复位 IDLE
-     *        不影响真正正在 finalize（core.isActive()）的会话。
+     *        - 忙状态 watchdog（超时完整 abort → IDLE；不含 REBOOTING）
+     *        - ESP32_FINALIZING 但 core 已空闲：残留 → IDLE
+     *        - ERROR → IDLE 软清，避免 UI 长期卡错误态
      */
     void healOrphanStates();
 
@@ -476,9 +477,7 @@ private:
     bool lock() const;
     void unlock(bool handle) const;
 
-    // ★ 卡死自愈检查：若忙状态停留超过 watchdog 超时，强制转为 ERROR。
-    //   用于在中继 task 因任何原因（崩溃/SPI 死锁/看门狗复位残留）未能回调
-    //   notifyRelayComplete/notifyEsp32*Complete 时，让协调器自动脱离卡死状态。
+    // ★ 卡死自愈检查：忙状态超时则 doAbortLocked → IDLE（不含 REBOOTING）。
     //   必须在已持锁状态下调用。
     void watchdogCheckLocked();
 
@@ -513,11 +512,12 @@ private:
 
     // BLE 共存监听器（由 WifiOta 实现并注册）
     IBleCoexListener *m_bleCoexListener = nullptr;
-    static constexpr TickType_t kLockTimeout = pdMS_TO_TICKS(100);
+    static constexpr TickType_t kLockTimeout =
+        pdMS_TO_TICKS(OTA_COORD_LOCK_TIMEOUT_MS);
 
-    // ★ 忙状态 watchdog 超时。GD32 中继理论最大耗时 ≈ 60s(全局超时) + 15s(APP存活轮询) + 1s(bootloader) ≈ 76s，
-    //   取 90 s，正常流程远不会触及，仅在 task 卡死时触发自愈。
-    static constexpr TickType_t kBusyWatchdogTicks = pdMS_TO_TICKS(90U * 1000U);
+    // ★ 忙状态 watchdog：须覆盖最长中继预算；数值见 app_config.h
+    static constexpr TickType_t kBusyWatchdogTicks =
+        pdMS_TO_TICKS(OTA_COORD_BUSY_WATCHDOG_MS);
 };
 
 #endif // OTA_COORDINATOR_H

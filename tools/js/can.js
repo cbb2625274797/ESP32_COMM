@@ -3,8 +3,8 @@
  *
  * CAN 页面的编排逻辑：
  *   - cacheElements：缓存 DOM 元素到 el（dbc.js 导出的共享 el 对象）
- *   - setConnectionState：CAN 页面专用连接状态更新（canConnPill 等元素）
- *   - testConnection：CAN 页面专用连接检测（GET /system/status，操作 el.connectionNote 等）
+ *   - setConnectionState：顶栏 pills（连接/IP/RSSI/运行/版本）
+ *   - testConnection：GET /system/status，静默刷新顶栏（5s）
  *   - clearDbc / handleDbcFile / handleDbcError：DBC 文件读取与解析流程编排
  *   - bindEvents：绑定所有事件监听器（调用子模块的 bindNodeFilterEvents 等）
  *   - init：页面初始化入口
@@ -16,19 +16,26 @@
  *       （操作不同的 DOM 元素集），此处保留原 can.js 版本以保证行为一致。
  */
 
-import { state, el, getBaseUrl, parseDbc, readDbcText, buildSummary } from './can/dbc.js';
+/* 子模块 import 带同一 ?v=，避免浏览器缓存旧 dbc.js（无 getDeviceIp）且保证单例 state */
+import {
+  state, el, getBaseUrl, getDeviceIp, setDeviceIp, parseDbc, readDbcText, buildSummary,
+  rebuildMergedDbc, makeDbcSourceId
+} from './can/dbc.js?v=20260717t';
 import {
   updateDbcFileInfo,
   filterMessages,
   bindNodeFilterEvents,
   renderMessageList,
-  selectMessage
-} from './can/messages.js';
+  selectMessage,
+  recomputeTransmitterFilterEmpty,
+  updateNodeFilterLabel,
+  updateBatchUi
+} from './can/messages.js?v=20260717t';
 import {
   ensureMessageDefaults,
   renderSelectedMessage,
   updateEncodedPreview
-} from './can/signals.js';
+} from './can/signals.js?v=20260717t';
 import {
   renderHistory,
   sendSelectedMessage,
@@ -37,9 +44,15 @@ import {
   sendManualFrame,
   resetManualFields,
   loadPreviewToManual
-} from './can/send.js';
-import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js';
-import { showToast } from './common/toast.js';
+} from './can/send.js?v=20260717t';
+import {
+  scheduleCanPersist,
+  loadCanSession,
+  bindCanPersistLifecycle
+} from './can/persist.js?v=20260717t';
+import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js?v=20260717t';
+import { showToast } from './common/toast.js?v=20260717t';
+import { initCanMonitor } from './can_monitor.js?v=20260717t';
 
 // ==================== 本地工具 ====================
 // 原 can.js 的 formatUptime 输出格式与 common/utils.js 略有差异（d>0 时只到 h），
@@ -50,13 +63,15 @@ import { showToast } from './common/toast.js';
 function cacheElements() {
   [
     'toolIp', 'defaultChannel', 'manualChannel', 'manualId', 'manualDlc', 'manualData',
-    'testConnBtn', 'connIndicator', 'connIndicatorTxt', 'connectionNote',
     'dbcDropZone', 'dbcFileInput', 'dbcFileInfo', 'dbcFileName', 'dbcMessageCount',
-    'dbcSignalCount', 'dbcNodeCount', 'dbcFileSize', 'dbcSearch', 'dbcHint', 'clearDbcBtn',
+    'dbcSignalCount', 'dbcNodeCount', 'dbcFileSize', 'dbcFileCount', 'dbcFileChips',
+    'dbcSearch', 'dbcHint', 'clearDbcBtn',
+    'importDbcBtn', 'replaceDbcBtn',
     'messageList', 'sendSelectedBtn', 'generatedHex', 'generatedBytes', 'encodeHint',
     'dbcResp', 'dbcRespText', 'loadPreviewToRawBtn', 'manualHint', 'sendManualBtn',
     'resetManualBtn', 'manualResp', 'manualRespText', 'historyList', 'toast', 'toastIco',
-    'toastMsg', 'canConnPill', 'canConnTxt', 'canVersionPill', 'canChannelPill',
+    'toastMsg', 'canConnPill', 'canConnTxt', 'canIpPill', 'canRssiPill', 'canUptimePill',
+    'canVersionPill', 'canChannelPill',
     'dbcSummaryPill', 'messageSummaryPill',
     'selectedCountPill', 'selectAllBox', 'expandAllBtn', 'collapseAllBtn', 'sendCheckedBtn',
     'nodeFilterWrap', 'nodeFilterBtn', 'nodeFilterLabel', 'nodeFilterPanel', 'nodeFilterSearch',
@@ -66,16 +81,25 @@ function cacheElements() {
   });
 }
 
-// ==================== 连接状态 ====================
-function setConnectionState(connected, text, buildVersion, buildTime) {
+// ==================== 连接状态（仅顶栏 pills，与工作台去重） ====================
+function setConnectionState(connected, text, buildVersion, buildTime, wifi, uptimeSec) {
   if (el.canConnPill) {
     el.canConnPill.className = 'pill ' + (connected ? 'online' : 'offline');
   }
   if (el.canConnTxt) el.canConnTxt.textContent = text;
-  if (el.connIndicator) {
-    el.connIndicator.className = 'conn-indicator ' + (connected ? 'ok' : 'err');
+  wifi = wifi || {};
+  if (el.canIpPill) {
+    var ip = wifi.ip || getDeviceIp();
+    el.canIpPill.textContent = 'IP ' + (ip || '--');
   }
-  if (el.connIndicatorTxt) el.connIndicatorTxt.textContent = text;
+  if (el.canRssiPill) {
+    var rssiOk = wifi.rssi !== undefined && wifi.rssi !== null && wifi.rssi !== -127;
+    el.canRssiPill.textContent = rssiOk ? ('RSSI ' + wifi.rssi + ' dBm') : 'RSSI --';
+  }
+  if (el.canUptimePill) {
+    el.canUptimePill.textContent = '运行 ' + (uptimeSec !== undefined && uptimeSec !== null
+      ? formatUptime(uptimeSec) : '--');
+  }
   if (el.canVersionPill) {
     el.canVersionPill.textContent = buildVersion ? ('v' + buildVersion) : 'v--';
     el.canVersionPill.dataset.tooltip = buildTime ? ('编译: ' + buildTime) : '';
@@ -84,79 +108,27 @@ function setConnectionState(connected, text, buildVersion, buildTime) {
 
 async function testConnection() {
   var baseUrl = getBaseUrl();
-  if (el.connectionNote) {
-    el.connectionNote.className = 'helper-note';
-    el.connectionNote.innerHTML = '正在请求 <code>/system/status</code> 检查设备状态...';
-  }
   try {
     var resp = await fetch(baseUrl + '/system/status', { signal: AbortSignal.timeout(3000) });
     if (!resp.ok) {
-      setConnectionState(false, 'HTTP ' + resp.status, '', '');
-      if (el.connectionNote) {
-        el.connectionNote.className = 'helper-note err';
-        el.connectionNote.innerHTML = '状态接口返回 HTTP <b>' + resp.status + '</b>，请确认设备地址和 HTTP 服务。';
-      }
-      showToast('设备响应异常: HTTP ' + resp.status, 'error');
+      setConnectionState(false, 'HTTP ' + resp.status, '', '', {}, null);
       return;
     }
     var data = await resp.json();
     state.latestStatus = data;
     var wifi = data.wifi || {};
+    if (wifi.ip) setDeviceIp(wifi.ip);
     var connected = !!wifi.connected;
     var mode = wifi.mode || 'STA';
     var text = connected ? (mode + ' 已连接') : (mode + ' 未连接');
-    setConnectionState(connected, text, data.version, data.build_time);
-    if (el.connectionNote) {
-      el.connectionNote.className = 'helper-note ' + (connected ? 'ok' : 'warn');
-      el.connectionNote.innerHTML =
-        'IP: <code>' + sanitizeHtml(wifi.ip || '--') + '</code>，RSSI: <b>' +
-        sanitizeHtml(wifi.rssi !== undefined && wifi.rssi !== -127 ? (wifi.rssi + ' dBm') : '--') +
-        '</b>，运行: <b>' + sanitizeHtml(formatUptime(data.uptime_sec)) + '</b>';
-    }
-    showToast(connected ? 'ESP32 当前在线' : '设备已响应，但 WiFi 未连接', connected ? 'success' : 'warning');
+    setConnectionState(connected, text, data.version, data.build_time, wifi, data.uptime_sec);
   } catch (err) {
-    setConnectionState(false, '连接失败', '', '');
-    if (el.connectionNote) {
-      el.connectionNote.className = 'helper-note err';
-      el.connectionNote.innerHTML = '无法访问 <code>/system/status</code>：' + sanitizeHtml(err.message);
-    }
-    showToast('连接失败: ' + err.message, 'error');
+    setConnectionState(false, '连接失败', '', '', {}, null);
   }
 }
 
-// ==================== DBC 文件流程 ====================
-async function handleDbcFile(file) {
-  if (!file) return;
-  var text = await readDbcText(file);
-  var dbc = parseDbc(text);
-  state.dbcFile = file;
-  state.dbcText = text;
-  state.dbc = dbc;
-  state.selectedMessageKey = '';
-  state.signalValues = {};
-  state.checkedKeys = {};
-  state.expandedKeys = {};
-  state.transmitterFilter = Object.create(null);
-  state.transmitterFilterEmpty = true;
-  updateDbcFileInfo(file, dbc);
-  buildSummary();
-  filterMessages();
-  if (dbc.messages.length) selectMessage(dbc.messages[0].key);
-  else renderSelectedMessage();
-  if (el.dbcHint) {
-    el.dbcHint.className = 'helper-note ok';
-    el.dbcHint.innerHTML = 'DBC 已解析：<b>' + dbc.messages.length + '</b> 条报文，<b>' +
-      dbc.messages.reduce(function (sum, msg) { return sum + msg.signals.length; }, 0) +
-      '</b> 个信号。';
-  }
-  showToast('DBC 导入成功', 'success');
-}
-
-function clearDbc() {
-  state.dbcFile = null;
-  state.dbcText = '';
-  state.dbc = null;
-  state.filteredMessages = [];
+// ==================== DBC 文件流程（支持多文件叠加） ====================
+function resetSelectionState() {
   state.selectedMessageKey = '';
   state.signalValues = {};
   state.checkedKeys = {};
@@ -164,22 +136,125 @@ function clearDbc() {
   state.transmitterFilter = Object.create(null);
   state.transmitterFilterEmpty = true;
   state.generatedData = new Uint8Array(0);
-  if (el.dbcFileInput) el.dbcFileInput.value = '';
-  if (el.dbcSearch) el.dbcSearch.value = '';
-  updateDbcFileInfo(null, null);
+}
+
+function afterDbcSourcesChanged(opts) {
+  opts = opts || {};
+  rebuildMergedDbc();
+  if (opts.resetSelection) resetSelectionState();
+  updateDbcFileInfo();
   buildSummary();
-  renderMessageList();
-  renderSelectedMessage();
+  filterMessages();
+  if (state.dbc && state.dbc.messages.length) {
+    if (opts.resetSelection || !state.selectedMessageKey) {
+      selectMessage(state.dbc.messages[0].key);
+    } else {
+      renderSelectedMessage();
+      updateEncodedPreview();
+    }
+  } else {
+    renderSelectedMessage();
+  }
+  if (el.dbcHint) {
+    el.dbcHint.hidden = true;
+    el.dbcHint.textContent = '';
+  }
+  if (!opts.skipPersist) scheduleCanPersist();
+}
+
+/**
+ * 添加一个或多个 DBC。同名文件覆盖旧源；不同名叠加。
+ * @param {FileList|File[]} fileList
+ */
+async function handleDbcFiles(fileList) {
+  var files = Array.prototype.slice.call(fileList || []).filter(function (f) {
+    return f && f.name;
+  });
+  if (!files.length) return;
+
+  var added = 0;
+  var replaced = 0;
+  var errors = [];
+
+  for (var i = 0; i < files.length; i++) {
+    var file = files[i];
+    try {
+      var text = await readDbcText(file);
+      var dbc = parseDbc(text);
+      if (!dbc.messages.length) {
+        errors.push(file.name + '（无报文）');
+        continue;
+      }
+      var existingIdx = -1;
+      for (var j = 0; j < state.dbcSources.length; j++) {
+        if (state.dbcSources[j].name === file.name) {
+          existingIdx = j;
+          break;
+        }
+      }
+      var entry = {
+        id: existingIdx >= 0 ? state.dbcSources[existingIdx].id : makeDbcSourceId(file.name),
+        name: file.name,
+        size: file.size || 0,
+        text: text, /* 原文，供刷新后恢复 */
+        dbc: dbc
+      };
+      if (existingIdx >= 0) {
+        state.dbcSources[existingIdx] = entry;
+        replaced++;
+      } else {
+        state.dbcSources.push(entry);
+        added++;
+      }
+    } catch (err) {
+      errors.push(file.name + '（' + (err && err.message ? err.message : err) + '）');
+    }
+  }
+
+  afterDbcSourcesChanged({ resetSelection: true });
+
+  if (added || replaced) {
+    var msg = 'DBC：';
+    if (added) msg += '新增 ' + added;
+    if (added && replaced) msg += '，';
+    if (replaced) msg += '覆盖 ' + replaced;
+    msg += '，合计 ' + state.dbcSources.length + ' 个文件';
+    showToast(msg, 'success');
+  }
+  if (errors.length) {
+    showToast('部分失败: ' + errors.slice(0, 2).join('; '), 'warning');
+    if (el.dbcHint) {
+      el.dbcHint.hidden = false;
+      el.dbcHint.className = 'helper-note err';
+      el.dbcHint.innerHTML = '导入问题：' + sanitizeHtml(errors.join('；'));
+    }
+  }
+}
+
+function removeDbcSource(sourceId) {
+  state.dbcSources = state.dbcSources.filter(function (s) { return s.id !== sourceId; });
+  afterDbcSourcesChanged({ resetSelection: true });
   if (el.generatedHex) el.generatedHex.textContent = '--';
   if (el.generatedBytes) el.generatedBytes.innerHTML = '';
-  if (el.dbcHint) {
-    el.dbcHint.className = 'helper-note';
-    el.dbcHint.innerHTML = '当前解析器会自动识别常见 DBC 的 <code>BO_</code>、<code>SG_</code>、<code>VAL_</code>、<code>CM_</code> 和 <code>SIG_VALTYPE_</code>。';
-  }
+  showToast(state.dbcSources.length ? '已移除 1 个 DBC' : '已清除全部 DBC', 'success');
+}
+
+function clearDbc() {
+  state.dbcSources = [];
+  state.dbc = null;
+  state.filteredMessages = [];
+  resetSelectionState();
+  if (el.dbcFileInput) el.dbcFileInput.value = '';
+  if (el.dbcSearch) el.dbcSearch.value = '';
+  afterDbcSourcesChanged({ resetSelection: true });
+  /* 历史/原始帧表单仍保留并写回 localStorage */
+  if (el.generatedHex) el.generatedHex.textContent = '--';
+  if (el.generatedBytes) el.generatedBytes.innerHTML = '';
 }
 
 function handleDbcError(err) {
   if (el.dbcHint) {
+    el.dbcHint.hidden = false;
     el.dbcHint.className = 'helper-note err';
     el.dbcHint.innerHTML = 'DBC 解析失败：' + sanitizeHtml(err.message);
   }
@@ -188,42 +263,79 @@ function handleDbcError(err) {
 
 // ==================== 事件绑定 ====================
 function bindEvents() {
-  el.testConnBtn.addEventListener('click', testConnection);
-  el.defaultChannel.addEventListener('change', function () {
-    el.manualChannel.value = el.defaultChannel.value;
-    el.canChannelPill.textContent = 'CH' + el.defaultChannel.value;
-    renderMessageList();
-    renderSelectedMessage();
-    updateEncodedPreview();
-  });
-  el.dbcDropZone.addEventListener('click', function () { el.dbcFileInput.click(); });
-  el.dbcDropZone.addEventListener('dragover', function (event) {
-    event.preventDefault();
-    el.dbcDropZone.classList.add('dragover');
-  });
-  el.dbcDropZone.addEventListener('dragleave', function () {
-    el.dbcDropZone.classList.remove('dragover');
-  });
-  el.dbcDropZone.addEventListener('drop', function (event) {
-    event.preventDefault();
-    el.dbcDropZone.classList.remove('dragover');
-    var file = event.dataTransfer && event.dataTransfer.files ? event.dataTransfer.files[0] : null;
-    if (file) handleDbcFile(file).catch(handleDbcError);
-  });
-  el.dbcFileInput.addEventListener('change', function (event) {
-    var file = event.target && event.target.files ? event.target.files[0] : null;
-    if (file) handleDbcFile(file).catch(handleDbcError);
-  });
-  el.clearDbcBtn.addEventListener('click', clearDbc);
-  el.dbcSearch.addEventListener('input', filterMessages);
+  if (el.defaultChannel) {
+    el.defaultChannel.addEventListener('change', function () {
+      if (el.manualChannel) el.manualChannel.value = el.defaultChannel.value;
+      if (el.canChannelPill) el.canChannelPill.textContent = 'CH' + el.defaultChannel.value;
+      renderMessageList();
+      renderSelectedMessage();
+      updateEncodedPreview();
+      scheduleCanPersist();
+    });
+  }
+  function openDbcPicker() {
+    if (el.dbcFileInput) el.dbcFileInput.click();
+  }
+  if (el.importDbcBtn) el.importDbcBtn.addEventListener('click', openDbcPicker);
+  if (el.replaceDbcBtn) el.replaceDbcBtn.addEventListener('click', openDbcPicker);
+  if (el.dbcDropZone) {
+    el.dbcDropZone.addEventListener('dragover', function (event) {
+      event.preventDefault();
+      el.dbcDropZone.classList.add('dragover');
+    });
+    el.dbcDropZone.addEventListener('dragleave', function (event) {
+      if (!el.dbcDropZone.contains(event.relatedTarget)) {
+        el.dbcDropZone.classList.remove('dragover');
+      }
+    });
+    el.dbcDropZone.addEventListener('drop', function (event) {
+      event.preventDefault();
+      el.dbcDropZone.classList.remove('dragover');
+      var files = event.dataTransfer && event.dataTransfer.files ? event.dataTransfer.files : null;
+      if (files && files.length) handleDbcFiles(files).catch(handleDbcError);
+    });
+    el.dbcDropZone.addEventListener('click', function (event) {
+      var removeBtn = event.target.closest('[data-remove-id]');
+      if (removeBtn) {
+        event.preventDefault();
+        event.stopPropagation();
+        removeDbcSource(removeBtn.getAttribute('data-remove-id'));
+        return;
+      }
+      if (state.dbcSources.length) return;
+      if (event.target.closest('button, a, input, select, label')) return;
+      openDbcPicker();
+    });
+  }
+  if (el.dbcFileInput) {
+    el.dbcFileInput.addEventListener('change', function (event) {
+      var files = event.target && event.target.files ? event.target.files : null;
+      if (files && files.length) handleDbcFiles(files).catch(handleDbcError);
+      event.target.value = '';
+    });
+  }
+  if (el.clearDbcBtn) el.clearDbcBtn.addEventListener('click', clearDbc);
+  if (el.dbcSearch) {
+    el.dbcSearch.addEventListener('input', function () {
+      filterMessages();
+      scheduleCanPersist();
+    });
+  }
   el.sendSelectedBtn.addEventListener('click', sendSelectedMessage);
   el.loadPreviewToRawBtn.addEventListener('click', loadPreviewToManual);
   el.sendManualBtn.addEventListener('click', sendManualFrame);
-  el.resetManualBtn.addEventListener('click', resetManualFields);
-  el.manualData.addEventListener('input', refreshManualHint);
-  el.manualDlc.addEventListener('input', refreshManualHint);
-  el.manualId.addEventListener('input', refreshManualHint);
-  el.toolIp.addEventListener('change', testConnection);
+  el.resetManualBtn.addEventListener('click', function () {
+    resetManualFields();
+    scheduleCanPersist();
+  });
+  function onManualFieldChange() {
+    refreshManualHint();
+    scheduleCanPersist();
+  }
+  el.manualData.addEventListener('input', onManualFieldChange);
+  el.manualDlc.addEventListener('input', onManualFieldChange);
+  el.manualId.addEventListener('input', onManualFieldChange);
+  if (el.manualChannel) el.manualChannel.addEventListener('change', scheduleCanPersist);
   if (el.sendCheckedBtn) el.sendCheckedBtn.addEventListener('click', sendCheckedMessages);
   if (el.selectAllBox) el.selectAllBox.addEventListener('change', function () {
     var visible = state.filteredMessages || [];
@@ -233,16 +345,19 @@ function bindEvents() {
       visible.forEach(function (m) { delete state.checkedKeys[m.key]; });
     }
     renderMessageList();
+    scheduleCanPersist();
   });
   if (el.expandAllBtn) el.expandAllBtn.addEventListener('click', function () {
     var visible = state.filteredMessages || [];
     visible.forEach(function (m) { state.expandedKeys[m.key] = true; ensureMessageDefaults(m); });
     renderMessageList();
+    scheduleCanPersist();
   });
   if (el.collapseAllBtn) el.collapseAllBtn.addEventListener('click', function () {
     var visible = state.filteredMessages || [];
     visible.forEach(function (m) { delete state.expandedKeys[m.key]; });
     renderMessageList();
+    scheduleCanPersist();
   });
   bindNodeFilterEvents();
 }
@@ -251,15 +366,49 @@ function bindEvents() {
 function init() {
   cacheElements();
   bindEvents();
-  setConnectionState(false, '未连接', '', '');
-  if (el.canChannelPill) el.canChannelPill.textContent = 'CH' + el.defaultChannel.value;
-  if (el.manualChannel) el.manualChannel.value = el.defaultChannel.value;
+  bindCanPersistLifecycle();
+
+  var restoredInfo = loadCanSession();
+  setConnectionState(false, '未连接', '', '', { ip: getDeviceIp() }, null);
+  if (el.canChannelPill && el.defaultChannel) {
+    el.canChannelPill.textContent = 'CH' + el.defaultChannel.value;
+  }
+  if (el.manualChannel && el.defaultChannel && !restoredInfo.restored) {
+    el.manualChannel.value = el.defaultChannel.value;
+  }
+
+  recomputeTransmitterFilterEmpty();
+  updateNodeFilterLabel();
+  updateDbcFileInfo();
   buildSummary();
-  renderMessageList();
-  renderSelectedMessage();
+  filterMessages();
+  if (state.dbc && state.dbc.messages.length) {
+    if (state.selectedMessageKey) {
+      selectMessage(state.selectedMessageKey);
+    } else {
+      selectMessage(state.dbc.messages[0].key);
+    }
+  } else {
+    renderSelectedMessage();
+  }
+  updateBatchUi();
   refreshManualHint();
   renderHistory();
+
+  if (restoredInfo.restored && (restoredInfo.dbcCount || restoredInfo.historyCount)) {
+    var tip = '已恢复会话';
+    if (restoredInfo.dbcCount) tip += '：' + restoredInfo.dbcCount + ' 个 DBC';
+    if (restoredInfo.historyCount) {
+      tip += (restoredInfo.dbcCount ? '，' : '：') + restoredInfo.historyCount + ' 条发送记录';
+    }
+    showToast(tip, 'success');
+  }
+
   setTimeout(testConnection, 150);
+  /* 周期性刷新顶栏 STA/IP/RSSI/运行时间（与监控 1Hz 解耦，避免重复 pill） */
+  setInterval(testConnection, 5000);
+  /* 右侧抽屉：CAN 接收监控 */
+  initCanMonitor();
 }
 
 init();

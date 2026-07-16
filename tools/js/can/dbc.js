@@ -9,8 +9,9 @@
 
 // ==================== 共享状态 ====================
 export var state = {
-  dbcFile: null,
-  dbcText: '',
+  /** @type {{ id: string, name: string, size: number, dbc: object }[]} */
+  dbcSources: [],
+  /** 合并视图 { messages, nodeNames, messageMap }；由 rebuildMergedDbc() 维护 */
   dbc: null,
   filteredMessages: [],
   selectedMessageKey: '',
@@ -30,10 +31,32 @@ export var state = {
 export var el = {};
 
 // ==================== 基础工具 ====================
-/** @description 拼接设备基础 URL（http://<ip>），ip 取自 el.toolIp，默认 192.168.31.127。 */
+var LS_ESP_IP = 'dcu_esp_ip';
+var DEFAULT_ESP_IP = '192.168.31.127';
+
+/** @description 设备 IP：优先 localStorage（与 OTA 页共用），否则默认。 */
+export function getDeviceIp() {
+  try {
+    var saved = localStorage.getItem(LS_ESP_IP);
+    if (saved && saved.trim()) return saved.trim();
+  } catch (_) {}
+  if (el.toolIp && el.toolIp.value && el.toolIp.value.trim()) {
+    return el.toolIp.value.trim();
+  }
+  return DEFAULT_ESP_IP;
+}
+
+/** @description 记住设备 IP（status 回报或其它页写入）。 */
+export function setDeviceIp(ip) {
+  if (!ip || !String(ip).trim()) return;
+  var v = String(ip).trim();
+  try { localStorage.setItem(LS_ESP_IP, v); } catch (_) {}
+  if (el.toolIp) el.toolIp.value = v;
+}
+
+/** @description 拼接设备基础 URL（http://<ip>）。 */
 export function getBaseUrl() {
-  var ip = (el.toolIp && el.toolIp.value ? el.toolIp.value.trim() : '') || '192.168.31.127';
-  return 'http://' + ip;
+  return 'http://' + getDeviceIp();
 }
 
 /** @description 解析手动输入的 CAN ID（支持 0x/hex/十进制）。 */
@@ -239,15 +262,76 @@ export function parseMultiplexToken(token) {
   return { role: null, value: null };
 }
 
+/**
+ * 将多个 DBC 源合并为统一 messages 列表。
+ * 每条报文 key = sourceId:idRaw:name，避免不同文件同 ID/同名冲突。
+ */
+export function rebuildMergedDbc() {
+  if (!state.dbcSources.length) {
+    state.dbc = null;
+    return null;
+  }
+  var messages = [];
+  var nodeSet = Object.create(null);
+  var nodeNames = [];
+  var messageMap = {};
+  for (var s = 0; s < state.dbcSources.length; s++) {
+    var src = state.dbcSources[s];
+    var dbc = src.dbc;
+    if (!dbc || !dbc.messages) continue;
+    for (var n = 0; n < (dbc.nodeNames || []).length; n++) {
+      var nn = dbc.nodeNames[n];
+      if (nn && !nodeSet[nn]) {
+        nodeSet[nn] = 1;
+        nodeNames.push(nn);
+      }
+    }
+    for (var i = 0; i < dbc.messages.length; i++) {
+      var msg = dbc.messages[i];
+      var merged = {
+        idRaw: msg.idRaw,
+        name: msg.name,
+        dlc: msg.dlc,
+        transmitter: msg.transmitter,
+        signals: msg.signals,
+        comment: msg.comment,
+        id: msg.id,
+        isExtended: msg.isExtended,
+        sourceId: src.id,
+        sourceName: src.name,
+        key: src.id + ':' + msg.idRaw + ':' + msg.name
+      };
+      messages.push(merged);
+      messageMap[merged.key] = merged;
+    }
+  }
+  state.dbc = { messages: messages, nodeNames: nodeNames, messageMap: messageMap };
+  return state.dbc;
+}
+
+/** @description 生成唯一 source id（同名文件可多次添加时追加 #2） */
+export function makeDbcSourceId(fileName) {
+  var base = String(fileName || 'dbc').replace(/[^\w.\-]+/g, '_');
+  var id = base;
+  var n = 2;
+  while (state.dbcSources.some(function (s) { return s.id === id; })) {
+    id = base + '#' + n;
+    n++;
+  }
+  return id;
+}
+
 /** @description 更新顶部 DBC / 报文数量摘要 pill。 */
 export function buildSummary() {
-  if (!state.dbc) {
+  if (!state.dbc || !state.dbcSources.length) {
     if (el.dbcSummaryPill) el.dbcSummaryPill.textContent = '未导入 DBC';
     if (el.messageSummaryPill) el.messageSummaryPill.textContent = '0 报文';
     return;
   }
+  var nFiles = state.dbcSources.length;
   if (el.dbcSummaryPill) {
-    el.dbcSummaryPill.textContent = (state.dbc.nodeNames.length || 0) + ' 节点';
+    el.dbcSummaryPill.textContent =
+      nFiles + ' 文件 · ' + (state.dbc.nodeNames.length || 0) + ' 节点';
   }
   if (el.messageSummaryPill) {
     el.messageSummaryPill.textContent = state.dbc.messages.length + ' 报文';

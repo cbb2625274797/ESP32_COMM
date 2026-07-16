@@ -145,10 +145,16 @@ export async function pickFileViaFSAPI() {
     return false;
   }
   try {
-    const handles = await window.showOpenFilePicker({
+    const pickerOpts = {
+      id: 'dcu-fw-ble',
       types: [{ description: '固件文件', accept: { 'application/octet-stream': ['.bin', '.hex'] } }],
       multiple: false
-    });
+    };
+    /* 再次选择时定位到刷新/上次已选文件所在目录 */
+    if (state.selectedFileHandle) {
+      pickerOpts.startIn = state.selectedFileHandle;
+    }
+    const handles = await window.showOpenFilePicker(pickerOpts);
     if (handles && handles.length > 0) {
       const handle = handles[0];
       const file = await handle.getFile();

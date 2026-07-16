@@ -126,11 +126,11 @@ export function updateHeapAndTaskStatusUi(data) {
     setCpuFill(usagePct);
 
     if (taskList) {
-      var visibleTasks = tasks.slice(0, 8);
-      if (!visibleTasks.length) {
+      /* 按占用降序渲染全部任务；列表容器 CSS 默认露出约 3 条，其余滚动 */
+      if (!tasks.length) {
         taskList.innerHTML = '<div class="status-empty">当前采样没有任务增量</div>';
       } else {
-        taskList.innerHTML = visibleTasks.map(function (task) {
+        taskList.innerHTML = tasks.map(function (task) {
           var pct = Number(task.usage_pct) || 0;
           var delta = Number(task.runtime_delta) || 0;
           var fillClass = pct >= 85 ? 'err' : pct >= 70 ? 'warn' : '';
@@ -177,6 +177,16 @@ export function updateHeapAndTaskStatusUi(data) {
     if (!names.length) {
       taskList.innerHTML = '<div class="status-empty">当前状态未包含任务栈信息</div>';
     } else {
+      /* 峰值占用比例降序；容器默认露出最高 3 条，其余滚动 */
+      names.sort(function (a, b) {
+        var ia = taskStack[a] || {};
+        var ib = taskStack[b] || {};
+        var sa = Number(ia.stack_size_bytes) || 0;
+        var sb = Number(ib.stack_size_bytes) || 0;
+        var pa = sa > 0 ? ((Number(ia.peak_used_bytes) || 0) * 100 / sa) : 0;
+        var pb = sb > 0 ? ((Number(ib.peak_used_bytes) || 0) * 100 / sb) : 0;
+        return pb - pa;
+      });
       taskList.innerHTML = names.map(function (name) {
         var item = taskStack[name] || {};
         var stackSize = Number(item.stack_size_bytes) || 0;

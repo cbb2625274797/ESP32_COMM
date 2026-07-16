@@ -57,17 +57,12 @@
 #define BLE_OTA_FINISH_GD32_RELAY_DONE 0x11
 #define BLE_OTA_FINISH_ABORTED       0x20  // 用户主动中止（BLE 不断开）
 #define BLE_OTA_FINISH_ERR_FINALIZE 0x81
-#define BLE_OTA_ACK_WINDOW 32
 #define BLE_ATT_ERR_OTA_BUSY 0x80           // ESP32 OTA 被其他通道占用
 #define BLE_OTA_FINISH_ERR_MUTEX 0x83       // 互斥拒绝: OTA 被其他通道占用
 #define BLE_OTA_FINISH_ERR_GD32_SIZE 0x84   // GD32 固件超出分区大小
 #define BLE_OTA_FINISH_ERR_SHA_MISMATCH 0x85 // OTA SHA-256 不匹配
 #define BLE_OTA_FINISH_ERR_GD32_RELAY 0x86  // GD32 SPI OTA 转发失败
-
-// ── 数据队列：将 OTA 数据处理从 NimBLE host task 卸载到工作线程 ──
-// 避免 flash 操作（esp_ota_begin / esp_ota_write）阻塞 BLE 协议栈导致连接断开。
-// 深度略大于窗口：seq=0 整分区预擦期间前端若仍误发，可多扛几批，减少“队列满丢包→重传风暴”。
-#define BLE_OTA_DATA_QUEUE_LEN (BLE_OTA_ACK_WINDOW * 2 + 8)
+// BLE_OTA_ACK_WINDOW / BLE_OTA_DATA_QUEUE_LEN / BLE_OTA_REORDER_WINDOW → app_config.h
 
 struct BleOtaDataBatch {
     uint8_t *data;
@@ -105,6 +100,8 @@ static uint32_t packBleFinishValue(uint16_t session_id, uint16_t code);
 static void shaBytesToHexUpper(const uint8_t sha[32], char out_hex[65]);
 static void sendSha256Notify(const uint8_t sha[32], uint16_t session_id);
 static void esp32_reorder_free();
+static void ble_ota_session_reset(void);
+static void ble_ota_restore_wifi_ps(void);
 static void ble_ota_data_worker_task(void *pvParameters);
 static void ble_gd32_relay_wait_task(void *pvParameters);
 
@@ -182,7 +179,9 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
                         packBleFinishValue(session_id, 1));
         BleOta::instance().m_esp32RebootPending = false;
-        esp32_reorder_free();
+        // 无效会话：协调器可能仍假占用，走统一会话复位
+        ble_ota_session_reset();
+        ble_ota_restore_wifi_ps();
         vTaskDelete(NULL);
         return;
     }
@@ -217,18 +216,22 @@ static void ble_esp32_finish_and_reboot_task(void *pvParameters)
         DEBUG_ERR(TAG, "[FINISH] SHA-256 不匹配，OTA 已中止");
         sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH, packBleFinishValue(session_id, 0));
         BleOta::instance().m_esp32RebootPending = false;
-        // ★ finalize 内部已 abort 并释放 mutex，这里补充通知协调器复位状态机，
-        //   避免 m_sysState 卡在 ESP32_FINALIZING 导致下次 OTA 被假拒绝。
-        OtaCoordinator::instance().abortCurrent();
+        // ★ finalizeForReboot 失败路径已 abortCurrent（协调器→IDLE + core 释放）。
+        //   此处只清 BLE 会话侧 reorder，避免二次 abort 干扰新会话。
         esp32_reorder_free();
+        BleOta::instance().m_esp32LastSeq = 0xFFFFU;
+        BleOta::instance().m_esp32LastCmd = 0;
+        ble_ota_restore_wifi_ps();
     } else {
         DEBUG_ERR(TAG, "[FINISH] OTA 收尾失败: %s", esp_err_to_name(fr.err));
         sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE,
                         packBleFinishValue(session_id, 1));
         BleOta::instance().m_esp32RebootPending = false;
-        // ★ 同上：finalize 已 abort core，这里通知协调器复位状态机
-        OtaCoordinator::instance().abortCurrent();
+        // ★ 同上：协调器已由 finalizeForReboot 复位，仅清 BLE 侧残留
         esp32_reorder_free();
+        BleOta::instance().m_esp32LastSeq = 0xFFFFU;
+        BleOta::instance().m_esp32LastCmd = 0;
+        ble_ota_restore_wifi_ps();
     }
 
     vTaskDelete(NULL);
@@ -1222,7 +1225,7 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     // reorder 可能一次 flush 到下个窗口边界，例如 seq=99 使 expected 直达128；
     // 此时必须立即 ACK 127，否则后续重复包都不产生 progress，前端只能超时。
     //
-    // ★ seq=0 强制 ACK：begin 含整分区预擦，可能耗时数秒～数十秒。
+    // ★ seq=0 强制 ACK：begin 后首包需尽快 ACK，前端才能继续窗口。
     //   前端必须等“首包已落盘”ACK 后再发窗口内其余包，否则队列满丢包→重传极慢。
     uint32_t completedPackets = (afterReceived + BLE_OTA_CHUNK_PAYLOAD - 1U) /
                                 BLE_OTA_CHUNK_PAYLOAD;
@@ -1390,7 +1393,7 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     meta.stored_size = stored_size;
     meta.last_seq = seq;
     const bool transfer_complete = stored_size >= meta.total_size;
-    // seq=0：prepare 含整分区预擦，写完首包必须 ACK，前端才能继续发后续窗口
+    // seq=0：prepare 后写完首包必须 ACK，前端才能继续发后续窗口
     const bool checkpoint =
         (seq == 0U) ||
         ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U) ||

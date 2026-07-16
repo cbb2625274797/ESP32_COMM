@@ -4,11 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 CAN 通信控制台</title>
-<link rel="stylesheet" href="css/base.css?v=20260715a">
-<link rel="stylesheet" href="css/layout.css?v=20260715a">
-<link rel="stylesheet" href="css/components.css?v=20260715a">
-<link rel="stylesheet" href="css/can.css?v=20260715a">
-<link rel="stylesheet" href="css/responsive.css?v=20260715a">
+<link rel="stylesheet" href="css/base.css?v=20260717t">
+<link rel="stylesheet" href="css/layout.css?v=20260717t">
+<link rel="stylesheet" href="css/components.css?v=20260717t">
+<link rel="stylesheet" href="css/can.css?v=20260717t">
+<link rel="stylesheet" href="css/responsive.css?v=20260717t">
 </head>
 <body class="can-page">
 <div class="container can-container">
@@ -20,99 +20,62 @@
     </div>
     <div class="header-status">
       <span class="pill offline" id="canConnPill"><span class="indicator"></span><span id="canConnTxt">未连接</span></span>
+      <span class="pill" id="canIpPill">IP --</span>
+      <span class="pill" id="canRssiPill">RSSI --</span>
+      <span class="pill" id="canUptimePill">运行 --</span>
       <span class="pill" id="canVersionPill">v--</span>
       <span class="pill" id="canChannelPill">CH0</span>
       <span class="pill" id="dbcSummaryPill">未导入 DBC</span>
       <span class="pill" id="messageSummaryPill">0 报文</span>
+      <span class="pill" id="fbModePill">模式: --</span>
+      <span class="pill" id="fbPollStatus">轮询: --</span>
     </div>
     <div class="header-sub can-header-actions">
       <a class="pill can-link-pill" href="index.html">返回 OTA 控制台</a>
-      <a class="pill can-link-pill" href="can_monitor.html">CAN 接收监控</a>
+      <a class="pill can-link-pill" href="can_monitor.html" title="独立全屏监控页">监控全屏</a>
     </div>
   </header>
 
-  <div class="can-top-layout">
-    <section class="card can-toolbar-card">
-      <div class="card-head"><span class="ico">🧰</span> 工作台设置</div>
-      <div class="card-body">
-        <div class="can-toolbar-grid">
-          <div class="can-toolbar-block">
-            <label class="form-label" for="toolIp">ESP32 IP</label>
-            <div class="input-group">
-              <input class="input" type="text" id="toolIp" value="192.168.31.127" placeholder="输入 IP 地址">
-              <button class="btn btn-outline" id="testConnBtn" type="button">测试</button>
-            </div>
-          </div>
-
-          <div class="can-toolbar-block can-toolbar-channel">
-            <label class="form-label" for="defaultChannel">默认通道</label>
-            <select class="input" id="defaultChannel">
-              <option value="0">CH0</option>
-              <option value="1">CH1</option>
-              <option value="2">CH2</option>
-            </select>
-          </div>
-
-          <div class="can-toolbar-block can-toolbar-upload">
-            <label class="form-label">DBC 文件</label>
-            <div class="upload-zone upload-zone-sm dbc-dropzone" id="dbcDropZone">
-              <div class="upload-ico">📥</div>
-              <h4>导入 DBC</h4>
-              <p>点击或拖拽 .dbc 文件</p>
-            </div>
-            <input type="file" id="dbcFileInput" accept=".dbc,text/plain" style="display:none;">
-          </div>
-
-          <div class="can-toolbar-block can-toolbar-search">
-            <label class="form-label" for="dbcSearch">报文搜索</label>
-            <input class="input" type="text" id="dbcSearch" placeholder="按报文名、ID、节点或信号名过滤">
-          </div>
-        </div>
-
-        <div class="file-info can-file-info-inline" id="dbcFileInfo">
-          <div class="file-info-row">
-            <span class="can-file-name">📄 <span id="dbcFileName">-</span></span>
-            <button class="btn btn-ghost btn-sm" id="clearDbcBtn" type="button">清除</button>
-          </div>
-          <div class="file-info-grid">
-            <div class="file-meta-item"><span>报文</span><b id="dbcMessageCount">0</b></div>
-            <div class="file-meta-item"><span>信号</span><b id="dbcSignalCount">0</b></div>
-            <div class="file-meta-item"><span>节点</span><b id="dbcNodeCount">0</b></div>
-            <div class="file-meta-item"><span>大小</span><b id="dbcFileSize">0 B</b></div>
-          </div>
-        </div>
-
-        <div class="can-toolbar-foot">
-          <div class="conn-indicator err" id="connIndicator">
-            <span class="light"></span>
-            <span id="connIndicatorTxt">等待连接测试</span>
-          </div>
-          <div class="helper-note" id="connectionNote">
-            当前页面会直接调用 <code>/system/status</code> 和 <code>/can/send</code>。
-          </div>
-          <div class="helper-note" id="dbcHint">
-            当前解析器会自动识别常见 DBC 的 <code>BO_</code>、<code>SG_</code>、<code>VAL_</code>、
-            <code>CM_</code> 和 <code>SIG_VALTYPE_</code>。
-          </div>
-        </div>
-      </div>
-    </section>
-    <section class="card can-history-card">
-      <div class="card-head"><span class="ico">🕘</span> 最近发送</div>
-      <div class="card-body">
-        <div class="history-list history-list-compact" id="historyList">
-          <div class="status-empty">尚未发送任何 CAN 帧。</div>
-        </div>
-      </div>
-    </section>
-  </div>
+  <!-- DBC 并入报文列表：无文件时列表内大拖放区；有文件时标题栏紧凑摘要 + 更换 -->
+  <input type="file" id="dbcFileInput" accept=".dbc,text/plain" multiple style="display:none;">
 
   <div class="can-editor-layout">
-    <section class="card can-table-card">
-      <div class="card-head">
+    <div class="can-main-col">
+    <section class="card can-table-card" id="dbcDropZone">
+      <div class="card-head can-msg-list-head">
       <span class="ico">📚</span>
       <span>报文列表</span>
-      <div class="card-head-actions can-batch-actions">
+      <!-- 已导入：合计 + 文件 chip（可逐个移除） -->
+      <div class="dbc-summary-strip dbc-summary-inline" id="dbcFileInfo" hidden>
+        <span class="dbc-summary-meta">
+          <span><b id="dbcFileCount">0</b>文件</span>
+          <span><b id="dbcMessageCount">0</b>报文</span>
+          <span><b id="dbcSignalCount">0</b>信号</span>
+          <span><b id="dbcNodeCount">0</b>节点</span>
+          <span id="dbcFileSize">0 B</span>
+        </span>
+        <span class="dbc-file-chips" id="dbcFileChips"></span>
+      </div>
+      <div class="can-msg-head-actions">
+        <button class="btn btn-ghost btn-sm" id="clearDbcBtn" type="button" title="清除全部 DBC" hidden>全部清除</button>
+        <button class="btn btn-primary btn-sm" id="importDbcBtn" type="button">导入 DBC</button>
+      </div>
+    </div>
+    <!-- 通道 / 搜索 / 勾选 / 节点 / 批量 同一工具栏 -->
+    <div class="can-msg-toolbar" id="canMsgToolbar">
+      <label class="can-msg-channel" for="defaultChannel">
+        <span class="can-msg-channel-label">通道</span>
+        <select class="input can-msg-channel-select" id="defaultChannel" title="默认发送通道">
+          <option value="0">CH0</option>
+          <option value="1">CH1</option>
+          <option value="2">CH2</option>
+        </select>
+      </label>
+      <div class="can-msg-search-wrap">
+        <input class="input can-msg-search" type="text" id="dbcSearch"
+               placeholder="搜索报文名 / ID / 节点 / 信号" autocomplete="off">
+      </div>
+      <div class="can-batch-actions">
         <span class="pill" id="selectedCountPill">已勾选 0</span>
         <div class="can-node-filter" id="nodeFilterWrap">
           <button class="btn btn-outline btn-sm can-node-filter-btn" id="nodeFilterBtn" type="button" aria-haspopup="true" aria-expanded="false">
@@ -143,17 +106,31 @@
     </div>
     <div class="card-body can-table-card-body">
       <div class="message-list" id="messageList">
-        <div class="status-empty">等待导入 DBC...</div>
+        <div class="dbc-empty-drop" id="dbcEmptyDrop">
+          <div class="upload-ico">📥</div>
+          <h4>导入 DBC 开始编辑报文</h4>
+          <p>点击此处或拖拽 <code>.dbc</code> 文件到列表区域</p>
+        </div>
       </div>
+      <div class="helper-note" id="dbcHint" hidden></div>
     </div>
     </section>
 
+    <section class="card can-history-card">
+      <div class="card-head"><span class="ico">🕘</span> 最近发送</div>
+      <div class="card-body">
+        <div class="history-list history-list-compact" id="historyList">
+          <div class="status-empty">尚未发送任何 CAN 帧。</div>
+        </div>
+      </div>
+    </section>
+    </div>
+
     <aside class="can-sidepanel">
-      <section class="card">
+      <section class="card can-preview-card">
         <div class="card-head"><span class="ico">🛰️</span> 帧预览</div>
         <div class="card-body">
           <div class="can-frame-panel can-frame-panel-compact">
-            <div class="can-panel-kicker">编码结果</div>
             <div class="can-frame-hex" id="generatedHex">--</div>
             <div class="can-byte-strip" id="generatedBytes"></div>
             <div class="helper-note" id="encodeHint">选择报文后，信号值会实时编码为 CAN 数据。</div>
@@ -169,7 +146,7 @@
         </div>
       </section>
 
-      <section class="card">
+      <section class="card can-raw-card">
         <div class="card-head"><span class="ico">✍️</span> 原始帧发送</div>
         <div class="card-body">
           <div class="row-2 can-raw-grid">
@@ -207,16 +184,140 @@
           </div>
         </div>
       </section>
-
     </aside>
   </div>
 </div>
+
+<!-- 右侧滑出：CAN 接收监控（与 OTA 页「堆与任务栈」同样交互） -->
+<aside class="sys-drawer can-monitor-drawer" id="canMonitorDrawer" aria-label="CAN 接收监控">
+  <div class="sys-drawer-rail" title="悬停展开 CAN 接收监控">
+    <span class="sys-drawer-rail-ico">📊</span>
+    <span class="sys-drawer-rail-text">CAN 接收监控</span>
+  </div>
+  <div class="sys-drawer-panel card">
+    <div class="card-head sys-drawer-head">
+      <span class="ico">📊</span> CAN 接收监控
+    </div>
+    <div class="card-body sys-drawer-body">
+      <div class="status-section-title">接收模式</div>
+      <div class="input-group" style="margin-bottom:12px;flex-wrap:wrap;">
+        <button class="btn btn-primary btn-sm" id="btnModeAllPass" type="button">全收模式</button>
+        <button class="btn btn-outline btn-sm" id="btnModeFilter" type="button">过滤模式</button>
+        <button class="btn btn-outline btn-sm" id="btnModeBridge" type="button" title="CAN0 收到的每一帧按原帧格式自动转发到 CAN1 与 CAN2">CAN0→1/2 桥接</button>
+      </div>
+      <div class="helper-note" id="monHelper" style="margin-bottom:14px;">
+        地址与顶栏一致；1Hz <code>/can/feedback</code>。悬停抽屉保持展开。
+      </div>
+
+      <div class="status-section-title">三路 CAN 通道（1Hz）</div>
+      <div class="feedback-grid feedback-grid-drawer">
+        <div class="feedback-channel collapsed" id="fbCh0">
+          <div class="feedback-ch-head" role="button" tabindex="0" title="点击展开/折叠详情">
+            <span class="ch-dot ch0"></span> CAN0
+            <span class="feedback-expand-caret">▾</span>
+          </div>
+          <div class="feedback-primary">
+            <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb0State">--</span></div>
+            <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb0Rx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb0Tx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb0Drop">--</span></div>
+            <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb0Err">--</span></div>
+          </div>
+          <div class="feedback-detail">
+            <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb0Tec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb0Rec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb0Bus">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb0LastId">--</span></div>
+            <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb0Dlc">--</span></div>
+            <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb0Flags">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb0Seq">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb0Delta">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb0LastData">--</span></div>
+          </div>
+        </div>
+
+        <div class="feedback-channel collapsed" id="fbCh1">
+          <div class="feedback-ch-head" role="button" tabindex="0" title="点击展开/折叠详情">
+            <span class="ch-dot ch1"></span> CAN1
+            <span class="feedback-expand-caret">▾</span>
+          </div>
+          <div class="feedback-primary">
+            <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb1State">--</span></div>
+            <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb1Rx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb1Tx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb1Drop">--</span></div>
+            <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb1Err">--</span></div>
+          </div>
+          <div class="feedback-detail">
+            <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb1Tec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb1Rec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb1Bus">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb1LastId">--</span></div>
+            <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb1Dlc">--</span></div>
+            <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb1Flags">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb1Seq">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb1Delta">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb1LastData">--</span></div>
+          </div>
+        </div>
+
+        <div class="feedback-channel collapsed" id="fbCh2">
+          <div class="feedback-ch-head" role="button" tabindex="0" title="点击展开/折叠详情">
+            <span class="ch-dot ch2"></span> CAN2
+            <span class="feedback-expand-caret">▾</span>
+          </div>
+          <div class="feedback-primary">
+            <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb2State">--</span></div>
+            <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb2Rx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb2Tx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb2Drop">--</span></div>
+            <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb2Err">--</span></div>
+          </div>
+          <div class="feedback-detail">
+            <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb2Tec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb2Rec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb2Bus">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb2LastId">--</span></div>
+            <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb2Dlc">--</span></div>
+            <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb2Flags">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb2Seq">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb2Delta">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb2LastData">--</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="status-section-title" style="margin-top:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span>每 ID 快照表</span>
+        <select class="input" id="idsnapChannel" style="width:100px;text-transform:none;">
+          <option value="0">CAN0</option>
+          <option value="1">CAN1</option>
+          <option value="2">CAN2</option>
+        </select>
+        <span class="pill" id="idsnapStatus">--</span>
+      </div>
+      <div class="idsnap-table-wrap">
+        <table class="idsnap-table" id="idsnapTable">
+          <thead>
+            <tr>
+              <th>#</th><th>CAN ID</th><th>DLC</th>
+              <th>FD</th><th>BRS</th><th>ESI</th><th>数据 (HEX)</th>
+            </tr>
+          </thead>
+          <tbody id="idsnapBody">
+            <tr><td colspan="7" class="status-empty">等待数据...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</aside>
 
 <div class="toast" id="toast">
   <span class="toast-ico" id="toastIco">✓</span>
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script type="module" src="js/can.js?v=20260715a"></script>
+<script type="module" src="js/can.js?v=20260717t"></script>
 </body>
 </html>

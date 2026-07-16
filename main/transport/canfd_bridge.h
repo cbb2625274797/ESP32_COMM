@@ -30,7 +30,7 @@ typedef struct {
     can_channel_t channel;      ///< CAN 通道 (0~2)
     uint32_t      ext_id;      ///< 扩展帧 ID (29bit, Big-Endian 存储)
     uint8_t       data[CAN_MAX_DLC];  ///< CAN 数据负载 (最大 64 字节)
-    uint8_t       dlc;         ///< 数据长度 (1~64)
+    uint8_t       dlc;         ///< 数据长度 (0~64)
 } can_frame_t;
 
 /**
@@ -38,8 +38,8 @@ typedef struct {
  *        内部通过 SpiMaster 的公共 SPI 接口完成传输。
  * @param channel CAN 通道编号（0~2）。
  * @param ext_id 扩展帧 ID（29 位）。
- * @param data CAN 数据负载。
- * @param dlc 数据长度。
+ * @param data CAN 数据负载；dlc==0 时可为 nullptr。
+ * @param dlc 数据长度（0~64）；0 表示空数据帧，仍发送 ID。
  * @param recv_buf 接收数据缓冲区（可为 nullptr）。
  * @param recv_max 接收缓冲区最大长度。
  * @param timeout_ms 超时时间（毫秒）。
@@ -61,11 +61,14 @@ int canFdSend(can_channel_t channel, uint32_t ext_id,
 
 /**
  * @brief 单个不重复 ID 的最新帧快照条目。
+ *
+ * 0xC1 线协议条目：id(4LE)+dlc(1)+flags(1)+rsvd(2)+data(dlc)。
+ * seq / rx_count 未上线，解析后恒为 0（保留字段便于日后扩协议）。
  */
 typedef struct {
-    uint32_t id;
-    uint32_t seq;
-    uint32_t rx_count;
+    uint32_t id;        ///< CAN ID
+    uint32_t seq;       ///< 线协议未携带，解析后恒 0
+    uint32_t rx_count;  ///< 线协议未携带，解析后恒 0
     uint8_t  dlc;
     uint8_t  fd_flag;
     uint8_t  brs;
@@ -77,8 +80,6 @@ typedef struct {
 // CAN 接收过滤模式 & 1Hz 反馈快照
 // 与 GD32 DCU_APP SPI 协议帧 0xC1/0xC2 配套
 // ============================================================
-#define SPI_CAN_FEEDBACK_LAST_DATA_BYTES 93   ///< 反馈快照中最近一帧数据字节数（受 SPI 128B 应答帧约束（kTxBufSize=128 - overhead=5 - 前缀30 = 93））
-
 typedef enum {
     CAN_RX_MODE_ALL_PASS  = 0,  ///< 默认：禁用 ID 过滤，三路全部接收
     CAN_RX_MODE_FILTER_ID = 1,  ///< 按 CONFIG_CAN_RX_FILTER_ID/MASK 做标准帧过滤
@@ -115,24 +116,27 @@ typedef struct {
  * @brief 解析 GD32 主动推送的一页 CAN 反馈 payload，累积到结果结构中。
  *
  * GD32 APP 通过 requestEsp32Read(0xC1) 主动推送每页反馈，ESP32 收到后
- * 调用本函数解析。page=0 时重置 out 并填充固定头 + 首批条目；
- * page=1 时在已有条目后追加。每页解析后置 out->valid=1。
+ * 调用本函数解析：
+ *   - page=0：清空 entries、重置 entryIdx，填固定头 + 首批条目；
+ *   - page=1：校验 channel 与 page0 一致后追加；
+ *   - page>1 或声明条目却截断无法解析 → 失败。
+ * 成功时置 out->valid=1。
  *
  * @param payload  GD32 推送帧的 payload（[channel, page, total, count, mode, seq, ...]）。
  * @param len      payload 长度。
  * @param out      累积结果（跨 page 0/1 累积）。
  * @param entryIdx 当前已填充条目数（page 0 时被重置为 0，调用方按通道维护）。
- * @return 0 成功，<0 失败（payload 过短或通道非法）。
+ * @return 0 成功，<0 失败（payload 过短、页号/通道非法或条目截断）。
  */
 int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
                            can_feedback_result_t *out, uint8_t *entryIdx);
 
 /**
- * @brief 切换 GD32 三路 CAN 的接收过滤模式。
- * @param mode       目标模式（0=全收，1=按 ID 过滤）。
+ * @brief 切换 GD32 三路 CAN 的接收过滤模式（SPI 0xC2）。
+ * @param mode       目标模式（0=全收，1=按 ID 过滤，2=CAN0 桥接到 1/2）。
  * @param actual     可选输出，GD32 实际生效模式。
  * @param timeout_ms SPI 事务超时。
- * @return 0 成功，<0 失败。
+ * @return 0 成功，<0 失败（失败时打 WARN 日志）。
  */
 int canFdSetRxMode(can_rx_mode_t mode,
                    can_rx_mode_t *actual,

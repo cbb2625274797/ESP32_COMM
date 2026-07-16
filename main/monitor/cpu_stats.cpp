@@ -6,11 +6,16 @@
 #include <algorithm>
 #include <cstring>
 #include <inttypes.h>
-#include <stdlib.h>
 
 #include "app_config.h"
 #include "esp_timer.h"
 #include "monitor/debug_log.h"
+
+/** 截断/回绕 WARN 最小间隔（30s） */
+static TickType_t cpuStatsWarnIntervalTicks()
+{
+    return pdMS_TO_TICKS(30000);
+}
 
 CpuStats& CpuStats::instance()
 {
@@ -78,91 +83,113 @@ static bool taskNameIsIdle(const char* name)
 
 void CpuStats::sampleOnce()
 {
-    UBaseType_t task_count = uxTaskGetNumberOfTasks();
-    if (task_count == 0) {
+    const UBaseType_t live = uxTaskGetNumberOfTasks();
+    if (live == 0) {
         return;
     }
-    task_count = std::min<UBaseType_t>(task_count + 2U, (UBaseType_t)CPU_TASK_SNAPSHOT_MAX);
 
-    TaskStatus_t* tasks = (TaskStatus_t*)calloc(task_count, sizeof(TaskStatus_t));
-    if (!tasks) {
-        return;
+    /* P1：任务数超出快照上限时节流告警（否则静默丢任务） */
+    if (live > (UBaseType_t)CPU_TASK_SNAPSHOT_MAX) {
+        const TickType_t now_tick = xTaskGetTickCount();
+        if (m_lastTruncWarnTick == 0 ||
+            (now_tick - m_lastTruncWarnTick) >= cpuStatsWarnIntervalTicks()) {
+            m_lastTruncWarnTick = now_tick;
+            DEBUG_WARN("CPU",
+                       "任务数 %lu > 快照上限 %u，本拍仅统计前 %u 个任务",
+                       (unsigned long)live,
+                       (unsigned)CPU_TASK_SNAPSHOT_MAX,
+                       (unsigned)CPU_TASK_SNAPSHOT_MAX);
+        }
     }
+
+    /* P1：固定成员缓冲，免每拍 heap */
+    const UBaseType_t buf_slots =
+        std::min<UBaseType_t>(live + 2U, (UBaseType_t)CPU_TASK_SNAPSHOT_MAX);
 
     configRUN_TIME_COUNTER_TYPE total_runtime = 0;
-    UBaseType_t captured = uxTaskGetSystemState(tasks, task_count, &total_runtime);
+    const UBaseType_t captured =
+        uxTaskGetSystemState(m_taskStatusBuf, buf_slots, &total_runtime);
     const int64_t now_us = esp_timer_get_time();
 
-    if (captured == 0 || captured > task_count) {
+    if (captured == 0 || captured > buf_slots) {
         DEBUG_WARN("CPU", "uxTaskGetSystemState 异常: captured=%lu buf=%lu",
-                   (unsigned long)captured, (unsigned long)task_count);
-        free(tasks);
+                   (unsigned long)captured, (unsigned long)buf_slots);
         return;
     }
 
     CpuUsageSnapshot snap = {};
     snap.available = true;
 
+    /*
+     * P2：先用 m_lastSamples 算本窗口，再写回基线（无需栈上 previous 拷贝）。
+     * total 回绕（total_runtime < m_lastTotal）时丢弃本窗，只重建基线。
+     */
     const bool had_previous = m_hasLast;
-    const configRUN_TIME_COUNTER_TYPE previous_total = m_lastTotal;
-    const int64_t previous_time_us = m_lastTimeUs;
-    const size_t previous_count = m_lastCount;
-    TaskSample previous_samples[CPU_TASK_SNAPSHOT_MAX];
-    for (size_t i = 0; i < previous_count && i < CPU_TASK_SNAPSHOT_MAX; ++i) {
-        previous_samples[i] = m_lastSamples[i];
+    const bool wrapped = had_previous && total_runtime < m_lastTotal;
+    if (wrapped) {
+        const TickType_t now_tick = xTaskGetTickCount();
+        if (m_lastWrapWarnTick == 0 ||
+            (now_tick - m_lastWrapWarnTick) >= cpuStatsWarnIntervalTicks()) {
+            m_lastWrapWarnTick = now_tick;
+            DEBUG_WARN("CPU",
+                       "run-time 计数回绕，丢弃本采样窗 total=%" PRIu64 " prev=%" PRIu64,
+                       (uint64_t)total_runtime,
+                       (uint64_t)m_lastTotal);
+        }
     }
 
-    /* 先更新基线，再算本窗口（与旧 HTTP 路径语义一致） */
-    size_t copy_count = std::min<size_t>((size_t)captured, CPU_TASK_SNAPSHOT_MAX);
-    for (size_t i = 0; i < copy_count; ++i) {
-        m_lastSamples[i].task_number = tasks[i].xTaskNumber;
-        m_lastSamples[i].runtime = tasks[i].ulRunTimeCounter;
-    }
-    m_lastCount = copy_count;
-    m_lastTotal = total_runtime;
-    m_lastTimeUs = now_us;
-    m_hasLast = true;
-
-    const bool can_compute = had_previous && total_runtime >= previous_total && now_us > previous_time_us;
-    const uint64_t total_delta = can_compute ? runtimeDelta(total_runtime, previous_total) : 0U;
+    const bool can_compute =
+        had_previous && !wrapped && now_us > m_lastTimeUs;
+    const uint64_t total_delta =
+        can_compute ? runtimeDelta(total_runtime, m_lastTotal) : 0U;
     uint64_t idle_delta = 0U;
 
     if (can_compute && total_delta > 0U) {
         for (UBaseType_t i = 0; i < captured; ++i) {
             configRUN_TIME_COUNTER_TYPE last_runtime = 0;
             bool found = false;
-            for (size_t j = 0; j < previous_count; ++j) {
-                if (previous_samples[j].task_number == tasks[i].xTaskNumber) {
-                    last_runtime = previous_samples[j].runtime;
+            for (size_t j = 0; j < m_lastCount; ++j) {
+                if (m_lastSamples[j].task_number == m_taskStatusBuf[i].xTaskNumber) {
+                    last_runtime = m_lastSamples[j].runtime;
                     found = true;
                     break;
                 }
             }
             if (!found) {
-                continue;
+                continue; /* 新任务：本窗无 delta */
             }
-            uint64_t delta = runtimeDelta(tasks[i].ulRunTimeCounter, last_runtime);
+            /* 单任务计数回绕时 runtimeDelta→0，本任务本窗记 0 */
+            uint64_t delta = runtimeDelta(m_taskStatusBuf[i].ulRunTimeCounter, last_runtime);
             double pct = (double)delta * 100.0 / (double)total_delta;
-            if (taskNameIsIdle(tasks[i].pcTaskName)) {
+            if (taskNameIsIdle(m_taskStatusBuf[i].pcTaskName)) {
                 idle_delta += delta;
             }
             if (snap.task_count < CPU_TASK_SNAPSHOT_MAX) {
                 CpuTaskMetric& m = snap.tasks[snap.task_count++];
-                const char* n = tasks[i].pcTaskName ? tasks[i].pcTaskName : "";
+                const char* n = m_taskStatusBuf[i].pcTaskName ? m_taskStatusBuf[i].pcTaskName : "";
                 strncpy(m.name, n, sizeof(m.name) - 1);
                 m.name[sizeof(m.name) - 1] = '\0';
-                m.task_number = tasks[i].xTaskNumber;
+                m.task_number = m_taskStatusBuf[i].xTaskNumber;
                 m.runtime_delta = delta;
                 m.usage_pct = pct;
             }
         }
         snap.valid = true;
-        snap.sample_ms = (uint32_t)((now_us - previous_time_us) / 1000);
+        snap.sample_ms = (uint32_t)((now_us - m_lastTimeUs) / 1000);
         snap.idle_pct = std::min(100.0, (double)idle_delta * 100.0 / (double)total_delta);
         snap.usage_pct = std::max(0.0, 100.0 - snap.idle_pct);
     }
 
-    free(tasks);
+    /* 更新基线（首拍 / 正常窗 / 回绕丢窗后均重建） */
+    const size_t copy_count = std::min<size_t>((size_t)captured, CPU_TASK_SNAPSHOT_MAX);
+    for (size_t i = 0; i < copy_count; ++i) {
+        m_lastSamples[i].task_number = m_taskStatusBuf[i].xTaskNumber;
+        m_lastSamples[i].runtime = m_taskStatusBuf[i].ulRunTimeCounter;
+    }
+    m_lastCount = copy_count;
+    m_lastTotal = total_runtime;
+    m_lastTimeUs = now_us;
+    m_hasLast = true;
 
     portENTER_CRITICAL(&m_mux);
     m_published = snap;

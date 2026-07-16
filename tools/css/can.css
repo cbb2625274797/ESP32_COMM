@@ -147,6 +147,11 @@
 }
 
 /* === CAN WORKSPACE PAGE === */
+/* 右侧监控抽屉 translate 出屏时，防止 body 被撑出横向滚动条 */
+body.can-page {
+  overflow-x: hidden;
+  max-width: 100%;
+}
 .can-page::after {
   content: "";
   position: fixed;
@@ -157,7 +162,10 @@
     radial-gradient(circle at 85% 14%, rgba(245,158,11,.05), transparent 24%);
 }
 .can-container {
-  max-width: 1700px;
+  max-width: min(1700px, 100%);
+  width: 100%;
+  overflow-x: hidden;
+  box-sizing: border-box;
 }
 .can-header {
   position: sticky;
@@ -180,44 +188,329 @@
 }
 .can-toolbar-grid {
   display: grid;
-  grid-template-columns: minmax(260px, 1.1fr) 180px minmax(220px, .9fr) minmax(260px, 1fr);
+  grid-template-columns: minmax(220px, 1.1fr) 140px minmax(200px, 1fr);
   gap: 14px;
-  align-items: stretch;
+  align-items: start;
+}
+.can-toolbar-grid-compact {
+  grid-template-columns: 140px minmax(220px, 1fr);
+}
+.can-toolbar-grid-dbc-only {
+  grid-template-columns: 1fr;
+  max-width: 420px;
+}
+
+/* DBC 并入报文列表卡 */
+.can-table-card.dbc-dropzone {
+  position: relative;
+  transition: box-shadow .15s, border-color .15s;
+}
+.can-table-card.dbc-dropzone.dragover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+.can-table-card.dbc-dropzone.dragover::after {
+  content: '松开以导入 DBC';
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(9, 14, 21, 0.72);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 15px;
+  pointer-events: none;
+  border-radius: inherit;
+}
+/* 标题栏内：统计 + 文件 chip 同一行；chip 先铺满横轴，真不够再折行 */
+.dbc-summary-inline {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin: 0 0 0 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: none;
+  padding: 2px 6px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.dbc-summary-inline .dbc-summary-meta {
+  flex: 0 0 auto;
+}
+.dbc-file-chips {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap; /* 仅在占满标题栏剩余宽度后折行 */
+  align-items: center;
+  align-content: flex-start;
+  gap: 4px 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: none; /* 去掉 40vw/360px 上限，吃满横轴 */
+  overflow: hidden;
+}
+.dbc-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 140px;
+  padding: 1px 2px 1px 6px;
+  border-radius: 999px;
+  background: rgba(34, 211, 238, 0.1);
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  font-size: 10px;
+  color: var(--text);
+  flex: 0 0 auto;
+}
+.dbc-file-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 110px;
+}
+.dbc-file-chip-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: 50%;
+}
+.dbc-file-chip-remove:hover {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.12);
+}
+.dbc-empty-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 280px;
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  cursor: pointer;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  margin: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.dbc-empty-drop:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.dbc-empty-drop h4 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+  font-weight: 600;
+}
+.dbc-empty-drop p {
+  margin: 0;
+  font-size: 12px;
+}
+.can-table-card-body .helper-note {
+  margin: 0 12px 12px;
 }
 .can-toolbar-block {
   min-width: 0;
 }
 .can-toolbar-upload .upload-zone {
-  height: 100%;
-  min-height: 88px;
-  padding: 18px 14px;
+  min-height: 72px;
+  padding: 12px 12px;
 }
-.can-file-info-inline {
-  margin-top: 14px;
+.can-toolbar-upload .upload-zone h4 { font-size: 13px; margin: 4px 0 2px; }
+.can-toolbar-upload .upload-zone p { font-size: 11px; margin: 0; }
+/* DBC 解析摘要：强制单行 */
+.dbc-summary-strip {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 0;
+  white-space: nowrap;
 }
-.can-file-name {
-  font-weight: 700;
+.dbc-summary-strip[hidden] { display: none !important; }
+.dbc-summary-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 600;
 }
+.dbc-summary-meta {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0 8px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.dbc-summary-meta > span {
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.dbc-summary-meta b {
+  color: var(--text);
+  font-weight: 600;
+  margin-right: 1px;
+}
+.dbc-summary-strip .btn { flex: 0 0 auto; padding: 2px 8px; white-space: nowrap; }
 .can-toolbar-foot {
-  display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
-  margin-top: 14px;
-  align-items: start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 12px;
+  align-items: center;
+}
+.can-toolbar-foot .helper-note {
+  flex: 1 1 160px;
+  margin: 0;
+  font-size: 11px;
+}
+
+/* 报文列表标题栏：标题 | 摘要+chip(吃满中间) | 清除/添加 */
+.can-msg-list-head {
+  flex-wrap: nowrap;
+  row-gap: 8px;
+  min-width: 0;
+}
+.can-msg-list-head > .dbc-summary-inline {
+  margin-left: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.can-msg-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: 8px;
+}
+.can-msg-list-head > .dbc-summary-inline + .can-msg-head-actions {
+  margin-left: 8px;
+}
+.can-msg-head-actions #clearDbcBtn[hidden] {
+  display: none !important;
+}
+/* 通道 / 搜索 / 勾选 / 节点 / 批量 — 同一行工具栏 */
+.can-msg-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.35);
+  min-width: 0;
+  /* 不可用 overflow-x:auto：会把 overflow-y 也变成 clip，节点下拉被裁切 */
+  overflow: visible;
+  position: relative;
+  z-index: 40; /* 高于 .message-table-head / 列表，避免下拉沉底 */
+}
+.can-msg-channel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  cursor: pointer;
+  margin: 0;
+}
+.can-msg-channel-label {
+  white-space: nowrap;
+}
+.can-msg-channel-select {
+  width: 72px;
+  min-width: 72px;
+  height: 30px;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+.can-msg-search-wrap {
+  flex: 1 1 140px;
+  min-width: 120px;
+  max-width: 260px;
+}
+.can-msg-search {
+  width: 100%;
+  padding: 5px 10px;
+  font-size: 12px;
+  height: 30px;
+}
+.can-msg-toolbar .can-batch-actions {
+  flex: 0 1 auto;
+  margin-left: auto;
+  flex-wrap: nowrap;
+  gap: 6px;
+  min-width: 0;
+}
+.can-msg-toolbar .pill {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.can-msg-toolbar .btn-sm {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.can-msg-toolbar .can-batch-all-label {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .can-table-card-body {
   padding: 0;
 }
 .can-editor-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 340px);
   gap: 18px;
   align-items: start;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+.can-editor-layout > .can-main-col,
+.can-editor-layout > .can-sidepanel {
+  min-width: 0;
+  max-width: 100%;
 }
 .can-sidepanel {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 10px; /* 两卡间距略紧，仍保持独立卡片 */
+  width: 100%;
+}
+.can-sidepanel > .card {
+  margin-top: 0;
+  min-width: 0;
+  max-width: 100%;
+}
+.can-preview-card .card-body,
+.can-raw-card .card-body {
+  padding-top: 12px;
+  padding-bottom: 12px;
 }
 .dbc-dropzone {
   position: relative;
@@ -234,30 +527,59 @@
 }
 .message-list {
   max-height: 390px;
-  overflow: auto;
+  overflow-x: hidden !important;
+  overflow-y: auto;
+  overscroll-behavior-x: none;
 }
 .message-table {
-  /* 列宽随左栏宽度自适应压缩，不再强制水平滚动 */
+  /* 列宽随左栏宽度自适应压缩，禁止撑出横向滚动 */
+  min-width: 0 !important;
+  width: 100%;
+  max-width: 100%;
+  table-layout: fixed;
+}
+.message-table-body {
   min-width: 0;
   width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 .message-table-head,
 .message-row {
   display: grid;
+  /* 报文名称勿抢宽；标识符/DLC/信号/节点给固定下限，避免被挤没 */
   grid-template-columns:
-    36px              /* 勾选 */
-    32px              /* 展开 */
-    40px              /* # */
-    minmax(0, 1.6fr)  /* 报文名称 */
-    96px              /* 标识符 */
-    52px              /* 通道 */
-    52px              /* 类型 */
-    46px              /* DLC */
-    50px              /* 信号 */
-    minmax(0, 1fr)    /* 发送节点 */
-    minmax(0, 2fr);   /* 注释 */
+    34px                 /* 勾选 */
+    34px                 /* 展开 */
+    28px                 /* # */
+    minmax(0, 0.55fr)    /* DBC名称 */
+    minmax(0, 1fr)       /* 报文名称（收窄，长名省略） */
+    minmax(7.2em, 0.65fr)/* 标识符 */
+    0fr                  /* 通道 */
+    0fr                  /* 类型 */
+    2.8em                /* DLC */
+    2.8em                /* 信号 */
+    minmax(5.5em, 0.8fr) /* 发送节点 */
+    minmax(0, 0.65fr);   /* 注释 */
   align-items: center;
   min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.message-col-name {
+  /* 名称过长只省略，不撑开其它列 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.message-col-id,
+.message-col-dlc,
+.message-col-signal,
+.message-col-node {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .message-table-head {
   position: sticky;
@@ -284,10 +606,12 @@
   box-shadow: inset 3px 0 0 0 var(--accent);
 }
 .message-col {
-  padding: 11px 12px;
+  padding: 8px 6px;
   font-size: 12px;
   line-height: 1.45;
   border-right: 1px solid rgba(255,255,255,.03);
+  min-width: 0;
+  box-sizing: border-box;
 }
 .message-table-head .message-col {
   font-size: 11px;
@@ -322,6 +646,12 @@
 .message-col-id {
   color: var(--accent);
   font-size: 12px;
+}
+.message-col-dbc {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  opacity: .9;
 }
 .can-empty-state {
   display: grid;
@@ -363,8 +693,7 @@
   color: var(--text-dim);
   font-size: 13px;
 }
-.can-selection-bar,
-.history-item-top {
+.can-selection-bar {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -436,30 +765,44 @@
 .can-byte-strip {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 4px;
+  margin-top: 8px;
 }
 .byte-pill {
-  min-width: 62px;
-  padding: 8px 10px;
-  border-radius: 10px;
+  min-width: 0;
+  width: 36px;
+  padding: 3px 2px 4px;
+  border-radius: 6px;
   background: rgba(34,211,238,.08);
   border: 1px solid rgba(34,211,238,.16);
   text-align: center;
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.2;
+  font-family: var(--font-mono);
+  flex: 0 0 auto;
 }
 .byte-pill b {
   display: block;
   color: var(--text-label);
-  font-size: 10px;
-  margin-bottom: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  margin-bottom: 1px;
+  letter-spacing: 0;
+  font-family: var(--font);
+}
+.byte-pill > span {
+  font-variant-numeric: tabular-nums;
 }
 .signal-table-host {
   display: block;
   margin-top: 18px;
+  min-width: 0;
+  max-width: 100%;
 }
 .signal-table {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: 12px;
   overflow: hidden;
@@ -467,8 +810,30 @@
 .signal-table-head,
 .signal-row {
   display: grid;
-  grid-template-columns: 52px minmax(220px, 1.2fr) minmax(220px, 1fr) minmax(220px, 1fr) minmax(190px, .9fr) minmax(220px, 1fr);
+  /* 全部可收缩，禁止固定 min 像素把容器撑宽 */
+  grid-template-columns:
+    2.2em
+    minmax(0, 1.15fr)
+    minmax(0, 0.9fr)
+    minmax(0, 0.95fr)
+    minmax(0, 0.85fr)
+    minmax(0, 0.9fr);
   align-items: stretch;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.signal-table-inline .signal-cell {
+  padding: 8px 8px;
+}
+.signal-table-inline .signal-cell b,
+.signal-table-inline .signal-cell small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
 }
 .signal-table-head {
   background: #182330;
@@ -476,7 +841,8 @@
 }
 .signal-table-body {
   max-height: 520px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .signal-row {
   border-bottom: 1px solid rgba(255,255,255,.04);
@@ -554,32 +920,60 @@
 .history-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 4px;
   max-height: 620px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding-right: 4px;
+  min-width: 0;
+  max-width: 100%;
 }
 .history-list-compact {
-  max-height: 360px;
+  max-height: 420px;
 }
+/* 单行紧凑历史：充分利用横轴，减少行高 */
 .history-item {
-  padding: 12px 13px;
-  border-radius: 12px;
+  padding: 5px 10px;
+  border-radius: 8px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.history-item-row {
+  display: grid;
+  grid-template-columns:
+    auto
+    56px
+    minmax(0, 0.9fr)
+    minmax(0, 1.4fr)
+    minmax(0, 0.8fr);
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+  max-width: 100%;
+}
+.history-item-row.is-err {
+  border-color: rgba(239, 68, 68, 0.35);
 }
 .history-item-time {
   color: var(--text-label);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .history-item-tag {
   display: inline-flex;
   align-items: center;
-  padding: 4px 8px;
+  justify-content: center;
+  padding: 2px 7px;
   border-radius: 999px;
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: .1em;
+  letter-spacing: .06em;
+  white-space: nowrap;
+  line-height: 1.3;
 }
 .history-item-tag.ok {
   background: rgba(34,197,94,.12);
@@ -590,20 +984,33 @@
   color: #fecaca;
 }
 .history-item-main {
-  margin-top: 10px;
+  margin-top: 0;
   font-size: 12px;
   color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .history-item-hex {
-  margin-top: 8px;
-  font-size: 12px;
+  margin-top: 0;
+  font-size: 11px;
   color: #7ef3ff;
-  word-break: break-all;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  word-break: normal;
 }
 .history-item-foot {
-  margin-top: 8px;
+  margin-top: 0;
   font-size: 11px;
   color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  text-align: right;
 }
 
 /* === CAN 1Hz FEEDBACK === */
@@ -615,6 +1022,27 @@
 .feedback-grid {
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
 }
+/* can.html 右侧监控抽屉：竖向排三路，窄宽也能读 */
+.feedback-grid-drawer {
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+.can-monitor-drawer {
+  /* 用 100% 视口减量，避免 100vw 含滚动条宽度把页面撑出横条 */
+  --sys-drawer-panel-w: min(440px, calc(100% - 48px));
+  max-width: 100%;
+}
+.can-monitor-drawer .sys-drawer-body .status-section-title:first-child {
+  margin-top: 0;
+}
+.can-monitor-drawer .conn-indicator {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  margin: 0;
+  background: transparent;
+  border: none;
+}
 .feedback-channel {
   background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.07);
   border-radius: 10px; padding: 14px 16px;
@@ -622,6 +1050,35 @@
 .feedback-ch-head {
   font-weight: 700; font-size: 15px; margin-bottom: 10px;
   display: flex; align-items: center; gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.feedback-expand-caret {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  transition: transform .15s ease;
+  opacity: .7;
+}
+.feedback-channel.collapsed .feedback-expand-caret {
+  transform: rotate(-90deg);
+}
+.feedback-channel.collapsed .feedback-detail {
+  display: none;
+}
+.feedback-channel:not(.collapsed) .feedback-ch-head {
+  margin-bottom: 8px;
+}
+.feedback-primary .feedback-row:last-child {
+  border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.feedback-channel:not(.collapsed) .feedback-primary .feedback-row:last-child {
+  border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.feedback-detail {
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px dashed rgba(255,255,255,.06);
 }
 .ch-dot {
   width: 10px; height: 10px; border-radius: 50%; display: inline-block;
@@ -675,28 +1132,84 @@
 .message-col-check,
 .message-col-toggle {
   text-align: center;
-  padding: 6px 4px;
+  padding: 6px 2px;
+  /* 勿被全局单元格 overflow:hidden 裁切勾选/展开 */
+  overflow: visible !important;
+  text-overflow: clip;
 }
-.message-check {
-  width: 16px;
-  height: 16px;
+/* 统一：报文行 / 全选 / 节点过滤 勾选框外观 */
+.can-page input[type="checkbox"],
+.message-check,
+.checkbox-inline input[type="checkbox"],
+.can-node-filter-item input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  padding: 0;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  border: 1.5px solid rgba(148, 163, 184, 0.55);
+  border-radius: 4px;
+  background: rgba(15, 23, 42, 0.9);
   cursor: pointer;
-  accent-color: var(--accent, #22d3ee);
+  vertical-align: middle;
+  position: relative;
+  display: inline-block;
+  transition: border-color .12s ease, background .12s ease, box-shadow .12s ease;
+}
+.can-page input[type="checkbox"]:hover,
+.message-check:hover,
+.checkbox-inline input[type="checkbox"]:hover,
+.can-node-filter-item input[type="checkbox"]:hover {
+  border-color: rgba(34, 211, 238, 0.65);
+}
+.can-page input[type="checkbox"]:checked,
+.message-check:checked,
+.checkbox-inline input[type="checkbox"]:checked,
+.can-node-filter-item input[type="checkbox"]:checked {
+  background: var(--accent, #22d3ee);
+  border-color: var(--accent, #22d3ee);
+  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.18);
+}
+.can-page input[type="checkbox"]:checked::after,
+.message-check:checked::after,
+.checkbox-inline input[type="checkbox"]:checked::after,
+.can-node-filter-item input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #0b1220;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.can-page input[type="checkbox"]:focus-visible,
+.message-check:focus-visible,
+.checkbox-inline input[type="checkbox"]:focus-visible,
+.can-node-filter-item input[type="checkbox"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.28);
 }
 .message-toggle {
-  width: 22px;
-  height: 22px;
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
   border-radius: 6px;
-  border: 1px solid rgba(255,255,255,.12);
+  border: 1px solid rgba(255,255,255,.14);
   background: rgba(255,255,255,.04);
   color: #c8d6e7;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
+  box-sizing: border-box;
   transition: background .12s ease, border-color .12s ease, color .12s ease;
 }
 .message-toggle:hover {
@@ -715,19 +1228,46 @@
   background: rgba(255,255,255,.02);
   border-top: 1px dashed rgba(255,255,255,.06);
   border-bottom: 1px solid rgba(255,255,255,.04);
-  padding: 10px 14px 14px;
+  padding: 10px 12px 12px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  /* 禁止展开区出现横向滑条；内容省略/折行 */
+  overflow-x: hidden;
 }
 .message-row-expand[hidden] {
   display: none;
 }
 .message-row-expand .signal-table-host {
   margin-top: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 .message-row-expand .signal-table {
   border-radius: 10px;
+  min-width: 0 !important;
+  max-width: 100%;
 }
 .message-row-expand .signal-table-body {
   max-height: 360px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.message-row-expand .signal-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.message-row-expand .signal-input,
+.message-row-expand .signal-input-compact,
+.message-row-expand select.input,
+.message-row-expand input.input {
+  width: 100%;
+  min-width: 0 !important;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .can-batch-actions {
@@ -747,7 +1287,6 @@
   user-select: none;
 }
 .checkbox-inline input {
-  accent-color: var(--accent, #22d3ee);
   cursor: pointer;
 }
 .card-head-actions {
@@ -765,11 +1304,35 @@
 }
 
 /* === 2026-06-30c: 报文列表与右侧操作栏并列布局调整 === */
-/* 报文列表移入 can-editor-layout 后，作为左列；侧栏作为右列；不再需要顶部独立信号编辑卡。 */
-.can-editor-layout > .can-table-card {
+/* 左列：报文列表 + 最近发送；右列：帧预览等 */
+.can-editor-layout > .can-main-col {
   margin-top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+  max-width: 100%;
 }
-.can-sidepanel .card-body { padding-top: 14px; }
+.can-main-col > .can-table-card {
+  margin-top: 0;
+  min-width: 0;
+  max-width: 100%;
+  /* 保持 visible，避免裁切「发送节点」下拉；横向由内部 message-list 锁死 */
+  overflow: visible;
+}
+.can-main-col > .can-history-card {
+  margin-top: 0;
+  align-self: stretch;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+.can-table-card-body,
+.can-msg-list-head,
+.can-msg-toolbar {
+  min-width: 0;
+  max-width: 100%;
+}
 .can-frame-actions {
   display: flex;
   gap: 8px;
@@ -777,7 +1340,9 @@
   flex-wrap: wrap;
 }
 .can-frame-actions .btn { flex: 1 1 auto; min-width: 120px; }
-.can-frame-panel-compact .can-frame-hex { word-break: break-all; }
+.can-frame-panel-compact .can-frame-hex {
+  word-break: break-all;
+}
 
 
 /* === 2026-06-30c: 报文列表压缩列宽 + 纵向滚动美化 === */
@@ -785,8 +1350,12 @@
   /* 提高可视高度，并改用美化的纵向滚动条 */
   max-height: calc(100vh - 300px);
   min-height: 420px;
-  overflow-x: hidden;
+  overflow-x: hidden !important;
   overflow-y: auto;
+  overscroll-behavior-x: none;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   scrollbar-width: thin;
   scrollbar-color: rgba(34,211,238,.35) transparent;
 }
@@ -807,13 +1376,30 @@
   border: 2px solid transparent;
 }
 
-/* 单元格统一省略号 */
+.msg-src {
+  display: inline-block;
+  max-width: 4.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  opacity: .85;
+  margin-right: 2px;
+}
+/* 单元格统一省略号；切断 grid 项默认 min-content 最小宽 */
 .message-row .message-col,
 .message-table-head .message-col {
-  min-width: 0;
+  min-width: 0 !important;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  box-sizing: border-box;
+}
+.message-col {
+  padding: 8px 6px;
 }
 /* 紧凑列的内边距收一点，腾出空间给名称/注释 */
 .message-col-index,
@@ -826,85 +1412,126 @@
 }
 .message-col-check,
 .message-col-toggle {
-  padding-left: 4px;
-  padding-right: 4px;
+  padding-left: 2px;
+  padding-right: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 /* 注释列允许浅色降权显示 */
 .message-row .message-col-comment {
   color: var(--muted);
 }
 
-/* === 2026-06-30c: 窄屏报文表降级（按位置缩为 0 宽，保持 grid 对齐） === */
-/* 列序：check(1) toggle(2) #(3) name(4) id(5) channel(6) type(7) dlc(8) signal(9) node(10) comment(11) */
-@media (max-width: 1280px) {
+/* === 窄屏报文表降级（0fr 隐藏列，保持 track 数量） === */
+/* 列序：check toggle # dbc name id channel type dlc signal node comment */
+/* 隐藏列必须把 padding/border/内容贡献压到 0，否则仍会撑出横向滚动 */
+.message-col-channel,
+.message-col-type {
+  padding: 0 !important;
+  border: 0 !important;
+  margin: 0 !important;
+  overflow: hidden !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  font-size: 0 !important;
+  line-height: 0 !important;
+  visibility: hidden;
+  pointer-events: none;
+}
+@media (max-width: 1200px) {
   .message-table-head,
   .message-row {
     grid-template-columns:
-      36px 32px 40px
-      minmax(0, 1.6fr)  /* name */
-      90px              /* id */
-      52px              /* channel */
-      0                 /* type 隐藏 */
-      46px              /* dlc */
-      0                 /* signal 隐藏 */
-      minmax(0, 0.9fr)  /* node */
-      minmax(0, 1.8fr); /* comment */
+      34px 34px 28px
+      minmax(0, 0.5fr)    /* dbc */
+      minmax(0, 1fr)      /* name */
+      minmax(6.8em, 0.6fr)/* id */
+      0fr 0fr
+      2.6em               /* dlc */
+      0fr                 /* signal */
+      minmax(5em, 0.7fr)  /* node */
+      minmax(0, 0.55fr);  /* comment */
   }
-  .message-col-type,
-  .message-col-signal { padding: 0; border: 0; overflow: hidden; }
+  .message-col-signal {
+    padding: 0 !important;
+    border: 0 !important;
+    overflow: hidden !important;
+    min-width: 0 !important;
+    max-width: 0 !important;
+    font-size: 0 !important;
+    visibility: hidden;
+    pointer-events: none;
+  }
 }
 @media (max-width: 1024px) {
   .message-table-head,
   .message-row {
     grid-template-columns:
-      36px 32px 36px
-      minmax(0, 1.6fr)
-      86px
-      0
-      0
-      46px
-      0
-      0
-      minmax(0, 1.8fr);
+      34px 34px 26px
+      minmax(0, 0.5fr)
+      minmax(0, 1fr)
+      minmax(6.5em, 0.55fr)
+      0fr 0fr
+      2.6em
+      0fr
+      0fr               /* node */
+      minmax(0, 0.55fr);
   }
-  .message-col-channel,
-  .message-col-node { padding: 0; border: 0; overflow: hidden; }
+  .message-col-node {
+    padding: 0 !important;
+    border: 0 !important;
+    overflow: hidden !important;
+    min-width: 0 !important;
+    max-width: 0 !important;
+    font-size: 0 !important;
+    visibility: hidden;
+    pointer-events: none;
+  }
+}
+@media (max-width: 900px) {
+  .message-table-head,
+  .message-row {
+    grid-template-columns:
+      34px 34px 26px
+      0fr               /* dbc */
+      minmax(0, 1fr)
+      minmax(6.2em, 0.55fr)
+      0fr 0fr
+      2.6em
+      0fr 0fr
+      minmax(0, 0.5fr);
+  }
+  .message-col-dbc {
+    padding: 0 !important;
+    border: 0 !important;
+    overflow: hidden !important;
+    min-width: 0 !important;
+    max-width: 0 !important;
+    font-size: 0 !important;
+    visibility: hidden;
+    pointer-events: none;
+  }
 }
 
 
-/* 行内信号编辑展开区允许局部横向滚动（信号字段较多时），不影响外层报文表 */
-.message-row-expand {
-  overflow-x: auto;
-}
-.message-row-expand::-webkit-scrollbar { height: 6px; }
-.message-row-expand::-webkit-scrollbar-thumb {
-  background: rgba(34,211,238,.35);
-  border-radius: 4px;
-}
-
-
-/* === 2026-06-30e: 工作台设置 + 最近发送 双列布局 === */
+/* 工作台单独一行 */
 .can-top-layout {
   margin-top: 18px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
-  gap: 18px;
-  align-items: stretch;
+  display: block;
 }
-/* 工作台卡和历史卡都放进 grid 后不需要单独的顶部外边距 */
-.can-top-layout > .can-toolbar-card,
-.can-top-layout > .can-history-card {
+.can-top-layout > .can-toolbar-card {
   margin-top: 0;
 }
-/* 历史卡固定高度，仅容纳约 3 条历史，超出滚动 */
-.can-history-card { align-self: start; }
+/* 历史卡：报文列表下方，单行紧凑约 8～10 条可见 */
 .can-history-card .card-body {
   display: flex;
   flex-direction: column;
+  padding-top: 10px;
+  padding-bottom: 10px;
 }
 .can-history-card .history-list {
-  /* 约 3 条历史的高度：(每条 ~96px) * 3 + gap 10px * 2 ≈ 308px */
-  max-height: 312px;
+  max-height: min(42vh, 420px);
   overflow-y: auto;
   padding-right: 4px;
   scrollbar-width: thin;
@@ -923,17 +1550,16 @@
   background-clip: padding-box;
 }
 
-/* 窄屏堆叠 */
-@media (max-width: 1100px) {
-  .can-top-layout { grid-template-columns: 1fr; }
-  .can-history-card .history-list { max-height: 312px; }
-}
-
 
 /* === 2026-07-01a: 发送节点过滤下拉 === */
 .can-node-filter {
   position: relative;
   display: inline-flex;
+  z-index: 1;
+}
+/* 面板打开时整块提到最前 */
+.can-node-filter.is-open {
+  z-index: 50;
 }
 .can-node-filter-btn {
   display: inline-flex;
@@ -954,7 +1580,7 @@
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  z-index: 30;
+  z-index: 60;
   min-width: 260px;
   max-width: 320px;
   background: #182330;

@@ -9,7 +9,6 @@
 #include "esp32_ota_core.h"
 #include "relay/ota_relay.h"
 #include "storage/gd32_flash_store.h"
-#include "transport/spi_master.h"
 #include "server/ble_ota.h"
 #include "monitor/debug_log.h"
 #include "esp_system.h"
@@ -57,8 +56,8 @@ bool OtaCoordinator::lock() const
     if (!m_mutex) return false;
     bool ok = (xSemaphoreTake(m_mutex, kLockTimeout) == pdTRUE);
     if (!ok) {
-        DEBUG_WARN(TAG, "lock() 超时 (%u ms)，本次状态变更被跳过",
-                   (unsigned)pdTICKS_TO_MS(kLockTimeout));
+        DEBUG_ERR(TAG, "lock() 超时 (%u ms)，本次状态变更被跳过",
+                  (unsigned)pdTICKS_TO_MS(kLockTimeout));
     }
     return ok;
 }
@@ -76,16 +75,16 @@ void OtaCoordinator::unlock(bool handle) const
 // ============================================================
 void OtaCoordinator::watchdogCheckLocked()
 {
-    // 仅对"忙"状态（可能卡死的）做检查
+    // 仅对"忙"状态（可能卡死的）做检查。
+    // REBOOTING：已 set_boot，即将 esp_restart，不入狗，避免 abort 成 IDLE 与重启竞态。
     switch (m_sysState) {
         case OTA_SYS_GD32_STORING:
         case OTA_SYS_GD32_RELAYING:
         case OTA_SYS_ESP32_RECEIVING:
         case OTA_SYS_ESP32_FINALIZING:
-        case OTA_SYS_ESP32_REBOOTING:
             break;
         default:
-            return;  // IDLE/STORED/COMPLETE/ERROR 无需检查
+            return;  // IDLE/STORED/COMPLETE/ERROR/REBOOTING 无需检查
     }
 
     if (m_busySinceTick == 0) {
@@ -162,9 +161,7 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t ch
             return ESP_ERR_INVALID_STATE;
         }
         DEBUG_WARN(TAG, "GD32 存储仍在进行中（同通道），中止旧存储并重新开始");
-        Gd32FlashStore::instance().metaClear();
-        m_sysState = OTA_SYS_IDLE;
-        m_busySinceTick = 0;
+        doAbortLocked();  // 清 meta + IDLE，与 abort 路径一致
         // epoch 将在下方设置 GD32_STORING 后递增
     }
 
@@ -221,27 +218,17 @@ esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t 
         return err;
     }
 
-    // 3. 整分区预擦（不再边写边擦）：prepare 阶段擦完 gd32_ota 分区，
-    //    收流时 flashWriteChunk 仅 write，吞吐更稳。会阻塞数秒～数十秒。
+    // 3. 复位擦除水位；不在 prepare 整区预擦。
+    //    旧方案在 HTTP JSON 头后同步擦 gd32_ota，TCP 堵在开头。
+    //    现由 flashWriteChunk → ensureErasedForWrite 按需擦扇区，与收流交织。
     Gd32FlashStore::instance().beginWriteSession();
-    {
-        const esp_partition_t *gd32_part = Gd32FlashStore::instance().getPartition();
-        const uint32_t erase_bytes = gd32_part ? (uint32_t)gd32_part->size : 0U;
-        if (erase_bytes == 0U) {
-            DEBUG_ERR(TAG, "prepareGd32Storage: 找不到 gd32_ota 分区");
-            abortCurrent();
-            return ESP_ERR_NOT_FOUND;
-        }
-        DEBUG_INFO(TAG, "prepareGd32Storage: 整分区预擦 %u 字节 (fw=%" PRIu32 ")...",
-                   (unsigned)erase_bytes, total_size);
-        err = Gd32FlashStore::instance().erasePartition(erase_bytes);
-        if (err != ESP_OK) {
-            DEBUG_ERR(TAG, "prepareGd32Storage: 整分区预擦失败: %s", esp_err_to_name(err));
-            abortCurrent();
-            return err;
-        }
-        DEBUG_INFO(TAG, "prepareGd32Storage: 整分区预擦完成");
+    if (Gd32FlashStore::instance().getPartition() == nullptr) {
+        DEBUG_ERR(TAG, "prepareGd32Storage: 找不到 gd32_ota 分区");
+        abortCurrent();
+        return ESP_ERR_NOT_FOUND;
     }
+    DEBUG_INFO(TAG, "prepareGd32Storage: 会话就绪 fw=%" PRIu32 "（按需擦除，无整区预擦）",
+               total_size);
 
     // 4. 清空旧 meta + 写入初始 meta（total_size + stored_size=0 + last_seq=0）
     clearGd32Meta();
@@ -285,54 +272,38 @@ esp_err_t OtaCoordinator::finishGd32StorageAfterReceive()
 }
 
 // ============================================================
-// GD32 存储操作（传输层统一入口）
-// ── 以下 8 个 wrapper 已 inline 化至 ota_coordinator.h，直接转发到
-//    Gd32FlashStore::instance()，消除跨 TU 调用开销。
-// ============================================================
-
-// ============================================================
 // GD32 中继阶段
 // ============================================================
 esp_err_t OtaCoordinator::triggerGd32Relay()
 {
     bool h = lock();
-
-    // ★ 卡死自愈检查
-    if (h) watchdogCheckLocked();
-
-    // 校验：必须处于"已存储"或"已中继完成"状态
-    if (h && m_sysState != OTA_SYS_GD32_STORED && m_sysState != OTA_SYS_IDLE) {
-        if (m_sysState == OTA_SYS_GD32_STORING) {
-            DEBUG_WARN(TAG, "GD32 正在存储中，拒绝触发中继");
-            unlock(h);
-            return ESP_ERR_INVALID_STATE;
-        }
-        if (m_sysState == OTA_SYS_GD32_RELAYING) {
-            DEBUG_WARN(TAG, "GD32 中继已在进行中");
-            unlock(h);
-            return ESP_ERR_INVALID_STATE;
-        }
-        if (m_sysState == OTA_SYS_ESP32_RECEIVING ||
-            m_sysState == OTA_SYS_ESP32_FINALIZING ||
-            m_sysState == OTA_SYS_ESP32_REBOOTING) {
-            DEBUG_WARN(TAG, "ESP32 OTA 进行中，拒绝中继触发");
-            unlock(h);
-            return ESP_ERR_INVALID_STATE;
-        }
+    if (!h) {
+        DEBUG_ERR(TAG, "triggerGd32Relay: lock 超时");
+        return ESP_ERR_INVALID_STATE;
     }
 
-    // 验证固件是否确实已存储（通过 NVS 元数据）
+    watchdogCheckLocked();
+
+    /* 白名单：仅 STORED / IDLE（NVS 有完整固件）/ COMPLETE（允许再中继）可触发 */
+    if (m_sysState != OTA_SYS_GD32_STORED &&
+        m_sysState != OTA_SYS_IDLE &&
+        m_sysState != OTA_SYS_GD32_COMPLETE) {
+        DEBUG_WARN(TAG, "拒绝触发中继: 当前状态 %s (%d) 不在白名单",
+                   stateToString(m_sysState), (int)m_sysState);
+        unlock(h);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ota_meta_t meta;
-    if (h && (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK ||
+    if (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK ||
         meta.total_size == 0 ||
-        meta.stored_size < meta.total_size)) {
+        meta.stored_size < meta.total_size) {
         DEBUG_WARN(TAG, "GD32 固件未完整存储，拒绝触发中继");
         unlock(h);
         return ESP_ERR_INVALID_STATE;
     }
 
-    // 检查 OtaRelay 是否空闲
-    if (h && OtaRelay::getState() != RELAY_IDLE &&
+    if (OtaRelay::getState() != RELAY_IDLE &&
         OtaRelay::getState() != RELAY_DONE &&
         OtaRelay::getState() != RELAY_ERROR) {
         DEBUG_WARN(TAG, "OtaRelay 正忙 (state=%d)，拒绝触发", (int)OtaRelay::getState());
@@ -340,47 +311,42 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
         return ESP_ERR_INVALID_STATE;
     }
 
-    // 向 OtaRelay task 发送启动消息
     QueueHandle_t dq = OtaRelay::getDispatchQueue();
-    if (h && !dq) {
+    if (!dq) {
         DEBUG_ERR(TAG, "OtaRelay dispatchQueue 未就绪");
         unlock(h);
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!h) {
-        unlock(h);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    m_sysState = OTA_SYS_GD32_RELAYING;
-    m_busySinceTick = xTaskGetTickCount();  // ★ 记录忙状态起始时刻
+    /* 先入队再标 RELAYING：失败时状态与 CAN 反馈都不变 */
     pauseCanFeedbackTask(true);
-    DEBUG_INFO(TAG, "触发 GD32 中继, 系统状态 → GD32_RELAYING");
-
     uint32_t cmd = 1;
     BaseType_t ret = xQueueSend(dq, &cmd, pdMS_TO_TICKS(100));
     if (ret != pdTRUE) {
         DEBUG_ERR(TAG, "向 OtaRelay 发送启动消息失败");
-        m_sysState = OTA_SYS_GD32_STORED;
-        m_busySinceTick = 0;  // 回退到 STORED（非忙）
+        pauseCanFeedbackTask(false);
         unlock(h);
         return ESP_FAIL;
     }
 
+    m_sysState = OTA_SYS_GD32_RELAYING;
+    m_busySinceTick = xTaskGetTickCount();
+    DEBUG_INFO(TAG, "触发 GD32 中继, 系统状态 → GD32_RELAYING");
     unlock(h);
     return ESP_OK;
 }
 
-/** @brief 通知协调器：GD32 中继已开始，更新系统状态为 GD32_RELAYING。 */
+/** @brief 中继 task 已真正开始：若 trigger 已标 RELAYING 则只补 pause；否则兜底设状态。 */
 void OtaCoordinator::notifyRelayStarted()
 {
     bool h = lock();
-    if (h && m_sysState != OTA_SYS_GD32_RELAYING) {
-        m_sysState = OTA_SYS_GD32_RELAYING;
-        m_busySinceTick = xTaskGetTickCount();  // ★ 记录起始时刻
+    if (h) {
+        if (m_sysState != OTA_SYS_GD32_RELAYING) {
+            m_sysState = OTA_SYS_GD32_RELAYING;
+            m_busySinceTick = xTaskGetTickCount();
+            DEBUG_INFO(TAG, "中继已开始(兜底), 系统状态 → GD32_RELAYING");
+        }
         pauseCanFeedbackTask(true);
-        DEBUG_INFO(TAG, "中继已开始, 系统状态 → GD32_RELAYING");
     }
     unlock(h);
 }
@@ -466,9 +432,7 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
             return ESP_ERR_INVALID_STATE;
         }
         DEBUG_WARN(TAG, "ESP32 OTA 仍在接收中（同通道），中止旧会话并重新开始");
-        Esp32OtaCore::instance().abort();
-        m_sysState = OTA_SYS_IDLE;
-        m_busySinceTick = 0;
+        doAbortLocked();  // abort core + IDLE + 恢复 CAN 反馈
         // epoch 将在下方 begin 成功后递增，自动使旧 handler 的清理代码失效
     }
 
@@ -558,6 +522,12 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
 void OtaCoordinator::setEsp32StateLocked(ota_system_state_t s, const char *dbg_msg)
 {
     m_sysState = s;
+    /* REBOOTING 不参与 busy watchdog，清零起点避免误中止 */
+    if (s == OTA_SYS_ESP32_REBOOTING) {
+        m_busySinceTick = 0;
+    } else if (s == OTA_SYS_ESP32_FINALIZING && m_busySinceTick == 0) {
+        m_busySinceTick = xTaskGetTickCount();
+    }
     DEBUG_INFO(TAG, "%s", dbg_msg);
 }
 
@@ -667,12 +637,24 @@ void OtaCoordinator::healOrphanStates()
     bool need_resume = false;
     bool h = lock();
     if (h) {
-        watchdogCheckLocked();
+        ota_system_state_t before = m_sysState;
+        watchdogCheckLocked();  // 超时则 doAbortLocked → IDLE
         // finalize 失败后 core 已空、协调器仍 FINALIZING 的假占用：status 轮询即可自愈
         if (m_sysState == OTA_SYS_ESP32_FINALIZING &&
             !Esp32OtaCore::instance().isActive()) {
             DEBUG_WARN(TAG, "status 路径发现 ESP32_FINALIZING 残留，自愈 → IDLE");
             doAbortLocked();
+        }
+        /* ERROR 非忙：status 轮询软清到 IDLE，避免 UI 长期卡 ERROR（新 begin 本也可覆盖） */
+        if (m_sysState == OTA_SYS_ERROR) {
+            DEBUG_INFO(TAG, "status 路径 ERROR → IDLE（软清）");
+            m_sysState = OTA_SYS_IDLE;
+            m_busySinceTick = 0;
+            m_gd32StorageDone = false;
+            pauseCanFeedbackTask(false);
+        }
+        // 任意自愈到 IDLE：恢复 WiFi OTA 期间挂起的 BLE（watchdog 旧路径漏 resume）
+        if (before != OTA_SYS_IDLE && m_sysState == OTA_SYS_IDLE) {
             need_resume = true;
         }
         unlock(h);
@@ -806,28 +788,27 @@ OtaSnapshot OtaCoordinator::getSnapshot() const
 // ============================================================
 // GD32 APP 探测
 // ============================================================
-// 注：本函数与 OtaRelay::probeAndCacheAppAlive 逻辑相似，但因依赖方向
-//     （OtaCoordinator → OtaRelay）不应调用 OtaRelay 的内部实现细节，
-//     故此处保留独立实现。
 esp_err_t OtaCoordinator::probeGd32AppOnce(gd32_version_t *out_version, uint32_t *out_uptime)
 {
+    /* 统一走 OtaRelay 公开探测，避免与 probeAndCacheAppAlive 双份逻辑 */
     uint32_t uptime = 0;
-    gd32_version_t ver = {};
-
-    esp_err_t err = SpiMaster::instance().appPing(500, &uptime, &ver);
-    if (err == ESP_OK) {
-        OtaRelay::setGd32AppAlive(true);
-        OtaRelay::setGd32Version(ver);
-        if (out_version) *out_version = ver;
-        if (out_uptime)  *out_uptime  = uptime;
+    if (OtaRelay::probeAndCacheAppAlive(500, &uptime)) {
+        if (out_version) {
+            *out_version = OtaRelay::getSnapshot().version;
+        }
+        if (out_uptime) {
+            *out_uptime = uptime;
+        }
         DEBUG_INFO(TAG, "GD32 APP 探测成功: alive, uptime=%" PRIu32 "s", uptime);
-    } else {
-        OtaRelay::setGd32AppAlive(false);
-        if (out_version) *out_version = ver;
-        if (out_uptime)  *out_uptime  = 0;
-        DEBUG_WARN(TAG, "GD32 APP 探测失败: %s", esp_err_to_name(err));
+        return ESP_OK;
     }
-    return err;
+    if (out_version) {
+        *out_version = gd32_version_t{};
+    }
+    if (out_uptime) {
+        *out_uptime = 0;
+    }
+    return ESP_FAIL;
 }
 
 // ============================================================
@@ -835,12 +816,12 @@ esp_err_t OtaCoordinator::probeGd32AppOnce(gd32_version_t *out_version, uint32_t
 // ============================================================
 void OtaCoordinator::reset()
 {
+    // ★ 与 abortCurrent 共用 doAbortLocked：清 Esp32OtaCore / relay / meta，勿只改枚举
     bool h = lock();
     if (h) {
-        m_sysState = OTA_SYS_IDLE;
-        m_gd32StorageDone = false;
-        m_busySinceTick = 0;  // ★ 复位
-        DEBUG_INFO(TAG, "协调器已完全复位");
+        doAbortLocked();
+        DEBUG_INFO(TAG, "协调器已完全复位（含子系统 abort）");
     }
     unlock(h);
+    wifiOtaResumeBleIfNeeded();
 }

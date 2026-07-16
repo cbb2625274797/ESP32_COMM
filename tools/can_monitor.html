@@ -4,11 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 CAN 接收监控</title>
-<link rel="stylesheet" href="css/base.css?v=20260715a">
-<link rel="stylesheet" href="css/layout.css?v=20260715a">
-<link rel="stylesheet" href="css/components.css?v=20260715a">
-<link rel="stylesheet" href="css/can.css?v=20260715a">
-<link rel="stylesheet" href="css/responsive.css?v=20260715a">
+<link rel="stylesheet" href="css/base.css?v=20260716s">
+<link rel="stylesheet" href="css/layout.css?v=20260716s">
+<link rel="stylesheet" href="css/components.css?v=20260716s">
+<link rel="stylesheet" href="css/can.css?v=20260716s">
+<link rel="stylesheet" href="css/responsive.css?v=20260716s">
 </head>
 <body class="can-page">
 <div class="container can-container">
@@ -67,59 +67,79 @@
     <div class="card-head"><span class="ico">📊</span> 三路 CAN 通道反馈（1Hz）</div>
     <div class="card-body">
       <div class="feedback-grid">
-
-        <div class="feedback-channel" id="fbCh0">
-          <div class="feedback-ch-head"><span class="ch-dot ch0"></span> CAN0</div>
-          <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb0State">--</span></div>
-          <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb0Rx">--</span></div>
-          <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb0Tx">--</span></div>
-          <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb0Drop">--</span></div>
-          <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb0Err">--</span></div>
-          <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb0Tec">--</span></div>
-          <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb0Rec">--</span></div>
-          <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb0Bus">--</span></div>
-          <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb0LastId">--</span></div>
-          <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb0Dlc">--</span></div>
-          <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb0Flags">--</span></div>
-          <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb0Seq">--</span></div>
-          <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb0Delta">--</span></div>
-          <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb0LastData">--</span></div>
+        <div class="feedback-channel collapsed" id="fbCh0">
+          <div class="feedback-ch-head" role="button" tabindex="0" title="点击展开/折叠详情">
+            <span class="ch-dot ch0"></span> CAN0
+            <span class="feedback-expand-caret">▾</span>
+          </div>
+          <div class="feedback-primary">
+            <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb0State">--</span></div>
+            <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb0Rx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb0Tx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb0Drop">--</span></div>
+            <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb0Err">--</span></div>
+          </div>
+          <div class="feedback-detail">
+            <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb0Tec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb0Rec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb0Bus">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb0LastId">--</span></div>
+            <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb0Dlc">--</span></div>
+            <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb0Flags">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb0Seq">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb0Delta">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb0LastData">--</span></div>
+          </div>
         </div>
 
-        <div class="feedback-channel" id="fbCh1">
-          <div class="feedback-ch-head"><span class="ch-dot ch1"></span> CAN1</div>
-          <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb1State">--</span></div>
-          <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb1Rx">--</span></div>
-          <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb1Tx">--</span></div>
-          <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb1Drop">--</span></div>
-          <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb1Err">--</span></div>
-          <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb1Tec">--</span></div>
-          <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb1Rec">--</span></div>
-          <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb1Bus">--</span></div>
-          <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb1LastId">--</span></div>
-          <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb1Dlc">--</span></div>
-          <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb1Flags">--</span></div>
-          <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb1Seq">--</span></div>
-          <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb1Delta">--</span></div>
-          <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb1LastData">--</span></div>
+        <div class="feedback-channel collapsed" id="fbCh1">
+          <div class="feedback-ch-head" role="button" tabindex="0" title="点击展开/折叠详情">
+            <span class="ch-dot ch1"></span> CAN1
+            <span class="feedback-expand-caret">▾</span>
+          </div>
+          <div class="feedback-primary">
+            <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb1State">--</span></div>
+            <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb1Rx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb1Tx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb1Drop">--</span></div>
+            <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb1Err">--</span></div>
+          </div>
+          <div class="feedback-detail">
+            <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb1Tec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb1Rec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb1Bus">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb1LastId">--</span></div>
+            <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb1Dlc">--</span></div>
+            <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb1Flags">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb1Seq">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb1Delta">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb1LastData">--</span></div>
+          </div>
         </div>
 
-        <div class="feedback-channel" id="fbCh2">
-          <div class="feedback-ch-head"><span class="ch-dot ch2"></span> CAN2</div>
-          <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb2State">--</span></div>
-          <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb2Rx">--</span></div>
-          <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb2Tx">--</span></div>
-          <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb2Drop">--</span></div>
-          <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb2Err">--</span></div>
-          <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb2Tec">--</span></div>
-          <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb2Rec">--</span></div>
-          <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb2Bus">--</span></div>
-          <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb2LastId">--</span></div>
-          <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb2Dlc">--</span></div>
-          <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb2Flags">--</span></div>
-          <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb2Seq">--</span></div>
-          <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb2Delta">--</span></div>
-          <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb2LastData">--</span></div>
+        <div class="feedback-channel collapsed" id="fbCh2">
+          <div class="feedback-ch-head" role="button" tabindex="0" title="点击展开/折叠详情">
+            <span class="ch-dot ch2"></span> CAN2
+            <span class="feedback-expand-caret">▾</span>
+          </div>
+          <div class="feedback-primary">
+            <div class="feedback-row"><span class="fb-label">状态</span><span class="fb-val" id="fb2State">--</span></div>
+            <div class="feedback-row"><span class="fb-label">接收数</span><span class="fb-val" id="fb2Rx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">发送数</span><span class="fb-val" id="fb2Tx">--</span></div>
+            <div class="feedback-row"><span class="fb-label">丢帧</span><span class="fb-val" id="fb2Drop">--</span></div>
+            <div class="feedback-row"><span class="fb-label">错误</span><span class="fb-val" id="fb2Err">--</span></div>
+          </div>
+          <div class="feedback-detail">
+            <div class="feedback-row"><span class="fb-label">TEC</span><span class="fb-val" id="fb2Tec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">REC</span><span class="fb-val" id="fb2Rec">--</span></div>
+            <div class="feedback-row"><span class="fb-label">总线状态</span><span class="fb-val" id="fb2Bus">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新ID</span><span class="fb-val mono" id="fb2LastId">--</span></div>
+            <div class="feedback-row"><span class="fb-label">DLC</span><span class="fb-val" id="fb2Dlc">--</span></div>
+            <div class="feedback-row"><span class="fb-label">FD/BRS/ESI</span><span class="fb-val" id="fb2Flags">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Seq</span><span class="fb-val" id="fb2Seq">--</span></div>
+            <div class="feedback-row"><span class="fb-label">Δrx/s</span><span class="fb-val" id="fb2Delta">--</span></div>
+            <div class="feedback-row"><span class="fb-label">最新HEX</span><span class="fb-val mono fb-data-cell" id="fb2LastData">--</span></div>
+          </div>
         </div>
 
       </div>
@@ -162,6 +182,6 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script type="module" src="js/can_monitor.js?v=20260715a"></script>
+<script type="module" src="js/can_monitor.js?v=20260716v"></script>
 </body>
 </html>

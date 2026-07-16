@@ -111,6 +111,8 @@ export function updateEsp32StagesError() {
  * @param {string} reason 失败原因描述
  */
 export function cleanupAfterOtaFailure(reason) {
+  // 幂等：已在 FAILED 且无活跃 XHR 时只刷新文案，避免 abort 事件二次递归清状态
+  var alreadyFailed = window.otaSessionState === window.OtaSessionState.FAILED;
   var chip = window.activeUploadChip || window.otaSessionTarget || window.currentOtaTarget || window.flashTarget || 'esp32';
 
   // 0. 状态机：转入 FAILED（先于标志重置）
@@ -136,23 +138,33 @@ export function cleanupAfterOtaFailure(reason) {
   setActivePhase(null);
   window.currentOtaTarget = null;
 
-  // 4. 恢复上传按钮
-  var btnId = (chip === 'gd32') ? 'uploadGd32Btn' : 'uploadEsp32Btn';
-  var btn = document.getElementById(btnId);
-  if (btn) {
+  // 4. 恢复上传按钮（两枚都解禁，避免 chip 判错时另一侧仍灰）
+  ['uploadEsp32Btn', 'uploadGd32Btn'].forEach(function (btnId) {
+    var btn = document.getElementById(btnId);
+    if (!btn) return;
     btn.disabled = false;
-    if (window.uploadBtnOrigText) btn.textContent = window.uploadBtnOrigText;
-  }
+    if (window.uploadBtnOrigText &&
+        ((chip === 'gd32' && btnId === 'uploadGd32Btn') ||
+         (chip !== 'gd32' && btnId === 'uploadEsp32Btn'))) {
+      btn.textContent = window.uploadBtnOrigText;
+    }
+  });
   window.activeUploadChip = null;
   window.otaSessionTarget = null;
   window.uploadBtnOrigText = '';
 
-  window.updateUploadButtonLabel();
+  if (typeof window.updateUploadButtonLabel === 'function') {
+    window.updateUploadButtonLabel();
+  }
 
   // 5. 恢复轮询（之后 status 不得覆盖 FAILED UI，直至用户新上传或设备 idle 复位）
-  window.resumePollingAfterUpload();
+  if (typeof window.resumePollingAfterUpload === 'function') {
+    window.resumePollingAfterUpload();
+  }
 
-  addLog('E', 'OTA', '刷写流程已中止，已清理残留状态: ' + (reason || '未知原因'));
+  if (!alreadyFailed) {
+    addLog('E', 'OTA', '刷写流程已中止，已清理残留状态: ' + (reason || '未知原因'));
+  }
 }
 
 /** @description 设置当前活跃 OTA 阶段并更新 UI 步骤指示器。 */

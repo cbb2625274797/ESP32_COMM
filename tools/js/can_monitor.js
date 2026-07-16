@@ -1,6 +1,9 @@
-import { showToast } from './common/toast.js';
+/**
+ * can_monitor.js - CAN 接收监控（独立页 can_monitor.html 与 can.html 右侧抽屉共用）
+ */
+import { showToast } from './common/toast.js?v=20260717t';
 
-var state = { fbTimer: null };
+var state = { fbTimer: null, fbAbortCtrl: null };
 
 var el = {};
 
@@ -16,7 +19,8 @@ var ids = [
   'fb2LastId', 'fb2Dlc', 'fb2Flags', 'fb2LastData',
   'btnModeAllPass', 'btnModeFilter', 'btnModeBridge',
   'idsnapChannel', 'idsnapStatus', 'idsnapBody',
-  'toast', 'toastIco', 'toastMsg'
+  'toast', 'toastIco', 'toastMsg',
+  'toolIp' /* can.html 共用 IP */
 ];
 
 function cacheElements() {
@@ -29,29 +33,45 @@ function sanitize(text) {
 }
 
 function getBaseUrl() {
-  var ip = (el.monIp && el.monIp.value ? el.monIp.value.trim() : '') || '192.168.31.127';
+  var ip = '';
+  if (el.monIp && el.monIp.value) {
+    ip = el.monIp.value.trim();
+  } else if (el.toolIp && el.toolIp.value) {
+    ip = el.toolIp.value.trim();
+  } else {
+    try {
+      var saved = localStorage.getItem('dcu_esp_ip');
+      if (saved && saved.trim()) ip = saved.trim();
+    } catch (_) {}
+  }
+  if (!ip) ip = '192.168.31.127';
   return 'http://' + ip;
 }
 
 function setConnState(ok, text) {
+  /* 嵌入 can.html 时顶栏已有 canConnPill，不再用 monConn 重复占位 */
   if (el.monConnPill) el.monConnPill.className = 'pill ' + (ok ? 'online' : 'offline');
   if (el.monConnTxt) el.monConnTxt.textContent = text;
   if (el.monConnIndicator) el.monConnIndicator.className = 'conn-indicator ' + (ok ? 'ok' : 'err');
   if (el.monConnIndicatorTxt) el.monConnIndicatorTxt.textContent = text;
+  /* 轮询状态即监控连通性（与顶栏 canConn 去重时仍更新 fbPollStatus） */
+  if (!el.monConnPill && el.fbPollStatus && !ok) {
+    el.fbPollStatus.textContent = '轮询: 离线';
+    el.fbPollStatus.className = 'pill offline';
+  }
 }
 
 // ── 1Hz 轮询 /can/feedback ─────────────────────────────────
 async function pollFeedback() {
-  // 取消上一次 in-flight 请求，防止 SPI 慢响应堆积导致 UI 瞬间刷新多次
-  if (state.fbAbortCtrl) { try { state.fbAbortCtrl.abort(); } catch(_e) {} }
+  if (state.fbAbortCtrl) { try { state.fbAbortCtrl.abort(); } catch (_e) {} }
   state.fbAbortCtrl = new AbortController();
-  var fbPollTimer = setTimeout(function() { try { state.fbAbortCtrl.abort(); } catch(_e) {} }, 3000);
+  var fbPollTimer = setTimeout(function () { try { state.fbAbortCtrl.abort(); } catch (_e) {} }, 3000);
   try {
     var resp = await fetch(getBaseUrl() + '/can/feedback', { signal: state.fbAbortCtrl.signal });
     if (!resp.ok) return;
     var data = await resp.json();
     var channels = data.channels || [];
-    var selectedCh = el.idsnapChannel ? parseInt(el.idsnapChannel.value) : 0;
+    var selectedCh = el.idsnapChannel ? parseInt(el.idsnapChannel.value, 10) : 0;
 
     for (var i = 0; i < 3; i++) {
       var ch = channels[i];
@@ -62,7 +82,6 @@ async function pollFeedback() {
       renderChannel(i, ch);
     }
 
-    // 渲染选中通道的 ID 快照表
     var sel = channels[selectedCh];
     if (sel && sel.valid && sel.entries) {
       renderIdTable(sel.entries, sel.count || sel.entries.length);
@@ -82,8 +101,7 @@ async function pollFeedback() {
     clearTimeout(fbPollTimer);
   } catch (e) {
     clearTimeout(fbPollTimer);
-    // 自身 AbortController 触发的取消不算失败，静默返回
-    if (e && e.name === "AbortError") return;
+    if (e && e.name === 'AbortError') return;
     if (el.fbPollStatus) {
       el.fbPollStatus.textContent = '轮询: 离线';
       el.fbPollStatus.className = 'pill offline';
@@ -99,12 +117,18 @@ function renderChannel(i, ch) {
     el[p + 'State'].textContent = hasIds ? '活跃 (' + ch.count + ' ID)' : '无帧（总线空闲）';
     el[p + 'State'].className = 'fb-val ' + (hasIds ? 'ok' : 'info');
   }
-  if (el[p + 'Rx'])   el[p + 'Rx'].textContent = ch.rx;
-  if (el[p + 'Tx'])   el[p + 'Tx'].textContent = ch.tx;
+  if (el[p + 'Rx']) el[p + 'Rx'].textContent = ch.rx;
+  if (el[p + 'Tx']) el[p + 'Tx'].textContent = ch.tx;
   if (el[p + 'Drop']) { el[p + 'Drop'].textContent = ch.drop; el[p + 'Drop'].className = 'fb-val' + (ch.drop > 0 ? ' warn' : ''); }
-  if (el[p + 'Err'])  { el[p + 'Err'].textContent = ch.err;  el[p + 'Err'].className = 'fb-val' + (ch.err > 0 ? ' err' : ''); }
-  if (el[p + 'Tec']) { el[p + 'Tec'].textContent = (ch.tec !== undefined && ch.tec !== null) ? ch.tec : '--'; el[p + 'Tec'].className = 'fb-val' + (ch.tec > 0 ? ' warn' : ''); }
-  if (el[p + 'Rec']) { el[p + 'Rec'].textContent = (ch.rec !== undefined && ch.rec !== null) ? ch.rec : '--'; el[p + 'Rec'].className = 'fb-val' + (ch.rec > 0 ? ' warn' : ''); }
+  if (el[p + 'Err']) { el[p + 'Err'].textContent = ch.err; el[p + 'Err'].className = 'fb-val' + (ch.err > 0 ? ' err' : ''); }
+  if (el[p + 'Tec']) {
+    el[p + 'Tec'].textContent = (ch.tec !== undefined && ch.tec !== null) ? ch.tec : '--';
+    el[p + 'Tec'].className = 'fb-val' + (ch.tec > 0 ? ' warn' : '');
+  }
+  if (el[p + 'Rec']) {
+    el[p + 'Rec'].textContent = (ch.rec !== undefined && ch.rec !== null) ? ch.rec : '--';
+    el[p + 'Rec'].className = 'fb-val' + (ch.rec > 0 ? ' warn' : '');
+  }
   if (el[p + 'Bus']) {
     if (ch.bus_state === undefined || ch.bus_state === null) {
       el[p + 'Bus'].textContent = '未知';
@@ -118,23 +142,22 @@ function renderChannel(i, ch) {
       if (bs & 8) parts.push('BUS_OFF');
       if (bs & 16) parts.push('ERR_WARN');
       el[p + 'Bus'].textContent = (bs === 0) ? '正常' : (parts.length ? parts.join(' ') : '正常');
-      el[p + 'Bus'].className = 'fb-val' + ((bs & 8) ? ' err' : (bs & (4|16)) ? ' warn' : '');
+      el[p + 'Bus'].className = 'fb-val' + ((bs & 8) ? ' err' : (bs & (4 | 16)) ? ' warn' : '');
     }
   }
-  if (el[p + 'Seq'])  el[p + 'Seq'].textContent = ch.seq;
+  if (el[p + 'Seq']) el[p + 'Seq'].textContent = ch.seq;
   if (el[p + 'Delta']) { el[p + 'Delta'].textContent = ch.count || 0; el[p + 'Delta'].className = 'fb-val'; }
-  // 最新帧摘要
   var entries = ch.entries;
   if (entries && entries.length) {
     var last = entries[entries.length - 1];
-    if (el[p + 'LastId'])   { el[p + 'LastId'].textContent = last.id;   el[p + 'LastId'].className = 'fb-val mono'; }
-    if (el[p + 'Dlc'])      el[p + 'Dlc'].textContent = last.dlc;
-    if (el[p + 'Flags'])    el[p + 'Flags'].textContent = (last.fd ? 'FD' : '-') + ' / ' + (last.brs ? 'BRS' : '-') + ' / ' + (last.esi ? 'ESI' : '-');
+    if (el[p + 'LastId']) { el[p + 'LastId'].textContent = last.id; el[p + 'LastId'].className = 'fb-val mono'; }
+    if (el[p + 'Dlc']) el[p + 'Dlc'].textContent = last.dlc;
+    if (el[p + 'Flags']) el[p + 'Flags'].textContent = (last.fd ? 'FD' : '-') + ' / ' + (last.brs ? 'BRS' : '-') + ' / ' + (last.esi ? 'ESI' : '-');
     if (el[p + 'LastData']) { el[p + 'LastData'].textContent = last.data || '--'; el[p + 'LastData'].className = 'fb-val mono fb-data-cell'; }
   } else {
-    if (el[p + 'LastId'])   { el[p + 'LastId'].textContent = '--';   el[p + 'LastId'].className = 'fb-val mono'; }
-    if (el[p + 'Dlc'])      el[p + 'Dlc'].textContent = '--';
-    if (el[p + 'Flags'])    el[p + 'Flags'].textContent = '--';
+    if (el[p + 'LastId']) { el[p + 'LastId'].textContent = '--'; el[p + 'LastId'].className = 'fb-val mono'; }
+    if (el[p + 'Dlc']) el[p + 'Dlc'].textContent = '--';
+    if (el[p + 'Flags']) el[p + 'Flags'].textContent = '--';
     if (el[p + 'LastData']) { el[p + 'LastData'].textContent = '--'; el[p + 'LastData'].className = 'fb-val mono fb-data-cell'; }
   }
   if (i === 0 && el.fbModePill) {
@@ -146,13 +169,14 @@ function renderChannel(i, ch) {
 function renderChannelEmpty(i) {
   var p = 'fb' + i;
   if (el[p + 'State']) { el[p + 'State'].textContent = 'SPI 离线'; el[p + 'State'].className = 'fb-val err'; }
-  ['Rx','Tx','Drop','Err','Tec','Rec','Bus','Seq','Delta','Dlc','Flags'].forEach(function (f) {
+  ['Rx', 'Tx', 'Drop', 'Err', 'Tec', 'Rec', 'Bus', 'Seq', 'Delta', 'Dlc', 'Flags'].forEach(function (f) {
     if (el[p + f]) { el[p + f].textContent = '--'; el[p + f].className = 'fb-val'; }
   });
-  if (el[p + 'LastId'])   { el[p + 'LastId'].textContent = '--';   el[p + 'LastId'].className = 'fb-val mono'; }
+  if (el[p + 'LastId']) { el[p + 'LastId'].textContent = '--'; el[p + 'LastId'].className = 'fb-val mono'; }
   if (el[p + 'LastData']) { el[p + 'LastData'].textContent = '--'; el[p + 'LastData'].className = 'fb-val mono fb-data-cell'; }
 }
-function renderIdTable(entries, count) {
+
+function renderIdTable(entries) {
   var tbody = el.idsnapBody;
   if (!tbody) return;
   if (!entries || !entries.length) {
@@ -181,7 +205,6 @@ function renderIdTableEmpty() {
   if (el.idsnapStatus) { el.idsnapStatus.textContent = '--'; el.idsnapStatus.className = 'pill'; }
 }
 
-// ── 连接测试 ─────────────────────────────────────────────
 async function testConnection() {
   try {
     var resp = await fetch(getBaseUrl() + '/can/feedback', { signal: AbortSignal.timeout(3000) });
@@ -194,7 +217,6 @@ async function testConnection() {
   }
 }
 
-// ── 模式切换 ─────────────────────────────────────────────
 async function setCanMode(mode) {
   try {
     var resp = await fetch(getBaseUrl() + '/can/mode', {
@@ -214,19 +236,55 @@ async function setCanMode(mode) {
   }
 }
 
-// ── 初始化 ───────────────────────────────────────────────
-function init() {
+/**
+ * 初始化监控逻辑。可在 can_monitor.html（独立）或 can.html（抽屉）中调用。
+ * 幂等：重复调用不会叠加多个 interval。
+ */
+export function initCanMonitor() {
   cacheElements();
+  /* 无监控 DOM 时跳过（纯 can 发送页历史形态） */
+  if (!el.fb0State && !el.idsnapBody) return;
+
+  if (state.fbTimer) {
+    clearInterval(state.fbTimer);
+    state.fbTimer = null;
+  }
+
   setConnState(false, '未连接');
-  if (el.monTestBtn) el.monTestBtn.addEventListener('click', testConnection);
-  if (el.monIp) el.monIp.addEventListener('change', testConnection);
-  if (el.btnModeAllPass) el.btnModeAllPass.addEventListener('click', function () { setCanMode(0); });
-  if (el.btnModeFilter)  el.btnModeFilter.addEventListener('click', function () { setCanMode(1); });
-  if (el.btnModeBridge)  el.btnModeBridge.addEventListener('click', function () { setCanMode(2); });
-  if (el.idsnapChannel) el.idsnapChannel.addEventListener('change', pollFeedback);
+  if (!state.bound) {
+    state.bound = true;
+    if (el.monTestBtn) el.monTestBtn.addEventListener('click', testConnection);
+    if (el.monIp) el.monIp.addEventListener('change', testConnection);
+    /* 嵌入 can.html 时 IP 与发送台共用 */
+    if (el.toolIp && !el.monIp) {
+      el.toolIp.addEventListener('change', function () {
+        pollFeedback();
+      });
+    }
+    if (el.btnModeAllPass) el.btnModeAllPass.addEventListener('click', function () { setCanMode(0); });
+    if (el.btnModeFilter) el.btnModeFilter.addEventListener('click', function () { setCanMode(1); });
+    if (el.btnModeBridge) el.btnModeBridge.addEventListener('click', function () { setCanMode(2); });
+    if (el.idsnapChannel) el.idsnapChannel.addEventListener('change', pollFeedback);
+
+    /* 通道卡：默认折叠详情，点标题展开/收起 */
+    document.querySelectorAll('.feedback-channel .feedback-ch-head').forEach(function (head) {
+      var toggle = function (e) {
+        e.preventDefault();
+        var card = head.closest('.feedback-channel');
+        if (card) card.classList.toggle('collapsed');
+      };
+      head.addEventListener('click', toggle);
+      head.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') toggle(e);
+      });
+    });
+  }
   setTimeout(testConnection, 150);
   pollFeedback();
   state.fbTimer = setInterval(pollFeedback, 1000);
 }
 
-init();
+/* 独立页 can_monitor.html：有 monIp 时自启；嵌入 can.html 由 can.js 调用 initCanMonitor() */
+if (document.getElementById('monIp')) {
+  initCanMonitor();
+}

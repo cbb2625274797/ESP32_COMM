@@ -12,79 +12,165 @@
  * 时序说明：
  *   esp_netif_init() 创建 tcpip 线程后才可安全使用 socket
  *   本模块在首次 send() 时才创建 socket（延迟创建）
- *   WiFi 连接前 sendto() 会失败（无路由），日志仍可写入 UART 与 HTTP 日志缓冲
- *   WiFi 连接后 UDP 立即生效，无需额外操作
+ *   WiFi 未获 IP 时跳过 sendto；日志仍写 UART 与 HTTP ring
+ *
+ * 线程：仅任务上下文；禁止 ISR 调用 DEBUG_*（内部 portMAX_DELAY mutex）。
  */
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <sys/socket.h>
-#include <netdb.h>
 #include <arpa/inet.h>
+#include <errno.h>
+
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_netif.h"
 #include "driver/uart.h"
 
 #include "debug_log.h"
 
 static const char *TAG = "DEBUG_LOG";
 
+static TickType_t warnIntervalTicks()
+{
+    return pdMS_TO_TICKS(10000);
+}
+static constexpr int kUdpSndTimeoutMs = 200;
+static constexpr uint8_t kUdpFailRecreate = 8;
+
 // ============================================================
-// 单例
+// 单例 / 工具
 // ============================================================
-/**
-  * @brief 获取 DebugLog 单例实例。
- * @return DebugLog 引用。
- */
 DebugLog& DebugLog::instance()
 {
     static DebugLog inst;
     return inst;
 }
 
-// ============================================================
-// 日志环形缓冲区（供 HTTP /logs 拉取）
-// ============================================================
+bool DebugLog::isKeepAliveTag(const char *tag)
+{
+    if (!tag) {
+        return false;
+    }
+    /* OTA / OTA_COORD 等；上传路径 WIFI；总线 SPI */
+    if (strncmp(tag, "OTA", 3) == 0) {
+        return true;
+    }
+    if (strcmp(tag, "SPI") == 0 || strcmp(tag, "WIFI") == 0) {
+        return true;
+    }
+    return false;
+}
+
+char *DebugLog::allocEmptyJson(int *out_len)
+{
+    char *empty = (char *)malloc(3);
+    if (!empty) {
+        return nullptr;
+    }
+    empty[0] = '[';
+    empty[1] = ']';
+    empty[2] = '\0';
+    if (out_len) {
+        *out_len = 2;
+    }
+    return empty;
+}
+
 /**
-  * @brief 获取当前环形日志缓冲区中的日志条数。
- * @return 日志条数。
+ * JSON 字符串内容转义写入 buf[pos..]；返回新 pos。
+ * 控制字符除 \n\r\t 外写成 \u00XX；空间不足时截断并尽量写 "..."。
  */
+int DebugLog::jsonEscapeAppend(char *buf, int pos, int capacity, const char *src, int src_len)
+{
+    const int content_start = pos;
+    const int hard_limit = capacity - 6; /* 预留 "..." + '"' + ']' + '\0' 量级 */
+    bool truncated = false;
+
+    for (int i = 0; i < src_len; ++i) {
+        if (pos >= hard_limit) {
+            truncated = true;
+            break;
+        }
+        /* 单条转义上限，避免异常长行占满 drain */
+        if (pos - content_start >= LOG_RING_SIZE * 2) {
+            truncated = true;
+            break;
+        }
+
+        const unsigned char c = (unsigned char)src[i];
+        if (c == '"') {
+            if (pos + 2 > hard_limit) { truncated = true; break; }
+            buf[pos++] = '\\';
+            buf[pos++] = '"';
+        } else if (c == '\\') {
+            if (pos + 2 > hard_limit) { truncated = true; break; }
+            buf[pos++] = '\\';
+            buf[pos++] = '\\';
+        } else if (c == '\n') {
+            if (pos + 2 > hard_limit) { truncated = true; break; }
+            buf[pos++] = '\\';
+            buf[pos++] = 'n';
+        } else if (c == '\r') {
+            if (pos + 2 > hard_limit) { truncated = true; break; }
+            buf[pos++] = '\\';
+            buf[pos++] = 'r';
+        } else if (c == '\t') {
+            if (pos + 2 > hard_limit) { truncated = true; break; }
+            buf[pos++] = '\\';
+            buf[pos++] = 't';
+        } else if (c < 0x20) {
+            /* 其它控制符 → \u00XX（6 字符） */
+            if (pos + 6 > hard_limit) { truncated = true; break; }
+            static const char hex[] = "0123456789abcdef";
+            buf[pos++] = '\\';
+            buf[pos++] = 'u';
+            buf[pos++] = '0';
+            buf[pos++] = '0';
+            buf[pos++] = hex[(c >> 4) & 0xF];
+            buf[pos++] = hex[c & 0xF];
+        } else {
+            buf[pos++] = (char)c;
+        }
+    }
+
+    if (truncated && pos + 3 <= hard_limit) {
+        buf[pos++] = '.';
+        buf[pos++] = '.';
+        buf[pos++] = '.';
+    }
+    return pos;
+}
+
+// ============================================================
+// 环形缓冲（Locked 变体假定已持 m_logRingMutex）
+// ============================================================
 int DebugLog::ringCount()
 {
-    if (!m_logRingMutex) return 0;
+    if (!m_logRingMutex) {
+        return 0;
+    }
     xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
-    int count = m_logRingCount;
+    const int count = m_logRingCount;
     xSemaphoreGive(m_logRingMutex);
     return count;
 }
 
-/**
-  * @brief 弹出一条最旧日志并从环形缓冲区移除。
- * @param out 输出缓冲区。
- * @param out_size 输出缓冲区大小。
- * @param out_len 输出日志长度。
- * @return true 表示成功弹出一条日志，false 表示缓冲区为空或参数无效。
- */
-bool DebugLog::ringPopOldest(char *out, size_t out_size, int *out_len)
+bool DebugLog::ringPopOldestLocked(char *out, size_t out_size, int *out_len)
 {
     if (out_len) {
         *out_len = 0;
     }
-    if (!m_logRingMutex || !out || out_size == 0) {
+    if (!out || out_size == 0 || m_logRingCount <= 0) {
         return false;
     }
 
-    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
-
-    if (m_logRingCount <= 0) {
-        xSemaphoreGive(m_logRingMutex);
-        return false;
-    }
-
-    int idx = (m_logRingHead - m_logRingCount + LOG_RING_SLOTS) % LOG_RING_SLOTS;
+    const int idx = (m_logRingHead - m_logRingCount + LOG_RING_SLOTS) % LOG_RING_SLOTS;
     int len = m_logRingLens[idx];
     if (len < 0) {
         len = 0;
@@ -105,132 +191,212 @@ bool DebugLog::ringPopOldest(char *out, size_t out_size, int *out_len)
 
     m_logRingLens[idx] = 0;
     m_logRingCount--;
-
-    xSemaphoreGive(m_logRingMutex);
     return true;
 }
 
-/**
- * @brief 将环形缓冲区所有日志导出为 JSON 数组字符串。
- * @param out_len 输出 JSON 字符串长度。
- * @return 动态分配的 JSON 字符串，调用者须 free()。
- */
-char* DebugLog::ringDrainJson(int *out_len)
+bool DebugLog::ringPopOldest(char *out, size_t out_size, int *out_len)
 {
-    if (!out_len) return NULL;
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!m_logRingMutex || !out || out_size == 0) {
+        return false;
+    }
+
+    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
+    const bool ok = ringPopOldestLocked(out, out_size, out_len);
+    xSemaphoreGive(m_logRingMutex);
+    return ok;
+}
+
+/** 预览即将 drain 的条数与原始字节总和（用于估 capacity）。 */
+int DebugLog::ringPeekDrainMetaLocked(int max_n, int *total_raw_len) const
+{
+    if (total_raw_len) {
+        *total_raw_len = 0;
+    }
+    int n = m_logRingCount;
+    if (n > max_n) {
+        n = max_n;
+    }
+    if (n <= 0) {
+        return 0;
+    }
+
+    int sum = 0;
+    for (int i = 0; i < n; ++i) {
+        const int idx = (m_logRingHead - m_logRingCount + i + LOG_RING_SLOTS) % LOG_RING_SLOTS;
+        int len = m_logRingLens[idx];
+        if (len < 0) {
+            len = 0;
+        }
+        if (len >= LOG_RING_SIZE) {
+            len = LOG_RING_SIZE - 1;
+        }
+        sum += len;
+    }
+    if (total_raw_len) {
+        *total_raw_len = sum;
+    }
+    return n;
+}
+
+void DebugLog::ringPushLocked(const char *data, int len)
+{
+    if (!data || len <= 0) {
+        return;
+    }
+
+    int copy_len = len;
+    if (copy_len >= LOG_RING_SIZE) {
+        copy_len = LOG_RING_SIZE - 1;
+    }
+
+    memcpy(m_logRing[m_logRingHead], data, (size_t)copy_len);
+    m_logRing[m_logRingHead][copy_len] = '\0';
+    m_logRingLens[m_logRingHead] = copy_len;
+
+    m_logRingHead = (m_logRingHead + 1) % LOG_RING_SLOTS;
+    if (m_logRingCount < LOG_RING_SLOTS) {
+        m_logRingCount++;
+    }
+}
+
+void DebugLog::ringPush(const char *data, int len)
+{
+    if (!m_logRingMutex || len <= 0) {
+        return;
+    }
+    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
+    ringPushLocked(data, len);
+    xSemaphoreGive(m_logRingMutex);
+}
+
+/**
+ * 单次持锁：peek 元数据 →（可选）按堆缩小条数 → pop+转义拼 JSON。
+ * capacity 按真实 raw 长度估算，避免 48×320 虚高导致 OTA 期返空。
+ */
+char *DebugLog::ringDrainJson(int *out_len)
+{
+    if (!out_len) {
+        return nullptr;
+    }
     *out_len = 0;
 
-    /* 堆紧时不 malloc：返回堆上最小 "[]"，调用方仍 free。 */
     const uint32_t free_now = esp_get_free_heap_size();
-    if (free_now < kDrainMinFree) {
-        char *empty = (char *)malloc(3);
-        if (!empty) return NULL;
-        empty[0] = '[';
-        empty[1] = ']';
-        empty[2] = '\0';
-        *out_len = 2;
-        return empty;
+    if (free_now < kDrainMinFree || !m_logRingMutex) {
+        return allocEmptyJson(out_len);
     }
 
-    int count = ringCount();
-    /* OTA 沉默失败排查需要一次多拉；上限 24 条 */
-    static constexpr int kMaxDrain = 24;
-    if (count > kMaxDrain) count = kMaxDrain;
-    int capacity = count * (LOG_RING_SIZE * 2) + 16;
-    if (capacity < 16) capacity = 16;
+    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
 
+    int total_raw = 0;
+    int drain_n = ringPeekDrainMetaLocked(LOG_DRAIN_MAX, &total_raw);
+    if (drain_n <= 0) {
+        xSemaphoreGive(m_logRingMutex);
+        return allocEmptyJson(out_len);
+    }
+
+    /* 转义最坏 ~2x + 每条 "" 与逗号 + 数组括号 */
+    auto calc_capacity = [](int n, int raw) -> int {
+        int cap = raw * 2 + n * 4 + 16;
+        if (cap < 16) {
+            cap = 16;
+        }
+        return cap;
+    };
+
+    int capacity = calc_capacity(drain_n, total_raw);
     const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-    if (largest < (size_t)capacity) {
-        char *empty = (char *)malloc(3);
-        if (!empty) return NULL;
-        empty[0] = '[';
-        empty[1] = ']';
-        empty[2] = '\0';
-        *out_len = 2;
-        return empty;
+
+    /* 堆不够则减条数重估（仍持锁，peek 只读；减 n 时从最旧开始仍一致） */
+    while (drain_n > 0 && largest < (size_t)capacity) {
+        drain_n = drain_n / 2;
+        if (drain_n == 0) {
+            break;
+        }
+        total_raw = 0;
+        drain_n = ringPeekDrainMetaLocked(drain_n, &total_raw);
+        capacity = calc_capacity(drain_n, total_raw);
     }
 
-    char *buf = (char*)malloc(capacity);
-    if (!buf) return NULL;
+    if (drain_n <= 0 || largest < (size_t)capacity) {
+        xSemaphoreGive(m_logRingMutex);
+        return allocEmptyJson(out_len);
+    }
+
+    /* 持锁期间尽量短：只 pop 到栈上临时区会爆栈；改为直接写入 malloc 缓冲。
+     * 先释放锁再 malloc，再二次持锁 pop——中间可能插入新日志，只 drain 最旧 N 条即可。 */
+    xSemaphoreGive(m_logRingMutex);
+
+    char *buf = (char *)malloc((size_t)capacity);
+    if (!buf) {
+        return allocEmptyJson(out_len);
+    }
+
+    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
+
+    /* 重新核对：ring 可能变少 */
+    if (m_logRingCount <= 0) {
+        xSemaphoreGive(m_logRingMutex);
+        free(buf);
+        return allocEmptyJson(out_len);
+    }
+    if (drain_n > m_logRingCount) {
+        drain_n = m_logRingCount;
+    }
+    if (drain_n > LOG_DRAIN_MAX) {
+        drain_n = LOG_DRAIN_MAX;
+    }
 
     int pos = 0;
     buf[pos++] = '[';
     bool first = true;
     char entry[LOG_RING_SIZE];
-    int entryLen = 0;
 
-    while (ringPopOldest(entry, sizeof(entry), &entryLen) && entryLen > 0) {
-        // 逗号写入前做边界检查，预留 4 字节给 ']' + '\0' 及末尾余量
+    for (int k = 0; k < drain_n; ++k) {
+        /* 先估空间再 pop，避免 pop 后写不下导致丢条 */
+        const int need_min = first ? 4 : 5; /* ,"x" 或 "x" 量级 + 闭合余量 */
+        if (pos + need_min >= capacity - 2) {
+            break;
+        }
+
+        int entry_len = 0;
+        if (!ringPopOldestLocked(entry, sizeof(entry), &entry_len) || entry_len <= 0) {
+            break;
+        }
+
         if (!first) {
-            if (pos + 1 >= capacity - 4) break;
             buf[pos++] = ',';
         }
         first = false;
         buf[pos++] = '"';
-
-        // 单条日志转义后超过 LOG_RING_SIZE * 2 时截断，标记 "..." 后缀
-        int content_start = pos;
-        bool truncated = false;
-        for (int i = 0; i < entryLen && pos < capacity - 4; i++) {
-            if (pos - content_start >= LOG_RING_SIZE * 2) {
-                truncated = true;
-                break;
-            }
-            char c = entry[i];
-            if (c == '"') { buf[pos++] = '\\'; buf[pos++] = '"'; }
-            else if (c == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
-            else if (c == '\n') { buf[pos++] = '\\'; buf[pos++] = 'n'; }
-            else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r'; }
-            else if (c == '\t') { buf[pos++] = '\\'; buf[pos++] = 't'; }
-            else if ((unsigned char)c >= 0x20) { buf[pos++] = c; }
+        pos = jsonEscapeAppend(buf, pos, capacity, entry, entry_len);
+        if (pos < capacity - 1) {
+            buf[pos++] = '"';
+        } else if (pos < capacity) {
+            buf[pos - 1] = '"'; /* 极端：覆盖末字节闭合 */
         }
-        if (truncated) {
-            // 确保 "..." + '"' + ']' + '\0' (共 6 字节) 有空间才写入标记
-            if (pos + 6 <= capacity) {
-                buf[pos++] = '.';
-                buf[pos++] = '.';
-                buf[pos++] = '.';
-            }
-        }
-        buf[pos++] = '"';
     }
-    buf[pos++] = ']';
-    buf[pos] = '\0';
+
+    if (pos + 1 < capacity) {
+        buf[pos++] = ']';
+        buf[pos] = '\0';
+    } else if (capacity >= 3) {
+        buf[capacity - 2] = ']';
+        buf[capacity - 1] = '\0';
+        pos = capacity - 1;
+    }
+
+    xSemaphoreGive(m_logRingMutex);
+
     *out_len = pos;
     return buf;
 }
 
-/**
-  * @brief 向环形日志缓冲区中推送一条日志数据。
- * @param data 日志数据指针。
- * @param len 数据长度。
- */
-void DebugLog::ringPush(const char *data, int len)
-{
-    if (!m_logRingMutex || len <= 0) return;
-
-    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
-
-    int copy_len = len;
-    if (copy_len >= LOG_RING_SIZE) copy_len = LOG_RING_SIZE - 1;
-
-    memcpy(m_logRing[m_logRingHead], data, copy_len);
-    m_logRing[m_logRingHead][copy_len] = '\0';
-    m_logRingLens[m_logRingHead] = copy_len;
-
-    m_logRingHead = (m_logRingHead + 1) % LOG_RING_SLOTS;
-    if (m_logRingCount < LOG_RING_SLOTS) m_logRingCount++;
-
-    xSemaphoreGive(m_logRingMutex);
-}
-
 // ============================================================
-// UART 调试日志
+// UART
 // ============================================================
-/**
-  * @brief 初始化 UART0 调试串口。
- * @return esp_err_t 错误码。
- */
 esp_err_t DebugLog::uartInit()
 {
     if (m_uartInitialized) {
@@ -248,7 +414,8 @@ esp_err_t DebugLog::uartInit()
 
     esp_err_t ret = uart_driver_install(uart_port, 1024, 0, 0, NULL, 0);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "UART0 驱动安装失败: %s", esp_err_to_name(ret));
+        /* 可能 console 已占用 UART0——降级为 ring-only */
+        ESP_LOGW(TAG, "UART0 驱动安装失败（可能 console 占用）: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -266,49 +433,34 @@ esp_err_t DebugLog::uartInit()
     }
 
     m_uartInitialized = true;
-    // 标记 UART 真正可用，send() 依据此标志决定是否调用 uart_write_bytes
     m_uartAvailable = true;
     ESP_LOGD(TAG, "UART0 调试输出已初始化 (TX=GPIO%d, RX=GPIO%d, %d baud)",
              UART_DEBUG_TX_GPIO, UART_DEBUG_RX_GPIO, UART_DEBUG_BAUD_RATE);
-
     return ESP_OK;
 }
 
-/**
-  * @brief 通过 UART0 直接发送原始字节数据。
- * @param data 待发送数据指针。
- * @param len 数据长度。
- * @return esp_err_t 错误码。
- */
 esp_err_t DebugLog::uartSend(const uint8_t *data, size_t len)
 {
-    if (!m_uartInitialized) {
+    if (!m_uartInitialized || !m_uartAvailable) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    int ret = uart_write_bytes(UART_NUM_0, data, len);
+    const int ret = uart_write_bytes(UART_NUM_0, data, len);
     if (ret < 0) {
         return ESP_FAIL;
     }
-
     return ESP_OK;
 }
 
 // ============================================================
-// 初始化（UART 立即可用，UDP socket 延迟到首次发送时创建）
+// 初始化 / UDP
 // ============================================================
-/**
-  * @brief 初始化日志系统，包括 UART 输出、UDP 目标和内部缓冲区。
- * @return esp_err_t 错误码。
- */
 esp_err_t DebugLog::init()
 {
     if (m_initialized) {
         return ESP_OK;
     }
 
-    // 检查 uartInit 返回值；失败时仍让 ring buffer 模式工作，
-    //   但记录"UART 不可用"日志，并在 send() 中跳过 uart_write_bytes 调用。
     esp_err_t uart_ret = uartInit();
     if (uart_ret != ESP_OK) {
         ESP_LOGW(TAG, "UART 不可用，仅 ring buffer 模式 (err=%s)", esp_err_to_name(uart_ret));
@@ -316,8 +468,13 @@ esp_err_t DebugLog::init()
     }
 
     m_logRingMutex = xSemaphoreCreateMutex();
+    if (!m_logRingMutex) {
+        ESP_LOGE(TAG, "ring mutex 创建失败，HTTP /logs 将不可用");
+        /* 仍标记 initialized，避免 log() 反复 init；UART 路径可工作 */
+        m_initialized = true;
+        return ESP_ERR_NO_MEM;
+    }
 
-    // 目标地址：单播到上位机
     memset(&m_debugAddr, 0, sizeof(m_debugAddr));
     m_debugAddr.sin_family = AF_INET;
     m_debugAddr.sin_port = htons(DEBUG_LOG_PORT);
@@ -325,121 +482,173 @@ esp_err_t DebugLog::init()
 
     m_initialized = true;
     ESP_LOGI(TAG, "调试日志已初始化，上位机 %s:%d", DEBUG_LOG_IP, DEBUG_LOG_PORT);
-
     return ESP_OK;
 }
 
-/**
-  * @brief 确保 UDP socket 已创建（延迟创建）。
- * @return esp_err_t 错误码。
- */
+bool DebugLog::udpNetifHasIp() const
+{
+    esp_netif_ip_info_t info = {};
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta && esp_netif_get_ip_info(sta, &info) == ESP_OK && info.ip.addr != 0) {
+        return true;
+    }
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap && esp_netif_get_ip_info(ap, &info) == ESP_OK && info.ip.addr != 0) {
+        return true;
+    }
+    return false;
+}
+
+void DebugLog::closeUdpSocket()
+{
+    int s = -1;
+    portENTER_CRITICAL(&m_udpMux);
+    s = m_udpSock;
+    m_udpSock = -1;
+    portEXIT_CRITICAL(&m_udpMux);
+    if (s >= 0) {
+        close(s);
+    }
+}
+
 esp_err_t DebugLog::ensureUdpSocket()
 {
+    portENTER_CRITICAL(&m_udpMux);
     if (m_udpSock >= 0) {
+        portEXIT_CRITICAL(&m_udpMux);
         return ESP_OK;
     }
+    portEXIT_CRITICAL(&m_udpMux);
 
-    m_udpSock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (m_udpSock < 0) {
-        ESP_LOGE(TAG, "创建 UDP socket 失败");
+    const int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        ESP_LOGE(TAG, "创建 UDP socket 失败 errno=%d", errno);
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "UDP socket 创建成功");
+    /* 避免 sendto 在无路由/对端不可达时长时间阻塞日志路径 */
+    struct timeval tv = {};
+    tv.tv_sec = kUdpSndTimeoutMs / 1000;
+    tv.tv_usec = (kUdpSndTimeoutMs % 1000) * 1000;
+    (void)setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    portENTER_CRITICAL(&m_udpMux);
+    if (m_udpSock >= 0) {
+        /* 竞态：另一任务已建好 */
+        portEXIT_CRITICAL(&m_udpMux);
+        close(s);
+        return ESP_OK;
+    }
+    m_udpSock = s;
+    portEXIT_CRITICAL(&m_udpMux);
+
+    ESP_LOGI(TAG, "UDP socket 创建成功 (SNDTIMEO=%dms)", kUdpSndTimeoutMs);
     return ESP_OK;
 }
 
-/**
-  * @brief 发送原始日志数据到底层输出通道。
- * @param data 待发送数据指针。
- * @param len 数据长度。
- * @return esp_err_t 错误码。
- */
 esp_err_t DebugLog::send(const uint8_t *data, size_t len)
 {
+    if (!data || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     esp_err_t udp_ret = ESP_FAIL;
     esp_err_t uart_ret = ESP_FAIL;
     const uint32_t free_now = esp_get_free_heap_size();
 
-    // UART 通道（UART 不可用时跳过 uart_write_bytes 调用）
     if (m_uartAvailable) {
         uart_ret = uartSend(data, len);
     }
 
-    /* UDP 通道：堆紧时跳过 sendto，避免申请 LWIP TX pbuf 与 HTTP 回包抢堆。
-     * WiFi 未连接时 sendto 失败也静默跳过。
-     * ★ 修复：堆不足跳过时写一条告警到 ring buffer，让前端 /logs 可见。 */
-    if (m_initialized && free_now >= kSkipUdpFree) {
+    /* UDP：堆紧 / 无 IP 时跳过 sendto */
+    if (m_initialized && free_now >= kSkipUdpFree && udpNetifHasIp()) {
         if (m_udpSock < 0) {
-            ensureUdpSocket();
+            (void)ensureUdpSocket();
         }
 
-        if (m_udpSock >= 0) {
-            size_t send_len = len > 1024 ? 1024 : len;
-            int ret = ::sendto(m_udpSock, data, send_len, 0,
-                               (struct sockaddr *)&m_debugAddr, sizeof(m_debugAddr));
+        int sock = -1;
+        portENTER_CRITICAL(&m_udpMux);
+        sock = m_udpSock;
+        portEXIT_CRITICAL(&m_udpMux);
+
+        if (sock >= 0) {
+            const size_t send_len = len > 1024 ? 1024 : len;
+            const int ret = ::sendto(sock, data, send_len, 0,
+                                     (struct sockaddr *)&m_debugAddr, sizeof(m_debugAddr));
             if (ret >= 0) {
                 udp_ret = ESP_OK;
+                m_udpFailStreak = 0;
+            } else {
+                if (m_udpFailStreak < 255) {
+                    m_udpFailStreak++;
+                }
+                if (m_udpFailStreak >= kUdpFailRecreate) {
+                    closeUdpSocket();
+                    m_udpFailStreak = 0;
+                    const TickType_t now = xTaskGetTickCount();
+                    if (m_lastUdpFailWarnTick == 0 ||
+                        (now - m_lastUdpFailWarnTick) >= warnIntervalTicks()) {
+                        m_lastUdpFailWarnTick = now;
+                        static const char kMsg[] = "[W][LOG] UDP 连续失败，已重建 socket\n";
+                        ringPush(kMsg, (int)sizeof(kMsg) - 1);
+                    }
+                }
             }
         }
-    } else if (m_initialized) {
-        /* 堆不足导致 UDP 被跳过——通过 ring buffer 记录，避免上位机无法感知 */
-        static uint32_t s_lastUdpSkipWarnMs = 0;
-        uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-        /* 限制告警频率：每 10 秒最多一条，避免刷屏 */
-        if ((now_ms - s_lastUdpSkipWarnMs) > 10000) {
-            s_lastUdpSkipWarnMs = now_ms;
+    } else if (m_initialized && free_now < kSkipUdpFree) {
+        const TickType_t now = xTaskGetTickCount();
+        if (m_lastUdpSkipWarnTick == 0 ||
+            (now - m_lastUdpSkipWarnTick) >= warnIntervalTicks()) {
+            m_lastUdpSkipWarnTick = now;
             static const char kUdpSkipMsg[] = "[W][LOG] UDP 发送已暂停: 堆内存不足\n";
-            ringPush(kUdpSkipMsg, sizeof(kUdpSkipMsg) - 1);
+            ringPush(kUdpSkipMsg, (int)sizeof(kUdpSkipMsg) - 1);
         }
     }
 
-    // 同时写入环形缓冲区（供 HTTP /logs 拉取）——静态，不占堆
     ringPush((const char *)data, (int)len);
 
     if (udp_ret == ESP_OK || uart_ret == ESP_OK) {
         return ESP_OK;
     }
-    /* 仅 ring 成功也算可用（OTA 堆紧时常见） */
     if (m_logRingMutex) {
         return ESP_OK;
     }
     return ESP_FAIL;
 }
 
-/**
-  * @brief 按日志级别与标签格式化输出一条日志。
- * @param level 日志级别。
- * @param tag 日志标签。
- * @param fmt 格式化字符串。
- * @param ... 可变参数。
- */
 void DebugLog::log(debug_log_level_t level, const char *tag, const char *fmt, ...)
 {
     if (!m_initialized) {
-        init();
+        (void)init();
     }
 
-    if (level > logLevel) {
+    if (level > m_logLevel) {
         return;
     }
 
-    /* 堆门控：OTA/SPI 的 INFO 必须进 ring，否则 WebUI 只能看到“沉默失败”。 */
     const uint32_t free_now = esp_get_free_heap_size();
-    const bool keep_ota_spi = (tag != nullptr &&
-                               (strcmp(tag, "OTA") == 0 || strcmp(tag, "SPI") == 0));
-    if (!keep_ota_spi) {
-        if (free_now < kDropWarnFree && level > DEBUG_LOG_ERR) {
-            return;  // 无关模块：仅 ERR
+    const bool keep = isKeepAliveTag(tag);
+
+    /*
+     * 堆门控：
+     * - ERR/WARN：永不因堆丢弃（排障必需）
+     * - keep-alive（OTA 前缀 / SPI / WIFI）：INFO 保留；极紧时仍丢 DBG
+     * - 其它：free < kDropInfoFree 丢 INFO/DBG
+     */
+    if (level >= DEBUG_LOG_INFO) {
+        if (level >= DEBUG_LOG_DBG && free_now < kDropWarnFree) {
+            return;
         }
-        if (free_now < kDropInfoFree && level > DEBUG_LOG_WARN) {
-            return;  // 无关模块：丢 INFO/DBG
+        if (!keep) {
+            if (free_now < kDropInfoFree) {
+                return;
+            }
+        } else if (level >= DEBUG_LOG_DBG && free_now < kDropInfoFree) {
+            /* keep-alive DBG：中等堆紧也丢，减刷屏 */
+            return;
         }
-    } else if (free_now < kDropWarnFree && level >= DEBUG_LOG_DBG) {
-        return;  // OTA/SPI：极紧时仍丢 DBG，INFO/WARN/ERR 保留
     }
 
-    char prefix[24];
     const char *level_str;
     switch (level) {
         case DEBUG_LOG_ERR:  level_str = "E"; break;
@@ -448,29 +657,47 @@ void DebugLog::log(debug_log_level_t level, const char *tag, const char *fmt, ..
         case DEBUG_LOG_DBG:  level_str = "D"; break;
         default:             level_str = "?"; break;
     }
-    snprintf(prefix, sizeof(prefix), "[%s][%s]", level_str, tag);
 
-    /* 栈缓冲与 LOG_RING_SIZE 对齐，减轻 httpd 等任务栈压。 */
-    va_list args;
-    va_start(args, fmt);
-    char msg[160];
-    vsnprintf(msg, sizeof(msg), fmt, args);
-    va_end(args);
-
-    char log_buf[192];
-    int total = snprintf(log_buf, sizeof(log_buf), "%s %s\n", prefix, msg);
-
-    // ★ snprintf 截断时返回"本应写入的长度"(可能 > sizeof(log_buf))，
-    //   直接传给 send() 会越界读取栈外内存 → 破坏相邻任务 TCB → "Stack protection fault"
-    //   (崩溃栈中出现 HTTP User-Agent / "/ota/relay" 等字符串即此症状)。
-    //   截断到实际缓冲区大小，避免越界读。
-    if (total < 0) {
+    /* 单缓冲：与 LOG_RING_SIZE 对齐，避免 msg[]+log_buf[] 双栈 */
+    char log_buf[LOG_RING_SIZE];
+    const char *safe_tag = tag ? tag : "?";
+    int prefix_len = snprintf(log_buf, sizeof(log_buf), "[%s][%s] ", level_str, safe_tag);
+    if (prefix_len < 0) {
         return;
     }
-    if ((size_t)total >= sizeof(log_buf)) {
-        total = (int)sizeof(log_buf) - 1;
-        log_buf[total] = '\0';
+    if ((size_t)prefix_len >= sizeof(log_buf)) {
+        /* 前缀已截断：保证可发送的以 \\n 结尾的串 */
+        log_buf[sizeof(log_buf) - 2] = '\n';
+        log_buf[sizeof(log_buf) - 1] = '\0';
+        (void)send((const uint8_t *)log_buf, sizeof(log_buf) - 1);
+        return;
     }
 
-    send((const uint8_t *)log_buf, total);
+    va_list args;
+    va_start(args, fmt);
+    int body = vsnprintf(log_buf + prefix_len, sizeof(log_buf) - (size_t)prefix_len, fmt, args);
+    va_end(args);
+    if (body < 0) {
+        return;
+    }
+
+    size_t used = (size_t)prefix_len + (size_t)body;
+    if (used >= sizeof(log_buf)) {
+        used = sizeof(log_buf) - 1;
+        log_buf[used] = '\0';
+    }
+
+    /* 保证换行结尾（截断时覆盖末字节） */
+    if (used == 0 || log_buf[used - 1] != '\n') {
+        if (used + 1 < sizeof(log_buf)) {
+            log_buf[used++] = '\n';
+            log_buf[used] = '\0';
+        } else {
+            log_buf[sizeof(log_buf) - 2] = '\n';
+            log_buf[sizeof(log_buf) - 1] = '\0';
+            used = sizeof(log_buf) - 1;
+        }
+    }
+
+    (void)send((const uint8_t *)log_buf, used);
 }

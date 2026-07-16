@@ -12,6 +12,7 @@
 #include "ota_relay.h"
 #include "wifi_ota.h"
 #include "ble_ota.h"
+#include "spi_master.h"
 
 size_t collectTaskStackMetrics(TaskStackMetric* out, size_t max)
 {
@@ -30,8 +31,12 @@ size_t collectTaskStackMetrics(TaskStackMetric* out, size_t max)
     if (n < max) {
         out[n++] = { "cpu_stats", CpuStats::instance().getTaskHandle(), TASK_STACK_CPU_STATS };
     }
+    /* 转发热路径：ota_relay（业务）+ spi_worker（帧缓冲，此前监控缺口） */
     if (n < max) {
         out[n++] = { "ota_relay", OtaRelay::getTaskHandle(), TASK_STACK_OTA_RELAY };
+    }
+    if (n < max) {
+        out[n++] = { "spi_worker", SpiMaster::instance().getWorkerTaskHandle(), TASK_STACK_SPI_WORKER };
     }
     if (n < max) {
         out[n++] = { "wifi_ota", WifiOta::instance().getTaskHandle(), TASK_STACK_WIFI_OTA };

@@ -447,8 +447,10 @@ export async function uploadFirmware() {
       clearTimeout(state.ackWaiter.timer);
       state.ackWaiter = null;
     }
-    if (state.lastUploadStatus === 'failed') {
+    if (state.lastUploadStatus === 'failed' || state.lastUploadStatus === 'aborted') {
       clearOtaResultWaiter();
+      // 终态后允许下一次 uploadFirmware 干净起步（abortRequested 在下次入口也会清）
+      // 此处不强制清 abortRequested：中止循环可能仍在 unwind
     }
     state.uploading = false;
     state.uploadTargetKey = null;

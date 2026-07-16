@@ -5,10 +5,13 @@
  */
 // ==================== 工具函数 ====================
 /** @description 格式化字节大小为人类可读字符串（B/KB/MB）。 */
+/** @description 字节格式化为 B / KB（不升到 MB，避免 1024KB 显示成 1.00MB）。 */
 export function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '--';
   if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  var kb = bytes / 1024;
+  if (Math.abs(kb - Math.round(kb)) < 1e-9) return Math.round(kb) + ' KB';
+  return kb.toFixed(1) + ' KB';
 }
 /** @description 格式化 Date 对象为 HH:MM:SS.mmm 时间字符串。 */
 export function formatTime(date) {

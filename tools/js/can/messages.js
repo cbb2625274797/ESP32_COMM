@@ -7,30 +7,59 @@
  *       common/utils.js（escapeHtml/formatBytes）、
  *       signals.js（renderInlineSignalGrid/ensureMessageDefaults/renderSelectedMessage/updateEncodedPreview）。
  */
-import { state, el, padHex, normalizeWhitespace, cssEscape } from './dbc.js';
-import { escapeHtml as sanitizeHtml, formatBytes } from '../common/utils.js';
-import { renderInlineSignalGrid, ensureMessageDefaults, renderSelectedMessage, updateEncodedPreview } from './signals.js';
+import { state, el, padHex, normalizeWhitespace, cssEscape } from './dbc.js?v=20260717t';
+import { escapeHtml as sanitizeHtml, formatBytes } from '../common/utils.js?v=20260717t';
+import { renderInlineSignalGrid, ensureMessageDefaults, renderSelectedMessage, updateEncodedPreview } from './signals.js?v=20260717t';
+import { scheduleCanPersist } from './persist.js?v=20260717t';
 
 // ==================== DBC 文件信息 ====================
 /** @description 更新 DBC 文件信息卡片（文件名/报文数/信号数/节点数/大小）。 */
-export function updateDbcFileInfo(file, dbc) {
-  if (!el.dbcFileInfo) return;
-  if (!file || !dbc) {
-    el.dbcFileInfo.classList.remove('show');
-    el.dbcFileName.textContent = '-';
-    el.dbcMessageCount.textContent = '0';
-    el.dbcSignalCount.textContent = '0';
-    el.dbcNodeCount.textContent = '0';
-    el.dbcFileSize.textContent = '0 B';
+/** @description 刷新多 DBC 摘要条与文件 chip 列表。 */
+export function updateDbcFileInfo() {
+  var sources = state.dbcSources || [];
+  var has = sources.length > 0;
+  var dbc = state.dbc;
+
+  if (el.dbcFileInfo) {
+    el.dbcFileInfo.hidden = !has;
+    el.dbcFileInfo.classList.toggle('show', has);
+  }
+  /* 有文件时仍显示「添加」，文案改成添加；「全部清除」紧挨添加按钮 */
+  if (el.importDbcBtn) {
+    el.importDbcBtn.hidden = false;
+    el.importDbcBtn.textContent = has ? '添加 DBC' : '导入 DBC';
+  }
+  if (el.clearDbcBtn) el.clearDbcBtn.hidden = !has;
+  if (el.dbcDropZone) el.dbcDropZone.classList.toggle('has-dbc', has);
+
+  if (!has || !dbc) {
+    if (el.dbcFileCount) el.dbcFileCount.textContent = '0';
+    if (el.dbcMessageCount) el.dbcMessageCount.textContent = '0';
+    if (el.dbcSignalCount) el.dbcSignalCount.textContent = '0';
+    if (el.dbcNodeCount) el.dbcNodeCount.textContent = '0';
+    if (el.dbcFileSize) el.dbcFileSize.textContent = '0 B';
+    if (el.dbcFileChips) el.dbcFileChips.innerHTML = '';
     return;
   }
+
   var signalCount = dbc.messages.reduce(function (sum, msg) { return sum + msg.signals.length; }, 0);
-  el.dbcFileInfo.classList.add('show');
-  el.dbcFileName.textContent = file.name || '-';
-  el.dbcMessageCount.textContent = String(dbc.messages.length);
-  el.dbcSignalCount.textContent = String(signalCount);
-  el.dbcNodeCount.textContent = String(dbc.nodeNames.length);
-  el.dbcFileSize.textContent = formatBytes(file.size || 0);
+  var totalSize = sources.reduce(function (sum, s) { return sum + (s.size || 0); }, 0);
+  if (el.dbcFileCount) el.dbcFileCount.textContent = String(sources.length);
+  if (el.dbcMessageCount) el.dbcMessageCount.textContent = String(dbc.messages.length);
+  if (el.dbcSignalCount) el.dbcSignalCount.textContent = String(signalCount);
+  if (el.dbcNodeCount) el.dbcNodeCount.textContent = String(dbc.nodeNames.length);
+  if (el.dbcFileSize) el.dbcFileSize.textContent = formatBytes(totalSize);
+
+  if (el.dbcFileChips) {
+    el.dbcFileChips.innerHTML = sources.map(function (s) {
+      var nMsg = (s.dbc && s.dbc.messages) ? s.dbc.messages.length : 0;
+      return '' +
+        '<span class="dbc-file-chip" data-source-id="' + sanitizeHtml(s.id) + '" title="' + sanitizeHtml(s.name) + ' · ' + nMsg + ' 报文">' +
+          '<span class="dbc-file-chip-name">' + sanitizeHtml(s.name) + '</span>' +
+          '<button type="button" class="dbc-file-chip-remove" data-remove-id="' + sanitizeHtml(s.id) + '" title="移除此文件">×</button>' +
+        '</span>';
+    }).join('');
+  }
 }
 
 // ==================== 报文过滤 ====================
@@ -109,6 +138,7 @@ export function renderNodeFilterList() {
       else delete state.transmitterFilter[name];
       recomputeTransmitterFilterEmpty();
       filterMessages();
+      scheduleCanPersist();
     });
   }
 }
@@ -143,9 +173,11 @@ export function setNodeFilterPanelOpen(open) {
     renderNodeFilterList();
     el.nodeFilterPanel.hidden = false;
     el.nodeFilterBtn.setAttribute('aria-expanded', 'true');
+    if (el.nodeFilterWrap) el.nodeFilterWrap.classList.add('is-open');
   } else {
     el.nodeFilterPanel.hidden = true;
     el.nodeFilterBtn.setAttribute('aria-expanded', 'false');
+    if (el.nodeFilterWrap) el.nodeFilterWrap.classList.remove('is-open');
   }
 }
 
@@ -173,12 +205,14 @@ export function bindNodeFilterEvents() {
     recomputeTransmitterFilterEmpty();
     renderNodeFilterList();
     filterMessages();
+    scheduleCanPersist();
   });
   if (el.nodeFilterNoneBtn) el.nodeFilterNoneBtn.addEventListener('click', function () {
     state.transmitterFilter = Object.create(null);
     state.transmitterFilterEmpty = true;
     renderNodeFilterList();
     filterMessages();
+    scheduleCanPersist();
   });
 }
 
@@ -186,8 +220,13 @@ export function bindNodeFilterEvents() {
 /** @description 渲染报文列表表格（表头 + 行 + 展开区）。 */
 export function renderMessageList() {
   if (!el.messageList) return;
-  if (!state.dbc) {
-    el.messageList.innerHTML = '<div class="status-empty">等待导入 DBC...</div>';
+  if (!state.dbc || !state.dbcSources.length) {
+    el.messageList.innerHTML =
+      '<div class="dbc-empty-drop" id="dbcEmptyDrop">' +
+        '<div class="upload-ico">📥</div>' +
+        '<h4>导入 DBC 开始编辑报文</h4>' +
+        '<p>支持一次选择或拖入 <b>多个</b> <code>.dbc</code> 文件</p>' +
+      '</div>';
     updateBatchUi();
     return;
   }
@@ -210,7 +249,10 @@ export function renderMessageList() {
       '<span class="message-col message-col-check"><input type="checkbox" class="message-check" data-key="' + sanitizeHtml(msg.key) + '"' + checked + '></span>' +
       '<span class="message-col message-col-toggle"><button type="button" class="message-toggle' + (expanded ? ' expanded' : '') + '" data-key="' + sanitizeHtml(msg.key) + '" aria-label="展开/收起信号">' + caret + '</button></span>' +
       '<span class="message-col message-col-index">' + (index + 1) + '</span>' +
-      '<span class="message-col message-col-name" title="' + sanitizeHtml(msg.name) + '">' + sanitizeHtml(msg.name) + '</span>' +
+      '<span class="message-col message-col-dbc" title="' + sanitizeHtml(msg.sourceName || '-') + '">' +
+        sanitizeHtml(msg.sourceName ? String(msg.sourceName).replace(/\.dbc$/i, '') : '-') + '</span>' +
+      '<span class="message-col message-col-name" title="' + sanitizeHtml(msg.name) + '">' +
+        sanitizeHtml(msg.name) + '</span>' +
       '<span class="message-col message-col-id">' + sanitizeHtml(idHex) + '</span>' +
       '<span class="message-col message-col-channel">CH' + sanitizeHtml(channelTxt) + '</span>' +
       '<span class="message-col message-col-type">' + sanitizeHtml(msg.isExtended ? '扩展' : '标准') + '</span>' +
@@ -230,6 +272,7 @@ export function renderMessageList() {
     '<span class="message-col message-col-check"></span>' +
     '<span class="message-col message-col-toggle"></span>' +
     '<span class="message-col message-col-index">#</span>' +
+    '<span class="message-col message-col-dbc">DBC名称</span>' +
     '<span class="message-col message-col-name">报文名称</span>' +
     '<span class="message-col message-col-id">标识符</span>' +
     '<span class="message-col message-col-channel">通道</span>' +
@@ -260,6 +303,7 @@ export function renderMessageList() {
       if (this.checked) state.checkedKeys[k] = true;
       else delete state.checkedKeys[k];
       updateBatchUi();
+      scheduleCanPersist();
     });
   }
   var toggles = el.messageList.querySelectorAll('.message-toggle');
@@ -314,6 +358,7 @@ function toggleMessageExpand(key) {
     toggle.classList.toggle('expanded', willExpand);
     toggle.textContent = willExpand ? '\u25BE' : '\u25B8';
   }
+  scheduleCanPersist();
 }
 
 // ==================== 批量 UI ====================
@@ -352,4 +397,5 @@ export function selectMessage(key) {
   renderMessageList();
   renderSelectedMessage();
   updateEncodedPreview();
+  scheduleCanPersist();
 }

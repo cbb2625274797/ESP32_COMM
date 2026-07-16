@@ -72,7 +72,7 @@ public:
 
     /**
      * @brief 新一轮 GD32 固件写入会话开始时调用：复位擦除水位。
-     *        prepareGd32Storage 随后会 erasePartition(整分区)。
+     *        后续 flashWriteChunk 经 ensureErasedForWrite 按需擦扇区。
      */
     void beginWriteSession();
 
@@ -152,8 +152,8 @@ private:
 
     const esp_partition_t *m_partition = nullptr; ///< gd32_ota 分区指针（懒初始化）
 
-    // ── 擦除水位：prepare 整分区预擦后 m_erasedUpTo==part->size；
-    //   flashWriteChunk 内 ensureErased 为安全兜底（水位已覆盖则立即返回）。
+    // ── 擦除水位：beginWriteSession 后从 0 起；
+    //   flashWriteChunk → ensureErasedForWrite 按需推进（不再依赖 prepare 整区预擦）。
     static constexpr uint32_t kFlashSectorSize = 4096U;
     uint32_t m_erasedUpTo = 0;
     esp_err_t ensureErasedForWrite(uint32_t offset, size_t len);

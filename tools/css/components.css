@@ -183,20 +183,37 @@
 
 .heap-bar-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 10px;
 }
 
 .heap-bar-text {
+  order: 1;
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 13px;
   font-weight: 600;
   white-space: nowrap;
-  min-width: 165px;
   color: var(--text);
 }
 
+/* 百分比数值与文案同一行；进度条单独占下一行 */
+.heap-bar-pct {
+  order: 2;
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+  min-width: 42px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
 .heap-bar-track {
-  flex: 1;
+  order: 3;
+  flex: 1 1 100%;
+  width: 100%;
   height: 14px;
   background: rgba(255,255,255,0.06);
   border-radius: 7px;
@@ -210,21 +227,12 @@
   border-radius: 7px;
   background: linear-gradient(90deg, var(--accent), #5eead4);
   transition: width .4s ease;
+}
 .heap-bar-fill.warn {
   background: linear-gradient(90deg, #f59e0b, #d97706);
 }
 .heap-bar-fill.danger {
   background: linear-gradient(90deg, #ef4444, #dc2626);
-}
-}
-
-.heap-bar-pct {
-  font-size: 12px;
-  font-weight: 600;
-  min-width: 42px;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-  color: var(--text-dim);
 }
 
 .heap-detail-row {
@@ -252,6 +260,26 @@
 .status-task-list {
   display: grid;
   gap: 8px;
+}
+/* 默认露出约 3 条（按占用排序后的最高项），其余纵向滚动 */
+.status-task-list.list-scroll-top3 {
+  --status-task-row-est: 6.75rem; /* 单条卡片近似高度（含 meta） */
+  max-height: calc(3 * var(--status-task-row-est) + 2 * 8px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+}
+.status-task-list.list-scroll-top3::-webkit-scrollbar {
+  width: 6px;
+}
+.status-task-list.list-scroll-top3::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+}
+.status-task-list.list-scroll-top3::-webkit-scrollbar-track {
+  background: transparent;
 }
 .status-task {
   background: var(--bg-elevated);
@@ -315,6 +343,42 @@
   font-size: 11px;
   font-family: var(--font-mono);
 }
+/* 区块内二级折叠：默认 collapsed 收起，点击标题展开 */
+.status-subfold {
+  margin-top: 14px;
+}
+.status-subfold-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  padding: 6px 0;
+  border-radius: var(--radius-sm);
+}
+.status-subfold-head:hover {
+  color: var(--text);
+}
+.status-subfold-title {
+  margin: 0 !important;
+  flex: 1;
+}
+.status-subfold-head .collapse-arrow {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-dim);
+  transition: transform .15s ease;
+}
+.status-subfold.collapsed .collapse-arrow {
+  transform: rotate(-90deg);
+}
+.status-subfold.collapsed .status-subfold-body {
+  display: none;
+}
+.status-subfold-body {
+  margin-top: 6px;
+}
 .status-json {
   margin-top: 0;
   padding: 12px;
@@ -329,6 +393,8 @@
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--font-mono);
+  resize: vertical; /* 展开后可拖动缩放高度 */
+  min-height: 80px;
 }
 .status-empty {
   padding: 12px;

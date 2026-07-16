@@ -9,11 +9,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 OTA 中继控制台</title>
-<link rel="stylesheet" href="css/base.css?v=20260715a">
-<link rel="stylesheet" href="css/layout.css?v=20260715a">
-<link rel="stylesheet" href="css/components.css?v=20260715a">
-<link rel="stylesheet" href="css/can.css?v=20260715a">
-<link rel="stylesheet" href="css/responsive.css?v=20260715a">
+<link rel="stylesheet" href="css/base.css?v=20260716o">
+<link rel="stylesheet" href="css/layout.css?v=20260716o">
+<link rel="stylesheet" href="css/components.css?v=20260716o">
+<link rel="stylesheet" href="css/can.css?v=20260716o">
+<link rel="stylesheet" href="css/responsive.css?v=20260716o">
 </head>
 <body>
 <div class="container">
@@ -288,55 +288,6 @@
         </div>
       </div>
 
-      <div class="card collapsed">
-        <div class="card-head" onclick="toggleCollapse(this)">
-          <span class="ico">🧠</span> 堆与任务栈
-          <button class="btn btn-ghost btn-sm card-head-btn" onclick="refreshSystemStatusNow(event)">刷新</button>
-          <span class="collapse-arrow">▼</span>
-        </div>
-          <div class="card-body">
-          <div class="status-section-title">CPU 占用</div>
-          <div class="heap-group cpu-group">
-            <div class="heap-group-title">ESP32 Runtime <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(FreeRTOS)</span></div>
-            <div class="heap-bar-row">
-              <span class="heap-bar-text" id="cpuUsageText">等待采样...</span>
-              <span class="heap-bar-track"><span class="heap-bar-fill cpu-fill" id="cpuUsageFill"></span></span>
-              <span class="heap-bar-pct" id="cpuUsagePct">--</span>
-            </div>
-            <div class="heap-detail-row">
-              <span>空闲: <b id="cpuIdlePct">--</b></span>
-              <span>窗口: <b id="cpuSampleMs">--</b></span>
-              <span>任务数: <b id="cpuTaskCount">--</b></span>
-            </div>
-          </div>
-          <div class="status-task-list cpu-task-list" id="cpuTaskList">
-            <div class="status-empty">等待下一次状态刷新...</div>
-          </div>
-
-          <div class="status-section-title">堆概况</div>
-          <div class="heap-group">
-            <div class="heap-group-title">内部 DRAM <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(数据堆)</span></div>
-            <div class="heap-bar-row">
-              <span class="heap-bar-text" id="memInternalUsage">--</span>
-              <span class="heap-bar-track"><span class="heap-bar-fill" id="memInternalFill"></span></span>
-              <span class="heap-bar-pct" id="memInternalPct">--</span>
-            </div>
-            <div class="heap-detail-row">
-              <span>空闲: <b id="mInternalHeap">--</b></span>
-              <span>最低空闲: <b id="mInternalMinHeap">--</b></span>
-              <span>最大块: <b id="mInternalLargestBlock">--</b></span>
-            </div>
-          </div>
-
-          <div class="status-section-title">任务栈水位</div>
-          <div class="status-task-list" id="taskStackList">
-            <div class="status-empty">等待状态刷新...</div>
-          </div>
-          <div class="status-section-title">原始 JSON</div>
-          <pre class="status-json" id="statusJson">--</pre>
-        </div>
-      </div>
-
       <!-- CAN workspace entry -->
       <div class="card collapsed">
         <div class="card-head" onclick="toggleCollapse(this)">
@@ -363,34 +314,13 @@
             <div class="can-launch-actions">
               <a class="btn btn-primary can-launch-primary" href="can.html">进入 CAN 页面</a>
               <button class="btn btn-outline can-launch-secondary" type="button" onclick="window.open('can.html','_blank','noopener')">新窗口打开</button>
-              <a class="btn btn-outline can-launch-secondary" href="can_monitor.html">CAN 接收监控</a>
+              <a class="btn btn-outline can-launch-secondary" href="can.html" title="发送页右侧抽屉内嵌监控">CAN 发送 + 监控</a>
+              <a class="btn btn-outline can-launch-secondary" href="can_monitor.html">监控全屏</a>
             </div>
             <div class="can-launch-foot">
               <span class="can-launch-foot-label">说明</span>
-              <span>手工 CAN 表单已迁到独立页面，避免和 OTA 控制流混在一起；SPI 调试仍保留在当前页。</span>
+              <span>手工 CAN 表单已迁到独立页面，避免和 OTA 控制流混在一起。</span>
             </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- SPI panel -->
-      <div class="card collapsed">
-        <div class="card-head" onclick="toggleCollapse(this)">
-          <span class="ico">⚡</span> SPI 发送
-          <span class="collapse-arrow">▼</span>
-        </div>
-        <div class="card-body">
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-            <input class="input" type="text" id="spiType" value="01" maxlength="2" placeholder="type" title="帧类型 (hex)" style="width:52px;flex:none;">
-            <input class="input" type="text" id="spiData" value="" placeholder="payload hex..." style="flex:1;min-width:100px;">
-            <input class="input" type="number" id="spiTimeout" value="1000" min="100" max="10000" title="超时 ms" style="width:68px;flex:none;">
-            <span style="font-size:11px;color:var(--text-dim);">ms</span>
-            <button class="btn btn-primary" onclick="sendSpiFrame()" style="padding:4px 14px;">发送</button>
-            <button class="btn btn-outline" onclick="clearSpiFields()" style="padding:4px 10px;">清空</button>
-          </div>
-          <div class="helper-note" id="spiHint">type(hex) + payload → 自动构建 SOF+LEN+CRC 帧</div>
-          <div id="spiResp" style="display:none;margin-top:8px;padding:8px 10px;background:var(--bg-elevated);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;">
-            <span id="spiRespText" style="color:var(--accent);"></span>
           </div>
         </div>
       </div>
@@ -425,14 +355,78 @@
   </div>
 </div>
 
+<!-- 右侧滑出：堆与任务栈（默认露出一条，悬停展开） -->
+<aside class="sys-drawer" id="sysDrawer" aria-label="堆与任务栈">
+  <div class="sys-drawer-rail" title="悬停展开堆与任务栈">
+    <span class="sys-drawer-rail-ico">🧠</span>
+    <span class="sys-drawer-rail-text">堆与任务栈</span>
+  </div>
+  <div class="sys-drawer-panel card">
+    <div class="card-head sys-drawer-head">
+      <span class="ico">🧠</span> 堆与任务栈
+      <button class="btn btn-ghost btn-sm card-head-btn" type="button" onclick="refreshSystemStatusNow(event)">刷新</button>
+    </div>
+    <div class="card-body sys-drawer-body">
+      <div class="status-section-title">CPU 占用</div>
+      <div class="heap-group cpu-group">
+        <div class="heap-group-title">ESP32 Runtime <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(FreeRTOS)</span></div>
+        <div class="heap-bar-row">
+          <span class="heap-bar-text" id="cpuUsageText">等待采样...</span>
+          <span class="heap-bar-track"><span class="heap-bar-fill cpu-fill" id="cpuUsageFill"></span></span>
+          <span class="heap-bar-pct" id="cpuUsagePct">--</span>
+        </div>
+        <div class="heap-detail-row">
+          <span>空闲: <b id="cpuIdlePct">--</b></span>
+          <span>窗口: <b id="cpuSampleMs">--</b></span>
+          <span>任务数: <b id="cpuTaskCount">--</b></span>
+        </div>
+      </div>
+      <div class="status-task-list cpu-task-list list-scroll-top3" id="cpuTaskList" title="按占用降序，默认显示前 3 项，下滑查看其余">
+        <div class="status-empty">等待下一次状态刷新...</div>
+      </div>
+
+      <div class="status-section-title">堆概况</div>
+      <div class="heap-group">
+        <div class="heap-group-title">内部 DRAM <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(数据堆)</span></div>
+        <div class="heap-bar-row">
+          <span class="heap-bar-text" id="memInternalUsage">--</span>
+          <span class="heap-bar-track"><span class="heap-bar-fill" id="memInternalFill"></span></span>
+          <span class="heap-bar-pct" id="memInternalPct">--</span>
+        </div>
+        <div class="heap-detail-row">
+          <span>空闲: <b id="mInternalHeap">--</b></span>
+          <span>最低空闲: <b id="mInternalMinHeap">--</b></span>
+          <span>最大块: <b id="mInternalLargestBlock">--</b></span>
+        </div>
+      </div>
+
+      <div class="status-section-title">任务栈水位 <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-dim);">（峰值占用 Top，下滑查看）</span></div>
+      <div class="status-task-list list-scroll-top3" id="taskStackList" title="按峰值占用降序，默认显示前 3 项，下滑查看其余">
+        <div class="status-empty">等待状态刷新...</div>
+      </div>
+      <div class="status-subfold collapsed" id="statusJsonFold">
+        <div class="status-subfold-head" role="button" tabindex="0"
+             onclick="this.parentElement.classList.toggle('collapsed')"
+             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.parentElement.classList.toggle('collapsed');}">
+          <span class="status-section-title status-subfold-title">原始 JSON</span>
+          <span class="collapse-arrow">▼</span>
+        </div>
+        <div class="status-subfold-body">
+          <pre class="status-json" id="statusJson">--</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</aside>
+
 <!-- Toast -->
 <div class="toast" id="toast">
   <span class="toast-ico" id="toastIco">✓</span>
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script type="module" src="js/app.js?v=20260716c"></script>
-<script type="module" src="js/ota/console-mode.js?v=20260716c"></script>
-<script type="module" src="js/ble_ota.js?v=20260716c"></script>
+<script type="module" src="js/app.js?v=20260716p"></script>
+<script type="module" src="js/ota/console-mode.js?v=20260716p"></script>
+<script type="module" src="js/ble_ota.js?v=20260716p"></script>
 </body>
 </html>
