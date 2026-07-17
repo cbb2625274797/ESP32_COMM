@@ -7,14 +7,13 @@
  *       common/utils.js（escapeHtml/formatBytes）、
  *       signals.js（renderInlineSignalGrid/ensureMessageDefaults/updateEncodedPreview）。
  */
-import { state, el, padHex, normalizeWhitespace, cssEscape } from './dbc.js?v=20260717x';
-import { escapeHtml as sanitizeHtml, formatBytes } from '../common/utils.js?v=20260717x';
+import { state, el, padHex, normalizeWhitespace, cssEscape, findMessageByKey } from './dbc.js?v=20260717x';
+import { escapeHtml, formatBytes } from '../common/utils.js?v=20260717x';
 import { renderInlineSignalGrid, ensureMessageDefaults, updateEncodedPreview } from './signals.js?v=20260717x';
 import { scheduleCanPersist } from './persist.js?v=20260717x';
 
 // ==================== DBC 文件信息 ====================
-/** @description 更新 DBC 文件信息卡片（文件名/报文数/信号数/节点数/大小）。 */
-/** @description 刷新多 DBC 摘要条与文件 chip 列表。 */
+/** @description 更新 DBC 文件信息卡片（文件名/报文数/信号数/节点数/大小），并刷新多 DBC 摘要条与文件 chip 列表。 */
 export function updateDbcFileInfo() {
   var sources = state.dbcSources || [];
   var has = sources.length > 0;
@@ -54,9 +53,9 @@ export function updateDbcFileInfo() {
     el.dbcFileChips.innerHTML = sources.map(function (s) {
       var nMsg = (s.dbc && s.dbc.messages) ? s.dbc.messages.length : 0;
       return '' +
-        '<span class="dbc-file-chip" data-source-id="' + sanitizeHtml(s.id) + '" title="' + sanitizeHtml(s.name) + ' · ' + nMsg + ' 报文">' +
-          '<span class="dbc-file-chip-name">' + sanitizeHtml(s.name) + '</span>' +
-          '<button type="button" class="dbc-file-chip-remove" data-remove-id="' + sanitizeHtml(s.id) + '" title="移除此文件">×</button>' +
+        '<span class="dbc-file-chip" data-source-id="' + escapeHtml(s.id) + '" title="' + escapeHtml(s.name) + ' · ' + nMsg + ' 报文">' +
+          '<span class="dbc-file-chip-name">' + escapeHtml(s.name) + '</span>' +
+          '<button type="button" class="dbc-file-chip-remove" data-remove-id="' + escapeHtml(s.id) + '" title="移除此文件">×</button>' +
         '</span>';
     }).join('');
   }
@@ -93,7 +92,7 @@ export function filterMessages() {
 
 // ==================== 发送节点过滤 ====================
 /** @description 收集 DBC 中所有发送节点（去重 + 排序）。 */
-export function collectTransmitters() {
+function collectTransmitters() {
   var set = Object.create(null);
   var list = [];
   if (!state.dbc) return list;
@@ -106,10 +105,10 @@ export function collectTransmitters() {
 }
 
 /** @description 渲染发送节点过滤面板的复选框列表。 */
-export function renderNodeFilterList() {
+function renderNodeFilterList() {
   if (!el.nodeFilterList) return;
   var txs = collectTransmitters();
-  var kw = (el.nodeFilterSearch && el.nodeFilterSearch.value || '').trim().toLowerCase();
+  var kw = (el.nodeFilterSearch ? (el.nodeFilterSearch.value || '') : '').trim().toLowerCase();
   if (kw) txs = txs.filter(function (n) { return n.toLowerCase().indexOf(kw) >= 0; });
   if (!txs.length) {
     el.nodeFilterList.innerHTML = '<div class="status-empty">无匹配节点</div>';
@@ -125,8 +124,8 @@ export function renderNodeFilterList() {
   el.nodeFilterList.innerHTML = txs.map(function (name) {
     var checked = !!state.transmitterFilter[name] ? ' checked' : '';
     return '<label class="can-node-filter-item">' +
-      '<input type="checkbox" data-node="' + sanitizeHtml(name) + '"' + checked + '>' +
-      '<span class="can-node-filter-name">' + sanitizeHtml(name) + '</span>' +
+      '<input type="checkbox" data-node="' + escapeHtml(name) + '"' + checked + '>' +
+      '<span class="can-node-filter-name">' + escapeHtml(name) + '</span>' +
       '<span class="can-node-filter-count">' + (counts[name] || 0) + '</span>' +
       '</label>';
   }).join('');
@@ -167,7 +166,7 @@ export function updateNodeFilterLabel() {
 }
 
 /** @description 打开/关闭发送节点过滤面板。 */
-export function setNodeFilterPanelOpen(open) {
+function setNodeFilterPanelOpen(open) {
   if (!el.nodeFilterPanel || !el.nodeFilterBtn) return;
   if (open) {
     renderNodeFilterList();
@@ -245,23 +244,23 @@ export function renderMessageList() {
     var comment = msg.comment || '';
     if (comment.length > 36) comment = comment.slice(0, 36) + '...';
     var rowHtml = '' +
-      '<div class="message-row' + active + '" data-key="' + sanitizeHtml(msg.key) + '" role="button" tabindex="0">' +
-      '<span class="message-col message-col-check"><input type="checkbox" class="message-check" data-key="' + sanitizeHtml(msg.key) + '"' + checked + '></span>' +
-      '<span class="message-col message-col-toggle"><button type="button" class="message-toggle' + (expanded ? ' expanded' : '') + '" data-key="' + sanitizeHtml(msg.key) + '" aria-label="展开/收起信号">' + caret + '</button></span>' +
+      '<div class="message-row' + active + '" data-key="' + escapeHtml(msg.key) + '" role="button" tabindex="0">' +
+      '<span class="message-col message-col-check"><input type="checkbox" class="message-check" data-key="' + escapeHtml(msg.key) + '"' + checked + '></span>' +
+      '<span class="message-col message-col-toggle"><button type="button" class="message-toggle' + (expanded ? ' expanded' : '') + '" data-key="' + escapeHtml(msg.key) + '" aria-label="展开/收起信号">' + caret + '</button></span>' +
       '<span class="message-col message-col-index">' + (index + 1) + '</span>' +
-      '<span class="message-col message-col-dbc" title="' + sanitizeHtml(msg.sourceName || '-') + '">' +
-        sanitizeHtml(msg.sourceName ? String(msg.sourceName).replace(/\.dbc$/i, '') : '-') + '</span>' +
-      '<span class="message-col message-col-name" title="' + sanitizeHtml(msg.name) + '">' +
-        sanitizeHtml(msg.name) + '</span>' +
-      '<span class="message-col message-col-id">' + sanitizeHtml(idHex) + '</span>' +
-      '<span class="message-col message-col-channel">CH' + sanitizeHtml(channelTxt) + '</span>' +
-      '<span class="message-col message-col-type">' + sanitizeHtml(msg.isExtended ? '扩展' : '标准') + '</span>' +
-      '<span class="message-col message-col-dlc">' + sanitizeHtml(msg.dlc) + '</span>' +
-      '<span class="message-col message-col-signal">' + sanitizeHtml(msg.signals.length) + '</span>' +
-      '<span class="message-col message-col-node" title="' + sanitizeHtml(msg.transmitter || 'Vector__XXX') + '">' + sanitizeHtml(msg.transmitter || 'Vector__XXX') + '</span>' +
-      '<span class="message-col message-col-comment" title="' + sanitizeHtml(msg.comment || '') + '">' + sanitizeHtml(comment || '-') + '</span>' +
+      '<span class="message-col message-col-dbc" title="' + escapeHtml(msg.sourceName || '-') + '">' +
+        escapeHtml(msg.sourceName ? String(msg.sourceName).replace(/\.dbc$/i, '') : '-') + '</span>' +
+      '<span class="message-col message-col-name" title="' + escapeHtml(msg.name) + '">' +
+        escapeHtml(msg.name) + '</span>' +
+      '<span class="message-col message-col-id">' + escapeHtml(idHex) + '</span>' +
+      '<span class="message-col message-col-channel">CH' + escapeHtml(channelTxt) + '</span>' +
+      '<span class="message-col message-col-type">' + escapeHtml(msg.isExtended ? '扩展' : '标准') + '</span>' +
+      '<span class="message-col message-col-dlc">' + escapeHtml(msg.dlc) + '</span>' +
+      '<span class="message-col message-col-signal">' + escapeHtml(msg.signals.length) + '</span>' +
+      '<span class="message-col message-col-node" title="' + escapeHtml(msg.transmitter || 'Vector__XXX') + '">' + escapeHtml(msg.transmitter || 'Vector__XXX') + '</span>' +
+      '<span class="message-col message-col-comment" title="' + escapeHtml(msg.comment || '') + '">' + escapeHtml(comment || '-') + '</span>' +
       '</div>';
-    var expandHtml = '<div class="message-row-expand" data-key="' + sanitizeHtml(msg.key) + '"' + (expanded ? '' : ' hidden') + '>' +
+    var expandHtml = '<div class="message-row-expand" data-key="' + escapeHtml(msg.key) + '"' + (expanded ? '' : ' hidden') + '>' +
       '<div class="signal-table-host"></div>' +
       '</div>';
     return rowHtml + expandHtml;
@@ -331,10 +330,7 @@ function handleMessageRowClick(event) {
 
 function toggleMessageExpand(key) {
   if (!state.dbc) return;
-  var msg = null;
-  for (var i = 0; i < state.dbc.messages.length; i++) {
-    if (state.dbc.messages[i].key === key) { msg = state.dbc.messages[i]; break; }
-  }
+  var msg = findMessageByKey(key);
   if (!msg) return;
   var willExpand = !state.expandedKeys[key];
   if (willExpand) {
@@ -384,13 +380,7 @@ export function updateBatchUi() {
 /** @description 选中指定 key 的报文，并刷新列表/信号编辑/编码预览。 */
 export function selectMessage(key) {
   if (!state.dbc) return;
-  var msg = null;
-  for (var i = 0; i < state.dbc.messages.length; i++) {
-    if (state.dbc.messages[i].key === key) {
-      msg = state.dbc.messages[i];
-      break;
-    }
-  }
+  var msg = findMessageByKey(key);
   if (!msg) return;
   state.selectedMessageKey = key;
   ensureMessageDefaults(msg);

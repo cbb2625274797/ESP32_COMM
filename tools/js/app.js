@@ -49,24 +49,6 @@ function formatPercent(value) {
   if (!Number.isFinite(value)) return '--';
   return value.toFixed(1).replace(/\.0$/, '') + '%';
 }
-function formatHttpErrorDetail(text) {
-  var detail = (text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  if (detail.length > 180) detail = detail.slice(0, 177) + '...';
-  return detail;
-}
-function isOtaBusyError(status, detail) {
-  var text = (detail || '').toLowerCase();
-  return status === 403 ||
-    status === 409 ||
-    status === 423 ||
-    text.indexOf('busy') >= 0 ||
-    text.indexOf('occupied') >= 0 ||
-    text.indexOf('another ota') >= 0 ||
-    text.indexOf('invalid state') >= 0 ||
-    text.indexOf('占用') >= 0 ||
-    text.indexOf('互斥') >= 0 ||
-    text.indexOf('系统忙') >= 0;
-}
 function getEspIp() {
   var el = document.getElementById('espIp');
   var ip = el && el.value ? el.value.trim() : '';
@@ -116,9 +98,11 @@ function applyDisconnectedRuntimeState() {
 function applyRebootingRuntimeState() {
   var pc = document.getElementById('pillConn');
   var pct = document.getElementById('pillConnTxt');
-  pc.className = 'pill processing';
-  var elapsed = Math.round((Date.now() - window.rebootStartTime) / 1000);
-  pct.textContent = '重启中 ' + elapsed + 's';
+  if (pc) pc.className = 'pill processing';
+  if (pct) {
+    var elapsed = Math.round((Date.now() - window.rebootStartTime) / 1000);
+    pct.textContent = '重启中 ' + elapsed + 's';
+  }
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
   if (cs) cs.className = 'conn-indicator warn';
@@ -136,14 +120,29 @@ function applyUploadingRuntimeState() {
   }
   var pc = document.getElementById('pillConn');
   var pct = document.getElementById('pillConnTxt');
-  pc.className = 'pill processing';
-  pct.textContent = '上传中';
+  if (pc) pc.className = 'pill processing';
+  if (pct) pct.textContent = '上传中';
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
   if (cs) cs.className = 'conn-indicator warn';
   if (cst) cst.textContent = '固件上传中，设备忙...';
   var bc = document.getElementById('bConn');
   if (bc) bc.textContent = '上传中';
+  if (bc) bc.className = 'v warn';
+}
+/** 设备忙（OTA/中继/重启期间不响应轮询）的连接胶囊/状态条运行时态。
+ *  与上面三兄弟同模式，区别是不改进度/阶段，只标记连接胶囊为 processing + warn。 */
+function applyDeviceBusyRuntimeState(pillText, statusText, badgeText) {
+  var pc = document.getElementById('pillConn');
+  var pct = document.getElementById('pillConnTxt');
+  if (pc) pc.className = 'pill processing';
+  if (pct) pct.textContent = pillText || '设备忙';
+  var cs = document.getElementById('connStatus');
+  var cst = document.getElementById('connStatusTxt');
+  if (cs) cs.className = 'conn-indicator warn';
+  if (cst) cst.textContent = statusText || '设备忙（OTA/重启中），保持 1s 轮询';
+  var bc = document.getElementById('bConn');
+  if (bc) bc.textContent = badgeText || '设备忙';
   if (bc) bc.className = 'v warn';
 }
 
@@ -223,8 +222,7 @@ window.resetStageFlow = resetStageFlow;
 window.applyDisconnectedRuntimeState = applyDisconnectedRuntimeState;
 window.applyRebootingRuntimeState = applyRebootingRuntimeState;
 window.applyUploadingRuntimeState = applyUploadingRuntimeState;
-window.formatHttpErrorDetail = formatHttpErrorDetail;
-window.isOtaBusyError = isOtaBusyError;
+window.applyDeviceBusyRuntimeState = applyDeviceBusyRuntimeState;
 
 // ==================== 顶层副作用（原 app.js 末尾的初始化） ====================
 setupDropZone('uploadZoneEsp32', 'esp32');

@@ -4,28 +4,31 @@
  * 将设备端 relay_state / sys_state 映射到 GD32 阶段节点 UI，
  * 并驱动 updateSystemStatusUi 综合 UI 更新。
  *
+ * 结构：
+ *   applyDashboardUi        — 堆/连接/版本/温湿度等常驻面板
+ *   applyGd32OtaSessionUi   — GD32 会话进度/完成/失败（唯一 UI 应用路径）
+ *   updateSystemStatusUi    — 入口：仪表盘 →（非 BLE/非 ESP32-OTA）会话
+ *
  * 共享状态（通过 window.* 引用）：
  *   window.latestSystemStatus / window.currentOtaTarget / window.esp32OtaPhase
  *   window.otaSessionState / window.otaSessionTarget / window.isUploading
  *   window.gd32CompleteAnnounced / window.gd32RelaySessionLive
- *   window.lastSysStateCode / window.lastRelayState
  *
  * 复用的函数（通过 window.* 引用）：
- *   window.updateHeapAndTaskStatusUi / window.updateConnectionUi / window.updateHealthUi
- *   window.updateStagesFromRelayState / window.setActivePhase / window.setProgress
+ *   window.setActivePhase / window.setProgress
  *   window.markGd32OtaUiComplete / window.cleanupAfterOtaFailure / window.otaSessionReset
- *   window.stopRelayProgressWatch / window.pollLogs / window.formatBytes / window.formatUptime
+ *   window.stopRelayProgressWatch / window.pollLogs / window.emitRelayProgress
  */
 import { formatBytes, formatUptime } from '../common/utils.js';
 import { updateConnectionUi, updateHealthUi, updateHeapAndTaskStatusUi } from '../common/connection.js';
-import { setActivePhase, setProgress, markPhaseDone } from './progress.js';
-import {
-  otaSessionActive, otaSessionReset, otaSessionTransition, OtaSessionState
-} from './session.js';
+import { setActivePhase, setProgress } from './progress.js';
+import { otaSessionReset, OtaSessionState } from './session.js';
 
 // Relay state comes from relay_state_t in main/relay/ota_relay.h:
 //   0=IDLE, 1=HANDSHAKING, 2=SIZE_NEG, 3=TRANSFERRING,
 //   4=FINISHING, 5=DONE, 255=ERROR.
+// 与 index.html #gd32Stages s1..s6 一一对应（rs→节点序号）：
+//   1→s1, 2→s2, 3→s3, 4→s4, 5→s1..s6 全 done。
 const relayStateDetailMap = {
   0: '待机',
   1: '认证握手',
@@ -36,48 +39,56 @@ const relayStateDetailMap = {
   255: '错误'
 };
 
+/** 上次刷到阶段条的 displayRelayState，未变则跳过 DOM 重建 */
+var lastDisplayedRelayState = undefined;
+
+/**
+ * 将 relay_state 映射到 GD32 阶段节点 (s1..s6)。
+ * @param {number|null|undefined} rs
+ */
 export function updateStagesFromRelayState(rs) {
   var ids = ['s1', 's2', 's3', 's4', 's5', 's6'];
   var detailIds = ['sd1', 'sd2', 'sd3', 'sd4', 'sd5', 'sd6'];
   var all = ids.map(function(id) { return document.getElementById(id); });
   var details = detailIds.map(function(id) { return document.getElementById(id); });
-  // reset all
   all.forEach(function (s) { if (s) s.className = 'stage-node'; });
   details.forEach(function (d) { if (d) d.textContent = ''; });
-  // status bar
   var statusBar = document.getElementById('stageStatusBar');
   var statusText = document.getElementById('stageStatusText');
   if (rs === undefined || rs === null) {
     if (statusBar) statusBar.className = 'stage-status-bar';
     if (statusText) statusText.textContent = '待机';
+    lastDisplayedRelayState = rs;
     return;
   }
   if (rs === 255) {
     all.forEach(function (s) { if (s) s.className = 'stage-node err'; });
     if (statusBar) statusBar.className = 'stage-status-bar err';
     if (statusText) statusText.textContent = '错误';
+    lastDisplayedRelayState = 255;
     return;
   }
+  /* rs → 节点：1..4 直接对应 s1..s4；rs=5 DONE → 点亮完成链（s1..s6 全 done） */
   var activeStage = 0;
   if (rs === 1) activeStage = 1;
   else if (rs === 2) activeStage = 2;
   else if (rs === 3) activeStage = 3;
-  else if (rs === 4) activeStage = 5;
+  else if (rs === 4) activeStage = 4;
   else if (rs === 5) activeStage = 6;
   for (var i = 0; i < activeStage - 1; i++) {
     if (all[i]) all[i].className = 'stage-node done';
   }
   if (rs === 5) {
+    /* DONE：s1..s5 已在上方标 done，s5/s6 一并完成 */
+    if (all[4]) all[4].className = 'stage-node done';
     if (all[5]) all[5].className = 'stage-node done';
+    if (details[5]) details[5].textContent = relayStateDetailMap[5];
   } else if (activeStage >= 1 && activeStage <= 6) {
     if (all[activeStage - 1]) all[activeStage - 1].className = 'stage-node live';
+    if (details[activeStage - 1]) {
+      details[activeStage - 1].textContent = relayStateDetailMap[rs] || '';
+    }
   }
-  // Show detail text for the active stage
-  var detailText = relayStateDetailMap[rs] || '';
-  if (activeStage >= 1 && activeStage <= 6 && details[activeStage - 1]) {
-    details[activeStage - 1].textContent = detailText;
-  }
-  // Update status bar
   if (statusBar && statusText) {
     if (rs === 0) {
       statusBar.className = 'stage-status-bar';
@@ -87,27 +98,33 @@ export function updateStagesFromRelayState(rs) {
       statusText.textContent = (relayStateDetailMap[rs] || '未知') + ' (' + rs + ')';
     }
   }
+  lastDisplayedRelayState = rs;
 }
 
-export function updateSystemStatusUi(data) {
-  if (!data) return;
-  window.latestSystemStatus = data;
+function setDisplayedRelayState(rs) {
+  if (lastDisplayedRelayState === rs) return;
+  updateStagesFromRelayState(rs);
+}
+
+/**
+ * 常驻仪表盘：堆、连接、健康、版本、温湿度、IP/RSSI、OTA cache。
+ * @param {object} data  /system/status JSON
+ * @param {object} ota   data.ota
+ * @param {object} wifi  data.wifi
+ */
+function applyDashboardUi(data, ota, wifi) {
   updateHeapAndTaskStatusUi(data);
-  var wifi = data.wifi || {};
-  var ota = data.ota || {};
-  var healthCode = data.health;
-  // Use global relayStateDetailMap defined in updateStagesFromRelayState section
   var connected = !!wifi.connected;
   var connText = connected ? (wifi.mode || 'STA') + ' 已连接' : (wifi.mode || 'STA') + ' 未连接';
   updateConnectionUi(connected, connText);
-  updateHealthUi(healthCode, data.free_heap);
+  updateHealthUi(data.health, data.free_heap);
+
   if (data.version) {
     var pillVerEl = document.getElementById('pillVer');
     if (pillVerEl) {
       pillVerEl.textContent = 'v' + data.version;
-      pillVerEl.dataset.tooltip = data.build_time ? ("编译: " + data.build_time) : '';
+      pillVerEl.dataset.tooltip = data.build_time ? ('编译: ' + data.build_time) : '';
     }
-    // GD32 版本
     var mGd32App = document.getElementById('mGd32App');
     var mGd32Boot = document.getElementById('mGd32Boot');
     if (mGd32App) {
@@ -124,24 +141,26 @@ export function updateSystemStatusUi(data) {
         mGd32Boot.textContent = ota.gd32_boot;
         mGd32Boot.className = 'v ok';
       } else {
-        mGd32Boot.textContent = ota.gd32_app_alive ? '未知' : '离线';
+        /* BOOT 版本与 APP alive 无直接关系，无版本时统一「未知」 */
+        mGd32Boot.textContent = '未知';
         mGd32Boot.className = 'v';
       }
     }
   }
-  // temperature
+
   var mTempEl = document.getElementById('mTemp');
-  if (mTempEl) mTempEl.textContent =
-    Number.isFinite(data.temperature) ? data.temperature.toFixed(1) + '\u00B0C' : '--';
-  // uptime
+  if (mTempEl) {
+    mTempEl.textContent =
+      Number.isFinite(data.temperature) ? data.temperature.toFixed(1) + '\u00B0C' : '--';
+  }
   var uptimeEl = document.getElementById('pillUptime');
   if (uptimeEl) uptimeEl.textContent = '\u23F1 ' + formatUptime(data.uptime_sec);
-  // wifi / signal
   var pillIPEl = document.getElementById('pillIP');
   if (pillIPEl) pillIPEl.textContent = wifi.ip || '--';
   var rssi = (wifi.rssi !== undefined && wifi.rssi !== -127) ? wifi.rssi + ' dBm' : '--';
   var pillRSSIEl = document.getElementById('pillRSSI');
   if (pillRSSIEl) pillRSSIEl.textContent = rssi;
+
   var mOtaCache = document.getElementById('mOtaCache');
   var otaStored = ota.stored_size || 0;
   if (mOtaCache) {
@@ -153,19 +172,14 @@ export function updateSystemStatusUi(data) {
       mOtaCache.className = 'v';
     }
   }
-  // 共享进度条按当前连接模式归属：BLE 模式下由 ble_ota.js 的设备 ACK
-  // 驱动包数、阶段和完成状态，HTTP 状态轮询不能覆盖这套实时进度。
-  if (window.connectionMode === 'ble') {
-    return;
-  }
-  // relay state - skip GD32 relay UI when ESP32 OTA is active
-  if (window.currentOtaTarget === 'esp32' && window.esp32OtaPhase > 0) {
-    return;
-  }
-  // ★ 状态机守卫：本会话已 FAILED 时，禁止后端状态覆盖失败 UI。
-  //   后端可能仍在跑 GD32 中继（网络断开不会停止设备端流程），
-  //   若不拦截，会把进度条/阶段从"网络错误"错误地刷回"数据转发"。
-  //   只有设备真正回 IDLE 才允许自动复位状态机（见下方 else 分支）。
+}
+
+/**
+ * GD32 OTA 会话 UI：阶段节点 + 进度条 + 完成/失败。
+ * 门控逻辑保持与历史实现一致，勿随意放宽完成条件。
+ * @param {object} ota data.ota
+ */
+function applyGd32OtaSessionUi(ota) {
   var rs = ota.relay_state;
   var sysState = ota.sys_state || '';
   var sysStateCode = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
@@ -173,42 +187,41 @@ export function updateSystemStatusUi(data) {
   var isGd32Relaying = sysState === 'GD32_RELAYING' || sysStateCode === 3;
   var isGd32Complete = sysState === 'GD32_COMPLETE' || sysStateCode === 4;
   var isGd32Error = sysState === 'ERROR' || sysStateCode === 8 || rs === 255;
-  // OTA cache progress (GD32 upload to ESP32 flash)
+
   var total = ota.total_size || 0;
   var stored = ota.stored_size || 0;
   var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
-  // GD32 relay forwarding progress — 以 /system/status 的 relay_seq 为准，不依赖日志
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
   var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
   var gd32AppAlive = ota.gd32_app_alive;
 
+  /* ★ FAILED 守卫：禁止后端状态覆盖失败 UI；设备回 IDLE 才自动复位 */
   if (window.otaSessionState === OtaSessionState.FAILED) {
-    var _deviceIdle = (sysStateCode === 0 || sysStateCode === 2 || sysStateCode === 4) &&
-                      (rs === 0 || rs === 5);
-    if (!_deviceIdle) {
-      // 会话已失败，但设备可能仍在中继：继续用 relay_seq 刷进度，避免“假卡死”
+    var deviceIdle = (sysStateCode === 0 || sysStateCode === 2 || sysStateCode === 4) &&
+                     (rs === 0 || rs === 5);
+    if (!deviceIdle) {
       if ((rs === 3 || isGd32Relaying) && relayTotal > 0) {
         setActivePhase('gd32Ota');
         var failRelayOverall = 60 + Math.round(relayProgress * 0.30);
         setProgress(failRelayOverall,
           '已转发 ' + relaySeq + ' / ' + relayTotal + ' 包（设备仍在跑）');
-        updateStagesFromRelayState(3);
+        setDisplayedRelayState(3);
       } else {
-        updateStagesFromRelayState(255);
+        setDisplayedRelayState(255);
       }
       return;
     }
-    // 设备已回 IDLE —— 自动复位状态机，恢复正常 UI
     otaSessionReset();
     window.stopRelayProgressWatch();
-    // 落到下方正常分支刷新 UI
+    /* 落到下方正常分支刷新 UI */
   }
 
   var displayRelayState = isGd32Complete ? 5 : (isGd32Relaying && rs === 0 ? 1 : rs);
-  if (window.currentOtaTarget !== 'esp32') { updateStagesFromRelayState(displayRelayState); }
+  if (window.currentOtaTarget !== 'esp32') {
+    setDisplayedRelayState(displayRelayState);
+  }
 
-  /* 本会话正在 GD32 路径（含仅 RELAYING 而 target 被清的情况） */
   var gd32Session =
     window.otaSessionState === OtaSessionState.RELAYING ||
     window.currentOtaTarget === 'gd32' ||
@@ -225,25 +238,28 @@ export function updateSystemStatusUi(data) {
     window.cleanupAfterOtaFailure(failDetail);
     window.pollLogs();
     return;
-  } else if (isGd32Error) {
-    // 非当前 OTA 会话的错误：仅标记阶段指示器，不触发完整清理
-    updateStagesFromRelayState(255);
+  }
+
+  if (isGd32Error) {
+    setDisplayedRelayState(255);
     var sbErr = document.getElementById('stageStatusBar');
     var stErr = document.getElementById('stageStatusText');
     if (sbErr) sbErr.className = 'stage-status-bar err';
     if (stErr) stErr.textContent = 'GD32 错误（待机）';
-  } else if (window.otaSessionState === OtaSessionState.UPLOADING) {
+    return;
+  }
+
+  if (window.otaSessionState === OtaSessionState.UPLOADING) {
     /* 上传进行中：不要用旧缓存/旧完成态覆盖进度条 */
-  } else if (window.otaSessionState === OtaSessionState.RELAYING) {
-    /* 必须先看到本会话真实中继（HANDSHAKE~FINISHING），才允许 DONE；
-     * 禁止一进 RELAYING 就吃掉上一次的 rs=5 / app_alive。 */
+    return;
+  }
+
+  if (window.otaSessionState === OtaSessionState.RELAYING) {
+    /* 必须先看到本会话真实中继，才允许 DONE */
     if (isGd32Relaying || (rs >= 1 && rs <= 4)) {
       window.gd32RelaySessionLive = true;
     }
-    /*
-     * 设备侧 ERROR 常被 status 软清为 IDLE，前端收不到 code=8。
-     * 已见真实中继、设备已回 IDLE、且未宣布完成 → 按失败收尾，释放会话。
-     */
+
     var deviceIdleAfterRelay =
       (sysStateCode === 0 || sysStateCode === 2) &&
       (rs === 0 || rs === 5) &&
@@ -257,7 +273,11 @@ export function updateSystemStatusUi(data) {
       window.pollLogs();
       return;
     }
-    /* 包进度：进入 FINISHING/COMPLETE 时先补 100%，再走完成/收尾 UI */
+
+    /*
+     * 包进度/完成：统一走 emitRelayProgress + markGd32OtaUiComplete。
+     * FINISHING 时 force100 后只改文案，禁止 setProgress(95) 回跳。
+     */
     if (window.gd32RelaySessionLive && relayTotal > 0 &&
         (relaySeq >= relayTotal || rs >= 4 || isGd32Complete)) {
       if (typeof window.emitRelayProgress === 'function') {
@@ -267,32 +287,29 @@ export function updateSystemStatusUi(data) {
                typeof window.emitRelayProgress === 'function') {
       window.emitRelayProgress(relaySeq, relayTotal);
     }
+
     if (window.gd32RelaySessionLive &&
         (isGd32Complete || rs === 5 ||
          (gd32AppAlive && relayTotal > 0 && relaySeq >= relayTotal && rs >= 3))) {
       if (!window.gd32CompleteAnnounced) {
         window.markGd32OtaUiComplete('GD32 刷写完成');
       }
-    } else if (rs === 1) {
-      // HANDSHAKING
+      return;
+    }
+
+    if (rs === 1) {
       setActivePhase('gd32Ota');
       setProgress(50, '握手与认证中...');
     } else if (rs === 4) {
-      // FINISHING：转发已 100%，进度条进入收尾段（勿再落回中间百分比）
+      /* 收尾：保持 100%，只更新文案（避免 100→95 回跳） */
       setActivePhase('gd32Ota');
       if (!window.gd32CompleteAnnounced) {
-        setProgress(95, gd32AppAlive ? '收尾中…' : '收尾中，等待 APP 启动...');
+        setProgress(100, gd32AppAlive ? '收尾中…' : '收尾中，等待 APP 启动...');
       }
-    } else if (rs === 3 || (relayTotal > 0 && relaySeq > 0 && rs !== 5 && rs !== 4)) {
-      // TRANSFERRING（不含 FINISHING）
+    } else if (rs === 3 && relaySeq <= 0) {
       setActivePhase('gd32Ota');
-      var relayOverall = 60 + Math.round(relayProgress * 0.30);
-      var relayLabel = relayTotal > 0
-        ? ('已转发 ' + relaySeq + ' / ' + relayTotal + ' 包 (' + relayProgress + '%)')
-        : '数据包传输中...';
-      setProgress(relayOverall, relayLabel);
+      setProgress(60, '数据包传输中...');
     } else if (rs === 2 || (isGd32Relaying && relaySeq === 0)) {
-      // SIZE_NEG
       setActivePhase('gd32Ota');
       setProgress(55, relayTotal > 0
         ? ('大小协商中（共 ' + relayTotal + ' 包）')
@@ -301,13 +318,40 @@ export function updateSystemStatusUi(data) {
       setActivePhase('gd32Ota');
       setProgress(48, '已触发中继，等待设备进入握手…');
     }
-  } else if (isGd32Storing || (total > 0 && stored < total && !window.isUploading &&
-             window.otaSessionState !== OtaSessionState.DONE &&
-             window.otaSessionState !== OtaSessionState.IDLE)) {
+    return;
+  }
+
+  if (isGd32Storing || (total > 0 && stored < total && !window.isUploading &&
+      window.otaSessionState !== OtaSessionState.DONE &&
+      window.otaSessionState !== OtaSessionState.IDLE)) {
     setActivePhase('gd32Ota');
     var storeOverall = Math.min(45, Math.round(storageProgress * 0.45));
     if (!window.isUploading) {
-      setProgress(storeOverall, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total) + '');
+      setProgress(storeOverall, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
     }
   }
+}
+
+/**
+ * /system/status → UI 总入口。
+ * @param {object} data
+ */
+export function updateSystemStatusUi(data) {
+  if (!data) return;
+  window.latestSystemStatus = data;
+  var wifi = data.wifi || {};
+  var ota = data.ota || {};
+
+  applyDashboardUi(data, ota, wifi);
+
+  /* BLE：仪表盘可更新，进度/阶段由 ble 路径独占 */
+  if (window.connectionMode === 'ble') {
+    return;
+  }
+  /* ESP32 OTA 进行中：勿用 GD32 relay 覆盖阶段条 */
+  if (window.currentOtaTarget === 'esp32' && window.esp32OtaPhase > 0) {
+    return;
+  }
+
+  applyGd32OtaSessionUi(ota);
 }

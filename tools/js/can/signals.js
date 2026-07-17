@@ -5,7 +5,7 @@
  *
  * 依赖：dbc.js（state/el/padHex/bytesToHex/cssEscape/findSignal）、common/utils.js（escapeHtml）。
  */
-import { state, el, padHex, bytesToHex, cssEscape, findSignal } from './dbc.js?v=20260717x';
+import { state, el, padHex, bytesToHex, cssEscape, findSignal, findMessageByKey } from './dbc.js?v=20260717x';
 import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717x';
 import { scheduleCanPersist } from './persist.js?v=20260717x';
 
@@ -53,10 +53,7 @@ function getDefaultSignalValue(signal) {
 /** @description 获取当前选中的报文对象（无选中返回 null）。 */
 export function getSelectedMessage() {
   if (!state.dbc || !state.selectedMessageKey) return null;
-  for (var i = 0; i < state.dbc.messages.length; i++) {
-    if (state.dbc.messages[i].key === state.selectedMessageKey) return state.dbc.messages[i];
-  }
-  return null;
+  return findMessageByKey(state.selectedMessageKey);
 }
 
 function getMultiplexerSignal(message) {
@@ -111,6 +108,7 @@ export function renderInlineSignalGrid(message, host) {
 function renderSignalRow(message, signal, index) {
   var bag = getSignalValueMap(message);
   var enumKeys = Object.keys(signal.enumMap || {});
+  var enumCount = enumKeys.length;
   var bitRange = signal.startBit + '|' + signal.length + ' @' + (signal.byteOrder === 'little' ? 'Intel' : 'Motorola');
   var rangeText = '';
   if (Number.isFinite(signal.min) || Number.isFinite(signal.max)) {
@@ -123,7 +121,7 @@ function renderSignalRow(message, signal, index) {
   var comment = signal.comment || '-';
   if (comment.length > 48) comment = comment.slice(0, 48) + '...';
   var inputHtml = '';
-  if (enumKeys.length) {
+  if (enumCount) {
     inputHtml = '<select class="input signal-input signal-input-compact" data-msg="' + sanitizeHtml(message.key) + '" data-signal="' + sanitizeHtml(signal.name) + '">' +
       enumKeys.map(function (key) {
         var label = signal.enumMap[key];
@@ -145,7 +143,7 @@ function renderSignalRow(message, signal, index) {
     '<span class="signal-cell signal-cell-value">' + inputHtml + '</span>' +
     '<span class="signal-cell signal-cell-range">' +
     '<b>' + sanitizeHtml(rangeText) + '</b>' +
-    (enumKeys.length ? '<small>' + sanitizeHtml(enumKeys.slice(0, 3).map(function (key) { return key + ':' + signal.enumMap[key]; }).join(' / ')) + (enumKeys.length > 3 ? ' ...' : '') + '</small>' : '<small>' + sanitizeHtml(factorText) + '</small>') +
+    (enumCount ? '<small>' + sanitizeHtml(enumKeys.slice(0, 3).map(function (key) { return key + ':' + signal.enumMap[key]; }).join(' / ')) + (enumCount > 3 ? ' ...' : '') + '</small>' : '<small>' + sanitizeHtml(factorText) + '</small>') +
     '</span>' +
     '<span class="signal-cell signal-cell-meta">' +
     '<b>' + sanitizeHtml(bitRange) + '</b>' +
@@ -160,15 +158,16 @@ function handleSignalInputEvent(evt) {
   var key = input.getAttribute('data-msg');
   var name = input.getAttribute('data-signal');
   if (!key || !name || !state.dbc) return;
-  var message = null;
-  for (var i = 0; i < state.dbc.messages.length; i++) {
-    if (state.dbc.messages[i].key === key) { message = state.dbc.messages[i]; break; }
-  }
+  var message = findMessageByKey(key);
   if (!message) return;
   setSignalValue(message, name, input.value);
   var signal = findSignal(message, name);
   if (signal && signal.multiplexRole === 'mux') {
-    var inlineGrid = document.querySelector('.message-row-expand[data-key="' + cssEscape(key) + '"] .signal-table-host');
+    /* MUX 值变更后需重建信号表格（激活信号集变化）。
+     * 限定在 el.messageList 作用域内查找，避免多列表/多 DBC 场景匹配到错误节点
+     *（与 messages.js 中 toggleMessageExpand 的作用域策略一致）。 */
+    var root = el.messageList || document;
+    var inlineGrid = root.querySelector('.message-row-expand[data-key="' + cssEscape(key) + '"] .signal-table-host');
     if (inlineGrid) renderInlineSignalGrid(message, inlineGrid);
   }
   if (key === state.selectedMessageKey) updateEncodedPreview();
@@ -256,7 +255,7 @@ export function encodeMessageData(message, signalValues) {
   return bytes;
 }
 
-/** @description 粗判信号位域是否至少有一部分落在 dlc 字节内（越界整段则跳过）。 */
+/** @description 粗判信号位域是否完全落在 dlc 字节内（越界整段则跳过）。 */
 function signalFitsInDlc(signal, dlc) {
   if (!signal || dlc <= 0) return false;
   var maxBit = dlc * 8 - 1;
@@ -264,9 +263,22 @@ function signalFitsInDlc(signal, dlc) {
     var end = signal.startBit + signal.length - 1;
     return signal.startBit >= 0 && signal.startBit <= maxBit && end <= maxBit;
   }
-  /* Motorola：用起始位所在字节粗判；更严的检查仍在 setBitByIndex */
-  var startByte = Math.floor(signal.startBit / 8);
-  return startByte >= 0 && startByte < dlc && signal.length > 0;
+  /* float：要求整段字节落在 DLC 内（startBit 必须字节对齐，由 writeFloatSignal 另校验） */
+  if (signal.valueType === 'float' || signal.valueType === 'double') {
+    var startByte = signal.startBit / 8;
+    var byteLen = signal.length / 8;
+    return startByte >= 0 && Number.isInteger(startByte) &&
+           startByte + byteLen <= dlc;
+  }
+  /* Motorola：用 buildMotorolaBitPositions 计算实际占用位序，检查最大位是否落在 DLC 内。
+   * 此前仅判 startByte，长跨字节信号末位可能越界 → 会被 setBitByIndex 抛错而非跳过，
+   * 与 little 分支"越界整段跳过"语义不一致；这里统一为"越界即跳过"。 */
+  if (signal.length <= 0 || signal.length > 64) return false;
+  var positions = buildMotorolaBitPositions(signal.startBit, signal.length);
+  for (var j = 0; j < positions.length; j++) {
+    if (positions[j] < 0 || positions[j] > maxBit) return false;
+  }
+  return true;
 }
 
 function parseSignalInput(signal, inputValue) {
@@ -274,6 +286,16 @@ function parseSignalInput(signal, inputValue) {
   if (value === '' || value == null) value = getDefaultSignalValue(signal);
   var num = Number(value);
   if (!Number.isFinite(num)) throw new Error(signal.name + ' 不是合法数字');
+  /* enum 信号：取值是离散枚举 key（数字字符串），DBC 的 min/max 是物理连续值范围，
+   * 对 enum 不适用 —— 合法 enum 值可能落在 [min,max] 之外（例如 fault 枚举）。
+   * 因此 enum 信号只做"值必须 ∈ enumMap keys"的校验，跳过 min/max。 */
+  var enumKeys = Object.keys(signal.enumMap || {});
+  if (enumKeys.length) {
+    if (enumKeys.indexOf(String(value)) < 0) {
+      throw new Error(signal.name + ' 不是合法枚举值：' + value);
+    }
+    return { numeric: num, text: String(value).trim() };
+  }
   if (Number.isFinite(signal.min) && num < signal.min) {
     throw new Error(signal.name + ' 低于最小值 ' + signal.min);
   }
@@ -296,6 +318,10 @@ function physicalToRawBigInt(signal, parsedValue) {
       isIntegerLike(parsedValue.text)) {
     return BigInt(parsedValue.text);
   }
+  /* factor=0 是 DBC 异常情况（规范上 factor 不应为 0），此处为防御性兜底：
+   *   - 有 offset：物理值直接减 offset 作为 raw（把 offset 视为"物理=raw 的偏移基线"）
+   *   - 无 offset：物理值即 raw
+   * 实际 DBC 不应走到此分支，但避免除零导致 NaN。 */
   var rawNumber = signal.factor === 0
     ? Math.round(signal.offset ? (parsedValue.numeric - signal.offset) : parsedValue.numeric)
     : Math.round((parsedValue.numeric - signal.offset) / signal.factor);
@@ -367,13 +393,21 @@ function writeFloatSignal(bytes, signal, physicalValue) {
   if (signal.startBit % 8 !== 0) {
     throw new Error(signal.name + ' 浮点信号起始位必须按字节对齐');
   }
-  var buffer = new ArrayBuffer(signal.length / 8);
+  var startByte = signal.startBit / 8;
+  var byteLen = signal.length / 8;
+  /* 越界防御：signalFitsInDlc 已在 encodeMessageData 入口过滤，这里二次断言，
+   * 避免任何直接调用方（如未来新增的 decode 路径）漏检导致写越界。 */
+  if (startByte + byteLen > bytes.length) {
+    throw new Error(signal.name + ' 浮点信号写入越界：startByte=' + startByte +
+      ' + length=' + byteLen + ' > 缓冲区 ' + bytes.length + ' 字节');
+  }
+  var buffer = new ArrayBuffer(byteLen);
   var view = new DataView(buffer);
   if (signal.length === 32) view.setFloat32(0, physicalValue, true);
   else view.setFloat64(0, physicalValue, true);
   var rawBytes = new Uint8Array(buffer);
   for (var i = 0; i < rawBytes.length; i++) {
-    bytes[(signal.startBit / 8) + i] = rawBytes[i];
+    bytes[startByte + i] = rawBytes[i];
   }
 }
 
@@ -393,7 +427,7 @@ function setBitByIndex(bytes, bitIndex, bitValue) {
   var bitInByte = bitIndex % 8;
   if (byteIndex < 0 || byteIndex >= bytes.length) {
     throw new Error('信号写入越界，bit=' + bitIndex +
-      '（缓冲区 ' + bytes.length + ' 字节 / DLC=' + bytes.length + '）');
+      '（缓冲区 ' + bytes.length + ' 字节）');
   }
   if (bitValue) bytes[byteIndex] |= (1 << bitInByte);
   else bytes[byteIndex] &= ~(1 << bitInByte);

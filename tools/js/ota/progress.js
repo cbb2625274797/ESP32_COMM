@@ -12,6 +12,17 @@
  */
 import { addLog } from '../common/log.js';
 
+// ==================== 常量 ====================
+// ESP32 OTA 阶段 DOM 节点 id（es1..es6 + esd1..esd6）
+var ESP32_STAGE_IDS = ['es1', 'es2', 'es3', 'es4', 'es5', 'es6'];
+var ESP32_DETAIL_IDS = ['esd1', 'esd2', 'esd3', 'esd4', 'esd5', 'esd6'];
+// 顶部步骤 pill → phase 名映射
+var STEP_MAP = { esp32Ota: 'ppEsp32', gd32Ota: 'ppGd32Ota' };
+// 进度条 DOM 元素懒缓存（首次访问后复用，DOM 未就绪时回退到 getElementById）
+var progressFillEl = null;
+var progressTxtEl = null;
+var progressPctEl = null;
+
 // ==================== 折叠面板 ====================
 export function toggleCollapse(headEl) {
   headEl.closest('.card').classList.toggle('collapsed');
@@ -29,25 +40,37 @@ export function switchStageFlow(target) {
   if (target === 'esp32') {
     if (esp32El) esp32El.style.display = '';
     if (gd32El) gd32El.style.display = 'none';
-  } else {
+  } else if (target === 'gd32') {
     if (esp32El) esp32El.style.display = 'none';
     if (gd32El) gd32El.style.display = '';
+  } else {
+    // null / 'ble' / 未知：隐藏两套面板（reset 语义，避免残留显示）
+    if (esp32El) esp32El.style.display = 'none';
+    if (gd32El) gd32El.style.display = 'none';
   }
-  // 重置 ESP32 阶段节点
-  ['es1','es2','es3','es4','es5','es6'].forEach(function(id) {
+  resetEsp32StageNodes();
+  resetGd32StageNodes();
+}
+
+/** @description 把 ESP32 阶段节点（es1..es6 / esd1..esd6）复位到初始态。 */
+function resetEsp32StageNodes() {
+  ESP32_STAGE_IDS.forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.className = 'stage-node';
   });
-  ['esd1','esd2','esd3','esd4','esd5','esd6'].forEach(function(id) {
+  ESP32_DETAIL_IDS.forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.textContent = '';
   });
-  // 重置 GD32 阶段节点
-  ['s1','s2','s3','s4','s5','s6'].forEach(function(id) {
+}
+
+/** @description 把 GD32 阶段节点（s1..s6 / sd1..sd6）复位到初始态。 */
+function resetGd32StageNodes() {
+  ['s1', 's2', 's3', 's4', 's5', 's6'].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.className = 'stage-node';
   });
-  ['sd1','sd2','sd3','sd4','sd5','sd6'].forEach(function(id) {
+  ['sd1', 'sd2', 'sd3', 'sd4', 'sd5', 'sd6'].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.textContent = '';
   });
@@ -59,10 +82,8 @@ export const esp32PhaseLabels = ['', '上传中', '写入中', '校验中', '应
 
 export function updateEsp32StagesFromPhase(phase) {
   window.esp32OtaPhase = phase;
-  var ids = ['es1', 'es2', 'es3', 'es4', 'es5', 'es6'];
-  var detailIds = ['esd1', 'esd2', 'esd3', 'esd4', 'esd5', 'esd6'];
-  var all = ids.map(function(id) { return document.getElementById(id); });
-  var details = detailIds.map(function(id) { return document.getElementById(id); });
+  var all = ESP32_STAGE_IDS.map(function (id) { return document.getElementById(id); });
+  var details = ESP32_DETAIL_IDS.map(function (id) { return document.getElementById(id); });
   all.forEach(function (s) { if (s) s.className = 'stage-node'; });
   details.forEach(function (d) { if (d) d.textContent = ''; });
   var statusBar = document.getElementById('stageStatusBar');
@@ -78,7 +99,7 @@ export function updateEsp32StagesFromPhase(phase) {
     if (!all[i]) continue;
     if (i < phase - 1) {
       all[i].className = 'stage-node done';
-    } else if (i === phase - 1 && phase >= 1) {
+    } else if (i === phase - 1) {
       all[i].className = (phase >= 6) ? 'stage-node done' : 'stage-node live';
       if (details[i]) details[i].textContent = esp32PhaseLabels[phase] || '';
     }
@@ -95,9 +116,11 @@ export function updateEsp32StagesFromPhase(phase) {
 }
 
 export function updateEsp32StagesError() {
-  var ids = ['es1', 'es2', 'es3', 'es4', 'es5', 'es6'];
-  var all = ids.map(function(id) { return document.getElementById(id); });
+  var all = ESP32_STAGE_IDS.map(function (id) { return document.getElementById(id); });
+  var details = ESP32_DETAIL_IDS.map(function (id) { return document.getElementById(id); });
   all.forEach(function (s) { if (s) s.className = 'stage-node'; });
+  // ★ 失败态：阶段下方文案也要清空，避免残留"上传中/校验中"与红色样式并存
+  details.forEach(function (d) { if (d) d.textContent = ''; });
   var statusBar = document.getElementById('stageStatusBar');
   var statusText = document.getElementById('stageStatusText');
   if (statusBar) statusBar.className = 'stage-status-bar err';
@@ -117,7 +140,14 @@ export function updateEsp32StagesError() {
 export function cleanupAfterOtaFailure(reason) {
   // 幂等：已在 FAILED 且无活跃 XHR 时只刷新文案，避免 abort 事件二次递归清状态
   var alreadyFailed = window.otaSessionState === window.OtaSessionState.FAILED;
-  var chip = window.activeUploadChip || window.otaSessionTarget || window.currentOtaTarget || window.flashTarget || 'esp32';
+  /* chip 判定优先级（权威来源顺序）：
+   *   activeUploadChip — XHR 上传开始时由 startUpload 写入，WiFi 路径权威
+   *   otaSessionTarget — OTA 会话状态机目标（仅 WiFi 走 OtaSessionState，BLE 不走）
+   *   currentOtaTarget — switchStageFlow 设置的当前面板目标
+   *   flashTarget      — 用户选择的目标（BLE 路径未设上述两者时兜底）
+   *   'esp32'          — 最终默认值 */
+  var chip = window.activeUploadChip || window.otaSessionTarget ||
+             window.currentOtaTarget || window.flashTarget || 'esp32';
 
   // 0. 状态机：转入 FAILED（先于标志重置）
   window.otaSessionTransition(window.OtaSessionState.FAILED, reason);
@@ -142,16 +172,12 @@ export function cleanupAfterOtaFailure(reason) {
   setActivePhase(null);
   window.currentOtaTarget = null;
 
-  // 4. 恢复上传按钮（两枚都解禁，避免 chip 判错时另一侧仍灰）
+  // 4. 恢复上传按钮（两枚都解禁并恢复原文案，避免 chip 判错或一侧残留"上传中"）
   ['uploadEsp32Btn', 'uploadGd32Btn'].forEach(function (btnId) {
     var btn = document.getElementById(btnId);
     if (!btn) return;
     btn.disabled = false;
-    if (window.uploadBtnOrigText &&
-        ((chip === 'gd32' && btnId === 'uploadGd32Btn') ||
-         (chip !== 'gd32' && btnId === 'uploadEsp32Btn'))) {
-      btn.textContent = window.uploadBtnOrigText;
-    }
+    if (window.uploadBtnOrigText) btn.textContent = window.uploadBtnOrigText;
   });
   window.activeUploadChip = null;
   window.otaSessionTarget = null;
@@ -175,9 +201,8 @@ export function cleanupAfterOtaFailure(reason) {
 export function setActivePhase(phase) {
   if (phase === 'gd32Upload' || phase === 'gd32Relay') phase = 'gd32Ota';
   window.activePhase = phase;
-  var stepMap = { esp32Ota: 'ppEsp32', gd32Ota: 'ppGd32Ota' };
-  Object.keys(stepMap).forEach(function(p) {
-    var el = document.getElementById(stepMap[p]);
+  Object.keys(STEP_MAP).forEach(function (p) {
+    var el = document.getElementById(STEP_MAP[p]);
     if (!el) return;
     el.classList.remove('active', 'done');
     if (p === phase) el.classList.add('active');
@@ -190,8 +215,7 @@ export function setActivePhase(phase) {
 /** @description 标记指定阶段为完成，更新进度条颜色。 */
 export function markPhaseDone(phase) {
   if (phase === 'gd32Upload' || phase === 'gd32Relay') phase = 'gd32Ota';
-  var stepMap = { esp32Ota: 'ppEsp32', gd32Ota: 'ppGd32Ota' };
-  var el = document.getElementById(stepMap[phase]);
+  var el = document.getElementById(STEP_MAP[phase]);
   if (el) { el.classList.remove('active'); el.classList.add('done'); }
   // All done? turn progress bar green
   if (phase === 'gd32Ota' || phase === 'esp32Ota') {
@@ -200,14 +224,20 @@ export function markPhaseDone(phase) {
   }
 }
 
-/** @description 更新进度条百分比和文本显示。 */
+/** @description 更新进度条百分比和文本显示。对 pct 做边界校验，过滤 NaN/undefined。 */
 export function setProgress(pct, text) {
-  var fillEl = document.getElementById('progressFill');
-  var txtEl = document.getElementById('progressTxt');
-  var pctEl = document.getElementById('progressPct');
-  if (fillEl) fillEl.style.width = pct + '%';
-  if (txtEl) txtEl.textContent = text;
-  if (pctEl) pctEl.textContent = pct + '%';
+  // 数值校验：BLE ACK 高频调用路径偶尔传入 undefined/NaN，需兜底避免出现 "undefined%"
+  var n = Number(pct);
+  if (!Number.isFinite(n)) n = 0;
+  if (n < 0) n = 0;
+  else if (n > 100) n = 100;
+  // 懒缓存 DOM 元素引用；DOM 未就绪时回退到 getElementById（兼容早期调用）
+  if (!progressFillEl || !progressFillEl.isConnected) progressFillEl = document.getElementById('progressFill');
+  if (!progressTxtEl || !progressTxtEl.isConnected) progressTxtEl = document.getElementById('progressTxt');
+  if (!progressPctEl || !progressPctEl.isConnected) progressPctEl = document.getElementById('progressPct');
+  if (progressFillEl) progressFillEl.style.width = n + '%';
+  if (progressTxtEl) progressTxtEl.textContent = text;
+  if (progressPctEl) progressPctEl.textContent = n + '%';
 }
 
 /** @description 重置进度条和阶段状态到初始值。 */
@@ -216,7 +246,7 @@ export function resetProgress() {
   window.activePhase = null;
   window.esp32OtaPhase = 0;
   switchStageFlow(null);
-  ['ppEsp32', 'ppGd32Ota'].forEach(function(id) {
+  ['ppEsp32', 'ppGd32Ota'].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.classList.remove('active', 'done');
   });

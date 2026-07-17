@@ -25,9 +25,7 @@ function safeJsonParse(raw) {
 function transmitterFilterToPlain() {
   var out = {};
   for (var k in state.transmitterFilter) {
-    if (Object.prototype.hasOwnProperty.call(state.transmitterFilter, k) || state.transmitterFilter[k]) {
-      out[k] = !!state.transmitterFilter[k];
-    }
+    if (state.transmitterFilter[k]) out[k] = true;
   }
   return out;
 }
@@ -196,11 +194,8 @@ export function loadCanSession() {
     state.transmitterFilterEmpty = !anyTx;
 
     /* 选中键若不存在则清空，交由调用方选第一条 */
-    if (state.selectedMessageKey && state.dbc && state.dbc.messageMap) {
-      if (!state.dbc.messageMap[state.selectedMessageKey]) {
-        state.selectedMessageKey = '';
-      }
-    } else if (state.selectedMessageKey && (!state.dbc || !state.dbc.messages.length)) {
+    if (state.selectedMessageKey &&
+        (!state.dbc || !state.dbc.messageMap[state.selectedMessageKey])) {
       state.selectedMessageKey = '';
     }
 

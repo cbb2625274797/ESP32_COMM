@@ -55,6 +55,16 @@ function buildPacket(seq, totalSize, payload, cmd) {
   return packet;
 }
 
+/** @description 将 64 字符十六进制 SHA-256 字符串转为 32 字节数组。 */
+function sha256HexToBytes(shaHex) {
+  const hex = shaHex.toUpperCase();
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
 export function waitForAck(cmd, expectedSeq, timeoutMs = 8000, opts = {}) {
   // ★ 中止快速退出：若 0x20 ABORTED 已先于本调用到达（ackWaiter 当时为 null），
   //   这里立即 reject，避免在已中止的会话上盲等超时。
@@ -101,7 +111,7 @@ export async function uploadFirmware() {
       const freshFile = await state.selectedFileHandle.getFile();
       await updateFileInfo(freshFile);
       var actualFile = state.selectedFile || freshFile;
-      bleLog('FILE', '已重新读取本地文件: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')');
+      bleLog('FILE', '已重新读取本地文件: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')', 'D');
     } catch (e) {
       bleLog('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
     }
@@ -151,13 +161,13 @@ export async function uploadFirmware() {
       throw new Error('DATA_OUT 通知未开启，无法使用 ACK 模式');
     }
 
-    bleLog('OTA', `开始准备固件: target=${cfg.label}, file=${file.name}, payload=${payloadSize}, cmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, ackWindow=${BLE_OTA_ACK_WINDOW}`);
+    bleLog('OTA', `开始准备固件: target=${cfg.label}, file=${file.name}, payload=${payloadSize}, cmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, ackWindow=${BLE_OTA_ACK_WINDOW}`, 'D');
     setProgress(0, `[${cfg.label}] 正在读取固件文件...`);
     setBleStage(4, '读取固件...', null);
     const fileBytes = new Uint8Array(await file.arrayBuffer());
     const totalSize = fileBytes.length;
     const packetTotal = Math.ceil(totalSize / payloadSize);
-    bleLog('OTA', `固件已读取: totalSize=${totalSize}, packetTotal=${packetTotal}, file.size=${file.size}`);
+    bleLog('OTA', `固件已读取: totalSize=${totalSize}, packetTotal=${packetTotal}, file.size=${file.size}`, 'D');
     if (totalSize !== file.size) {
       bleLog('OTA', `⚠️ file.size(${file.size}) ≠ arrayBuffer(${totalSize})，以 arrayBuffer 为准，请确认页面已 Ctrl+F5 刷新`, 'W');
     }
@@ -169,7 +179,7 @@ export async function uploadFirmware() {
       fileSha256 = state.fileSha256.toLowerCase();
     } else {
       // 极端兜底：state.fileSha256 未初始化（理论上 updateFileInfo 总会先设置）
-      bleLog('OTA', '正在计算文件 SHA-256 哈希...');
+      bleLog('OTA', '正在计算文件 SHA-256 哈希...', 'D');
       const hashBuffer = await crypto.subtle.digest('SHA-256', fileBytes.buffer);
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       fileSha256 = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
@@ -186,7 +196,7 @@ export async function uploadFirmware() {
     state.activePacketTotal = packetTotal;
     els.sentCount.textContent = '0';
     setProgress(0, `[${cfg.label}] 等待设备确认 0/${packetTotal} 包`);
-    bleLog('OTA', `开始写入 DATA_IN: build=${UI_BUILD}, target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`);
+    bleLog('OTA', `开始写入 DATA_IN: build=${UI_BUILD}, target=${cfg.label}, file=${file.name}, total=${totalSize}, packets=${packetTotal}, payload=${payloadSize}, windowAck=${BLE_OTA_ACK_WINDOW}`, 'D');
 
     const MAX_WINDOW_RETRIES = 3;
     // 整分区预擦可长达数十秒；首包 ACK 超时必须覆盖 begin/erase
@@ -214,7 +224,7 @@ export async function uploadFirmware() {
         if (seq === 0) {
           try {
             await state.dataInChar.writeValueWithResponse(packet);
-            bleLog('OTA', 'seq=0 已用 writeValueWithResponse 确认送达，等待设备 begin/预擦完成…', 'I');
+            bleLog('OTA', 'seq=0 已用 writeValueWithResponse 确认送达，等待设备 begin/预擦完成…', 'D');
             setBleStageText('设备预擦 Flash 中，请等待…');
           } catch (e) {
             bleLog('OTA', `seq=0 写入失败: ${e.message}`, 'E');
@@ -233,7 +243,7 @@ export async function uploadFirmware() {
           if (state.lastAckBytes < firstBytes) {
             throw new Error('设备 begin 就绪 ACK 字节不足: got=' + state.lastAckBytes + ' need=' + firstBytes);
           }
-          bleLog('OTA', '设备 begin 就绪 (ackBytes=' + state.lastAckBytes + ')，继续发送窗口数据', 'I');
+          bleLog('OTA', '设备 begin 就绪 (ackBytes=' + state.lastAckBytes + ')，继续发送窗口数据', 'D');
           setBleStageText('正在写入 ' + packetTotal + ' 包数据...');
           continue;
         }
@@ -315,7 +325,6 @@ export async function uploadFirmware() {
         } catch (e) {
           bleLog('OTA', `重试 ACK 等待失败: ${e.message}`, 'W');
         }
-        expectedBytes = Math.min((endSeq + 1) * payloadSize, totalSize);
       }
 
       if (state.lastAckBytes < expectedBytes) {
@@ -340,10 +349,7 @@ export async function uploadFirmware() {
     if (cfg.label === 'ESP32') {
       state.deviceSha256 = null;
       const frontSha = fileSha256.toUpperCase();
-      const frontShaBytes = new Uint8Array(32);
-      for (let i = 0; i < 32; i++) {
-        frontShaBytes[i] = parseInt(frontSha.slice(i * 2, i * 2 + 2), 16);
-      }
+      const frontShaBytes = sha256HexToBytes(fileSha256);
       const trigger = new Uint8Array(35);
       trigger[0] = 0xF8;
       trigger.set(frontShaBytes, 1);
@@ -355,7 +361,7 @@ export async function uploadFirmware() {
       setBleStageText('发送 0xF8 + SHA-256，等待设备端校验...');
       try {
         await state.ctrlChar.writeValue(trigger);
-        bleLog('OTA', '0xF8 + 32B SHA-256 已发送，等待设备端校验');
+        bleLog('OTA', '0xF8 + 32B SHA-256 已发送，等待设备端校验', 'D');
       } catch (e) {
         clearOtaResultWaiter();
         state.lastUploadStatus = 'failed';
@@ -381,10 +387,7 @@ export async function uploadFirmware() {
 
     // GD32: send 0xF7 + 32B SHA-256 + session, then wait for SPI relay result.
     const frontSha = fileSha256.toUpperCase();
-    const frontShaBytes = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) {
-      frontShaBytes[i] = parseInt(frontSha.slice(i * 2, i * 2 + 2), 16);
-    }
+    const frontShaBytes = sha256HexToBytes(fileSha256);
     state.deviceSha256 = null;
     setBleStage(5, '发送触发...', 'active');
     setBleStageText('发送 0xF7 + SHA-256，等待设备端缓存校验...');
@@ -402,7 +405,7 @@ export async function uploadFirmware() {
       await state.ctrlChar.writeValue(cmd);
       setBleStage(5, '已触发', null);
       setBleStage(6, '等待设备端校验', 'active');
-      bleLog('OTA', `0xF7 + 32B SHA-256 已发送，等待设备端缓存校验与转发`);
+      bleLog('OTA', `0xF7 + 32B SHA-256 已发送，等待设备端缓存校验与转发`, 'D');
     } catch (_) {
       clearOtaResultWaiter();
       state.lastUploadStatus = 'failed';
@@ -478,7 +481,7 @@ export async function autoFlash() {
       if (changed) {
         await updateFileInfo(freshFile);
         var actualFile = state.selectedFile || freshFile;
-        bleLog('FILE', '已重新读取本地文件（已变更）: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')');
+        bleLog('FILE', '已重新读取本地文件（已变更）: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')', 'D');
       }
     } catch (e) {
       bleLog('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');

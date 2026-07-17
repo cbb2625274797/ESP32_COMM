@@ -1,5 +1,7 @@
-﻿/*
- * can_feedback_task.h - 周期性轮询 GD32 CAN 反馈快照的任务接口
+/*
+ * can_feedback_task.h - 被动接收 GD32 主动推送的 CAN 反馈快照
+ *
+ * ESP32 侧不主动 1Hz 轮询 0xC1；由 GD32 按铃推送，本任务 takeEvent 接收。
  */
 #ifndef CAN_FEEDBACK_TASK_H
 #define CAN_FEEDBACK_TASK_H
@@ -7,7 +9,7 @@
 #include <stdint.h>
 #include "transport/canfd_bridge.h"
 
-/** @brief 暂停/恢复 CAN 反馈轮询（OTA 期间调用 pause=true）。 */
+/** @brief 暂停/恢复 CAN 反馈监听（OTA 期间调用 pause=true）。 */
 void pauseCanFeedbackTask(bool pause);
 
 #ifdef __cplusplus
@@ -15,7 +17,7 @@ extern "C" {
 #endif
 
 /**
- * @brief 启动 1Hz CAN 反馈轮询任务（幂等）。
+ * @brief 启动 CAN 反馈被动监听任务（幂等）。
  * @return true 表示任务已存在或创建成功。
  */
 bool startCanFeedbackTask();

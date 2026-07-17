@@ -3,10 +3,10 @@
  *
  * 架构（GD32 主动推送，ESP32 被动接收）：
  *   GD32 APP 在主循环中调用 canFeedbackPushStep()，循环遍历 3 通道 × 2 页，
- *   通过 requestEsp32Read(0xC1) 下拉 SPIready 主动按铃，将每页反馈 payload
- *   推送给 ESP32。ESP32 本任务调用 checkGd32Request() 阻塞等待按铃，读到
- *   一帧后用 canFdParseFeedbackPage() 解析并累积到 s_work[channel]，再
- *   publish() 到 s_latest[channel] 供 Web/WebSocket 读取。
+ *   通过 requestEsp32Read(0xC1) 下拉 DATA_READY 主动按铃，将每页反馈 payload
+ *   推送给 ESP32。ESP32 本任务 SpiMaster::takeEvent() 阻塞等待按铃/事件，
+ *   读到一帧后用 canFdParseFeedbackPage() 解析并累积到 s_work[channel]，再
+ *   publish() 到 s_latest[channel] 供 Web 读取。
  *
  *   替代了原先 ESP32 1Hz 主动发 0xC1 轮询的逻辑，避免占用主线 SPI 带宽。
  *
@@ -161,9 +161,9 @@ void pauseCanFeedbackTask(bool pause)
     if (s_paused == pause) return;  // 幂等：状态未变时不重复日志
     s_paused = pause;
     if (pause) {
-        DEBUG_INFO(kTag, "CAN 监听已暂停（OTA 进行中）");
+        DEBUG_DBG(kTag, "CAN 监听已暂停（OTA 进行中）");
     } else {
-        DEBUG_INFO(kTag, "CAN 监听已恢复");
+        DEBUG_DBG(kTag, "CAN 监听已恢复");
     }
 }
 

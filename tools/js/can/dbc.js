@@ -88,7 +88,8 @@ export function bytesToHex(bytes) {
 /** @description 转义 CSS 选择器中的特殊字符。 */
 export function cssEscape(value) {
   if (window.CSS && CSS.escape) return CSS.escape(value);
-  return String(value).replace(/[^a-zA-Z0-9_-]/g, function (ch) { return '\\\\' + ch; });
+  /* fallback：每个非安全字符前加单个反斜杠（CSS 转义），双引号属性值内可安全使用 */
+  return String(value).replace(/[^a-zA-Z0-9_-]/g, function (ch) { return '\\' + ch; });
 }
 
 /** @description 去除回车并 trim，用于 DBC 搜索等输入归一化。 */
@@ -232,7 +233,7 @@ export function parseDbc(text) {
       signal.comment = comments.signals[String(msg.idRaw) + ':' + signal.name] || '';
       signal.enumMap = valueTables[String(msg.idRaw) + ':' + signal.name] || {};
       var dv = sigDefaults[String(msg.idRaw) + ':' + signal.name];
-      signal.defaultValue = (dv != null && Number.isFinite(Number(dv))) ? dv : null;
+      signal.defaultValue = (dv != null && Number.isFinite(Number(dv))) ? Number(dv) : null;
     });
   });
 
@@ -249,6 +250,16 @@ export function findSignal(message, signalName) {
     if (message.signals[i].name === signalName) return message.signals[i];
   }
   return null;
+}
+
+/**
+ * @description 按 key 在当前合并 DBC 中查找报文（O(1)，走 messageMap）。
+ *              messageMap 由 rebuildMergedDbc() 维护，key 格式与 message.key / state.selectedMessageKey 一致。
+ *              无 DBC 或 key 不存在时返回 null。
+ */
+export function findMessageByKey(key) {
+  if (!state.dbc || !state.dbc.messageMap || !key) return null;
+  return state.dbc.messageMap[key] || null;
 }
 
 /** @description 解析 SG_ 行的 multiplex token（M / mN / 空）。 */

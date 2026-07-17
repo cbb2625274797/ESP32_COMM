@@ -9,10 +9,12 @@ idf_component_register(
         "storage/gd32_flash_store.cpp" # GD32 Flash 存储抽象层（H1 提取）
         "server/wifi_ota.cpp"          # WiFi HTTP OTA 服务器
         "server/http_handlers.cpp"     # HTTP 路由处理（H2 从 wifi_ota 提取）
-        "server/ble_ota.cpp"           # BLE GATT OTA 服务器
+        "server/ble_ota.cpp"           # BLE OTA 公开 API / 收尾 / 共存
+        "server/ble_ota_data.cpp"      # BLE OTA 数据路径（reorder/worker/DATA_IN）
+        "server/ble_ota_host.cpp"      # BLE OTA GATT/GAP/广播/Host
         "monitor/health_monitor.cpp"   # 系统健康监控（温度/RSSI/堆内存/栈水位主动巡检）
         "monitor/cpu_stats.cpp"        # 1Hz FreeRTOS CPU 占用采样任务
-        "monitor/can_feedback_task.cpp" # CAN 1Hz 反馈轮询任务（0xC1）
+        "monitor/can_feedback_task.cpp" # CAN 反馈被动监听（0xC1 takeEvent）
         "monitor/debug_log.cpp"        # 三路调试日志（UART/UDP/环形缓冲）
         "monitor/task_stack_check.cpp" # 任务栈水位指标收集（health_mon 巡检 + /system/status 共享）
         "monitor/stack_overflow_hook.cpp" # FreeRTOS 栈溢出钩子（canary 触发时 UART 硬写告警）

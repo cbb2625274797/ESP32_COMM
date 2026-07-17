@@ -2,8 +2,9 @@
  * can_monitor.js - CAN 接收监控（独立页 can_monitor.html 与 can.html 右侧抽屉共用）
  */
 import { showToast } from './common/toast.js?v=20260717x';
+import { escapeHtml } from './common/utils.js';
 
-var state = { fbTimer: null, fbAbortCtrl: null };
+var state = { fbTimer: null, fbInFlight: false };
 
 var el = {};
 
@@ -25,11 +26,6 @@ var ids = [
 
 function cacheElements() {
   ids.forEach(function (id) { el[id] = document.getElementById(id); });
-}
-
-function sanitize(text) {
-  return String(text == null ? '' : text)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function getBaseUrl() {
@@ -63,15 +59,18 @@ function setConnState(ok, text) {
 
 // ── 1Hz 轮询 /can/feedback ─────────────────────────────────
 async function pollFeedback() {
-  if (state.fbAbortCtrl) { try { state.fbAbortCtrl.abort(); } catch (_e) {} }
-  state.fbAbortCtrl = new AbortController();
-  var fbPollTimer = setTimeout(function () { try { state.fbAbortCtrl.abort(); } catch (_e) {} }, 3000);
+  // 防重入：上一次 fetch 未完成则跳过本次 tick，避免并发请求叠加
+  if (state.fbInFlight) return;
+  state.fbInFlight = true;
+  var ac = new AbortController();
+  var timer = setTimeout(function () { ac.abort(); }, 3000);
   try {
-    var resp = await fetch(getBaseUrl() + '/can/feedback', { signal: state.fbAbortCtrl.signal });
+    var resp = await fetch(getBaseUrl() + '/can/feedback', { signal: ac.signal });
     if (!resp.ok) return;
     var data = await resp.json();
     var channels = data.channels || [];
     var selectedCh = el.idsnapChannel ? parseInt(el.idsnapChannel.value, 10) : 0;
+    if (!Number.isFinite(selectedCh)) selectedCh = 0;
 
     for (var i = 0; i < 3; i++) {
       var ch = channels[i];
@@ -84,7 +83,7 @@ async function pollFeedback() {
 
     var sel = channels[selectedCh];
     if (sel && sel.valid && sel.entries) {
-      renderIdTable(sel.entries, sel.count || sel.entries.length);
+      renderIdTable(sel.entries);
       if (el.idsnapStatus) {
         el.idsnapStatus.textContent = (sel.entries.length) + ' 个 ID';
         el.idsnapStatus.className = 'pill online';
@@ -98,15 +97,16 @@ async function pollFeedback() {
       el.fbPollStatus.className = 'pill online';
     }
     setConnState(true, '已连接');
-    clearTimeout(fbPollTimer);
   } catch (e) {
-    clearTimeout(fbPollTimer);
     if (e && e.name === 'AbortError') return;
     if (el.fbPollStatus) {
       el.fbPollStatus.textContent = '轮询: 离线';
       el.fbPollStatus.className = 'pill offline';
     }
     setConnState(false, '连接失败');
+  } finally {
+    clearTimeout(timer);
+    state.fbInFlight = false;
   }
 }
 
@@ -183,20 +183,22 @@ function renderIdTable(entries) {
     tbody.innerHTML = '<tr><td colspan="7" class="status-empty">无数据（CAN 未收到帧）</td></tr>';
     return;
   }
-  var html = '';
+  var frag = document.createDocumentFragment();
   for (var i = 0; i < entries.length; i++) {
     var e = entries[i];
-    html += '<tr>';
-    html += '<td>' + (i + 1) + '</td>';
-    html += '<td class="mono">' + sanitize(e.id) + '</td>';
-    html += '<td>' + e.dlc + '</td>';
-    html += '<td class="' + (e.fd ? 'flag-on' : 'flag-off') + '">' + (e.fd ? 'Y' : '-') + '</td>';
-    html += '<td class="' + (e.brs ? 'flag-on' : 'flag-off') + '">' + (e.brs ? 'Y' : '-') + '</td>';
-    html += '<td class="' + (e.esi ? 'flag-on' : 'flag-off') + '">' + (e.esi ? 'Y' : '-') + '</td>';
-    html += '<td class="idsnap-data mono">' + sanitize(e.data || '--') + '</td>';
-    html += '</tr>';
+    var tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + (i + 1) + '</td>' +
+      '<td class="mono">' + escapeHtml(e.id) + '</td>' +
+      '<td>' + escapeHtml(e.dlc) + '</td>' +
+      '<td class="' + (e.fd ? 'flag-on' : 'flag-off') + '">' + (e.fd ? 'Y' : '-') + '</td>' +
+      '<td class="' + (e.brs ? 'flag-on' : 'flag-off') + '">' + (e.brs ? 'Y' : '-') + '</td>' +
+      '<td class="' + (e.esi ? 'flag-on' : 'flag-off') + '">' + (e.esi ? 'Y' : '-') + '</td>' +
+      '<td class="idsnap-data mono">' + escapeHtml(e.data || '--') + '</td>';
+    frag.appendChild(tr);
   }
-  tbody.innerHTML = html;
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
 }
 
 function renderIdTableEmpty() {

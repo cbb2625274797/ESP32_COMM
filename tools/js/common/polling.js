@@ -1,11 +1,11 @@
 /**
  * polling.js - 轮询状态 + Page Visibility 补偿 + ESP32 实时日志拉取
  *
- * 递归 setTimeout 调度 /system/status + setInterval 调度 /logs，避免 setInterval 慢响应被 abort。
+ * 递归 setTimeout 调度 /system/status + 递归 setTimeout 调度 /logs，避免 setInterval 慢响应被 abort / 重叠抢 socket。
  *
  * 模块级状态（仅本模块使用，不导出）：
- *   statusTimerId / logsTimerId / statusAbortCtrl / statusPollInFlight / statusPollIntervalMs
- *   uploadPollChip / lastLogTimestamp / pageVisible
+ *   statusTimerId / logsTimerId / statusAbortCtrl / statusPollInFlight / logsInFlight / statusPollIntervalMs
+ *   uploadPollChip / pageVisible
  *
  * 共享状态（通过 window.* 引用）：
  *   window.pollingPausedForUpload   — 上传期间暂停轮询标志
@@ -24,12 +24,24 @@
  *   window.getEspIp / window.getBaseUrl
  *   window.updateSystemStatusUi / window.updateEsp32StagesFromPhase
  *   window.applyRebootingRuntimeState / window.applyDisconnectedRuntimeState / window.applyUploadingRuntimeState
+ *   window.applyDeviceBusyRuntimeState
  *   window.otaSessionActive / window.otaSessionTransition / window.otaSessionReset
  *   window.updateUploadButtonLabel
  */
 import { addLog } from './log.js';
 import { showToast } from './toast.js';
 import { updateConnectionUi, diagnoseNetwork } from './connection.js';
+
+// ==================== 状态码常量（与后端 ota_coordinator.h / ota_relay.h 枚举对齐） ====================
+// sys_state_code
+const SYS_GD32_STORING = 1;
+const SYS_GD32_RELAYING = 3;
+const SYS_ESP32_RECEIVING = 5;
+const SYS_ESP32_FINALIZING = 6;
+const SYS_ESP32_REBOOTING = 7;
+// relay_state（1~4 为握手/协商/传输/收尾，非 IDLE）
+const RELAY_ACTIVE_MIN = 1;
+const RELAY_ACTIVE_MAX = 4;
 
 // ==================== 轮询状态 ====================
 // 共享状态（初始化到 window，供 connection.js 等其他模块读写）
@@ -40,9 +52,10 @@ window.lastRelayState = 0;     // 上次成功的 relay_state
 // 模块级状态（仅本模块使用）
 var statusTimerId = null;
 var logsTimerId = null;
-var statusAbortCtrl = null;  // 当前 /system/status 请求的 AbortController（3s 超时用）
+var statusAbortCtrl = null;  // 当前 /system/status 请求的 AbortController（5s 超时用）
 var statusPollIntervalMs = 1000;  // 状态轮询目标间隔（中继期可由 setStatusPollIntervalMs 降到 400ms）
 var statusPollInFlight = false;   // 是否正在请求 /system/status，防止重叠
+var logsInFlight = false;          // 是否正在请求 /logs，防止重叠抢 socket
 var pageVisible = !document.hidden;   // 页面可见性：切到后台/最小化/切标签会变 false
 var uploadPollChip = null; // 当前暂停轮询的上传目标，用于区分 WiFi/日志策略
 
@@ -62,8 +75,11 @@ export function setStatusPollIntervalMs(ms) {
  *  传入 max(0, interval - 本轮耗时)，使 CPU 采样窗口 sample_ms ≈ interval，
  *  而不是「完成后 + interval」（会稳定偏到 1100+ ms）。
  *  仍保证 in-flight 不重叠，避免 setInterval 慢响应被 abort。
+ *  ★ 上传暂停期间（window.pollingPausedForUpload）不重挂定时器，
+ *    避免在途请求的 finally 把刚清掉的轮询又挂回来。
  */
 export function scheduleStatusPoll(delayMs) {
+  if (window.pollingPausedForUpload) return;
   if (statusTimerId) clearTimeout(statusTimerId);
   var interval = statusPollIntervalMs;
   statusTimerId = setTimeout(function() {
@@ -72,15 +88,24 @@ export function scheduleStatusPoll(delayMs) {
   }, delayMs !== undefined ? delayMs : interval);
 }
 
+/** @description 调度下一次 /logs 轮询（递归 setTimeout，仿 scheduleStatusPoll）。 */
+function scheduleLogsPoll(delayMs) {
+  if (logsTimerId) clearTimeout(logsTimerId);
+  logsTimerId = setTimeout(function() {
+    logsTimerId = null;
+    pollLogs();
+  }, delayMs !== undefined ? delayMs : statusPollIntervalMs);
+}
+
 /** @description 启动定时轮询（状态 + 日志）。 */
 
 export function startPolling() {
   window.consecutivePollFailures = 0;
   statusPollIntervalMs = 1000;
   if (statusTimerId) clearTimeout(statusTimerId);
-  if (logsTimerId) clearInterval(logsTimerId);
+  if (logsTimerId) clearTimeout(logsTimerId);
   scheduleStatusPoll(0);   // 立即开始第一次，完成后按 interval 递归调度
-  logsTimerId = setInterval(pollLogs, 1000);
+  scheduleLogsPoll(0);
 }
 export function pausePollingForUpload() {
   if (window.pollingPausedForUpload) return;
@@ -96,7 +121,7 @@ export function pausePollingForUpload() {
     statusTimerId = null;
   }
   if (logsTimerId) {
-    clearInterval(logsTimerId);
+    clearTimeout(logsTimerId);
     logsTimerId = null;
   }
   if (statusAbortCtrl) {
@@ -111,16 +136,48 @@ export function resumePollingAfterUpload() {
   uploadPollChip = null;
   window.consecutivePollFailures = 0;
   statusPollIntervalMs = 1000;
-  if (logsTimerId) clearInterval(logsTimerId);
-  logsTimerId = setInterval(pollLogs, statusPollIntervalMs);
+  if (logsTimerId) clearTimeout(logsTimerId);
   // 上传结束立即刷新一次状态；若当前已在请求中，则让它完成后按新间隔继续
   if (statusPollInFlight) {
     if (statusTimerId) clearTimeout(statusTimerId);
   } else {
     scheduleStatusPoll(0);
   }
-  pollLogs();
+  scheduleLogsPoll(0);
 }
+
+/**
+ * @description 统一的 ESP32 重启完成处理：清重启标志 → 推进阶段 6 → 状态机转 DONE → 刷新按钮。
+ *  抽出来供 pollStatus 成功分支与 pollLogs 启动 banner 分支复用，避免两处逻辑漂移。
+ *  以 isEsp32Rebooting 作幂等守卫：已处理过的重启不再重复弹 toast / 写日志 / 重复转 DONE。
+ *  @param {string} source 日志来源描述（如 '启动 banner 收到'），用于区分日志文案。
+ */
+function markEsp32RebootComplete(source) {
+  if (!window.isEsp32Rebooting) return;
+  window.isEsp32Rebooting = false;
+  window.rebootObservedDown = false;
+  window.updateEsp32StagesFromPhase(6);  // 启动完成
+  addLog('I', '系统', source ? 'ESP32 已恢复在线（' + source + '）' : 'ESP32 已恢复在线');
+  showToast('ESP32 已恢复在线', 'success');
+  // ★ 状态机：ESP32 重启完成 → DONE
+  if (window.otaSessionState === window.OtaSessionState.REBOOTING) {
+    window.otaSessionTransition(window.OtaSessionState.DONE);
+  }
+  if (typeof window.updateUploadButtonLabel === 'function') {
+    window.updateUploadButtonLabel();
+  }
+}
+
+/** @description 判断设备最近一次成功轮询时是否处于「忙」状态（OTA 存储/中继/接收/收尾/重启 或 relay 握手~收尾）。 */
+function isLastDeviceBusy() {
+  var s = window.lastSysStateCode;
+  var r = window.lastRelayState;
+  return s === SYS_GD32_STORING || s === SYS_GD32_RELAYING ||
+         s === SYS_ESP32_RECEIVING || s === SYS_ESP32_FINALIZING ||
+         s === SYS_ESP32_REBOOTING ||
+         (r >= RELAY_ACTIVE_MIN && r <= RELAY_ACTIVE_MAX);
+}
+
 /** @description 轮询 ESP32 系统状态（GET /status）并更新 UI。 */
 export async function pollStatus() {
   // 递归 setTimeout 调度，正常情况下不会重叠；做个保险避免并发请求
@@ -153,25 +210,12 @@ export async function pollStatus() {
       if (window.isEsp32Rebooting ||
           window.otaSessionState === window.OtaSessionState.REBOOTING) {
         var rbElapsed = Math.round((Date.now() - window.rebootStartTime) / 1000);
-        if (!window.rebootObservedDown && rbElapsed < 10) {
-          // pre-reboot 窗口：后端发响应后约 1s 才 esp_restart，期间设备仍响应轮询
-          // 保持"重启中"状态，不清除标志，不推进阶段
-          // ★ 真正的"重启完成"由 pollLogs 收到启动 banner（MAIN: ESP32-C3 OTA Relay v1.0 启动）触发
-        } else {
-          // 设备已重启并恢复在线（rebootObservedDown=true）
-          // 或超 10s 安全阈值仍未观察到下线（重启过快未捕获或未重启）——接受恢复
-          window.isEsp32Rebooting = false;
-          window.rebootObservedDown = false;
-          window.updateEsp32StagesFromPhase(6);  // 启动完成
-          addLog('I', '系统', 'ESP32 已恢复在线');
-          showToast('ESP32 已恢复在线', 'success');
-          // ★ 状态机：ESP32 重启完成 → DONE
-          if (window.otaSessionState === window.OtaSessionState.REBOOTING) {
-            window.otaSessionTransition(window.OtaSessionState.DONE);
-          }
-          if (typeof window.updateUploadButtonLabel === 'function') {
-            window.updateUploadButtonLabel();
-          }
+        // pre-reboot 窗口：后端发响应后约 1s 才 esp_restart，期间设备仍响应轮询，
+        // 保持"重启中"状态，不清除标志，不推进阶段。
+        // ★ 真正的"重启完成"由 pollLogs 收到启动 banner 触发；
+        //   这里只在已观察到下线（rebootObservedDown）或超 10s 安全阈值时接受恢复。
+        if (window.rebootObservedDown || rbElapsed >= 10) {
+          markEsp32RebootComplete();
         }
       }
       try { window.updateSystemStatusUi(data); } catch (e2) { console.warn('updateSystemStatusUi 异常:', e2); }
@@ -188,15 +232,7 @@ export async function pollStatus() {
     // 后台期间 setInterval 会被 Chrome/Edge 节流到最低 1 分钟/次，
     // 因此后台累积的失败计数不应递增，避免切回前台瞬间误触发 5-fail 诊断。
     if (pageVisible) window.consecutivePollFailures++;
-    // 判断设备是否处于"已知忙/重启"状态（依据最近一次成功轮询的 sys_state_code）：
-    //   1=GD32_STORING, 3=GD32_RELAYING, 5=ESP32_RECEIVING,
-    //   6=ESP32_FINALIZING, 7=ESP32_REBOOTING
-    // 也包含 relay_state 非 IDLE（1-4 表示握手/协商/传输/收尾）
-    var lastDeviceBusy =
-      window.lastSysStateCode === 1 || window.lastSysStateCode === 3 ||
-      window.lastSysStateCode === 5 || window.lastSysStateCode === 6 ||
-      window.lastSysStateCode === 7 ||
-      (window.lastRelayState >= 1 && window.lastRelayState <= 4);
+    var lastDeviceBusy = isLastDeviceBusy();
     // OTA/传输/重启中屏蔽网关无响应的检测功能（设备忙或正在重启，无法响应轮询是正常的）
     // 设备已知忙时：保持 1s 轮询，不触发降速诊断，避免错过设备恢复的即时反馈
     // ★ 状态机：用统一的会话活跃/失败判断替代散布的标志。
@@ -216,14 +252,7 @@ export async function pollStatus() {
     if (sessionFailed) {
       if (lastDeviceBusy) {
         // 设备端仍在跑（中继没停），标"设备忙"但不覆盖进度/阶段
-        var pcF = document.getElementById('pillConn');
-        var pctF = document.getElementById('pillConnTxt');
-        if (pcF) pcF.className = 'pill processing';
-        if (pctF) pctF.textContent = '设备忙';
-        var csF = document.getElementById('connStatus');
-        var cstF = document.getElementById('connStatusTxt');
-        if (csF) csF.className = 'conn-indicator warn';
-        if (cstF) cstF.textContent = '设备忙（OTA 后台运行中），等待回 IDLE';
+        window.applyDeviceBusyRuntimeState('设备忙', '设备忙（OTA 后台运行中），等待回 IDLE', '设备忙');
         updateConnectionUi(true, '设备忙');
       } else {
         // 设备已回 IDLE：连接胶囊显示未连接，但失败进度保留
@@ -253,14 +282,7 @@ export async function pollStatus() {
     } else if (sessionActive || lastDeviceBusy) {
       // 设备在 OTA/中继/重启期间不响应是正常的：保持 1s 轮询，UI 标记为"设备忙"
       // 不调用 applyRebootingRuntimeState（避免显示"重启中 Xs"误导）
-      var pc = document.getElementById('pillConn');
-      var pct = document.getElementById('pillConnTxt');
-      if (pc) pc.className = 'pill processing';
-      if (pct) pct.textContent = '设备忙';
-      var cs = document.getElementById('connStatus');
-      var cst = document.getElementById('connStatusTxt');
-      if (cs) cs.className = 'conn-indicator warn';
-      if (cst) cst.textContent = '设备忙（OTA/重启中），保持 1s 轮询';
+      window.applyDeviceBusyRuntimeState('设备忙', '设备忙（OTA/重启中），保持 1s 轮询', '设备忙');
       updateConnectionUi(true, '设备忙');
     } else {
       updateConnectionUi(false, '未连接');
@@ -271,7 +293,9 @@ export async function pollStatus() {
     statusAbortCtrl = null;
     /* 固定周期调度：interval 从本轮开始计时扣减请求耗时。
      * 旧逻辑「完成后 + 1000ms」→ 窗口稳定 1100+；现 sample_ms 贴近 1000/400。
-     * 本轮超时/很慢时 delay=0，立即补下一轮，仍不重叠。 */
+     * 本轮超时/很慢时 delay=0，立即补下一轮，仍不重叠。
+     * ★ 上传暂停期间不重挂（由 scheduleStatusPoll 内部判断），避免在途请求 abort 后
+     *   的 finally 把刚清掉的轮询又挂回来，导致上传中途再打 /system/status 抢 socket。 */
     var elapsed = Date.now() - pollStartedAt;
     var delay = Math.max(0, statusPollIntervalMs - elapsed);
     scheduleStatusPoll(delay);
@@ -297,10 +321,11 @@ document.addEventListener('visibilitychange', function () {
   pollLogs();
 });
 // ==================== ESP32 实时日志拉取 (增量) ====================
-var lastLogTimestamp = 0;
 /** @description 轮询 ESP32 日志（GET /logs）并追加到日志面板。 */
 export async function pollLogs() {
-  // ★ ESP32 上传期间也允许日志轮询
+  // ★ ESP32 上传期间也允许日志轮询；in-flight 守卫避免与 /system/status、/ota/upload 抢 socket
+  if (logsInFlight) return;
+  logsInFlight = true;
   try {
     var resp = await fetch(window.getBaseUrl() + '/logs', {
       signal: AbortSignal.timeout(5000)
@@ -308,28 +333,17 @@ export async function pollLogs() {
     if (!resp.ok) return;
     var logs = await resp.json();
     if (!Array.isArray(logs) || logs.length === 0) return;
-    var levelMap = { E: 'E', W: 'W', I: 'I', D: 'D' };
     logs.forEach(function (line) {
       var m = line.match(/^\[([EWID])\]\[([^\]]+)\]\s*(.*)$/);
       if (m) {
-        addLog(levelMap[m[1]] || 'I', m[2], m[3].trimEnd());
+        addLog(m[1], m[2], m[3].trimEnd());
         // ★ 复用设备启动 banner 作为 ESP32 重启完成的权威信号。
         //   esp_restart() 是硬件复位，不保证 TCP FIN/RST；靠轮询超时/网络错误判断
         //   "已下线"不可靠。设备启动后会推 [I][MAIN] ESP32-C3 OTA Relay v1.0 启动，
         //   收到这行即说明设备已重启回来，直接推进到阶段 6（启动完成）。
         /* 与 main 启动 banner 对齐：ESP32-C3 OTA Relay <FW_VERSION> 启动（勿写死 v1.0） */
         if (window.isEsp32Rebooting && m[2] === 'MAIN' && /OTA Relay .*启动/.test(m[3])) {
-          window.isEsp32Rebooting = false;
-          window.rebootObservedDown = false;
-          window.updateEsp32StagesFromPhase(6);  // 启动完成
-          addLog('I', '系统', 'ESP32 已恢复在线（启动 banner 收到）');
-          showToast('ESP32 已恢复在线', 'success');
-          if (window.otaSessionState === window.OtaSessionState.REBOOTING) {
-            window.otaSessionTransition(window.OtaSessionState.DONE);
-          }
-          if (typeof window.updateUploadButtonLabel === 'function') {
-            window.updateUploadButtonLabel();
-          }
+          markEsp32RebootComplete('启动 banner 收到');
         }
         /*
          * 设备已报「全部数据包已转发」时，立刻补 UI 100% 进度。
@@ -347,7 +361,13 @@ export async function pollLogs() {
         addLog('I', 'ESP32', line.trimEnd());
       }
     });
-  } catch (e) { /* 静默 */ }
+  } catch (e) { /* 静默 */ } finally {
+    logsInFlight = false;
+    // 递归调度下一轮：固定周期扣减本轮耗时，避免慢响应时重叠抢 socket
+    if (!window.pollingPausedForUpload) {
+      scheduleLogsPoll(statusPollIntervalMs);
+    }
+  }
 }
 setTimeout(function () {
   window.updateUploadButtonLabel();

@@ -10,7 +10,7 @@
  * 复用的函数（通过 window.* 引用）：
  *   window.updateUploadButtonLabel / window.showToast / window.addLog
  */
-import { formatBytes } from '../common/utils.js';
+import { formatBytes, bytesToHex } from '../common/utils.js';
 import { showToast } from '../common/toast.js';
 import { addLog } from '../common/log.js';
 
@@ -33,24 +33,31 @@ var IDB_STORE = 'file_handles';
  * 刷新后权限常为 prompt，requestPermission 必须在用户手势里才成功。
  * 此处暂存待授权 handle，点击上传区时再 requestPermission 并直接 getFile。
  */
-window._pendingFwHandles = window._pendingFwHandles || { esp32: null, gd32: null };
+window._pendingFwHandles = { esp32: null, gd32: null };
 
+/** 模块级 IndexedDB 连接缓存，避免每次 put/get 都重开 */
+var _idbDbPromise = null;
 function openHandleDb() {
-  return new Promise(function (resolve, reject) {
-    if (!window.indexedDB) {
-      reject(new Error('indexedDB unavailable'));
-      return;
-    }
-    var req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = function () {
-      var db = req.result;
-      if (!db.objectStoreNames.contains(IDB_STORE)) {
-        db.createObjectStore(IDB_STORE);
+  if (!_idbDbPromise) {
+    _idbDbPromise = new Promise(function (resolve, reject) {
+      if (!window.indexedDB) {
+        reject(new Error('indexedDB unavailable'));
+        return;
       }
-    };
-    req.onsuccess = function () { resolve(req.result); };
-    req.onerror = function () { reject(req.error || new Error('idb open failed')); };
-  });
+      var req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error || new Error('idb open failed')); };
+    });
+    // 失败时清空缓存，下次允许重试
+    _idbDbPromise.catch(function () { _idbDbPromise = null; });
+  }
+  return _idbDbPromise;
 }
 
 function idbPutHandle(chip, handle) {
@@ -97,8 +104,8 @@ export function loadPersistedFlashTarget() {
   }
 }
 
-/** 保存 FSAPI handle，刷新后可默认恢复该文件 */
-export function persistFileHandle(chip, handle) {
+/** 保存 FSAPI handle，刷新后可默认恢复该文件（仅模块内使用，不导出） */
+function persistFileHandle(chip, handle) {
   if (chip !== 'esp32' && chip !== 'gd32') return Promise.resolve();
   return idbPutHandle(chip, handle || null);
 }
@@ -136,6 +143,13 @@ function loadFileMeta(chip) {
   return map[chip] || null;
 }
 
+/** 安全调用 window.updateUploadButtonLabel（恢复路径可能在 app.js 初始化前触发） */
+function safeUpdateUploadButtonLabel() {
+  if (typeof window.updateUploadButtonLabel === 'function') {
+    window.updateUploadButtonLabel();
+  }
+}
+
 /** 仅 query，不 request（刷新无用户手势时 request 会失败） */
 async function queryHandlePermission(handle) {
   if (!handle || typeof handle.getFile !== 'function') return 'denied';
@@ -157,7 +171,7 @@ async function queryHandlePermission(handle) {
  */
 export async function resumePersistedFirmwareWithGesture(chip) {
   if (chip !== 'esp32' && chip !== 'gd32') return false;
-  var handle = (window._pendingFwHandles && window._pendingFwHandles[chip]) ||
+  var handle = (window._pendingFwHandles[chip]) ||
     (chip === 'esp32' ? window.esp32FileHandle : window.gd32FileHandle) ||
     null;
   if (!handle) {
@@ -183,7 +197,7 @@ export async function resumePersistedFirmwareWithGesture(chip) {
     }
     var file = await handle.getFile();
     applyRestoredFile(chip, handle, file, { silent: true });
-    if (window._pendingFwHandles) window._pendingFwHandles[chip] = null;
+    window._pendingFwHandles[chip] = null;
     addLog('I', '文件', chip.toUpperCase() + ' 已重新授权并恢复: ' + file.name);
     showToast(chip.toUpperCase() + ' 已恢复上次固件', 'success');
     return true;
@@ -208,16 +222,14 @@ function applyRestoredFile(chip, handle, file, options) {
   if (typeof window.syncBleFileFromSelectedTarget === 'function') {
     window.syncBleFileFromSelectedTarget();
   }
-  if (typeof window.updateUploadButtonLabel === 'function') {
-    window.updateUploadButtonLabel();
-  }
+  safeUpdateUploadButtonLabel();
 }
 
 /** 无权限时仍展示上次文件名，提示点上传区一键恢复 */
 function showPendingReauthUi(chip, handle, meta) {
   if (chip === 'esp32') window.esp32FileHandle = handle;
   else window.gd32FileHandle = handle;
-  if (window._pendingFwHandles) window._pendingFwHandles[chip] = handle;
+  window._pendingFwHandles[chip] = handle;
   if (window.sharedFirmwareFiles) {
     window.sharedFirmwareFiles[chip] = { file: null, handle: handle };
   }
@@ -234,9 +246,7 @@ function showPendingReauthUi(chip, handle, meta) {
   if (sizeEl) sizeEl.textContent = meta && meta.size ? formatBytes(meta.size) : '--';
   var shaEl = document.getElementById('fileSha256' + suffix);
   if (shaEl) shaEl.textContent = '刷新后需点击授权';
-  if (typeof window.updateUploadButtonLabel === 'function') {
-    window.updateUploadButtonLabel();
-  }
+  safeUpdateUploadButtonLabel();
 }
 
 /**
@@ -260,7 +270,7 @@ export async function restorePersistedFirmwareSelection() {
       if (perm === 'granted') {
         var file = await handle.getFile();
         applyRestoredFile(chip, handle, file, { silent: true, skipHandlePersist: true });
-        if (window._pendingFwHandles) window._pendingFwHandles[chip] = null;
+        window._pendingFwHandles[chip] = null;
         addLog('I', '文件', chip.toUpperCase() + ' 已恢复刷新前的固件: ' + file.name);
         continue;
       }
@@ -281,9 +291,7 @@ export async function restorePersistedFirmwareSelection() {
   if (typeof window.syncBleFileFromSelectedTarget === 'function') {
     window.syncBleFileFromSelectedTarget();
   }
-  if (typeof window.updateUploadButtonLabel === 'function') {
-    window.updateUploadButtonLabel();
-  }
+  safeUpdateUploadButtonLabel();
 }
 
 export function handleFileSelect(event, chip) {
@@ -292,7 +300,7 @@ export function handleFileSelect(event, chip) {
   /* 传统 input 无 handle：清掉旧 FSAPI 句柄，避免热重载读到过期路径 */
   if (chip === 'esp32') window.esp32FileHandle = null;
   else window.gd32FileHandle = null;
-  if (window._pendingFwHandles) window._pendingFwHandles[chip] = null;
+  window._pendingFwHandles[chip] = null;
   persistFileHandle(chip, null);
   processFile(file, chip);
 }
@@ -303,7 +311,7 @@ export async function pickFileViaFSAPI(chip) {
    * 仅在「刷新后待授权」或「尚无已加载 File」时尝试一键恢复。
    * 已有可用文件时再点上传区 → 打开选文件对话框（可换文件）。
    */
-  var pending = window._pendingFwHandles && window._pendingFwHandles[chip];
+  var pending = window._pendingFwHandles[chip];
   var hasLoadedFile = !!(chip === 'esp32' ? window.esp32File : window.gd32File);
   if (pending || !hasLoadedFile) {
     var resumed = await resumePersistedFirmwareWithGesture(chip);
@@ -321,7 +329,7 @@ export async function pickFileViaFSAPI(chip) {
       ? { 'application/octet-stream': ['.bin'] }
       : { 'application/octet-stream': ['.bin', '.hex'] };
     var prevHandle = chip === 'esp32' ? window.esp32FileHandle : window.gd32FileHandle;
-    if (!prevHandle && window._pendingFwHandles) {
+    if (!prevHandle) {
       prevHandle = window._pendingFwHandles[chip] || null;
     }
     var opts = {
@@ -339,8 +347,8 @@ export async function pickFileViaFSAPI(chip) {
       var file = await handle.getFile();
       if (chip === 'esp32') window.esp32FileHandle = handle;
       else window.gd32FileHandle = handle;
-      if (window._pendingFwHandles) window._pendingFwHandles[chip] = null;
-      processFile(file, chip);
+      window._pendingFwHandles[chip] = null;
+      await processFile(file, chip);
       persistFileHandle(chip, handle);
       persistFileMeta(chip, file);
       persistFlashTarget(chip);
@@ -382,7 +390,7 @@ export function setupDropZone(zoneId, chip) {
  * @returns {{ data: Uint8Array, baseAddr: number, endAddr: number }}
  */
 export function parseIntelHex(hexText) {
-  var baseAddr = 0;     // 当前扩展地址
+  var baseAddr = 0;     // 当前扩展地址（uint32）
   var segments = [];     // { offset, data } 列表
   var minAddr = 0xFFFFFFFF;
   var maxAddr = 0;
@@ -391,13 +399,13 @@ export function parseIntelHex(hexText) {
     var line = lines[i].trim();
     if (!line || line[0] !== ':') continue;
     // 解析行: :LLAAAATT[DD...]CC
-    var byteCount = parseInt(line.substr(1, 2), 16);
-    var addr16   = parseInt(line.substr(3, 4), 16);
-    var recType  = parseInt(line.substr(7, 2), 16);
+    var byteCount = parseInt(line.slice(1, 3), 16);
+    var addr16   = parseInt(line.slice(3, 7), 16);
+    var recType  = parseInt(line.slice(7, 9), 16);
     // 校验和验证
     var sum = 0;
     for (var j = 1; j < line.length; j += 2) {
-      sum += parseInt(line.substr(j, 2), 16);
+      sum += parseInt(line.slice(j, j + 2), 16);
     }
     if ((sum & 0xFF) !== 0) {
       throw new Error('HEX 行 ' + (i + 1) + ' 校验和错误: ' + line);
@@ -406,17 +414,17 @@ export function parseIntelHex(hexText) {
       // EOF
       break;
     } else if (recType === 0x04) {
-      // 扩展线性地址 (upper 16 bits)
-      baseAddr = parseInt(line.substr(9, 4), 16) << 16;
+      // 扩展线性地址 (upper 16 bits)，>>>0 归整为 uint32
+      baseAddr = (parseInt(line.slice(9, 13), 16) << 16) >>> 0;
     } else if (recType === 0x02) {
-      // 扩展段地址
-      baseAddr = (parseInt(line.substr(9, 4), 16) << 4) & 0xFFFFF;
+      // 扩展段地址：seg << 4，不加掩码（避免截断 0x10FFEF 等合法地址）
+      baseAddr = (parseInt(line.slice(9, 13), 16) << 4) >>> 0;
     } else if (recType === 0x00) {
       // 数据记录
-      var absAddr = baseAddr + addr16;
+      var absAddr = (baseAddr + addr16) >>> 0;
       var data = new Uint8Array(byteCount);
       for (var k = 0; k < byteCount; k++) {
-        data[k] = parseInt(line.substr(9 + k * 2, 2), 16);
+        data[k] = parseInt(line.slice(9 + k * 2, 11 + k * 2), 16);
       }
       segments.push({ offset: absAddr, data: data });
       if (absAddr < minAddr) minAddr = absAddr;
@@ -459,15 +467,15 @@ export function isIntelHexText(text) {
  * 公共 HEX→BIN 转换：如果文件是 .hex 格式，自动解析为 bin。
  * BLE / WiFi 共用此函数，避免转换逻辑重复。
  * @param {File} file 原始文件
- * @returns {Promise<{file: File, converted: boolean, baseAddr: number|null}>}
+ * @returns {Promise<{file: File, converted: boolean, baseAddr: number|null, endAddr: number|null}>}
  */
 export async function convertHexFileToBin(file) {
   if (!file || !file.name.toLowerCase().endsWith('.hex')) {
-    return { file: file, converted: false, baseAddr: null };
+    return { file: file, converted: false, baseAddr: null, endAddr: null };
   }
   var text = await file.text();
   if (!isIntelHexText(text)) {
-    return { file: file, converted: false, baseAddr: null };
+    return { file: file, converted: false, baseAddr: null, endAddr: null };
   }
   var result = parseIntelHex(text);
   var binName = file.name.replace(/\.hex$/i, '.bin');
@@ -498,8 +506,7 @@ function _computeAndCacheFileSha(file, chip, optArrayBuffer) {
   return bufPromise.then(function(buf) {
     return crypto.subtle.digest('SHA-256', buf);
   }).then(function(hashBuffer) {
-    var hashArray = Array.from(new Uint8Array(hashBuffer));
-    var hashHex = hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('').toUpperCase();
+    var hashHex = bytesToHex(new Uint8Array(hashBuffer)).toUpperCase();
     if (shaElem) shaElem.textContent = hashHex;
     var meta = { size: file.size, lastModified: file.lastModified, name: file.name };
     if (chip === 'esp32') {
@@ -546,10 +553,13 @@ export function ensureFileShaCached(file, chip, optArrayBuffer) {
 // ==================== 文件处理 ====================
 /**
  * @description 处理用户选择的固件文件（HEX→BIN 转换、SHA-256 计算、文件校验）。
+ *              对 GD32 .hex 走异步转换；返回 Promise 以便调用方 await
+ *              （避免上游用 setTimeout 硬等，见 upload-esp32.js）。
  * @param {File} file
  * @param {'esp32'|'gd32'} chip
  * @param {{silent?: boolean, skipHandlePersist?: boolean}=} options
  *        silent: 恢复场景不弹 toast；skipHandlePersist: 已从 IDB 读出时不再写回
+ * @returns {Promise<void>}
  */
 export function processFile(file, chip, options) {
   var opts = options || {};
@@ -565,7 +575,7 @@ export function processFile(file, chip, options) {
   }
   if (chip === 'gd32' && isHexByName) {
     // GD32 固件: .hex 文件自动转换为 .bin，然后替换文件对象
-    convertHexFileToBin(file).then(function(result) {
+    return convertHexFileToBin(file).then(function(result) {
       if (!result.converted) {
         // 文件名 .hex 但内容不像，直接用原始文件
         addLog('W', '文件', file.name + ' 扩展名为 .hex 但内容不像 HEX 格式，按原始文件处理');
@@ -574,9 +584,8 @@ export function processFile(file, chip, options) {
         document.getElementById('fileName' + suffix).textContent = file.name;
         document.getElementById('fileType' + suffix).textContent = 'Binary(?)';
         document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
-        window.updateUploadButtonLabel();
-        ensureFileShaCached(file, 'gd32');
-        return;
+        safeUpdateUploadButtonLabel();
+        return ensureFileShaCached(file, 'gd32');
       }
       window.gd32File = result.file;
       var baseHex = '0x' + result.baseAddr.toString(16).toUpperCase().padStart(8, '0');
@@ -587,16 +596,16 @@ export function processFile(file, chip, options) {
       document.getElementById('fileName' + suffix).textContent = result.file.name + ' (由 ' + file.name + ' 转换)';
       document.getElementById('fileType' + suffix).textContent = 'Binary (HEX转换)';
       document.getElementById('fileSize' + suffix).textContent = formatBytes(result.file.size);
-      window.updateUploadButtonLabel();
-      ensureFileShaCached(result.file, 'gd32');
+      safeUpdateUploadButtonLabel();
+      return ensureFileShaCached(result.file, 'gd32');
     }).catch(function(err) {
       addLog('E', '文件', 'HEX 解析失败: ' + err.message);
       if (!silent) showToast('HEX 文件解析失败: ' + err.message, 'error');
       window.gd32File = null;
       document.getElementById('fileInfo' + suffix).classList.remove('show');
-      window.updateUploadButtonLabel();
+      safeUpdateUploadButtonLabel();
+      throw err; // 让上游 await 感知失败
     });
-    return; // 异步，回调里设置 gd32File
   }
   // .bin 文件或 ESP32 文件: 直接使用
   if (chip === 'esp32') window.esp32File = file;
@@ -606,7 +615,7 @@ export function processFile(file, chip, options) {
   document.getElementById('fileType' + suffix).textContent =
     isHexByName ? 'Intel HEX' : 'Binary';
   document.getElementById('fileSize' + suffix).textContent = formatBytes(file.size);
-  window.updateUploadButtonLabel();
+  safeUpdateUploadButtonLabel();
   if (silent) {
     addLog('I', '文件', chip.toUpperCase() + ' 已恢复: ' + file.name + ' (' + formatBytes(file.size) + ')');
   } else {
@@ -615,7 +624,7 @@ export function processFile(file, chip, options) {
   }
   // 选文件时就把 SHA-256 算好并缓存（ESP32/GD32 都算），
   // 上传时若文件未变 ensureFileShaCached 命中直接复用。
-  ensureFileShaCached(file, chip);
+  return Promise.resolve(ensureFileShaCached(file, chip));
 }
 
 /** @description 清除已选固件文件并重置对应 UI 状态。 */
@@ -628,13 +637,13 @@ export function clearFile(chip) {
     window.gd32File = null; window.gd32FileHandle = null;
     window._gd32FileSha256 = null; window._gd32FileShaMeta = null;
   }
-  if (window._pendingFwHandles) window._pendingFwHandles[chip] = null;
+  window._pendingFwHandles[chip] = null;
   persistFileHandle(chip, null);
   persistFileMeta(chip, null);
   document.getElementById('fileInput' + suffix).value = '';
   document.getElementById('fileInfo' + suffix).classList.remove('show');
-  var shaElem = document.getElementById('fileSha256' + suffix);
-  if (shaElem) shaElem.textContent = '-';
-  window.updateUploadButtonLabel();
+  var shaEl = document.getElementById('fileSha256' + suffix);
+  if (shaEl) shaEl.textContent = '-';
+  safeUpdateUploadButtonLabel();
   addLog('I', '文件', chip.toUpperCase() + ' 文件已清除');
 }

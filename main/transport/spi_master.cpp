@@ -409,9 +409,13 @@ void SpiMaster::workerLoop()
 /**
  * @brief GPIO 边沿中断回调（DATA_READY / PB6）。
  *
- * 仅处理下降沿：GD32 有待读数据（按铃）。若本端 IDLE 则置
- * m_gd32RequestPending 并唤醒 SPI worker。上升沿不再使用（旧 waitSpiReady 已删）。
+ * 仅处理下降沿：GD32 有待读数据（按铃）。上升沿不再使用（旧的"等上升沿
+ * ready"逻辑已删除，现由 waitSpiDataReady 做电平轮询）。
  * ISR 内仅做标志翻转 + 任务通知，不做 SPI 传输。
+ *
+ * 本端忙时（acceptRing()==false）：记下 pending 但不 notify，避免抢断
+ * 当前 SPI 事务；事务结束 worker 下一轮会立即消费此标志，省去最多 25ms
+ * 的回扫延迟。PB6 在被读走前保持低、不会产生新下降沿，不记 pending 即丢唤醒。
  */
 void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
 {
@@ -426,6 +430,10 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
         return;
     }
     if (!self->m_linkState.acceptRing()) {
+        /* 本端忙：记下 pending，不 notify 抢断当前事务；
+         * 事务结束 worker 下一轮会消费此标志（PB6 保持低、无新下降沿，
+         * 不记则只能等 25ms 回扫兜底）。 */
+        self->m_gd32RequestPending = true;
         return;
     }
     self->m_gd32RequestPending = true;

@@ -77,7 +77,7 @@ typedef struct {
 } id_snapshot_entry_t;
 
 // ============================================================
-// CAN 接收过滤模式 & 1Hz 反馈快照
+// CAN 接收过滤模式 & 反馈快照（GD32 约 1Hz 刷新；ESP32 被动收 0xC1）
 // 与 GD32 DCU_APP SPI 协议帧 0xC1/0xC2 配套
 // ============================================================
 typedef enum {
@@ -87,7 +87,7 @@ typedef enum {
 } can_rx_mode_t;
 
 /**
- * @brief 单通道 1Hz 反馈统计。
+ * @brief 单通道 CAN 反馈统计（快照字段；非 ESP32 侧 1Hz 轮询）。
  */
 typedef struct {
     uint8_t   channel;

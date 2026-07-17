@@ -71,6 +71,11 @@ export function currentTarget() {
   return TARGETS[window.flashTarget] || TARGETS.esp32;
 }
 
+/** BLE 通道是否正在上传/自动刷写。集中判定，避免各处重复 state.uploading || state.autoFlashing。 */
+export function isBleUploading() {
+  return !!(state.uploading || state.autoFlashing);
+}
+
 export function currentPayloadSize() {
   const cfg = currentTarget();
   return Math.max(32, Math.min(498, Number(cfg.recommendedPayload) || 480));
@@ -110,26 +115,23 @@ export function setReadyHint(html) {
 
 export function setConnectionState(connected) {
   const idle = connected && state.selectedFile && !state.uploading;
-  // 仅在 BLE 模式下更新共享连接指示器，避免覆盖 WiFi 轮询的状态
+  // 仅在 BLE 模式下更新共享连接指示器与 BLE 专用徽章，避免覆盖 WiFi 轮询的状态
   if (typeof connectionMode !== 'undefined' && connectionMode === 'ble') {
     if (els.connStatus) els.connStatus.className = connected ? 'conn-indicator ok' : 'conn-indicator err';
     if (els.connStatusTxt) els.connStatusTxt.textContent = connected ? 'BLE 已连接' : 'BLE 未连接';
-  }
-  // BLE 专用连接徽章 — 仅在 BLE 模式下更新，避免覆盖 WiFi 状态
-  if (typeof connectionMode !== 'undefined' && connectionMode === 'ble') {
-    if (els.connState) els.connState.textContent = connected ? '已连接' : '未连接';
-    if (els.connState && els.connState.parentElement) {
-      els.connState.parentElement.className = connected ? 'pill online' : 'pill offline';
+    if (els.connState) {
+      els.connState.textContent = connected ? '已连接' : '未连接';
+      if (els.connState.parentElement) {
+        els.connState.parentElement.className = connected ? 'pill online' : 'pill offline';
+      }
     }
-    els.connBadge.textContent = connected ? 'online' : 'offline';
-    els.connBadge.className = `v ${connected ? 'ok' : 'bad'}`;
-    els.gattState.textContent = connected ? 'GATT 已就绪' : '未就绪';
+    if (els.connBadge) {
+      els.connBadge.textContent = connected ? 'online' : 'offline';
+      els.connBadge.className = `v ${connected ? 'ok' : 'bad'}`;
+    }
+    if (els.gattState) els.gattState.textContent = connected ? 'GATT 已就绪' : '未就绪';
   }
-  if (connected) {
-    els.connectBtn.disabled = true;
-  } else {
-    els.connectBtn.disabled = false;
-  }
+  els.connectBtn.disabled = connected;
   els.disconnectBtn.disabled = !connected;
   els.autoFlashBtn.disabled = !idle;
   els.abortBtn.disabled = !state.uploading;

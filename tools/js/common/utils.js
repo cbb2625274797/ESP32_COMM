@@ -42,3 +42,19 @@ export function escapeHtml(text) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
+/**
+ * @description 将字节数组（Uint8Array 或 ArrayBuffer）转为小写 hex 字符串。
+ *              SHA-256 等哈希显示前需要 toUpperCase()。
+ * @param {Uint8Array|ArrayBuffer} bytes
+ * @returns {string}
+ */
+export function bytesToHex(bytes) {
+  var arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  var out = '';
+  for (var i = 0; i < arr.length; i++) {
+    var h = arr[i].toString(16);
+    if (h.length < 2) h = '0' + h;
+    out += h;
+  }
+  return out;
+}

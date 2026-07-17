@@ -10,11 +10,13 @@ export const UUIDS = {
   version: 0x0004,
 };
 
-export const UI_BUILD = '2026-07-18-ble-fix';
+export const UI_BUILD = '2026-07-18-ble-log-trim';
 export const BLE_OTA_NOTIFY_ACK = 0xA1;
 export const BLE_OTA_NOTIFY_FINISH = 0xB1;
 export const BLE_OTA_NOTIFY_SHA256 = 0xC1;
-export const BLE_OTA_ACK_WINDOW = 32;
+// ★ 须与后端 main/include/app_config.h BLE_OTA_ACK_WINDOW 保持一致
+//   64：实测 Windows 瓶颈在每窗口 ACK 往返，窗口 32→64 提速 ~10%，再试 96 无收益。
+export const BLE_OTA_ACK_WINDOW = 64;
 export const BLE_OTA_FINISH_ESP32_DONE = 0x02;
 export const BLE_OTA_FINISH_REBOOT_NOW = 0x07;
 export const BLE_OTA_FINISH_GD32_RELAY_START = 0x10;

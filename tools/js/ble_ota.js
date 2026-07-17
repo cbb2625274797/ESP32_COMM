@@ -26,23 +26,7 @@ window.bleOta = {
   },
   disconnect: disconnectBle,
   showToast: showToast,
-  notifyFileChange: async function(file, handle) {
-    // ★ 上传进行中拒绝外部文件变更通知：防止 index.html 的 syncBleFileFromSelectedTarget
-    //   在上传期间调用本函数 → updateFileInfo → setProgress(0, ...) 覆盖上传进度。
-    if (state.uploading || state.autoFlashing) {
-      bleLog('FILE', '上传进行中，忽略外部 notifyFileChange', 'D');
-      return;
-    }
-    // ★ WiFi 通道上传期间同样拒绝：setConsoleMode('ble') 等外部触发会覆盖 WiFi 进度
-    if (typeof window.isUploading !== 'undefined' && window.isUploading) {
-      bleLog('FILE', 'WiFi 上传进行中，忽略外部 notifyFileChange', 'D');
-      return;
-    }
-    if (file) {
-      if (handle) state.selectedFileHandle = handle;
-      await notifyFileChange(file, handle);
-    }
-  },
+  notifyFileChange: notifyFileChange,
   clearFile: clearSelectedFile,
   refreshButtons: function() {
     setConnectionState(!!state.server);

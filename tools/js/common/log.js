@@ -1,70 +1,101 @@
 /**
- * log.js - 日志系统（带去重 + 自动滚动）
+ * log.js - 日志系统（带去重 + 自动滚动 + 上限裁剪）
  *
  * 日志环形缓冲、去重、过滤、自动滚动逻辑。
  * 操作 DOM 元素 #logScroll / #logCount / #autoScrollBtn / .log-filter。
  */
-import { formatTime } from './utils.js';
+import { formatTime, escapeHtml } from './utils.js';
 
 // ==================== 日志系统状态 ====================
-let logFilter = 'all';
-let logEntries = [];
-let lastLogHash = null;
-let autoScroll = true;
+var MAX_LOGS = 1000;          // 缓冲上限，超出后丢弃最旧条目
+var logFilter = 'all';
+var logEntries = [];
+var lastLogHash = null;
+var autoScroll = true;
+
+// 缓存 DOM 引用，避免高频日志下重复 getElementById
+var scrollEl = document.getElementById('logScroll');
+var countEl = document.getElementById('logCount');
 
 // ==================== 日志系统 (带去重 + 自动滚动) ====================
 function makeLogHash(level, tag, message) {
   return level + '|' + tag + '|' + message;
 }
-/** @description 添加一条日志条目到环形缓冲区和日志面板。 */
-export function addLog(level, tag, message) {
-  var scroll = document.getElementById('logScroll');
-  var time = formatTime(new Date());
-  var hash = makeLogHash(level, tag, message);
-  if (hash === lastLogHash) return; // 去重
-  lastLogHash = hash;
-  var entry = { time: time, level: level, tag: tag, message: message };
-  logEntries.push(entry);
-  if (logFilter !== 'all' && level !== logFilter) return;
+/** 构造一条日志 DOM 节点（tag/message 经 HTML 转义，防 XSS）。 */
+function createLogLine(entry) {
   var div = document.createElement('div');
   div.className = 'log-line';
   div.innerHTML =
-    '<span class="lt">[' + time + ']</span>' +
-    '<span class="lv ' + level + '">' + level + '</span>' +
-    '<span class="lg">[' + tag + ']</span>' +
-    '<span class="lm">' + message + '</span>';
-  scroll.appendChild(div);
-  if (autoScroll) scroll.scrollTop = scroll.scrollHeight;
-  document.getElementById('logCount').textContent = logEntries.length;
+    '<span class="lt">[' + escapeHtml(entry.time) + ']</span>' +
+    '<span class="lv ' + escapeHtml(entry.level) + '">' + escapeHtml(entry.level) + '</span>' +
+    '<span class="lg">[' + escapeHtml(entry.tag) + ']</span>' +
+    '<span class="lm">' + escapeHtml(entry.message) + '</span>';
+  return div;
+}
+/** 同步 #logCount 为当前可见条目数。 */
+function syncCount() {
+  if (countEl) countEl.textContent = logEntries.length;
+}
+/** 超过上限时丢弃最旧条目，并同步移除其 DOM 节点。 */
+function trimIfNeeded() {
+  while (logEntries.length > MAX_LOGS) {
+    var old = logEntries.shift();
+    if (old && old.div && old.div.parentNode) old.div.parentNode.removeChild(old.div);
+  }
+}
+/** @description 添加一条日志条目到环形缓冲区和日志面板。 */
+export function addLog(level, tag, message) {
+  var hash = makeLogHash(level, tag, message);
+  if (hash === lastLogHash) return; // 去重
+  lastLogHash = hash;
+  var entry = {
+    time: formatTime(new Date()),
+    level: level,
+    tag: tag,
+    message: message,
+    div: null
+  };
+  logEntries.push(entry);
+  trimIfNeeded();
+  if (logFilter !== 'all' && level !== logFilter) {
+    syncCount();
+    return;
+  }
+  var div = createLogLine(entry);
+  entry.div = div;
+  if (scrollEl) {
+    scrollEl.appendChild(div);
+    if (autoScroll) scrollEl.scrollTop = scrollEl.scrollHeight;
+  }
+  syncCount();
 }
 export function clearLogs() {
-  document.getElementById('logScroll').innerHTML = '';
+  if (scrollEl) scrollEl.innerHTML = '';
   logEntries = [];
   lastLogHash = null;
-  document.getElementById('logCount').textContent = '0';
+  syncCount();
 }
 export function setLogFilter(level, btn) {
   document.querySelectorAll('.log-filter').forEach(function (b) { b.classList.remove('active'); });
-  btn.classList.add('active');
+  if (btn) btn.classList.add('active');
   logFilter = level;
-  var scroll = document.getElementById('logScroll');
-  scroll.innerHTML = '';
+  if (!scrollEl) return;
+  var frag = document.createDocumentFragment();
   logEntries.forEach(function (e) {
     if (level === 'all' || e.level === level) {
-      var div = document.createElement('div');
-      div.className = 'log-line';
-      div.innerHTML =
-        '<span class="lt">[' + e.time + ']</span>' +
-        '<span class="lv ' + e.level + '">' + e.level + '</span>' +
-        '<span class="lg">[' + e.tag + ']</span>' +
-        '<span class="lm">' + e.message + '</span>';
-      scroll.appendChild(div);
+      var div = createLogLine(e);
+      e.div = div;
+      frag.appendChild(div);
+    } else {
+      e.div = null;
     }
   });
-  if (autoScroll) scroll.scrollTop = scroll.scrollHeight;
+  scrollEl.innerHTML = '';
+  scrollEl.appendChild(frag);
+  if (autoScroll) scrollEl.scrollTop = scrollEl.scrollHeight;
 }
 export function toggleAutoScroll() {
   autoScroll = !autoScroll;
   var btn = document.getElementById('autoScrollBtn');
-  btn.textContent = autoScroll ? '\uD83D\uDCCC 自动滚动' : '\u23F8\uFE0F 暂停滚动';
+  if (btn) btn.textContent = autoScroll ? '\uD83D\uDCCC 自动滚动' : '\u23F8\uFE0F 暂停滚动';
 }

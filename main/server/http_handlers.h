@@ -22,7 +22,7 @@ esp_err_t spi_send_handler(httpd_req_t *req);
 esp_err_t system_status_handler(httpd_req_t *req);
 esp_err_t system_probe_handler(httpd_req_t *req);
 
-// CAN 1Hz 反馈快照与接收模式
+// CAN 反馈快照（被动 0xC1）与接收模式
 esp_err_t can_feedback_handler(httpd_req_t *req);
 esp_err_t can_mode_handler(httpd_req_t *req);
 

@@ -162,8 +162,9 @@ export async function startUpload(chip) {
         file = freshFile;
       } else {
         if (freshFile.name.toLowerCase().endsWith('.hex')) {
-          window.processFile(freshFile, 'gd32');
-          await new Promise(function(resolve) { setTimeout(resolve, 200); });
+          // processFile 现已返回 Promise，await 即可拿到转换后的 gd32File，
+          // 不再用 setTimeout 硬等（避免 HEX 稍大时拿到 null）。
+          await window.processFile(freshFile, 'gd32');
           file = window.gd32File;
         } else {
           window.gd32File = freshFile;

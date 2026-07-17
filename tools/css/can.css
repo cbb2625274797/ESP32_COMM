@@ -142,10 +142,6 @@
   letter-spacing: .12em;
   text-transform: uppercase;
 }
-.spi-grid {
-  display: grid; grid-template-columns: 80px 1fr 80px 80px; gap: 10px;
-}
-
 /* === CAN WORKSPACE PAGE === */
 /* 右侧监控抽屉 translate 出屏时，防止 body 被撑出横向滚动条 */
 body.can-page {

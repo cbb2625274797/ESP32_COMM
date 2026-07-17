@@ -29,7 +29,7 @@ import {
   currentTarget,
   sleep,
 } from './state.js';
-import { setBleStage, setBleStageError, setBleStageText, resetBleStages } from './stages.js';
+import { setBleStage, setBleStageError, setBleStageText, setBleStageStatus, resetBleStages } from './stages.js';
 import { setProgress, updateProgressFromAck } from './transfer.js';
 import { showBleVerifyInfo } from './verify.js';
 import {
@@ -43,6 +43,23 @@ import {
 } from './session.js';
 import { formatBytes } from '../common/utils.js';
 import { showToast } from '../common/toast.js';
+
+/**
+ * @description 中止当前 ACK 等待 Promise，并复位重连状态。
+ * 用于所有"错误类 FINISH"和"用户中止"路径，避免 ackWaiter 悬挂。
+ */
+function abortAckWaiter(reason) {
+  if (state.ackWaiter) {
+    const waiter = state.ackWaiter;
+    state.ackWaiter = null;
+    clearTimeout(waiter.timer);
+    waiter.reject(new Error(reason));
+  }
+  state.abortRequested = true;
+  state.expectedReboot = false;
+  state.reconnecting = false;
+  state.reconnectAttempts = 0;
+}
 
 /** @description 连接 BLE 设备（扫描→连接→发现服务→使能通知）。 */
 export async function connectBle() {
@@ -199,9 +216,10 @@ export function handleNotify(event) {
       updateProgressFromAck(state.activeTotalSize, state.activePacketTotal, state.lastAckBytes);
     }
 
-    /* 传输期少打日志：整窗 ACK 频繁时 hex 刷屏拖慢 UI/主线程 */
+    /* 传输期少打日志：整窗 ACK 频繁时 hex 刷屏拖慢 UI/主线程。
+     * ★ 降为 D 级：成功路径默认不显示，需要时切过滤级查看。 */
     if (!state.uploading || (ackSeq % 16) === 0 || ackSeq < 2) {
-      bleLog('ACK', `cmd=0x${ackCmd.toString(16).padStart(2, '0').toUpperCase()} seq=${ackSeq} bytes=${state.lastAckBytes} (${formatBytes(state.lastAckBytes)})`);
+      bleLog('ACK', `cmd=0x${ackCmd.toString(16).padStart(2, '0').toUpperCase()} seq=${ackSeq} bytes=${state.lastAckBytes} (${formatBytes(state.lastAckBytes)})`, 'D');
     }
 
     // ★ 放宽匹配条件：只要 cmd 匹配 + generation 匹配 + 字节数足够，即接受 ACK
@@ -269,10 +287,7 @@ export function handleNotify(event) {
       if (typeof markPhaseDone === 'function') markPhaseDone('gd32Ota');
       setProgress(100, '[GD32] OTA 转发完成，APP 已启动');
       showBleVerifyInfo(state.fileSha256 || '-', state.deviceSha256 || '设备未上报', { text: 'GD32 OTA 完成', ok: true });
-      var gd32Bar = document.getElementById('stageStatusBar');
-      var gd32Text = document.getElementById('stageStatusText');
-      if (gd32Bar) gd32Bar.className = 'stage-status-bar ok';
-      if (gd32Text) gd32Text.textContent = 'GD32 刷写完成';
+      setBleStageStatus('ok', 'GD32 刷写完成');
       state.lastUploadStatus = 'success';
       showToast('GD32 OTA 刷写完成', 'success');
       resolveOtaResult('success', { stage: stage, value: value });
@@ -283,21 +298,11 @@ export function handleNotify(event) {
     // 中止可由用户主动点"中止"按钮（abortTask 发 0xFB）触发，
     // 也可能是设备端因错误自动中止。两种情况都走同一清理路径。
     if (stage === BLE_OTA_FINISH_ABORTED) {
-      state.abortRequested = true;
-      state.expectedReboot = false;
-      state.reconnecting = false;
-      state.reconnectAttempts = 0;
       state.lastUploadStatus = 'aborted';
       setProgress(0, 'OTA 已中止');
       setBleStageError('OTA 已中止');
       showToast('OTA 已中止（BLE 保持连接）', 'warning');
-      // 解除任何等待 ACK / OTA 结果的 Promise
-      if (state.ackWaiter) {
-        const waiter = state.ackWaiter;
-        state.ackWaiter = null;
-        clearTimeout(waiter.timer);
-        waiter.reject(new Error('OTA 已中止'));
-      }
+      abortAckWaiter('OTA 已中止');
       rejectOtaResult('OTA 已中止', { stage: stage, value: value });
       return;
     }
@@ -328,10 +333,7 @@ export function handleNotify(event) {
       state.expectedReboot = true;
       setBleStage(finalizeStage, '设备重启', null);
       // ★ ESP32 收尾完成 = 成功路径：保持 status bar 绿色，不要切回 active 蓝
-      var rebootBar = document.getElementById('stageStatusBar');
-      var rebootBarTxt = document.getElementById('stageStatusText');
-      if (rebootBar) rebootBar.className = 'stage-status-bar ok';
-      if (rebootBarTxt) rebootBarTxt.textContent = 'ESP32 刷写完成，等待重启';
+      setBleStageStatus('ok', 'ESP32 刷写完成，等待重启');
       if (typeof markPhaseDone === 'function') {
         markPhaseDone('esp32Ota');
       }
@@ -393,16 +395,7 @@ export function handleNotify(event) {
     }
     // 错误类 FINISH 事件立即中断 waitForAck，并中止发送循环
     if (stage >= 0x80) {
-      state.abortRequested = true;  // ★ 阻止 fire-and-forget 继续发包
-      state.expectedReboot = false; // ★ 刷写失败，取消任何重连退避
-      state.reconnecting = false;
-      state.reconnectAttempts = 0;
-      if (state.ackWaiter) {
-        const waiter = state.ackWaiter;
-        state.ackWaiter = null;
-        clearTimeout(waiter.timer);
-        waiter.reject(new Error(`设备端 FINISH 错误: stage=0x${stage.toString(16).padStart(2, '0').toUpperCase()} value=${value}`));
-      }
+      abortAckWaiter(`设备端 FINISH 错误: stage=0x${stage.toString(16).padStart(2, '0').toUpperCase()} value=${value}`);
     }
     return;
   }
@@ -421,7 +414,7 @@ export function handleNotify(event) {
       return b.toString(16).padStart(2, '0');
     }).join('').toUpperCase();
     state.deviceSha256 = devSha;
-    bleLog('VERIFY', '设备端 SHA-256: ' + devSha);
+    bleLog('VERIFY', '设备端 SHA-256: ' + devSha, 'D');
 
     // 设备端上报 SHA-256 后，前端仅做展示与状态同步。
     var frontSha = state.fileSha256;
@@ -431,10 +424,7 @@ export function handleNotify(event) {
       showBleVerifyInfo(frontSha, devSha, { text: '校验通过 — SHA-256 一致', ok: true });
       setBleStage(verifyStage, 'SHA-256 ✓', null);
       // ★ 校验通过 = 刷写成功：status bar 标绿 + 顶部胶囊推进
-      var okBar = document.getElementById('stageStatusBar');
-      var okTxt = document.getElementById('stageStatusText');
-      if (okBar) okBar.className = 'stage-status-bar ok';
-      if (okTxt) okTxt.textContent = '刷写成功 — SHA-256 校验通过';
+      setBleStageStatus('ok', '刷写成功 — SHA-256 校验通过');
       if (typeof markPhaseDone === 'function') {
         markPhaseDone(state.uploadTargetKey === 'gd32' ? 'gd32Ota' : 'esp32Ota');
       }
@@ -471,9 +461,14 @@ export async function tryReconnect() {
   state.reconnecting = true;
   state.reconnectAttempts += 1;
   var attempt = state.reconnectAttempts;
-  // 退避：1s, 2s, 4s, 8s, 上限 10s
+  // 退避：约 1s / 1.6s / 2.6s / 4.1s / 6.6s / 10.5s…，上限 10s
   var backoff = Math.min(10000, 1000 * Math.pow(1.6, attempt - 1));
   if (backoff > 200) await sleep(backoff);
+  // ★ 退避期间用户可能已手动断开（disconnectBle 会清 expectedReboot），需二次校验避免幽灵重连
+  if (!state.expectedReboot || !state.device) {
+    state.reconnecting = false;
+    return;
+  }
   if (typeof connectionMode !== 'undefined' && connectionMode === 'ble') {
     if (els.connState) els.connState.textContent = '重连中(' + attempt + ')';
     if (els.connState && els.connState.parentElement) els.connState.parentElement.className = 'pill processing';

@@ -108,7 +108,11 @@ function setConnectionState(connected, text, buildVersion, buildTime, wifi, upti
 async function testConnection() {
   var baseUrl = getBaseUrl();
   try {
-    var resp = await fetch(baseUrl + '/system/status', { signal: AbortSignal.timeout(3000) });
+    /* 状态端点禁用 HTTP 缓存，避免命中旧响应 */
+    var resp = await fetch(baseUrl + '/system/status', {
+      signal: AbortSignal.timeout(3000),
+      cache: 'no-store'
+    });
     if (!resp.ok) {
       setConnectionState(false, 'HTTP ' + resp.status, '', '', {}, null);
       return;
@@ -209,7 +213,11 @@ async function handleDbcFiles(fileList) {
     }
   }
 
-  afterDbcSourcesChanged({ resetSelection: true });
+  /* 仅在确有新增/覆盖时才 reset 并刷新 UI；
+   * 全部解析失败时保留用户当前选中/勾选/信号值，只弹错误提示。 */
+  if (added || replaced) {
+    afterDbcSourcesChanged({ resetSelection: true });
+  }
 
   if (added || replaced) {
     var msg = 'DBC：';
@@ -317,10 +325,10 @@ function bindEvents() {
       scheduleCanPersist();
     });
   }
-  el.sendSelectedBtn.addEventListener('click', sendSelectedMessage);
-  el.loadPreviewToRawBtn.addEventListener('click', loadPreviewToManual);
-  el.sendManualBtn.addEventListener('click', sendManualFrame);
-  el.resetManualBtn.addEventListener('click', function () {
+  if (el.sendSelectedBtn) el.sendSelectedBtn.addEventListener('click', sendSelectedMessage);
+  if (el.loadPreviewToRawBtn) el.loadPreviewToRawBtn.addEventListener('click', loadPreviewToManual);
+  if (el.sendManualBtn) el.sendManualBtn.addEventListener('click', sendManualFrame);
+  if (el.resetManualBtn) el.resetManualBtn.addEventListener('click', function () {
     resetManualFields();
     scheduleCanPersist();
   });
@@ -328,9 +336,10 @@ function bindEvents() {
     refreshManualHint();
     scheduleCanPersist();
   }
-  el.manualData.addEventListener('input', onManualFieldChange);
-  el.manualDlc.addEventListener('input', onManualFieldChange);
-  el.manualId.addEventListener('input', onManualFieldChange);
+  /* 手动帧三字段统一守卫，避免任一元素缺失时后续绑定被中断 */
+  ['manualData', 'manualDlc', 'manualId'].forEach(function (id) {
+    if (el[id]) el[id].addEventListener('input', onManualFieldChange);
+  });
   if (el.manualChannel) el.manualChannel.addEventListener('change', scheduleCanPersist);
   if (el.sendCheckedBtn) el.sendCheckedBtn.addEventListener('click', sendCheckedMessages);
   if (el.selectAllBox) el.selectAllBox.addEventListener('change', function () {

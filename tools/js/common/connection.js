@@ -18,20 +18,25 @@ import { showToast } from './toast.js';
 
 // ==================== 连接管理 ====================
 export function updateConnectionUi(connected, text) {
+  var label = text || (connected ? '已连接' : '未连接');
   // header pill
   var pc = document.getElementById('pillConn');
   var pct = document.getElementById('pillConnTxt');
-  pc.className = connected ? 'pill online' : 'pill offline';
-  pct.textContent = text || (connected ? '已连接' : '未连接');
+  if (pc) {
+    pc.className = connected ? 'pill online' : 'pill offline';
+    if (pct) pct.textContent = label;
+  }
   // connection card indicator
   var cs = document.getElementById('connStatus');
   var cst = document.getElementById('connStatusTxt');
   if (cs) cs.className = connected ? 'conn-indicator ok' : 'conn-indicator err';
-  if (cst) cst.textContent = connected ? (text || '已连接') : '未连接';
+  if (cst) cst.textContent = connected ? label : '未连接';
   // primary badge
   var bc = document.getElementById('bConn');
-  bc.textContent = connected ? '在线' : '离线';
-  bc.className = 'v ' + (connected ? 'ok' : 'err');
+  if (bc) {
+    bc.textContent = connected ? '在线' : '离线';
+    bc.className = 'v ' + (connected ? 'ok' : 'err');
+  }
 }
 export function updateHealthUi(healthCode, freeHeap) {
   var healthNames = ['正常', '警告', '危险', '关机'];
@@ -141,15 +146,14 @@ function updateBootInitUi(data) {
   if (!window._bootInitLogged) {
     window._bootInitLogged = true;
     var logLine = '启动自检: ' + summary + (failed ? ' · 失败/跳过: ' + failed : '');
-    try {
-      addLog(allOk ? 'I' : (criticalOk ? 'W' : 'E'), 'BOOT', logLine);
-    } catch (_) {}
+    addLog(allOk ? 'I' : (criticalOk ? 'W' : 'E'), 'BOOT', logLine);
   }
   ensureHealthBootToggleBound();
 }
 
 export function updateHeapAndTaskStatusUi(data) {
   if (!data) return;
+  var formatPercent = window.formatPercent;
   var ota = data.ota || {};
   var setText = function (id, value) {
     var el = document.getElementById(id);
@@ -214,9 +218,9 @@ export function updateHeapAndTaskStatusUi(data) {
       return (Number(b.usage_pct) || 0) - (Number(a.usage_pct) || 0);
     });
 
-    setText('cpuUsageText', 'CPU 已用 ' + window.formatPercent(usagePct));
-    setText('cpuUsagePct', window.formatPercent(usagePct));
-    setText('cpuIdlePct', window.formatPercent(idlePct));
+    setText('cpuUsageText', 'CPU 已用 ' + formatPercent(usagePct));
+    setText('cpuUsagePct', formatPercent(usagePct));
+    setText('cpuIdlePct', formatPercent(idlePct));
     setText('cpuSampleMs', sampleMs > 0 ? sampleMs + ' ms' : '--');
     setText('cpuTaskCount', String(tasks.length));
     setCpuFill(usagePct);
@@ -234,13 +238,13 @@ export function updateHeapAndTaskStatusUi(data) {
             '<div class="status-task cpu-task">' +
               '<div class="status-task-head">' +
                 '<div class="status-task-name">' + escapeHtml(task.name || 'task') + '</div>' +
-                '<div class="status-task-ratio">' + escapeHtml(window.formatPercent(pct)) + '</div>' +
+                '<div class="status-task-ratio">' + escapeHtml(formatPercent(pct)) + '</div>' +
               '</div>' +
               '<div class="status-task-bar"><div class="status-task-bar-fill ' + fillClass + '" style="width:' + Math.max(0, Math.min(100, pct)) + '%"></div></div>' +
               '<div class="status-task-meta">' +
                 '<div><span>任务号</span><b>' + escapeHtml(task.task_number) + '</b></div>' +
                 '<div><span>增量</span><b>' + escapeHtml(delta) + '</b></div>' +
-                '<div><span>占比</span><b>' + escapeHtml(window.formatPercent(pct)) + '</b></div>' +
+                '<div><span>占比</span><b>' + escapeHtml(formatPercent(pct)) + '</b></div>' +
               '</div>' +
             '</div>';
         }).join('');
@@ -294,7 +298,7 @@ export function updateHeapAndTaskStatusUi(data) {
           '<div class="status-task">' +
             '<div class="status-task-head">' +
               '<div class="status-task-name">' + escapeHtml(name) + '</div>' +
-              '<div class="status-task-ratio">' + escapeHtml(window.formatPercent(usagePct)) + '</div>' +
+              '<div class="status-task-ratio">' + escapeHtml(formatPercent(usagePct)) + '</div>' +
             '</div>' +
             '<div class="status-task-bar"><div class="status-task-bar-fill ' + fillClass + '" style="width:' + Math.max(0, Math.min(100, usagePct)) + '%"></div></div>' +
             '<div class="status-task-meta">' +
@@ -351,38 +355,50 @@ export async function diagnoseNetwork() {
   return result.join('；');
 }
 
+/**
+ * 统一的 /system/status 抓取器：独立 AbortController，超时后中断，
+ * 避免与递归调度的 pollStatus 互相干扰。
+ * 成功返回 data，HTTP 非 2xx 抛 Error(含 status)，网络失败抛原 Error。
+ */
+async function fetchSystemStatus(timeoutMs) {
+  var ac = new AbortController();
+  var timer = setTimeout(function () { ac.abort(); }, timeoutMs || 3000);
+  try {
+    var resp = await fetch(window.getBaseUrl() + '/system/status', { signal: ac.signal });
+    if (!resp.ok) {
+      var err = new Error('HTTP ' + resp.status);
+      err.status = resp.status;
+      throw err;
+    }
+    return await resp.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** @description 测试与 ESP32 的连接（GET /status）。 */
 export async function testConnection() {
-  // 立即发一次请求检测
-  // 手动检测使用独立的 AbortController，避免打断递归调度的 pollStatus
-  var testAbort = new AbortController();
-  var testTimer = setTimeout(function() { try { testAbort.abort(); } catch(_e) {} }, 3000);
   try {
-    var resp = await fetch(window.getBaseUrl() + '/system/status', {
-      signal: testAbort.signal
-    });
-    if (resp.ok) {
-      var data = await resp.json();
-      window.latestSystemStatus = data;
-      window.updateSystemStatusUi(data);
-      var wifi = data.wifi || {};
-      addLog('I', '连接', wifi.connected
-        ? '已连接：' + (wifi.mode || 'STA') + ' ' + (wifi.ip || '')
-        : '未连接：' + (wifi.mode || 'STA'));
-      showToast(wifi.connected ? 'ESP32 当前在线' : 'ESP32 当前未连接',
-        wifi.connected ? 'success' : 'warning');
-    } else {
-      addLog('E', '连接', 'HTTP ' + resp.status);
-      showToast('设备响应异常: HTTP ' + resp.status, 'error');
-    }
+    var data = await fetchSystemStatus(3000);
+    window.latestSystemStatus = data;
+    window.updateSystemStatusUi(data);
+    var wifi = data.wifi || {};
+    addLog('I', '连接', wifi.connected
+      ? '已连接：' + (wifi.mode || 'STA') + ' ' + (wifi.ip || '')
+      : '未连接：' + (wifi.mode || 'STA'));
+    showToast(wifi.connected ? 'ESP32 当前在线' : 'ESP32 当前未连接',
+      wifi.connected ? 'success' : 'warning');
   } catch (e) {
+    if (e && e.status) {
+      addLog('E', '连接', 'HTTP ' + e.status);
+      showToast('设备响应异常: HTTP ' + e.status, 'error');
+      return;
+    }
     addLog('E', '连接', '连接失败: ' + e.message);
     // 连接失败时自动诊断
     var diag = await diagnoseNetwork();
     addLog('W', '诊断', diag);
     showToast('无法连接: ' + diag, 'error');
-  } finally {
-    clearTimeout(testTimer);
   }
 }
 export async function refreshSystemStatusNow(event) {
@@ -390,27 +406,19 @@ export async function refreshSystemStatusNow(event) {
     event.preventDefault();
     event.stopPropagation();
   }
-  // 手动刷新使用独立的 AbortController，避免与递归调度的 pollStatus 互相干扰
-  var manualAbort = new AbortController();
-  var manualTimer = setTimeout(function() { try { manualAbort.abort(); } catch(_e) {} }, 3000);
   try {
-    var resp = await fetch(window.getBaseUrl() + '/system/status', {
-      signal: manualAbort.signal
-    });
-    if (!resp.ok) {
-      addLog('E', '状态', '刷新失败: HTTP ' + resp.status);
-      showToast('状态刷新失败: HTTP ' + resp.status, 'error');
-      return;
-    }
-    var data = await resp.json();
+    var data = await fetchSystemStatus(3000);
     window.latestSystemStatus = data;
     window.updateSystemStatusUi(data);
     window.consecutivePollFailures = 0;
     addLog('I', '状态', '已手动刷新 /system/status');
   } catch (e) {
+    if (e && e.status) {
+      addLog('E', '状态', '刷新失败: HTTP ' + e.status);
+      showToast('状态刷新失败: HTTP ' + e.status, 'error');
+      return;
+    }
     addLog('E', '状态', '刷新失败: ' + e.message);
     showToast('状态刷新失败', 'error');
-  } finally {
-    clearTimeout(manualTimer);
   }
 }

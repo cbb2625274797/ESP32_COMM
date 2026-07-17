@@ -182,7 +182,7 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t ch
         m_sysState = OTA_SYS_GD32_STORING;
         m_gd32StorageDone = false;
         m_busySinceTick = xTaskGetTickCount();  // ★ 记录忙状态起始时刻
-        DEBUG_INFO(TAG, "GD32 固件存储开始: %" PRIu32 " 字节, 系统状态 → GD32_STORING (epoch=%u, channel=%d)",
+        DEBUG_DBG(TAG, "GD32 固件存储开始: %" PRIu32 " 字节, 系统状态 → GD32_STORING (epoch=%u, channel=%d)",
                    total_size, m_otaEpoch, (int)channel);
     }
     unlock(h);
@@ -248,7 +248,7 @@ void OtaCoordinator::completeGd32Storage()
         m_gd32StorageDone = true;
         m_busySinceTick = 0;  // ★ STORED 是非忙状态
         resume_ble = (m_otaChannel == OTA_CHANNEL_WIFI);
-        DEBUG_INFO(TAG, "GD32 固件存储完成, 系统状态 → GD32_STORED");
+        DEBUG_DBG(TAG, "GD32 固件存储完成, 系统状态 → GD32_STORED");
     } else if (h) {
         DEBUG_WARN(TAG, "completeGd32Storage 在非预期状态: %d", (int)m_sysState);
     }
@@ -324,7 +324,7 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
 
     m_sysState = OTA_SYS_GD32_RELAYING;
     m_busySinceTick = xTaskGetTickCount();
-    DEBUG_INFO(TAG, "触发 GD32 中继, 系统状态 → GD32_RELAYING");
+    DEBUG_DBG(TAG, "触发 GD32 中继, 系统状态 → GD32_RELAYING");
     unlock(h);
     return ESP_OK;
 }
@@ -337,7 +337,7 @@ void OtaCoordinator::notifyRelayStarted()
         if (m_sysState != OTA_SYS_GD32_RELAYING) {
             m_sysState = OTA_SYS_GD32_RELAYING;
             m_busySinceTick = xTaskGetTickCount();
-            DEBUG_INFO(TAG, "中继已开始(兜底), 系统状态 → GD32_RELAYING");
+            DEBUG_DBG(TAG, "中继已开始(兜底), 系统状态 → GD32_RELAYING");
         }
         pauseCanFeedbackTask(true);
     }
@@ -521,7 +521,7 @@ void OtaCoordinator::setEsp32StateLocked(ota_system_state_t s, const char *dbg_m
     } else if (s == OTA_SYS_ESP32_FINALIZING && m_busySinceTick == 0) {
         m_busySinceTick = xTaskGetTickCount();
     }
-    DEBUG_INFO(TAG, "%s", dbg_msg);
+    DEBUG_DBG(TAG, "%s", dbg_msg);
 }
 
 /** @brief 通知协调器：ESP32 固件接收完毕，状态转为 FINALIZING。 */

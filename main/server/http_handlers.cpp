@@ -630,7 +630,7 @@ esp_err_t logs_handler(httpd_req_t *req)
 
 
 // ============================================================
-// GET /can/feedback — 三路 CAN 1Hz 反馈快照
+// GET /can/feedback — 三路 CAN 反馈快照（GD32 推送，ESP32 缓存）
 // ============================================================
 esp_err_t can_feedback_handler(httpd_req_t *req)
 {

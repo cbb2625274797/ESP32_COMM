@@ -60,7 +60,7 @@ inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 3072;  ///< ble_ota_worker
 inline constexpr uint32_t TASK_STACK_HEALTH_MON    = 3072;  ///< health_mon：peak~1.2KB
 inline constexpr uint32_t TASK_STACK_CPU_STATS     = 3072;  ///< cpu_stats：peak~2KB
 inline constexpr uint32_t TASK_STACK_WIFI_RECONNECT = 2560; ///< wifi_reconnect：peak~1KB
-inline constexpr uint32_t TASK_STACK_CAN_FB        = 3072;  ///< can_fb：1Hz 轮询
+inline constexpr uint32_t TASK_STACK_CAN_FB        = 3072;  ///< can_fb：被动 takeEvent(0xC1)
 inline constexpr uint32_t TASK_STACK_BLE_FINISH    = 4096;  ///< 按需：SHA finalize（保持）
 inline constexpr uint32_t TASK_STACK_BLE_GD32_WAIT = 3072;  ///< 按需：GD32 中继等待
 inline constexpr uint32_t TASK_STACK_BLE_RESTART   = 2048;  ///< 按需：延时重启
@@ -130,9 +130,13 @@ inline constexpr uint8_t BLE_OTA_CMD_GD32_DATA  = 0x00;             ///< BLE 数
 inline constexpr uint8_t BLE_OTA_CMD_ESP32_DATA = 0x01;             ///< BLE 数据通道：ESP32 固件包标识
 inline constexpr size_t      BLE_OTA_CHUNK_PAYLOAD = 480;            ///< BLE 单包数据载荷大小（字节）
 // 滑动 ACK 窗口（须与前端 tools/js/ble/constants.js BLE_OTA_ACK_WINDOW 保持一致）
-inline constexpr size_t      BLE_OTA_ACK_WINDOW = 32;
+// ★ 64：实测 Windows WebBT 窗口内单包间隔 0.4-2.9ms（2M PHY 多包/事件），
+//        瓶颈在每窗口的 ACK 往返。窗口 32→64 提速 ~10%（40→44 KB/s），再试 96 无收益
+//        （ACK 往返在 64 已摊薄，稳态瓶颈是 Windows GATT 每包 ~10.6ms resolve 延迟）。
+//        内存：64×480B ≈ 30KB reorder buffer，分配失败有 fallback 丢弃策略兜底。
+inline constexpr size_t      BLE_OTA_ACK_WINDOW = 64;
 // Reorder buffer 窗口大小（吸收 BLE 窗口内乱序到达的包，须 >= BLE_OTA_ACK_WINDOW）
-inline constexpr size_t      BLE_OTA_REORDER_WINDOW = 32;
+inline constexpr size_t      BLE_OTA_REORDER_WINDOW = 64;
 // 数据队列深度：略大于窗口，seq=0 预擦期间多扛几批
 inline constexpr size_t      BLE_OTA_DATA_QUEUE_LEN = (BLE_OTA_ACK_WINDOW * 2 + 16);
 

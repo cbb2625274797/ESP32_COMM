@@ -13,7 +13,7 @@
  * 的 formatTime（含毫秒）不同，以保证发送历史时间戳输出格式一致。
  */
 import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js?v=20260717x';
-import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717x';
+import { escapeHtml } from '../common/utils.js?v=20260717x';
 import { showToast } from '../common/toast.js?v=20260717x';
 import { updateBatchUi } from './messages.js?v=20260717x';
 import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js?v=20260717x';
@@ -29,13 +29,13 @@ function formatTime(date) {
 }
 
 // ==================== 发送错误码描述 ====================
-export var CAN_SEND_ERR_DESC = {
+var CAN_SEND_ERR_DESC = {
   '-1': '参数错误（通道/ID/DLC 无效）',
   '-2': 'SPI 通信失败（ESP32 与 GD32 通信异常）',
   '-3': 'GD32 CAN 总线拒绝',
 };
 
-export var GD32_ERR_DESC = {
+var GD32_ERR_DESC = {
   0xE0: 'payload 过短',
   0xE1: '通道号非法',
   0xE2: 'BUS_OFF（总线离线，检查接线/终端电阻/对端上电）',
@@ -46,7 +46,7 @@ export var GD32_ERR_DESC = {
 };
 
 /** @description 构建发送响应的可读文本（成功显示 recv，失败拼接 CAN_SEND_ERR_DESC + GD32_ERR_DESC）。 */
-export function buildSendResponseText(result) {
+function buildSendResponseText(result) {
   if (result.status === 'ok') {
     return result.recv ? ('0x' + result.recv + ' (' + result.recv_len + ' 字节)') : '无响应数据';
   }
@@ -133,11 +133,27 @@ function updateResponseBox(box, textEl, result, mode) {
     el.manualHint.className = 'helper-note ' + (result.status === 'ok' ? 'ok' : 'err');
     el.manualHint.innerHTML = result.status === 'ok'
       ? '原始帧已发送到设备，若有响应则显示在下方。'
-      : '设备返回错误码 <b>' + sanitizeHtml(result.code) + '</b>。';
+      : '设备返回错误码 <b>' + escapeHtml(result.code) + '</b>。';
   }
 }
 
 // ==================== 发送历史 ====================
+/**
+ * 构造一条历史条目。集中字段，避免多处重复拼对象。
+ */
+function makeHistoryEntry(opts) {
+  return {
+    time: formatTime(new Date()),
+    mode: opts.mode,
+    ok: opts.ok,
+    channel: opts.channel,
+    idHex: opts.idHex,
+    dlc: opts.dlc,
+    dataHex: opts.dataHex || '',
+    resultText: opts.resultText
+  };
+}
+
 /**
  * @param {object} entry
  * @param {{ silent?: boolean }} [opts] silent=true 时不立刻重绘/落盘（批量用）
@@ -162,11 +178,11 @@ export function renderHistory() {
     var meta = 'CH' + item.channel + ' · ' + item.idHex + ' · DLC ' + item.dlc;
     return '' +
       '<div class="history-item history-item-row' + (item.ok ? '' : ' is-err') + '">' +
-      '<span class="history-item-tag ' + (item.ok ? 'ok' : 'err') + '">' + sanitizeHtml(item.mode) + '</span>' +
-      '<span class="history-item-time">' + sanitizeHtml(item.time) + '</span>' +
-      '<span class="history-item-main" title="' + sanitizeHtml(meta) + '">' + sanitizeHtml(meta) + '</span>' +
-      '<span class="history-item-hex" title="' + sanitizeHtml(item.dataHex || '') + '">' + sanitizeHtml(item.dataHex || '--') + '</span>' +
-      '<span class="history-item-foot" title="' + sanitizeHtml(item.resultText || '') + '">' + sanitizeHtml(item.resultText) + '</span>' +
+      '<span class="history-item-tag ' + (item.ok ? 'ok' : 'err') + '">' + escapeHtml(item.mode) + '</span>' +
+      '<span class="history-item-time">' + escapeHtml(item.time) + '</span>' +
+      '<span class="history-item-main" title="' + escapeHtml(meta) + '">' + escapeHtml(meta) + '</span>' +
+      '<span class="history-item-hex" title="' + escapeHtml(item.dataHex || '') + '">' + escapeHtml(item.dataHex || '--') + '</span>' +
+      '<span class="history-item-foot" title="' + escapeHtml(item.resultText || '') + '">' + escapeHtml(item.resultText) + '</span>' +
       '</div>';
   }).join('');
 }
@@ -191,128 +207,115 @@ export async function sendCheckedMessages() {
   var ok = 0, fail = 0;
   var silent = { silent: true };
 
-  /* 先全部编码，避免发到一半才因编码失败打断节奏 */
-  var prepared = [];
-  for (var i = 0; i < keys.length; i++) {
-    var key = keys[i];
-    var msg = null;
-    for (var m = 0; m < state.dbc.messages.length; m++) {
-      if (state.dbc.messages[m].key === key) { msg = state.dbc.messages[m]; break; }
-    }
-    if (!msg) continue;
-    ensureMessageDefaults(msg);
-    var idHex = '0x' + padHex(msg.id, msg.isExtended ? 8 : 3);
-    var dataBytes;
-    try {
-      dataBytes = encodeMessageData(msg, getSignalValueMap(msg));
-    } catch (err) {
-      fail++;
-      addHistoryEntry({
-        time: formatTime(new Date()),
-        mode: 'BATCH',
-        ok: false,
-        channel: channel,
-        idHex: idHex,
-        dlc: msg.dlc,
-        dataHex: '',
-        resultText: msg.name + ' · 编码失败: ' + err.message
-      }, silent);
-      continue;
-    }
-    var dataHex = bytesToHex(dataBytes);
-    var dlc = (typeof msg.dlc === 'number') ? msg.dlc : dataBytes.length;
-    prepared.push({
-      msg: msg,
-      idHex: idHex,
-      dlc: dlc,
-      dataHex: dataHex,
-      frame: { id: msg.id, dlc: dlc, data: dataHex }
-    });
+  /* 按 key 建索引，避免勾选数百条时 O(n²) 扫描 messages */
+  var msgByKey = Object.create(null);
+  for (var mi = 0; mi < state.dbc.messages.length; mi++) {
+    var mm = state.dbc.messages[mi];
+    msgByKey[mm.key] = mm;
   }
 
-  /* 分块批量接口；不支持时整段回退为无间隔单帧 */
-  var useBatchApi = true;
-  for (var off = 0; off < prepared.length; ) {
-    var chunk = prepared.slice(off, off + BATCH_CHUNK);
-    off += chunk.length;
-    var frames = chunk.map(function (p) { return p.frame; });
-    var results = null;
-
-    if (useBatchApi) {
+  try {
+    /* 先全部编码，避免发到一半才因编码失败打断节奏 */
+    var prepared = [];
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var msg = msgByKey[key];
+      if (!msg) continue;
+      ensureMessageDefaults(msg);
+      var idHex = '0x' + padHex(msg.id, msg.isExtended ? 8 : 3);
+      var dataBytes;
       try {
-        results = await sendCanBatchRequest(channel, frames);
-        if (results.length !== chunk.length) {
-          throw new Error('results 长度不匹配');
-        }
-      } catch (err) {
-        useBatchApi = false;
-        results = null;
-        /* 本 chunk 改单帧紧接 */
-      }
-    }
-
-    if (results) {
-      for (var r = 0; r < chunk.length; r++) {
-        var item = chunk[r];
-        var result = results[r] || { status: 'error', code: -3 };
-        if (result.status === 'ok') ok++; else fail++;
-        addHistoryEntry({
-          time: formatTime(new Date()),
-          mode: 'BATCH',
-          ok: result.status === 'ok',
-          channel: channel,
-          idHex: item.idHex,
-          dlc: item.dlc,
-          dataHex: item.dataHex || '',
-          resultText: item.msg.name + ' · ' + buildSendResponseText(result)
-        }, silent);
-      }
-      continue;
-    }
-
-    /* 回退：逐帧 HTTP，帧间无 sleep、无重试 */
-    for (var s = 0; s < chunk.length; s++) {
-      var one = chunk[s];
-      try {
-        var oneResult = await sendCanRequest({
-          ch: channel,
-          id: one.frame.id,
-          dlc: one.frame.dlc,
-          data: one.frame.data
-        });
-        if (oneResult.status === 'ok') ok++; else fail++;
-        addHistoryEntry({
-          time: formatTime(new Date()),
-          mode: 'BATCH',
-          ok: oneResult.status === 'ok',
-          channel: channel,
-          idHex: one.idHex,
-          dlc: one.dlc,
-          dataHex: one.dataHex || '',
-          resultText: one.msg.name + ' · ' + buildSendResponseText(oneResult)
-        }, silent);
+        dataBytes = encodeMessageData(msg, getSignalValueMap(msg));
       } catch (err) {
         fail++;
-        addHistoryEntry({
-          time: formatTime(new Date()),
-          mode: 'BATCH',
-          ok: false,
-          channel: channel,
-          idHex: one.idHex,
-          dlc: one.dlc,
-          dataHex: one.dataHex || '',
-          resultText: one.msg.name + ' · ' + err.message
-        }, silent);
+        addHistoryEntry(makeHistoryEntry({
+          mode: 'BATCH', ok: false, channel: channel, idHex: idHex,
+          dlc: msg.dlc, dataHex: '',
+          resultText: msg.name + ' · 编码失败: ' + err.message
+        }), silent);
+        continue;
+      }
+      var dataHex = bytesToHex(dataBytes);
+      var dlc = (typeof msg.dlc === 'number') ? msg.dlc : dataBytes.length;
+      prepared.push({
+        msg: msg,
+        idHex: idHex,
+        dlc: dlc,
+        dataHex: dataHex,
+        frame: { id: msg.id, dlc: dlc, data: dataHex }
+      });
+    }
+
+    /* 分块批量接口；不支持时整段回退为无间隔单帧 */
+    var useBatchApi = true;
+    for (var off = 0; off < prepared.length; ) {
+      var chunk = prepared.slice(off, off + BATCH_CHUNK);
+      off += chunk.length;
+      var frames = chunk.map(function (p) { return p.frame; });
+      var results = null;
+
+      if (useBatchApi) {
+        try {
+          results = await sendCanBatchRequest(channel, frames);
+          if (results.length !== chunk.length) {
+            throw new Error('results 长度不匹配');
+          }
+        } catch (err) {
+          useBatchApi = false;
+          results = null;
+          /* 本 chunk 改单帧紧接 */
+        }
+      }
+
+      if (results) {
+        for (var r = 0; r < chunk.length; r++) {
+          var item = chunk[r];
+          var result = results[r] || { status: 'error', code: -3 };
+          if (result.status === 'ok') ok++; else fail++;
+          addHistoryEntry(makeHistoryEntry({
+            mode: 'BATCH', ok: result.status === 'ok', channel: channel,
+            idHex: item.idHex, dlc: item.dlc, dataHex: item.dataHex,
+            resultText: item.msg.name + ' · ' + buildSendResponseText(result)
+          }), silent);
+        }
+        continue;
+      }
+
+      /* 回退：逐帧 HTTP，帧间无 sleep、无重试 */
+      for (var s = 0; s < chunk.length; s++) {
+        var one = chunk[s];
+        try {
+          var oneResult = await sendCanRequest({
+            ch: channel,
+            id: one.frame.id,
+            dlc: one.frame.dlc,
+            data: one.frame.data
+          });
+          if (oneResult.status === 'ok') ok++; else fail++;
+          addHistoryEntry(makeHistoryEntry({
+            mode: 'BATCH', ok: oneResult.status === 'ok', channel: channel,
+            idHex: one.idHex, dlc: one.dlc, dataHex: one.dataHex,
+            resultText: one.msg.name + ' · ' + buildSendResponseText(oneResult)
+          }), silent);
+        } catch (err) {
+          fail++;
+          addHistoryEntry(makeHistoryEntry({
+            mode: 'BATCH', ok: false, channel: channel,
+            idHex: one.idHex, dlc: one.dlc, dataHex: one.dataHex,
+            resultText: one.msg.name + ' · ' + err.message
+          }), silent);
+        }
       }
     }
-  }
 
-  renderHistory();
-  scheduleCanPersist();
-  state.batchInFlight = false;
-  updateBatchUi();
-  var tone = fail === 0 ? 'success' : (ok === 0 ? 'error' : 'warning');
-  showToast('批量发送完成：成功 ' + ok + '，失败 ' + fail, tone);
+    renderHistory();
+    scheduleCanPersist();
+    var tone = fail === 0 ? 'success' : (ok === 0 ? 'error' : 'warning');
+    showToast('批量发送完成：成功 ' + ok + '，失败 ' + fail, tone);
+  } finally {
+    state.batchInFlight = false;
+    updateBatchUi();
+  }
 }
 
 // ==================== 选中报文发送 ====================
@@ -338,16 +341,12 @@ export async function sendSelectedMessage() {
   try {
     var result = await sendCanRequest(payload);
     updateResponseBox(el.dbcResp, el.dbcRespText, result, 'dbc');
-    addHistoryEntry({
-      time: formatTime(new Date()),
-      mode: 'DBC',
-      ok: result.status === 'ok',
-      channel: channel,
+    addHistoryEntry(makeHistoryEntry({
+      mode: 'DBC', ok: result.status === 'ok', channel: channel,
       idHex: '0x' + padHex(msg.id, msg.isExtended ? 8 : 3),
-      dlc: msg.dlc,
-      dataHex: bytesToHex(state.generatedData),
+      dlc: msg.dlc, dataHex: bytesToHex(state.generatedData),
       resultText: buildSendResponseText(result)
-    });
+    }));
     showToast(result.status === 'ok' ? 'DBC 报文发送成功' : '发送失败', result.status === 'ok' ? 'success' : 'error');
   } catch (err) {
     if (el.dbcResp) {
@@ -355,16 +354,12 @@ export async function sendSelectedMessage() {
       el.dbcResp.className = 'can-response err';
       el.dbcRespText.textContent = err.message;
     }
-    addHistoryEntry({
-      time: formatTime(new Date()),
-      mode: 'DBC',
-      ok: false,
-      channel: channel,
+    addHistoryEntry(makeHistoryEntry({
+      mode: 'DBC', ok: false, channel: channel,
       idHex: '0x' + padHex(msg.id, msg.isExtended ? 8 : 3),
-      dlc: msg.dlc,
-      dataHex: bytesToHex(state.generatedData),
+      dlc: msg.dlc, dataHex: bytesToHex(state.generatedData),
       resultText: err.message
-    });
+    }));
     showToast('发送失败: ' + err.message, 'error');
   }
 }
@@ -397,7 +392,7 @@ export function refreshManualHint() {
     el.manualHint.innerHTML = '原始 HEX 合法，当前长度 <b>' + (dataHex.length / 2) + '</b> 字节。';
   } catch (err) {
     el.manualHint.className = 'helper-note err';
-    el.manualHint.innerHTML = sanitizeHtml(err.message);
+    el.manualHint.innerHTML = escapeHtml(err.message);
   }
 }
 
@@ -427,16 +422,12 @@ export async function sendManualFrame() {
       data: dataHex
     });
     updateResponseBox(el.manualResp, el.manualRespText, result, 'manual');
-    addHistoryEntry({
-      time: formatTime(new Date()),
-      mode: 'RAW',
-      ok: result.status === 'ok',
-      channel: channel,
+    addHistoryEntry(makeHistoryEntry({
+      mode: 'RAW', ok: result.status === 'ok', channel: channel,
       idHex: '0x' + padHex(id, id > 0x7FF ? 8 : 3),
-      dlc: dlc,
-      dataHex: dataHex,
+      dlc: dlc, dataHex: dataHex,
       resultText: buildSendResponseText(result)
-    });
+    }));
     showToast(result.status === 'ok' ? '原始帧发送成功' : '发送失败', result.status === 'ok' ? 'success' : 'error');
   } catch (err) {
     if (el.manualResp) {
@@ -444,16 +435,12 @@ export async function sendManualFrame() {
       el.manualResp.className = 'can-response err';
       el.manualRespText.textContent = err.message;
     }
-    addHistoryEntry({
-      time: formatTime(new Date()),
-      mode: 'RAW',
-      ok: false,
-      channel: channel,
+    addHistoryEntry(makeHistoryEntry({
+      mode: 'RAW', ok: false, channel: channel,
       idHex: '0x' + padHex(id, id > 0x7FF ? 8 : 3),
-      dlc: dlc,
-      dataHex: dataHex,
+      dlc: dlc, dataHex: dataHex,
       resultText: err.message
-    });
+    }));
     showToast('发送失败: ' + err.message, 'error');
   }
 }
