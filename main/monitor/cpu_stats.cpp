@@ -95,7 +95,7 @@ void CpuStats::sampleOnce()
             (now_tick - m_lastTruncWarnTick) >= cpuStatsWarnIntervalTicks()) {
             m_lastTruncWarnTick = now_tick;
             DEBUG_WARN("CPU",
-                       "任务数 %lu > 快照上限 %u，本拍仅统计前 %u 个任务",
+                       "任务数%lu>上限%u,只计前%u",
                        (unsigned long)live,
                        (unsigned)CPU_TASK_SNAPSHOT_MAX,
                        (unsigned)CPU_TASK_SNAPSHOT_MAX);

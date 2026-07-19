@@ -74,6 +74,17 @@ async function pollFeedback() {
 
     for (var i = 0; i < 3; i++) {
       var ch = channels[i];
+      var card = document.getElementById('fbCh' + i);
+      /* enabled 来自 GD32 HELLO/PING 身份；未知时默认按开启展示 */
+      var enabled = !ch || ch.enabled === undefined || ch.enabled === null || !!ch.enabled;
+      if (card) {
+        card.classList.toggle('ch-disabled', !enabled);
+        card.title = enabled ? '' : 'GD32 CONFIG_CAN_CH' + i + '_ENABLE=false（HELLO/PING 身份）';
+      }
+      if (!enabled) {
+        renderChannelDisabled(i);
+        continue;
+      }
       if (!ch || !ch.valid) {
         renderChannelEmpty(i);
         continue;
@@ -169,6 +180,20 @@ function renderChannel(i, ch) {
 function renderChannelEmpty(i) {
   var p = 'fb' + i;
   if (el[p + 'State']) { el[p + 'State'].textContent = 'SPI 离线'; el[p + 'State'].className = 'fb-val err'; }
+  ['Rx', 'Tx', 'Drop', 'Err', 'Tec', 'Rec', 'Bus', 'Seq', 'Delta', 'Dlc', 'Flags'].forEach(function (f) {
+    if (el[p + f]) { el[p + f].textContent = '--'; el[p + f].className = 'fb-val'; }
+  });
+  if (el[p + 'LastId']) { el[p + 'LastId'].textContent = '--'; el[p + 'LastId'].className = 'fb-val mono'; }
+  if (el[p + 'LastData']) { el[p + 'LastData'].textContent = '--'; el[p + 'LastData'].className = 'fb-val mono fb-data-cell'; }
+}
+
+/** GD32 编译关闭该通道（APP PING feat can_chN=false） */
+function renderChannelDisabled(i) {
+  var p = 'fb' + i;
+  if (el[p + 'State']) {
+    el[p + 'State'].textContent = '固件未启用';
+    el[p + 'State'].className = 'fb-val warn';
+  }
   ['Rx', 'Tx', 'Drop', 'Err', 'Tec', 'Rec', 'Bus', 'Seq', 'Delta', 'Dlc', 'Flags'].forEach(function (f) {
     if (el[p + f]) { el[p + f].textContent = '--'; el[p + f].className = 'fb-val'; }
   });

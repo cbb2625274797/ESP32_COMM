@@ -18,6 +18,7 @@
  */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -69,17 +70,13 @@ bool DebugLog::isKeepAliveTag(const char *tag)
 
 char *DebugLog::allocEmptyJson(int *out_len)
 {
-    char *empty = (char *)malloc(3);
-    if (!empty) {
-        return nullptr;
-    }
-    empty[0] = '[';
-    empty[1] = ']';
-    empty[2] = '\0';
+    /* 返回 nullptr 让 caller 走"[]"字面量分支，避免空环时每秒 malloc(3)/free(3)。
+     * ringDrainJson 的所有"返空"路径都调本函数，caller logs_handler 见 nullptr
+     * 后直接发 "[]" 字面量，零分配。 */
     if (out_len) {
-        *out_len = 2;
+        *out_len = 0;
     }
-    return empty;
+    return nullptr;
 }
 
 /**
@@ -148,8 +145,104 @@ int DebugLog::jsonEscapeAppend(char *buf, int pos, int capacity, const char *src
 }
 
 // ============================================================
-// 环形缓冲（Locked 变体假定已持 m_logRingMutex）
+// 环形缓冲（堆上；Locked 变体假定已持 m_logRingMutex）
 // ============================================================
+bool DebugLog::allocRing(int slots)
+{
+    if (slots <= 0) {
+        return false;
+    }
+    char *rows = static_cast<char *>(calloc((size_t)slots, (size_t)LOG_RING_SIZE));
+    int *lens = static_cast<int *>(calloc((size_t)slots, sizeof(int)));
+    if (!rows || !lens) {
+        free(rows);
+        free(lens);
+        return false;
+    }
+    free(m_logRing);
+    free(m_logRingLens);
+    m_logRing = rows;
+    m_logRingLens = lens;
+    m_logRingSlots = slots;
+    m_logRingHead = 0;
+    m_logRingCount = 0;
+    return true;
+}
+
+void DebugLog::shrinkRingAfterBoot()
+{
+    if (m_logRingShrunk || !m_logRingMutex) {
+        return;
+    }
+    if (m_logRingSlots > 0 && m_logRingSlots <= LOG_RING_SLOTS_STEADY) {
+        m_logRingShrunk = true;
+        return;
+    }
+
+    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
+
+    const int old_slots = m_logRingSlots;
+    const int old_count = m_logRingCount;
+    const int old_head = m_logRingHead;
+    char *old_ring = m_logRing;
+    int *old_lens = m_logRingLens;
+
+    const int new_slots = LOG_RING_SLOTS_STEADY;
+    char *rows = static_cast<char *>(calloc((size_t)new_slots, (size_t)LOG_RING_SIZE));
+    int *lens = static_cast<int *>(calloc((size_t)new_slots, sizeof(int)));
+    if (!rows || !lens) {
+        free(rows);
+        free(lens);
+        xSemaphoreGive(m_logRingMutex);
+        ESP_LOGW(TAG, "log ring shrink failed, keep boot ring (%d slots)", old_slots);
+        return;
+    }
+
+    /* 保留时间序上最新的 min(count, new_slots) 条 */
+    int keep = old_count;
+    if (keep > new_slots) {
+        keep = new_slots;
+    }
+    int new_head = 0;
+    if (old_ring && old_lens && keep > 0 && old_slots > 0) {
+        for (int i = 0; i < keep; ++i) {
+            /* 从最旧保留起点：跳过被挤掉的旧条 */
+            const int src_i = old_count - keep + i;
+            const int src = (old_head - old_count + src_i + old_slots * 4) % old_slots;
+            int len = old_lens[src];
+            if (len < 0) {
+                len = 0;
+            }
+            if (len >= LOG_RING_SIZE) {
+                len = LOG_RING_SIZE - 1;
+            }
+            char *dst = rows + (size_t)new_head * (size_t)LOG_RING_SIZE;
+            if (len > 0) {
+                memcpy(dst, old_ring + (size_t)src * (size_t)LOG_RING_SIZE, (size_t)len);
+            }
+            dst[len] = '\0';
+            lens[new_head] = len;
+            new_head = (new_head + 1) % new_slots;
+        }
+    }
+
+    m_logRing = rows;
+    m_logRingLens = lens;
+    m_logRingSlots = new_slots;
+    m_logRingCount = keep;
+    m_logRingHead = (keep >= new_slots) ? new_head : keep;
+    m_logRingShrunk = true;
+
+    xSemaphoreGive(m_logRingMutex);
+
+    free(old_ring);
+    free(old_lens);
+
+    ESP_LOGI(TAG, "log ring shrunk: %d → %d slots (free ~%d B)",
+             old_slots, new_slots,
+             (old_slots - new_slots) * (LOG_RING_SIZE + (int)sizeof(int)));
+}
+
 int DebugLog::ringCount()
 {
     if (!m_logRingMutex) {
@@ -166,11 +259,11 @@ bool DebugLog::ringPopOldestLocked(char *out, size_t out_size, int *out_len)
     if (out_len) {
         *out_len = 0;
     }
-    if (!out || out_size == 0 || m_logRingCount <= 0) {
+    if (!out || out_size == 0 || m_logRingCount <= 0 || !m_logRing || m_logRingSlots <= 0) {
         return false;
     }
 
-    const int idx = (m_logRingHead - m_logRingCount + LOG_RING_SLOTS) % LOG_RING_SLOTS;
+    const int idx = (m_logRingHead - m_logRingCount + m_logRingSlots) % m_logRingSlots;
     int len = m_logRingLens[idx];
     if (len < 0) {
         len = 0;
@@ -182,7 +275,7 @@ bool DebugLog::ringPopOldestLocked(char *out, size_t out_size, int *out_len)
     }
 
     if (copy_len > 0) {
-        memcpy(out, m_logRing[idx], (size_t)copy_len);
+        memcpy(out, ringSlot(idx), (size_t)copy_len);
     }
     out[copy_len] = '\0';
     if (out_len) {
@@ -215,6 +308,9 @@ int DebugLog::ringPeekDrainMetaLocked(int max_n, int *total_raw_len) const
     if (total_raw_len) {
         *total_raw_len = 0;
     }
+    if (!m_logRing || m_logRingSlots <= 0) {
+        return 0;
+    }
     int n = m_logRingCount;
     if (n > max_n) {
         n = max_n;
@@ -225,7 +321,7 @@ int DebugLog::ringPeekDrainMetaLocked(int max_n, int *total_raw_len) const
 
     int sum = 0;
     for (int i = 0; i < n; ++i) {
-        const int idx = (m_logRingHead - m_logRingCount + i + LOG_RING_SLOTS) % LOG_RING_SLOTS;
+        const int idx = (m_logRingHead - m_logRingCount + i + m_logRingSlots) % m_logRingSlots;
         int len = m_logRingLens[idx];
         if (len < 0) {
             len = 0;
@@ -243,7 +339,7 @@ int DebugLog::ringPeekDrainMetaLocked(int max_n, int *total_raw_len) const
 
 void DebugLog::ringPushLocked(const char *data, int len)
 {
-    if (!data || len <= 0) {
+    if (!data || len <= 0 || !m_logRing || !m_logRingLens || m_logRingSlots <= 0) {
         return;
     }
 
@@ -252,12 +348,27 @@ void DebugLog::ringPushLocked(const char *data, int len)
         copy_len = LOG_RING_SIZE - 1;
     }
 
-    memcpy(m_logRing[m_logRingHead], data, (size_t)copy_len);
-    m_logRing[m_logRingHead][copy_len] = '\0';
+    /* 满环时优先覆盖 INFO/DBG，保护 ERR/WARN。 */
+    if (m_logRingCount >= m_logRingSlots) {
+        int victim_idx = m_logRingHead;
+        for (int i = 0; i < m_logRingSlots; ++i) {
+            const int idx = (m_logRingHead + i) % m_logRingSlots;
+            const char *s = ringSlot(idx);
+            if (s[0] == '[' && (s[1] == 'I' || s[1] == 'D')) {
+                victim_idx = idx;
+                break;
+            }
+        }
+        m_logRingHead = victim_idx;
+    }
+
+    char *slot = ringSlot(m_logRingHead);
+    memcpy(slot, data, (size_t)copy_len);
+    slot[copy_len] = '\0';
     m_logRingLens[m_logRingHead] = copy_len;
 
-    m_logRingHead = (m_logRingHead + 1) % LOG_RING_SLOTS;
-    if (m_logRingCount < LOG_RING_SLOTS) {
+    m_logRingHead = (m_logRingHead + 1) % m_logRingSlots;
+    if (m_logRingCount < m_logRingSlots) {
         m_logRingCount++;
     }
 }
@@ -473,6 +584,15 @@ esp_err_t DebugLog::init()
         /* 仍标记 initialized，避免 log() 反复 init；UART 路径可工作 */
         m_initialized = true;
         return ESP_ERR_NO_MEM;
+    }
+
+    if (!allocRing(LOG_RING_SLOTS_BOOT)) {
+        ESP_LOGE(TAG, "boot log ring alloc 失败 (%d slots)，/logs 不可用", LOG_RING_SLOTS_BOOT);
+        /* UART/UDP 仍可用 */
+    } else {
+        ESP_LOGI(TAG, "boot log ring %d×%d (~%d B heap)",
+                 LOG_RING_SLOTS_BOOT, LOG_RING_SIZE,
+                 LOG_RING_SLOTS_BOOT * (LOG_RING_SIZE + (int)sizeof(int)));
     }
 
     memset(&m_debugAddr, 0, sizeof(m_debugAddr));

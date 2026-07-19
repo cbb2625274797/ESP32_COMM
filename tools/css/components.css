@@ -390,6 +390,298 @@
   font-size: 11px;
 }
 
+/* ===== 芯片 SRAM 分段条（IRAM / .data / .bss / 堆已用 / 堆空闲）===== */
+.mem-sram-track {
+  display: flex;
+  overflow: hidden;
+  gap: 0;
+  background: rgba(255,255,255,0.04);
+}
+.mem-seg {
+  display: block;
+  height: 100%;
+  min-width: 0;
+  transition: width .4s ease;
+}
+.mem-seg-iram {
+  background: linear-gradient(90deg, #a78bfa, #7c3aed);
+}
+.mem-seg-data {
+  background: linear-gradient(90deg, #fb923c, #ea580c);
+}
+.mem-seg-bss {
+  background: linear-gradient(90deg, #94a3b8, #64748b);
+}
+.mem-seg-static {
+  background: linear-gradient(90deg, #64748b, #475569);
+}
+.mem-seg-used {
+  background: linear-gradient(90deg, var(--accent), #5eead4);
+}
+.mem-seg-free {
+  background: rgba(255,255,255,0.08);
+}
+.heap-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.heap-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.heap-legend-item b {
+  color: var(--text);
+  font-weight: 500;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.mem-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+.mem-dot-iram { background: #8b5cf6; }
+.mem-dot-data { background: #f97316; }
+.mem-dot-bss { background: #64748b; }
+.mem-dot-static { background: #64748b; }
+.mem-dot-used { background: var(--accent, #2dd4bf); }
+.mem-dot-free { background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.2); box-sizing: border-box; }
+.mem-static-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.mem-static-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.mem-static-row:last-child { border-bottom: 0; }
+.mem-static-name {
+  color: var(--text-label, var(--text-dim));
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mem-static-size {
+  font-family: var(--font-mono);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.mem-static-pct {
+  font-family: var(--font-mono);
+  min-width: 42px;
+  text-align: right;
+  color: var(--text-dim);
+}
+.heap-hint {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255,255,255,0.04);
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  opacity: 0.9;
+}
+
+/* ============================================================
+   堆低水位 hover tooltip（鼠标移到 #mInternalMinHeap 上浮现）
+   ============================================================ */
+.heap-low-tooltip {
+  position: fixed;
+  z-index: 9999;
+  min-width: 480px;
+  max-width: 640px;
+  padding: 10px 12px 8px 12px;
+  background: var(--bg-elev, #1f2430);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+  font-size: 11px;
+  color: var(--text, #d4d4d4);
+  pointer-events: auto;
+  /* 初态不可见，由 JS 计算 left/top 后再切回 visible，避免闪到 (0,0) */
+  visibility: hidden;
+}
+.heap-low-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text, #d4d4d4);
+  display: flex;
+  align-items: center;
+}
+.heap-low-sub {
+  font-weight: 400;
+  color: var(--text-dim, #888);
+  margin-left: 6px;
+}
+.heap-low-clear {
+  margin-left: auto;
+  margin-right: 6px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid rgba(255,107,107,0.45);
+  border-radius: 4px;
+  background: rgba(255,107,107,0.12);
+  color: #ff8a80;
+  font-size: 11px;
+  line-height: 20px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.heap-low-clear:hover:not(:disabled) {
+  background: rgba(255,107,107,0.22);
+  border-color: rgba(255,107,107,0.7);
+  color: #ffcdd2;
+}
+.heap-low-clear:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+.heap-low-close {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim, #888);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.heap-low-close:hover {
+  background: rgba(255,255,255,0.08);
+  color: var(--text, #d4d4d4);
+}
+.heap-low-table-wrap {
+  max-height: 360px;  /* 留高一些容纳历史段 */
+  overflow-y: auto;
+}
+.heap-low-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+}
+/* 两段分隔：设备当前段 vs 前端累积历史段 */
+.heap-low-section { margin-bottom: 6px; }
+.heap-low-section + .heap-low-section { margin-top: 8px; padding-top: 6px; border-top: 1px dashed rgba(255,255,255,0.15); }
+.heap-low-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim, #aaa);
+  padding: 4px 6px 2px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 3px 3px 0 0;
+}
+.heap-low-section-hist .heap-low-section-title { color: #ffb74d; }
+.heap-low-section-hist .heap-low-table { opacity: 0.92; }
+.heap-low-table th,
+.heap-low-table td {
+  padding: 3px 6px;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.heap-low-table th {
+  color: var(--text-dim, #888);
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  background: var(--bg-elev, #1f2430);
+  text-align: right;
+}
+.heap-low-table td:nth-child(5),  /* OTA 状态 */
+.heap-low-table td:nth-child(6),  /* 连接 */
+.heap-low-table td:nth-child(7),  /* OTA 进度 */
+.heap-low-table td:nth-child(9) { /* 嫌疑资源 */
+  text-align: left;
+}
+.heap-low-table td:first-child { color: var(--text-dim, #888); }
+.heap-low-table tbody tr:hover { background: rgba(255,255,255,0.03); }
+/* 诊断列：OTA 资源有占用时标红（已锁定嫌疑）；推断结论标黄（排除法推断） */
+.heap-low-table td.has-suspect { color: #ff6b6b; font-weight: 500; }
+.heap-low-table td.idle-suspect { color: #ffb74d; }
+.heap-low-detail-meta {
+  display: flex;
+  gap: 18px;
+  font-size: 10px;
+  color: var(--text-dim, #888);
+  margin-bottom: 6px;
+}
+.heap-low-detail-meta b { color: var(--text, #d4d4d4); font-family: var(--font-mono, monospace); }
+/* heap hook 捕获区：突出显示"瞬时低谷触发者" */
+.heap-low-hook-meta {
+  margin: 8px 0 6px 0;
+  padding: 6px 8px;
+  background: rgba(255,107,107,0.08);
+  border-left: 2px solid #ff6b6b;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 10px;
+  color: var(--text-dim, #888);
+}
+.heap-low-hook-title {
+  width: 100%;
+  color: #ff6b6b;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.heap-low-hook-meta b { color: var(--text, #d4d4d4); font-family: var(--font-mono, monospace); }
+.heap-low-caller { color: #ff6b6b; }
+.heap-low-caller-hint { color: var(--text-dim, #888); font-size: 9px; }
+.heap-low-main-row { cursor: pointer; }
+.heap-low-expand-hint {
+  font-size: 9px;
+  color: var(--text-dim, #888);
+  margin-left: 4px;
+}
+/* 展开的任务栈子表 */
+.heap-low-stack-detail > td { padding: 6px 8px 8px 8px; background: rgba(0,0,0,0.15); }
+.heap-low-stack-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+}
+.heap-low-stack-table th,
+.heap-low-stack-table td {
+  padding: 2px 6px;
+  text-align: left;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.heap-low-stack-table th { color: var(--text-dim, #888); font-weight: 500; }
+.heap-low-stack-table td:last-child { text-align: right; }
+.heap-low-stack-table tr.crit td { color: #ff6b6b; }
+.heap-low-stack-table tr.warn td { color: #ffb74d; }
+.heap-low-empty {
+  padding: 14px 6px;
+  color: var(--text-dim, #888);
+  text-align: center;
+}
+.heap-low-tip {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-dim, #888);
+}
+
 /* 抽屉内数值/任务名/JSON 强制等宽，避免被其它样式冲掉 */
 .sys-drawer-body .heap-bar-pct,
 .sys-drawer-body .heap-detail-row b,

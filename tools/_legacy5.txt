@@ -1,0 +1,21 @@
+﻿Threshold: >128 bytes (prefix+body+newline, UTF-8)
+Candidates: 5
+
+  #   est  body pre  lv    tag           location
+----------------------------------------------------------------------------------------------------
+  1   176   157  18  DBG   TAG           main/server/ble_ota_data.cpp:100
+     fmt: BLEp(%s) %.1f-%.1f ce=%u-%u rc=%d
+     args: %s鈫?6:windows_compatible ? "Win" : "Hi"
+  2   153   134  18  WARN  kTag          main/monitor/can_feedback_task.cpp:122
+     fmt: CH%u s=%lu e=%lu T=%u R=%u st=%02X
+  3   153   134  18  DBG   TAG           main/server/ble_ota_data.cpp:69
+     fmt: %sitv=%.2f lat=%u sup=%u
+     args: %s鈫?8:phase
+  4   141   122  18  INFO  TAG           main/server/ble_ota_host.cpp:545
+     fmt: PHY %d %s/%s
+     args: %s鈫?8:rx_phy; %s鈫?8:tx_phy
+  5   135   116  18  ERR   TAG           main/ota/esp32_ota_core.cpp:227
+     fmt: ota_write %s n=%u off=%u free=%lu
+     args: %s鈫?2:esp_err_to_name(err)
+
+Total over 128B: 5

@@ -3,6 +3,7 @@
  */
 #include <string.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <inttypes.h>
 #include <algorithm>
 #include "freertos/FreeRTOS.h"
@@ -17,6 +18,7 @@
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 #include "esp_rom_sys.h"
+#include "soc/soc.h"
 #include "cJSON.h"
 
 #include "app_config.h"
@@ -32,7 +34,8 @@
 #include "spi_master.h"
 #include "canfd_bridge.h"
 #include "monitor/can_feedback_task.h"
-#include "monitor/task_stack_check.h"
+#include "monitor/gd32_adc_feedback.h"
+#include "monitor/task_stack.h"
 #include "ble_ota.h"
 #include "system_boot.h"
 
@@ -235,7 +238,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     http_set_cors_headers(req);
 
     uint8_t *recv_buf = s_ota_upload_recv;
-    DEBUG_WARN("WIFI", "=== HTTP: POST /ota/upload === content_len=%d free=%lu largest=%lu",
+    DEBUG_WARN("WIFI", "POST /ota/upload clen=%d free=%lu big=%lu",
                req->content_len,
                (unsigned long)esp_get_free_heap_size(),
                (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
@@ -318,7 +321,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         size_t total_firmware_written = 0;
         size_t total_received = json_header_len;
 
-        DEBUG_INFO("WIFI", "ESP32 OTA 开始收流: content_len=%d json_hdr=%d fw_expect=%d",
+        DEBUG_INFO("WIFI", "ESP32收流 clen=%d hdr=%d exp=%d",
                    req->content_len, json_header_len,
                    (req->content_len > json_header_len)
                        ? (req->content_len - json_header_len) : 0);
@@ -338,7 +341,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
 
             int ret = httpd_req_recv(req, (char *)fw_buf, to_read);
             if (ret <= 0) {
-                DEBUG_ERR("WIFI", "HTTP recv failed (ret=%d), aborting OTA recv=%u/%d free=%lu",
+                DEBUG_ERR("WIFI", "HTTP recv fail ret=%d OTA %u/%d free=%lu",
                           ret, (unsigned)total_received, req->content_len,
                           (unsigned long)esp_get_free_heap_size());
                 OtaCoordinator::instance().abortCurrentIfEpoch(my_epoch);
@@ -377,10 +380,9 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         httpd_resp_set_hdr(req, "Connection", "close");
         esp_err_t send_err = httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
         if (send_err != ESP_OK) {
-            DEBUG_ERR("WIFI", "ESP32 OTA 响应发送失败: %s (free=%lu largest=%lu)",
+            DEBUG_ERR("WIFI", "ESP32 OTA回包失败: %s free=%lu",
                       esp_err_to_name(send_err),
-                      (unsigned long)esp_get_free_heap_size(),
-                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+                      (unsigned long)esp_get_free_heap_size());
             /* 再试一次极简回包 */
             send_err = httpd_resp_send(req, "{\"status\":\"ok\",\"target\":\"esp32\"}",
                                        HTTPD_RESP_USE_STRLEN);
@@ -388,8 +390,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                 DEBUG_ERR("WIFI", "ESP32 OTA 简短响应仍失败: %s", esp_err_to_name(send_err));
             }
         } else {
-            DEBUG_INFO("WIFI",
-                       "ESP32 OTA 存储+响应完成: %u B elapsed=%lld ms free=%lu",
+            DEBUG_INFO("WIFI", "ESP32存完 %uB %lldms free=%lu",
                        (unsigned int)core.getReceived(),
                        (long long)((esp_timer_get_time() - t_recv0) / 1000),
                        (unsigned long)esp_get_free_heap_size());
@@ -505,11 +506,8 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
         if (sha_err != ESP_OK) {
             /* 存盘已完成，仍回 status=ok；relay 阶段会再比前端 SHA。
              * 此处必须醒目告警，避免只当 INFO 被忽略。 */
-            DEBUG_WARN("WIFI",
-                       "GD32 上传完成但 SHA-256 预计算失败: %s（仍返回 stored ok，/ota/relay 将再校验）",
+            DEBUG_WARN("WIFI", "GD32 SHA预算失败:%s (relay再校)",
                        esp_err_to_name(sha_err));
-            DEBUG_ERR("WIFI", "GD32 finishGd32StorageAfterReceive failed: %s",
-                      esp_err_to_name(sha_err));
         }
     }
 
@@ -519,10 +517,9 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Connection", "close");
     esp_err_t send_err = httpd_resp_send(req, resp, strlen(resp));
     if (send_err != ESP_OK) {
-        DEBUG_ERR("WIFI", "GD32 OTA 响应发送失败: %s (free=%lu largest=%lu)",
+        DEBUG_ERR("WIFI", "GD32 OTA回包失败: %s free=%lu",
                   esp_err_to_name(send_err),
-                  (unsigned long)esp_get_free_heap_size(),
-                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+                  (unsigned long)esp_get_free_heap_size());
     } else {
         DEBUG_INFO("WIFI", "GD32 OTA 存储+响应完成: %u / %u free=%lu",
                    (unsigned)gd32_offset, expected_fw_size_raw,
@@ -581,6 +578,11 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     }
 
     if (verify_err == ESP_ERR_INVALID_CRC) {
+        DEBUG_ERR("OTA", "GD32 SHA-256 不匹配");
+        DEBUG_ERR("OTA", "frontend=%s", frontend_sha_hex);
+        DEBUG_ERR("OTA", "device=%s", device_sha_hex);
+        /* 未进中继：须恢复 WiFi 上传期挂起的 BLE */
+        (void)BleOta::instance().resumeStack();
         char err_resp[256];
         snprintf(err_resp, sizeof(err_resp),
                  "{\"status\": \"error\", \"message\": \"SHA-256 mismatch\", "
@@ -589,12 +591,14 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         httpd_resp_send(req, err_resp, strlen(err_resp));
         return ESP_FAIL;
     } else if (verify_err != ESP_OK) {
+        (void)BleOta::instance().resumeStack();
         return http_send_json_error(req, "500 Internal Server Error",
                                     "sha_compute_failed", "SHA compute failed");
     }
 
     esp_err_t trigger_err = OtaCoordinator::instance().triggerGd32Relay();
     if (trigger_err != ESP_OK) {
+        (void)BleOta::instance().resumeStack();
         return http_send_json_error(req, "400 Bad Request",
             "relay_trigger_failed",
             "relay trigger failed - system busy or firmware not ready");
@@ -630,8 +634,53 @@ esp_err_t logs_handler(httpd_req_t *req)
 
 
 // ============================================================
-// GET /can/feedback — 三路 CAN 反馈快照（GD32 推送，ESP32 缓存）
+// HTTP JSON 共享工作区（.bss 单份 ~3KB）
+// 供 /system/status、/can/feedback、/system/heap_low_log 串行复用；
+// 互斥保护，禁止并发写同一缓冲（httpd 多 worker 时会排队）。
 // ============================================================
+static constexpr size_t HTTP_JSON_WORK_CAP = 3072;
+static char s_http_json_work[HTTP_JSON_WORK_CAP];
+static SemaphoreHandle_t s_http_json_mux = nullptr;
+static portMUX_TYPE s_http_json_init_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t httpJsonWorkMutex(void)
+{
+    if (s_http_json_mux == nullptr) {
+        portENTER_CRITICAL(&s_http_json_init_mux);
+        if (s_http_json_mux == nullptr) {
+            s_http_json_mux = xSemaphoreCreateMutex();
+        }
+        portEXIT_CRITICAL(&s_http_json_init_mux);
+    }
+    return s_http_json_mux;
+}
+
+// ============================================================
+// GET /can/feedback — 三路 CAN 反馈快照（GD32 推送，ESP32 缓存）
+// 分块发送：复用 s_http_json_work，一次 HTTP 内按通道 send_chunk；
+// 前端仍一次 fetch 收完整 JSON。
+// ============================================================
+/** 监控预览：data hex 最多 8 字节（16 字符），避免 FD 64B 撑爆分块 */
+static constexpr uint8_t FEEDBACK_DATA_HEX_MAX = 8;
+
+static int feedback_append(char *buf, size_t cap, int off, const char *fmt, ...)
+{
+    if (!buf || cap == 0 || off < 0 || (size_t)off >= cap) {
+        return -1;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, cap - (size_t)off, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return -1;
+    }
+    if (off + n >= (int)cap) {
+        return -1; /* 分块装不下：调用方截断 entries */
+    }
+    return off + n;
+}
+
 esp_err_t can_feedback_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
@@ -642,20 +691,61 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         valid[i] = getLatestCanFeedback(i, &results[i]);
     }
 
-    /* 静态响应缓冲，减少频繁大块堆分配 */
-    static char s_feedback_json[8192];
-    char *resp = s_feedback_json;
-    memset(resp, 0, sizeof(s_feedback_json));
+    const bool feat_known = SpiMaster::instance().gd32FeatKnown();
+    const uint32_t feat = SpiMaster::instance().gd32FeatFlags();
+    const bool ch_en[CAN_CHANNEL_MAX] = {
+        !feat_known || (feat & V2_FEAT_CAN_CH0) != 0U,
+        !feat_known || (feat & V2_FEAT_CAN_CH1) != 0U,
+        !feat_known || (feat & V2_FEAT_CAN_CH2) != 0U,
+    };
+    const unsigned ch_mask = feat_known
+        ? (unsigned)((feat & V2_FEAT_CAN_CH_MASK) >> V2_FEAT_CAN_CH_SHIFT)
+        : 0x7U;
 
-    char *p = resp;
-    p += sprintf(p, "{\"channels\":[");
+    SemaphoreHandle_t mux = httpJsonWorkMutex();
+    if (mux && xSemaphoreTake(mux, pdMS_TO_TICKS(200)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb busy");
+        return ESP_FAIL;
+    }
+
+    char *work = s_http_json_work;
+    httpd_resp_set_type(req, "application/json");
+
+    auto fail_unlock = [&](esp_err_t err) -> esp_err_t {
+        if (mux) {
+            xSemaphoreGive(mux);
+        }
+        return err;
+    };
+
+    int n = snprintf(work, HTTP_JSON_WORK_CAP,
+        "{\"feat_known\":%s,\"can_ch_mask\":%u,\"can_brs\":%s,\"channels\":[",
+        feat_known ? "true" : "false",
+        ch_mask,
+        (feat_known && (feat & V2_FEAT_CAN_BRS)) ? "true" : "false");
+    if (n < 0 || (size_t)n >= HTTP_JSON_WORK_CAP) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb hdr");
+        return fail_unlock(ESP_FAIL);
+    }
+    if (httpd_resp_send_chunk(req, work, n) != ESP_OK) {
+        return fail_unlock(ESP_FAIL);
+    }
+
     for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
         const can_feedback_result_t &r = results[i];
-        if (i > 0) p += sprintf(p, ",");
-        p += sprintf(p, "{\"ch\":%u,\"valid\":%s", (unsigned)i,
-                     valid[i] ? "true" : "false");
-        if (valid[i]) {
-            p += sprintf(p,
+        int off = 0;
+        off = feedback_append(work, HTTP_JSON_WORK_CAP, off,
+            "%s{\"ch\":%u,\"enabled\":%s,\"valid\":%s",
+            i == 0 ? "" : ",",
+            (unsigned)i,
+            ch_en[i] ? "true" : "false",
+            valid[i] ? "true" : "false");
+        if (off < 0) {
+            break;
+        }
+
+        if (valid[i] && ch_en[i]) {
+            off = feedback_append(work, HTTP_JSON_WORK_CAP, off,
                 ",\"mode\":%u,\"seq\":%lu,\"rx\":%lu,\"tx\":%lu,"
                 "\"drop\":%lu,\"err\":%lu,\"tec\":%u,\"rec\":%u,"
                 "\"bus_state\":%u,\"count\":%u,\"entries\":[",
@@ -669,33 +759,74 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
                 (unsigned)r.stats.rec,
                 (unsigned)r.stats.bus_state,
                 (unsigned)r.total_count);
+            if (off < 0) {
+                break;
+            }
+
+            uint8_t emitted = 0;
             for (uint8_t j = 0; j < r.total_count && j < CANFD_ID_SNAPSHOT_MAX; ++j) {
                 const id_snapshot_entry_t &e = r.entries[j];
-                if (j > 0) p += sprintf(p, ",");
-                p += sprintf(p,
-                    "{\"id\":\"0x%08lX\",\"dlc\":%u,\"fd\":%u,"
+                uint8_t dataLen = (e.dlc < CANFD_ID_SNAPSHOT_DATA_MAX)
+                    ? e.dlc : (uint8_t)CANFD_ID_SNAPSHOT_DATA_MAX;
+                if (dataLen > FEEDBACK_DATA_HEX_MAX) {
+                    dataLen = FEEDBACK_DATA_HEX_MAX;
+                }
+
+                /* 先估长度：装不下则截断 entries（count 仍报真实 total） */
+                char entry_tmp[96 + FEEDBACK_DATA_HEX_MAX * 2];
+                int elen = snprintf(entry_tmp, sizeof(entry_tmp),
+                    "%s{\"id\":\"0x%08lX\",\"dlc\":%u,\"fd\":%u,"
                     "\"brs\":%u,\"esi\":%u,\"data\":\"",
+                    emitted ? "," : "",
                     (unsigned long)e.id,
                     (unsigned)e.dlc,
                     (unsigned)e.fd_flag,
                     (unsigned)e.brs,
                     (unsigned)e.esi);
-                const uint8_t dataLen = (e.dlc < CANFD_ID_SNAPSHOT_DATA_MAX)
-                                        ? e.dlc : CANFD_ID_SNAPSHOT_DATA_MAX;
-                for (uint8_t d = 0; d < dataLen; ++d) {
-                    p += sprintf(p, "%02X", e.data[d]);
+                if (elen < 0 || (size_t)elen >= sizeof(entry_tmp)) {
+                    break;
                 }
-                p += sprintf(p, "\"}");
-            }
-            p += sprintf(p, "]");
-        }
-        p += sprintf(p, "}");
-    }
-    p += sprintf(p, "]}");
+                for (uint8_t d = 0; d < dataLen; ++d) {
+                    int hn = snprintf(entry_tmp + elen, sizeof(entry_tmp) - (size_t)elen,
+                                      "%02X", e.data[d]);
+                    if (hn != 2) {
+                        break;
+                    }
+                    elen += hn;
+                }
+                if (elen + 2 >= (int)sizeof(entry_tmp)) {
+                    break;
+                }
+                entry_tmp[elen++] = '"';
+                entry_tmp[elen++] = '}';
+                entry_tmp[elen] = '\0';
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, (int)(p - resp));
-    return ESP_OK;
+                if (off + elen + 2 >= (int)HTTP_JSON_WORK_CAP) {
+                    break; /* 本通道 entries 截断 */
+                }
+                memcpy(work + off, entry_tmp, (size_t)elen);
+                off += elen;
+                emitted++;
+            }
+            off = feedback_append(work, HTTP_JSON_WORK_CAP, off, "]");
+            if (off < 0) {
+                break;
+            }
+        }
+        off = feedback_append(work, HTTP_JSON_WORK_CAP, off, "}");
+        if (off < 0) {
+            break;
+        }
+        if (httpd_resp_send_chunk(req, work, off) != ESP_OK) {
+            return fail_unlock(ESP_FAIL);
+        }
+    }
+
+    if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) {
+        return fail_unlock(ESP_FAIL);
+    }
+    esp_err_t end_err = httpd_resp_send_chunk(req, NULL, 0);
+    return fail_unlock(end_err == ESP_OK ? ESP_OK : ESP_FAIL);
 }
 
 // ============================================================
@@ -767,79 +898,13 @@ esp_err_t can_mode_handler(httpd_req_t *req)
     httpd_resp_send(req, resp, len);
     return ESP_OK;
 }
-esp_err_t can_send_handler(httpd_req_t *req)
-{
-    http_set_cors_headers(req);
-    char buf[256] = {0};
-    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (ret <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "接收数据失败");
-        return ESP_FAIL;
-    }
-    buf[ret] = '\0';
-
-    cJSON *root = cJSON_Parse(buf);
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON 解析失败");
-        return ESP_FAIL;
-    }
-
-    cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
-    cJSON *id_item = cJSON_GetObjectItem(root, "id");
-    cJSON *data_item = cJSON_GetObjectItem(root, "data");
-    cJSON *dlc_item = cJSON_GetObjectItem(root, "dlc");
-
-    if (!ch_item || !id_item) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 ch 或 id 字段");
-        return ESP_FAIL;
-    }
-
-    can_channel_t ch = (can_channel_t)cJSON_GetNumberValue(ch_item);
-    uint32_t ext_id = (uint32_t)cJSON_GetNumberValue(id_item);
-    uint8_t dlc = dlc_item ? (uint8_t)cJSON_GetNumberValue(dlc_item) : 0;
-
-    uint8_t tx_data[CAN_MAX_DLC] = {0};
-    uint8_t tx_dlc = 0;
-
-    if (data_item && cJSON_IsString(data_item)) {
-        tx_dlc = (uint8_t)parseHexToBytes(cJSON_GetStringValue(data_item), tx_data, CAN_MAX_DLC);
-    }
-
-    if (tx_dlc == 0 && dlc > 0) {
-        tx_dlc = (dlc > CAN_MAX_DLC) ? CAN_MAX_DLC : dlc;
-    }
-    cJSON_Delete(root);
-
-    uint8_t resp_data[CAN_MAX_DLC] = {0};
-    uint8_t gd32_err = 0U;
-    int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
-                             resp_data, sizeof(resp_data), 2000, &gd32_err);
-
-    char resp[512];
-    if (resp_len >= 0) {
-        char resp_hex[CAN_MAX_DLC * 2 + 1] = {0};
-        bytesToHexUpper(resp_data, (size_t)resp_len, resp_hex);
-        snprintf(resp, sizeof(resp),
-            "{\"status\": \"ok\", \"ch\": %d, \"id\": %lu, \"sent\": %d, \"recv_len\": %d, \"recv\": \"%s\"}",
-            ch, (unsigned long)ext_id, tx_dlc, resp_len, resp_hex);
-    } else {
-        snprintf(resp, sizeof(resp),
-            "{\"status\": \"error\", \"code\": %d, \"gd32_err\": %u}",
-            resp_len, (unsigned)gd32_err);
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, strlen(resp));
-    return ESP_OK;
-}
-
 /**
- * @brief POST /can/send_batch — 同通道连续发送多帧，单次 HTTP 完成。
+ * @brief POST /can/send_batch — CAN 发送唯一入口（单帧 = frames 长度 1）。
  *
  * JSON: { "ch": 0, "frames": [ { "id": n, "dlc": n, "data": "HEX" }, ... ] }
  * 返回: { "status":"ok", "results":[ ... ], 可选 skipped/abort_* }
- * 帧间间隔 kInterFrameDelayMs；批量期间暂停 CAN 反馈任务。
+ * 单帧 canFdSend 超时 2000ms（等应答）；多帧 80ms/帧 + 帧间隔。
+ * 发送期间暂停 CAN 反馈任务。
  */
 esp_err_t can_send_batch_handler(httpd_req_t *req)
 {
@@ -848,6 +913,7 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
     constexpr int kMaxBody = 49152;
     constexpr int kMaxFrames = 128;
     constexpr uint32_t kPerFrameTimeoutMs = 80U;
+    constexpr uint32_t kSingleFrameTimeoutMs = 2000U;
     constexpr uint32_t kInterFrameDelayMs = 5U;
 
     int content_len = req->content_len;
@@ -893,6 +959,8 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
         return http_send_json_error(req, "400 Bad Request", "bad_frames",
                                     "frames 数量无效（1~128）");
     }
+    const uint32_t frame_timeout_ms =
+        (frame_count == 1) ? kSingleFrameTimeoutMs : kPerFrameTimeoutMs;
 
     cJSON *out_root = cJSON_CreateObject();
     cJSON *results = cJSON_CreateArray();
@@ -905,7 +973,7 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
     cJSON_AddStringToObject(out_root, "status", "ok");
     cJSON_AddItemToObject(out_root, "results", results);
 
-    /* 批量发送期间暂停 CAN 反馈，独占 SPI 业务路径 */
+    /* 发送期间暂停 CAN 反馈，独占 SPI 业务路径 */
     pauseCanFeedbackTask(true);
 
     auto fill_err = [](cJSON *item, int code, uint8_t gd32_err) {
@@ -962,7 +1030,7 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
         memset(resp_data, 0, sizeof(resp_data));
         uint8_t gd32_err = 0U;
         int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
-                                 resp_data, sizeof(resp_data), kPerFrameTimeoutMs, &gd32_err);
+                                 resp_data, sizeof(resp_data), frame_timeout_ms, &gd32_err);
 
         if (resp_len >= 0) {
             char resp_hex[CAN_MAX_DLC * 2 + 1];
@@ -1073,8 +1141,9 @@ esp_err_t spi_send_handler(httpd_req_t *req)
         snprintf(resp, sizeof(resp),
             "{\"status\": \"ok\", \"type\": \"%02X\", \"payload_len\": %zu, \"resp_type\": \"%02X\", \"resp_len\": %zu, \"recv\": \"%s\"}",
             frame_type, payload_len, resp_type, resp_len, resp_hex);
-        DEBUG_INFO("SPI", "WEB SPI 响应: type=0x%02X len=%zu payload=%s",
-                   resp_type, resp_len, resp_hex);
+        /* 日志只记 type/len，完整 payload 仅在 HTTP JSON 返回给前端 */
+        DEBUG_INFO("SPI", "WEB SPI ok: type=0x%02X len=%zu",
+                   resp_type, resp_len);
     } else {
         snprintf(resp, sizeof(resp),
             "{\"status\": \"error\", \"code\": %d, \"message\": \"%s\"}",
@@ -1088,24 +1157,26 @@ esp_err_t spi_send_handler(httpd_req_t *req)
 }
 
 static constexpr uint32_t INTERNAL_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-/* 状态 JSON 用静态缓冲：OTA 后 largest free 常 <2KB，calloc(8KB) 会 500 "no memory"。 */
-/* 含 boot 模块列表与 CPU 任务；OTA 后 largest free 常偏紧，仍用静态缓冲避免 calloc */
-static constexpr size_t SYSTEM_STATUS_JSON_CAP = 7168;
-static char s_status_json[SYSTEM_STATUS_JSON_CAP];
-static SemaphoreHandle_t s_status_json_mux = nullptr;
-static portMUX_TYPE s_status_json_init_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static SemaphoreHandle_t statusJsonMutex(void)
+/** 发送当前工作区并清空 offset（分块；失败返回 false） */
+static bool status_flush_chunk(httpd_req_t *req, char *buf, size_t cap, int *len)
 {
-    if (s_status_json_mux == nullptr) {
-        portENTER_CRITICAL(&s_status_json_init_mux);
-        if (s_status_json_mux == nullptr) {
-            s_status_json_mux = xSemaphoreCreateMutex();
-        }
-        portEXIT_CRITICAL(&s_status_json_init_mux);
+    if (!req || !buf || !len || *len <= 0) {
+        return true;
     }
-    return s_status_json_mux;
+    if (httpd_resp_send_chunk(req, buf, *len) != ESP_OK) {
+        return false;
+    }
+    *len = 0;
+    if (cap > 0) {
+        buf[0] = '\0';
+    }
+    return true;
 }
+
+/* CPU 快照静态缓冲：替代每秒 calloc(1.2KB)，消除 IDLE 期持续的堆抖动。
+ * 与 s_http_json_work 同由 httpJsonWorkMutex 串行化。 */
+static CpuUsageSnapshot s_cpu_snapshot;
 
 static size_t get_task_stack_high_watermark_bytes(TaskHandle_t handle)
 {
@@ -1136,9 +1207,10 @@ static int append_jsonf(char* buf, size_t cap, int offset, const char* fmt, ...)
     return offset + (int)written;
 }
 
-/** 将 CpuStats 1Hz 快照写入 JSON（不在 HTTP 线程采样） */
+/** 将 CpuStats 1Hz 快照写入 JSON（不在 HTTP 线程采样）。最多 16 条任务以免撑爆 3KB 分块。 */
 static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUsageSnapshot& cpu)
 {
+    static constexpr size_t kCpuTaskJsonMax = 16;
     offset = append_jsonf(buf, cap, offset,
         "\"cpu\":{\"available\":%s,\"valid\":%s,\"usage_pct\":%.2f,\"idle_pct\":%.2f,\"sample_ms\":%lu,\"tasks\":[",
         cpu.available ? "true" : "false",
@@ -1147,7 +1219,9 @@ static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUs
         cpu.valid ? cpu.idle_pct : 0.0,
         (unsigned long)(cpu.valid ? cpu.sample_ms : 0U));
 
-    for (size_t i = 0; i < cpu.task_count; ++i) {
+    const size_t ntask =
+        (cpu.task_count > kCpuTaskJsonMax) ? kCpuTaskJsonMax : cpu.task_count;
+    for (size_t i = 0; i < ntask; ++i) {
         const CpuTaskMetric& task = cpu.tasks[i];
         offset = append_jsonf(buf, cap, offset,
             "%s{\"name\":\"%s\",\"task_number\":%lu,\"runtime_delta\":%" PRIu64 ",\"usage_pct\":%.2f}",
@@ -1165,6 +1239,20 @@ static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUs
 esp_err_t system_status_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
+
+    /* layout=1：附带链接期静态布局（IRAM/.data/.bss/堆容量等），前端缓存后轮询不再要。
+     * 默认只下发 memory 动态字段，减 status JSON 体积。 */
+    bool want_mem_layout = false;
+    {
+        char query[48];
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            char val[8] = {};
+            if (httpd_query_key_value(query, "layout", val, sizeof(val)) == ESP_OK) {
+                want_mem_layout = (val[0] == '1' || val[0] == 'y' || val[0] == 'Y' ||
+                                   val[0] == 't' || val[0] == 'T');
+            }
+        }
+    }
 
     /* 堆极紧时仍返回精简 JSON，禁止 500（前端轮询会刷红）。 */
     const size_t largest_now = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
@@ -1184,10 +1272,10 @@ esp_err_t system_status_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    SemaphoreHandle_t mux = statusJsonMutex();
+    SemaphoreHandle_t mux = httpJsonWorkMutex();
     if (mux) {
         if (xSemaphoreTake(mux, pdMS_TO_TICKS(200)) != pdTRUE) {
-            /* 并发 status 冲突：仍回简包，避免 200 */
+            /* 与 feedback/heap_low 争用工作区：仍回简包，避免 500 刷红 */
             char busy[160];
             snprintf(busy, sizeof(busy),
                      "{\"version\":\"%s\",\"ota\":{\"sys_state\":\"busy\"},"
@@ -1229,10 +1317,58 @@ esp_err_t system_status_handler(httpd_req_t *req)
     size_t internal_largest_free_block = heap_caps_get_largest_free_block(INTERNAL_HEAP_CAPS);
     size_t internal_heap_total = heap_caps_get_total_size(INTERNAL_HEAP_CAPS);
     size_t default_heap_total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+
+    /* 内存全景：堆只是 SRAM 中可 malloc 的部分。
+     * 静态段用链接符号拆分（与 map 文件一致）：
+     *   [IRAM code | .data | .bss | heap ...]  （C3 上 IRAM/DRAM 同一物理 SRAM）
+     * 手册 400KB = DRAM 窗口 + 约 16KB 指令 cache（cache 不在 SOC_DRAM_* 窗口内）。 */
+    multi_heap_info_t internal_info = {};
+    heap_caps_get_info(&internal_info, INTERNAL_HEAP_CAPS);
+
+    extern char _iram_start[];
+    extern char _iram_end[];
+    extern char _data_start[];
+    extern char _data_end[];
+    extern char _bss_start[];
+    extern char _bss_end[];
+    extern char _heap_start[];
+    auto sym_span = [](const char *a, const char *b) -> size_t {
+        const uintptr_t ua = reinterpret_cast<uintptr_t>(a);
+        const uintptr_t ub = reinterpret_cast<uintptr_t>(b);
+        return (ub >= ua) ? static_cast<size_t>(ub - ua) : 0U;
+    };
+    const size_t iram_bytes = sym_span(_iram_start, _iram_end);
+    const size_t data_bytes = sym_span(_data_start, _data_end);
+    const size_t bss_bytes = sym_span(_bss_start, _bss_end);
+    /* C3 DIRAM：DRAM 基址起至 _heap_start 即为 IRAM+.data+.bss 占位 */
+    const uintptr_t heap_start_addr = reinterpret_cast<uintptr_t>(_heap_start);
+    const size_t static_to_heap =
+        (heap_start_addr >= static_cast<uintptr_t>(SOC_DRAM_LOW))
+            ? static_cast<size_t>(heap_start_addr - static_cast<uintptr_t>(SOC_DRAM_LOW))
+            : (iram_bytes + data_bytes + bss_bytes);
+
+    const size_t sram_soc =
+        (SOC_DRAM_HIGH > SOC_DRAM_LOW) ? (size_t)(SOC_DRAM_HIGH - SOC_DRAM_LOW) : 0U;
+    /* 应用实际接管：静态链接区 + 内部堆（比整窗更贴近“可用 DRAM”） */
+    const size_t sram_app = static_to_heap + internal_heap_total;
+    const size_t sram_total = (sram_app > 0) ? sram_app : sram_soc;
+    const size_t internal_heap_used = internal_info.total_allocated_bytes;
+    const size_t static_reserved = static_to_heap;
+    const size_t reserved_tail =
+        (sram_soc > sram_app) ? (sram_soc - sram_app) : 0U;
+    const size_t dma_total = heap_caps_get_total_size(MALLOC_CAP_DMA);
+    const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    const size_t rtc_total = heap_caps_get_total_size(MALLOC_CAP_RTCRAM);
+    const size_t rtc_free = heap_caps_get_free_size(MALLOC_CAP_RTCRAM);
+
     // 任务栈指标复用 health_monitor 共享的任务表（collectTaskStackMetrics），
     //   避免与巡检逻辑两地维护；http_server 在本 handler 上下文中，句柄即当前任务。
     TaskStackMetric task_metrics[12];
     size_t task_metrics_count = collectTaskStackMetrics(task_metrics, 12);
+    size_t task_stack_total_bytes = 0;
+    for (size_t i = 0; i < task_metrics_count; ++i) {
+        task_stack_total_bytes += task_metrics[i].stack_size_bytes;
+    }
     // http_server 行的句柄在 httpd 线程中取当前任务更准确
     for (size_t i = 0; i < task_metrics_count; ++i) {
         if (strcmp(task_metrics[i].name, "http_server") == 0) {
@@ -1241,28 +1377,22 @@ esp_err_t system_status_handler(httpd_req_t *req)
     }
 
     /* CPU：只读 cpu_stats 任务的 1Hz 快照，禁止在 httpd 里 uxTaskGetSystemState */
-    CpuUsageSnapshot cpu_local = {};
-    CpuUsageSnapshot *cpu = &cpu_local;
-    CpuUsageSnapshot *cpu_heap = nullptr;
-    if (largest_free_block >= (sizeof(CpuUsageSnapshot) + 512U)) {
-        cpu_heap = (CpuUsageSnapshot *)calloc(1, sizeof(CpuUsageSnapshot));
-        if (cpu_heap) {
-            cpu = cpu_heap;
-        }
-    }
+    CpuUsageSnapshot *cpu = &s_cpu_snapshot;   // 用静态缓冲，不再每秒 calloc(1.2KB)
     CpuStats::instance().getSnapshot(*cpu);
 
-    char *resp = s_status_json;
-    memset(resp, 0, SYSTEM_STATUS_JSON_CAP);
+    char *resp = s_http_json_work;
+    memset(resp, 0, HTTP_JSON_WORK_CAP);
+    httpd_resp_set_type(req, "application/json");
 
-    int len = snprintf(resp, SYSTEM_STATUS_JSON_CAP,
+    /* ── 分块 1：核心状态 + OTA/WiFi ── */
+    int len = snprintf(resp, HTTP_JSON_WORK_CAP,
         "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, "
         "\"free_heap\": %lu, \"min_free_heap\": %lu, \"largest_free_block\": %lu, "
         "\"internal_free_heap\": %lu, \"internal_min_free_heap\": %lu, \"internal_largest_free_block\": %lu, "
         "\"internal_heap_total\": %lu, \"default_heap_total\": %lu, "
         "\"temperature\": %.1f, \"uptime_sec\": %lu, "
         "\"wifi\": {\"mode\": \"%s\", \"ip\": \"%s\", \"rssi\": %d, \"connected\": %s}, "
-        "\"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"channel\": %d, \"channel_name\": \"%s\", \"total_size\": %lu, \"stored_size\": %lu, \"storage_done\": %s, "
+        "\"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"channel\": %d, \"channel_name\": \"%s\", "
         "\"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, "
         "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}, ",
         FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
@@ -1284,9 +1414,6 @@ esp_err_t system_status_handler(httpd_req_t *req)
         (int)snap.sys_state,
         (int)snap.channel,
         snap.channel == OTA_CHANNEL_BLE ? "BLE" : "WIFI",
-        (unsigned long)snap.meta.total_size,
-        (unsigned long)snap.meta.stored_size,
-        snap.storage_done ? "true" : "false",
         snap.relay.state,
         (unsigned long)snap.relay.seq,
         (unsigned long)snap.relay.total_packets,
@@ -1295,11 +1422,30 @@ esp_err_t system_status_handler(httpd_req_t *req)
         snap.relay.version.app_patch, snap.relay.version.app_build,
         snap.relay.version.boot_major, snap.relay.version.boot_minor,
         snap.relay.version.boot_patch, snap.relay.version.boot_build);
+    if (len < 0 || (size_t)len >= HTTP_JSON_WORK_CAP) {
+        if (mux) {
+            xSemaphoreGive(mux);
+        }
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status hdr");
+        return ESP_FAIL;
+    }
+    if (!status_flush_chunk(req, resp, HTTP_JSON_WORK_CAP, &len)) {
+        if (mux) {
+            xSemaphoreGive(mux);
+        }
+        return ESP_FAIL;
+    }
 
-    len = append_cpu_status_json(resp, SYSTEM_STATUS_JSON_CAP, len, *cpu);
+    /* ── 分块 2：CPU ── */
+    len = append_cpu_status_json(resp, HTTP_JSON_WORK_CAP, 0, *cpu);
+    if (!status_flush_chunk(req, resp, HTTP_JSON_WORK_CAP, &len)) {
+        if (mux) {
+            xSemaphoreGive(mux);
+        }
+        return ESP_FAIL;
+    }
 
-    /* SPI Link v2 统计（SPEC §12.1）— linkStatus 内部用 5ms 有界超时取 SPI 锁，
-     * OTA 中继期间拿不到锁时返回零值统计，绝不阻塞 /system/status 响应。 */
+    /* ── 分块 3：SPI / ADC / features / boot / memory ── */
     {
         SpiMaster::SpiLinkStatus ls = SpiMaster::instance().linkStatus();
         const char *role_str = "unknown";
@@ -1308,7 +1454,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
             case 2: role_str = "boot"; break;
             default: break;
         }
-        len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len,
+        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, 0,
             ",\"spi_link\":{\"version\":%u,\"gd32_role\":\"%s\",\"session_id\":\"0x%08lX\","
             "\"v2_active\":%s,\"local_credit\":%u,\"remote_credit\":%u,"
             "\"crc_errors\":%lu,\"duplicate_requests\":%lu,\"seq_errors\":%lu,"
@@ -1330,14 +1476,114 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)ls.stats.max_resp_latency_us);
     }
 
-    /* 启动自检位图（与串口 BOOT report 同源） */
-    len = SystemBoot::appendStatusJson(resp, SYSTEM_STATUS_JSON_CAP, len);
+    {
+        gd32_adc_feedback_t ga = {};
+        const bool have = getLatestGd32AdcFeedback(&ga);
+        const uint32_t age = gd32AdcFeedbackAgeMs();
+        const bool fresh = have && age != UINT32_MAX && age < 5000U;
+        const bool feat_known = SpiMaster::instance().gd32FeatKnown();
+        const bool feat_adc = SpiMaster::instance().gd32FeatAdcFeedback();
+        const char *en = feat_known ? (feat_adc ? "true" : "false")
+                                    : (have ? "true" : "null");
+        if (have) {
+            len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+                ",\"gd32_adc\":{\"enabled\":%s,\"feat_known\":%s,\"fresh\":%s,\"valid\":%s,"
+                "\"temperature\":%.2f,\"vdda\":%.3f,\"vin_adc\":%.3f,\"vcc\":%.3f,"
+                "\"temp_raw\":%u,\"vref_raw\":%u,\"seq\":%lu,"
+                "\"uptime_sec\":%lu,\"age_ms\":%lu}",
+                en, feat_known ? "true" : "false",
+                fresh ? "true" : "false", ga.valid ? "true" : "false",
+                (double)ga.temperature_c, (double)ga.vdda_v, (double)ga.vin_adc_v,
+                (double)ga.vcc_v,
+                (unsigned)ga.temp_raw, (unsigned)ga.vref_raw,
+                (unsigned long)ga.seq, (unsigned long)ga.uptime_sec,
+                (unsigned long)(age == UINT32_MAX ? 0UL : (unsigned long)age));
+        } else {
+            len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+                ",\"gd32_adc\":{\"enabled\":%s,\"feat_known\":%s,\"fresh\":false,\"valid\":false}",
+                en, feat_known ? "true" : "false");
+        }
+        const uint32_t fl = SpiMaster::instance().gd32FeatFlags();
+        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+            ",\"gd32_features\":{\"known\":%s,\"flags\":%lu,"
+            "\"adc_feedback\":%s,\"uart_temp_print\":%s,"
+            "\"spi_app_log\":%s,\"can_brs\":%s,"
+            "\"can_ch0\":%s,\"can_ch1\":%s,\"can_ch2\":%s,\"can_ch_mask\":%u}",
+            feat_known ? "true" : "false",
+            (unsigned long)fl,
+            (feat_known && (fl & V2_FEAT_ADC_FEEDBACK)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_UART_TEMP_PRINT)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_SPI_APP_LOG)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_CAN_BRS)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_CAN_CH0)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_CAN_CH1)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_CAN_CH2)) ? "true" : "false",
+            feat_known ? (unsigned)((fl & V2_FEAT_CAN_CH_MASK) >> V2_FEAT_CAN_CH_SHIFT) : 7U);
+    }
 
-    // 前导逗号与前一块分隔；之前因 append_cpu_status_json 尾随逗号叠加
-    // 形成 "],," 导致前端 JSON.parse 报 "Expected double-quoted property name"
-    len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len, ",\"task_stack\": {");
+    len = SystemBoot::appendStatusJson(resp, HTTP_JSON_WORK_CAP, len);
+
+    /* memory 动态字段：每次轮询；layout 仅 ?layout=1 时附带（链接期常量）。 */
+    if (want_mem_layout) {
+        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+            ",\"memory\":{\"layout\":{\"chip\":\"esp32c3\",\"sram_total\":%lu,\"sram_soc\":%lu,"
+            "\"static_reserved\":%lu,\"reserved_tail\":%lu,"
+            "\"iram\":%lu,\"data\":%lu,\"bss\":%lu,"
+            "\"heap_total\":%lu,\"dma_total\":%lu,\"rtc_total\":%lu,"
+            "\"task_stack_total\":%lu,\"default_heap_total\":%lu},"
+            "\"heap_used\":%lu,\"heap_free\":%lu,"
+            "\"heap_min_free\":%lu,\"heap_largest_free\":%lu,"
+            "\"alloc_blocks\":%lu,\"free_blocks\":%lu,"
+            "\"dma_free\":%lu,\"rtc_free\":%lu,\"default_heap_free\":%lu}",
+            (unsigned long)sram_total,
+            (unsigned long)sram_soc,
+            (unsigned long)static_reserved,
+            (unsigned long)reserved_tail,
+            (unsigned long)iram_bytes,
+            (unsigned long)data_bytes,
+            (unsigned long)bss_bytes,
+            (unsigned long)internal_heap_total,
+            (unsigned long)dma_total,
+            (unsigned long)rtc_total,
+            (unsigned long)task_stack_total_bytes,
+            (unsigned long)default_heap_total,
+            (unsigned long)internal_heap_used,
+            (unsigned long)internal_info.total_free_bytes,
+            (unsigned long)internal_info.minimum_free_bytes,
+            (unsigned long)internal_info.largest_free_block,
+            (unsigned long)internal_info.allocated_blocks,
+            (unsigned long)internal_info.free_blocks,
+            (unsigned long)dma_free,
+            (unsigned long)rtc_free,
+            (unsigned long)free_heap);
+    } else {
+        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+            ",\"memory\":{\"heap_used\":%lu,\"heap_free\":%lu,"
+            "\"heap_min_free\":%lu,\"heap_largest_free\":%lu,"
+            "\"alloc_blocks\":%lu,\"free_blocks\":%lu,"
+            "\"dma_free\":%lu,\"rtc_free\":%lu,\"default_heap_free\":%lu}",
+            (unsigned long)internal_heap_used,
+            (unsigned long)internal_info.total_free_bytes,
+            (unsigned long)internal_info.minimum_free_bytes,
+            (unsigned long)internal_info.largest_free_block,
+            (unsigned long)internal_info.allocated_blocks,
+            (unsigned long)internal_info.free_blocks,
+            (unsigned long)dma_free,
+            (unsigned long)rtc_free,
+            (unsigned long)free_heap);
+    }
+
+    if (!status_flush_chunk(req, resp, HTTP_JSON_WORK_CAP, &len)) {
+        if (mux) {
+            xSemaphoreGive(mux);
+        }
+        return ESP_FAIL;
+    }
+
+    /* ── 分块 4：task_stack + 闭合 ── */
+    len = append_jsonf(resp, HTTP_JSON_WORK_CAP, 0, ",\"task_stack\": {");
     for (size_t i = 0; i < task_metrics_count; ++i) {
-        len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len,
+        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
             "%s\"%s\":{\"stack_size_bytes\":%lu,\"high_watermark_bytes\":%lu,\"peak_used_bytes\":%lu}",
             i == 0 ? "" : ",",
             task_metrics[i].name,
@@ -1345,13 +1591,17 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)get_task_stack_high_watermark_bytes(task_metrics[i].handle),
             (unsigned long)get_task_stack_peak_used_bytes(task_metrics[i].handle, task_metrics[i].stack_size_bytes));
     }
-    len = append_jsonf(resp, SYSTEM_STATUS_JSON_CAP, len, "}}");
+    len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len, "}}");
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, len > 0 ? len : 0);
-    if (cpu_heap) {
-        free(cpu_heap);
+    if (!status_flush_chunk(req, resp, HTTP_JSON_WORK_CAP, &len)) {
+        if (mux) {
+            xSemaphoreGive(mux);
+        }
+        return ESP_FAIL;
     }
+    /* 结束 chunked body */
+    (void)httpd_resp_send_chunk(req, NULL, 0);
+
     if (mux) {
         xSemaphoreGive(mux);
     }
@@ -1386,3 +1636,41 @@ esp_err_t system_probe_handler(httpd_req_t *req)
     httpd_resp_send(req, resp, len);
     return ESP_OK;
 }
+
+// ============================================================
+// GET /system/heap_low_log — 设备唯一快照槽（0 或 1 条）
+// ============================================================
+/**
+ * @brief 返回设备侧最新一条"最低空闲创新低"上下文。
+ * 多条历史由网页 IndexedDB 累积；JSON 复用 s_http_json_work（无独立 .bss）。
+ */
+esp_err_t system_heap_low_log_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    SemaphoreHandle_t mux = httpJsonWorkMutex();
+    if (mux && xSemaphoreTake(mux, pdMS_TO_TICKS(200)) != pdTRUE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"records\":[]}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char *resp = s_http_json_work;
+    int len = HealthMonitor::instance().dumpHeapLowWaterJson(resp, HTTP_JSON_WORK_CAP, 0);
+    if (len < 0) {
+        len = 0;
+    }
+    if ((size_t)len >= HTTP_JSON_WORK_CAP) {
+        len = (int)HTTP_JSON_WORK_CAP - 1;
+    }
+    resp[len] = '\0';
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_send(req, resp, len);
+    if (mux) {
+        xSemaphoreGive(mux);
+    }
+    return err;
+}
+
+

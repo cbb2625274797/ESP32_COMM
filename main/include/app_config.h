@@ -11,18 +11,17 @@
 #include "version.h"
 
 // ============================================================
+// 功能开关（ESP32 本机；GD32 侧开关随 HELLO/PING 身份块上报，无需镜像）
+// ============================================================
+// 0 = AP 热点，1 = STA 连路由器
+inline constexpr uint8_t CONFIG_WIFI_MODE = 1;
+
+// ============================================================
 // 固件版本（由 version.h 自动生成，此处提供 C++ constexpr 访问）
 // ============================================================
 inline constexpr const char *FW_VERSION = FW_VERSION_STRING;     ///< 固件版本字符串（自动生成）
 inline constexpr const char *FW_BUILD_TIME = BUILD_TIME;         ///< 编译时间字符串（自动生成）
 inline constexpr const char *FW_GIT_HASH = GIT_HASH;             ///< Git 提交哈希（自动生成）
-
-// ============================================================
-// WiFi 工作模式选择
-// ============================================================
-// 0 = AP 模式（设备当热点）
-// 1 = STA 模式（连接路由器）
-inline constexpr uint8_t CONFIG_WIFI_MODE = 1;
 
 // ============================================================
 // WiFi STA 模式配置（连接路由器）
@@ -47,19 +46,21 @@ inline constexpr uint16_t HTTP_SERVER_PORT      = 80;              ///< HTTP 服
 
 // ============================================================
 // 任务栈大小（字节）— 2026-07 按板端 task_stack 水位收敛
-// 规则：peak_used 实测 + 至少 ~1.5–2KB 余量；httpd 路径最重单独放宽。
-// 实测（空闲/常规）：http peak~5KB, wifi_ota~1.4KB, ota_relay~1KB,
-//   health~1.2KB, cpu_stats~2KB, ble*~1KB, reconnect~1KB。
+// 规则：S ≈ peak_used + 1.5～2KB；偏松的收、偏紧的不砍。
+// 板测峰值量级（常规/OTA）：
+//   http~5.2KB, spi~1.9KB, wifi_ota~1.2KB, ble_ota~0.9KB,
+//   ble_worker 1004B, health/cpu~1.8KB, ota_relay 轻载~1.3KB。
+// 2026-07 余量优化：收 http/spi/wifi/ble* 偏松项，health/cpu/relay 保持。
 // ============================================================
-inline constexpr uint32_t HTTP_SERVER_STACK_SIZE   = 8192;  ///< httpd：原 10KB，peak~5KB → 8KB（余量~3KB）
-inline constexpr uint32_t TASK_STACK_WIFI_OTA      = 4096;  ///< wifi_ota 主循环：原 8KB，peak~1.4KB
-inline constexpr uint32_t TASK_STACK_OTA_RELAY     = 2560;  ///< ota_relay：2.5KB（轻载 peak~1KB；转发时看 /system/status.task_stack）
-inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 5120;  ///< spi_worker：5KB（帧缓冲热路径；已纳入 task_stack 巡检）
-inline constexpr uint32_t TASK_STACK_BLE_OTA       = 3072;  ///< ble_ota 主任务：peak~1KB
-inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 3072;  ///< ble_ota_worker
-inline constexpr uint32_t TASK_STACK_HEALTH_MON    = 3072;  ///< health_mon：peak~1.2KB
-inline constexpr uint32_t TASK_STACK_CPU_STATS     = 3072;  ///< cpu_stats：peak~2KB
-inline constexpr uint32_t TASK_STACK_WIFI_RECONNECT = 2560; ///< wifi_reconnect：peak~1KB
+inline constexpr uint32_t HTTP_SERVER_STACK_SIZE   = 7168;  ///< httpd：peak~5.2KB + ~2KB → 7KB（原 8/10KB）
+inline constexpr uint32_t TASK_STACK_WIFI_OTA      = 3072;  ///< wifi_ota：peak~1.2KB + ~1.8KB → 3KB（原 4/8KB）
+inline constexpr uint32_t TASK_STACK_OTA_RELAY     = 2560;  ///< ota_relay：2.5KB（轻载 peak~1.3KB；转发突发不砍）
+inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 4096;  ///< spi_worker：peak~1.9KB + ~2KB → 4KB（原 5KB）
+inline constexpr uint32_t TASK_STACK_BLE_OTA       = 2560;  ///< ble_ota：peak~0.9KB + ~1.5KB → 2.5KB（原 3KB）
+inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 2560;  ///< ble_ota_worker：peak 1004B + ~1.5KB → 2.5KB（原 3KB）
+inline constexpr uint32_t TASK_STACK_HEALTH_MON    = 3072;  ///< health_mon：peak~1.8KB，余量~1.2KB，不砍
+inline constexpr uint32_t TASK_STACK_CPU_STATS     = 3072;  ///< cpu_stats：peak~1.8KB，余量~1.2KB，不砍
+inline constexpr uint32_t TASK_STACK_WIFI_RECONNECT = 2560; ///< wifi_reconnect：轻载，2.5KB 保持
 inline constexpr uint32_t TASK_STACK_CAN_FB        = 3072;  ///< can_fb：被动 takeEvent(0xC1)
 inline constexpr uint32_t TASK_STACK_BLE_FINISH    = 4096;  ///< 按需：SHA finalize（保持）
 inline constexpr uint32_t TASK_STACK_BLE_GD32_WAIT = 3072;  ///< 按需：GD32 中继等待
@@ -68,9 +69,8 @@ inline constexpr uint32_t TASK_STACK_BLE_RESTART   = 2048;  ///< 按需：延时
 // ============================================================
 // OTA 配置
 // ============================================================
-inline constexpr size_t  OTA_BLOCK_SIZE         = 2048;            ///< 上传接收块：2KB 降峰值 BSS/堆（s_ota_upload_recv 静态占用）
-// OTA_BLOCK_SIZE 演进：8KB(原)→2KB(压堆)→4KB(试吞吐)→2KB(2026-07 回退省 DRAM)。
-//   4KB 时 s_ota_upload_recv BSS +2KB，开机 free/largest 更紧；回退 2KB 优先保内存。
+inline constexpr size_t  OTA_BLOCK_SIZE         = 4096;            ///< 上传接收块：4KB（吞吐优先；s_ota_upload_recv 静态 +2KB vs 2KB 块）
+// OTA_BLOCK_SIZE 演进：8KB→2KB(压堆)→4KB(试吞吐)→2KB(2026-07 回退)→4KB(2026-07-20 再提吞吐)。
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB = 221184B = 0x35F90，固件大小上限
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
 
@@ -88,6 +88,7 @@ inline constexpr size_t  HEAP_WARNING_MIN   = 10240;               ///< 堆内�
 
 // ============================================================
 // 调试配置（UDP 日志）
+// GD32 ADC/CAN 等开关：看 HELLO_ACK/PING 身份块 feat 位（GD32 config 顶部）
 // ============================================================
 inline constexpr const char* DEBUG_LOG_IP   = "192.168.31.3";      ///< UDP 日志目标 IP
 inline constexpr uint16_t DEBUG_LOG_PORT   = 6666;                 ///< UDP 日志目标端口

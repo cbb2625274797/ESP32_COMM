@@ -81,4 +81,12 @@ public:
     bool m_suspendedForWifiOta = false;            ///< 因 WiFi OTA 主动挂起
 };
 
+// ── 堆低水位快照辅助 getter（不在 BleOta 类内，file-static 资源访问） ──
+/** @brief BLE OTA 数据队列当前深度（每个 item 持有 malloc 的 data 缓冲）。
+ *        供 /system/heap_low_log 采样。非 OTA 期返回 0。 */
+uint32_t ble_ota_get_data_queue_depth();
+/** @brief BLE reorder buffer 已缓存的乱序包数（每个 slot 持有 malloc 的 payload）。
+ *        供 /system/heap_low_log 采样。非 ESP32 OTA 期返回 0。 */
+uint32_t ble_ota_get_reorder_cached_count();
+
 #endif // BLE_OTA_H

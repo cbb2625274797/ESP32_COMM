@@ -51,8 +51,14 @@ class DebugLog {
 public:
     static DebugLog& instance();
 
-    /** @brief 初始化日志系统（UART + ring；UDP socket 延迟创建）。 */
+    /** @brief 初始化日志系统（UART + 开机大环；UDP socket 延迟创建）。 */
     esp_err_t init();
+
+    /**
+     * @brief 启动 burst 结束后把环从开机容量缩到稳态小环，释放大块堆。
+     *        幂等；失败则保留大环。宜在 WiFi/HTTP 就绪后、日志变少时调用。
+     */
+    void shrinkRingAfterBoot();
 
     /** @brief 初始化 UART0 调试串口。 */
     esp_err_t uartInit();
@@ -96,16 +102,27 @@ private:
     bool m_uartAvailable = false;
     debug_log_level_t m_logLevel = DEBUG_LOG_INFO;
 
-    /* 环形日志：OTA 中继期需保留关键 INFO，64×160≈10KB BSS。 */
-    static constexpr int LOG_RING_SLOTS = 64;
-    static constexpr int LOG_RING_SIZE  = 160;
-    /** 单次 /logs drain 上限（与 SLOTS 更接近，减 burst 滞后） */
-    static constexpr int LOG_DRAIN_MAX  = 48;
-    char  m_logRing[LOG_RING_SLOTS][LOG_RING_SIZE] = {};
-    int   m_logRingLens[LOG_RING_SLOTS] = {};
+    /* 环形日志（堆上分配，非 .data）：
+     *  开机 LOG_RING_SLOTS_BOOT×128 容纳启动刷屏；
+     *  shrinkRingAfterBoot() 后改为 LOG_RING_SLOTS_STEADY×128，释放大环。
+     *  业务 DEBUG_* 目标：整行（[L][TAG]+正文+\\n）≤128B；槽 128 含 \\0 → 有效≤127。 */
+    static constexpr int LOG_RING_SLOTS_BOOT    = 64;   ///< 开机 burst：~8.4KB 堆
+    static constexpr int LOG_RING_SLOTS_STEADY  = 16;   ///< 稳态：~2.1KB 堆（对齐 drain）
+    static constexpr int LOG_RING_SIZE         = 128;  ///< 单条槽（含 \\0）；有效≤127（含换行）
+    static constexpr int LOG_DRAIN_MAX         = 16;   ///< 单次 /logs 最多条数
+    char *m_logRing = nullptr;       ///< [slots * LOG_RING_SIZE] 扁平行
+    int  *m_logRingLens = nullptr;   ///< [slots]
+    int   m_logRingSlots = 0;        ///< 当前容量
     int   m_logRingHead  = 0;
     int   m_logRingCount = 0;
+    bool  m_logRingShrunk = false;
     SemaphoreHandle_t m_logRingMutex = nullptr;
+
+    char *ringSlot(int idx) { return m_logRing + (size_t)idx * (size_t)LOG_RING_SIZE; }
+    const char *ringSlot(int idx) const {
+        return m_logRing + (size_t)idx * (size_t)LOG_RING_SIZE;
+    }
+    bool allocRing(int slots);
 
     /* 堆门控（防 OTA 时 UDP/格式化抢 LWIP 堆）：
      * ERR/WARN 永不因堆门控丢弃

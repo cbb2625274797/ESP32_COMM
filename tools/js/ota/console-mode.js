@@ -94,33 +94,41 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
     window.flashTarget = target === 'gd32' ? 'gd32' : 'esp32';
     persistFlashTarget(window.flashTarget);
     applySharedModeUi();
-    syncBleFileFromSelectedTarget();
+    /* 与 WiFi 一致：两路文件独立；切换只换「当前目标」面板 + 绑定该路文件到会话 */
     if (window.connectionMode === 'ble') {
       window.switchStageFlow('ble');
       if (typeof setActivePhase === 'function') {
-        setActivePhase(target === 'gd32' ? 'gd32Ota' : 'esp32Ota');
+        setActivePhase(window.flashTarget === 'gd32' ? 'gd32Ota' : 'esp32Ota');
       }
+      if (window.bleOta && typeof window.bleOta.refreshTargetUi === 'function') {
+        window.bleOta.refreshTargetUi();
+      }
+      /* 把当前目标对应的 esp32/gd32 固件绑到 BLE 会话（无文件则清空，避免误刷另一芯片） */
+      syncBleFileFromSelectedTarget();
     } else {
       window.switchStageFlow(window.flashTarget);
-    }
-    if (window.bleOta && typeof window.bleOta.refreshTargetUi === 'function') {
-      window.bleOta.refreshTargetUi();
     }
   };
 
   window.handleSharedFileSelect = function (event, chip) {
-    var file = event && event.target && event.target.files && event.target.files[0] ? event.target.files[0] : null;
-    if (file) {
-      /* 传统 input 无持久 handle，刷新后无法自动恢复该次选择 */
-      window.sharedFirmwareFiles[chip] = { file: file, handle: null };
-    }
-    if (typeof window.handleFileSelect === 'function') {
-      window.handleFileSelect(event, chip);
-    }
     window.flashTarget = chip === 'gd32' ? 'gd32' : 'esp32';
     persistFlashTarget(window.flashTarget);
     applySharedModeUi();
-    setTimeout(syncBleFileFromSelectedTarget, 0);
+    /* 等 processFile（含 HEX→BIN）完成后再写入 shared 并 sync */
+    var done = (typeof window.handleFileSelect === 'function')
+      ? Promise.resolve(window.handleFileSelect(event, chip))
+      : Promise.resolve();
+    done.then(function () {
+      var prepared = chip === 'gd32' ? window.gd32File : window.esp32File;
+      if (prepared) {
+        window.sharedFirmwareFiles[chip] = { file: prepared, handle: null };
+      }
+      syncBleFileFromSelectedTarget();
+    }).catch(function (err) {
+      if (typeof window.addLog === 'function') {
+        window.addLog('W', '文件', chip.toUpperCase() + ' 选择失败: ' + (err && err.message ? err.message : err));
+      }
+    });
   };
 
   window.pickSharedFirmware = function (chip) {
@@ -137,22 +145,25 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
         });
       };
       Promise.resolve(window.pickFileViaFSAPI(chip)).then(function () {
-        window.showOpenFilePicker = nativePicker;
-        if (!capturedHandle || typeof capturedHandle.getFile !== 'function') {
-          syncBleFileFromSelectedTarget();
-          return;
+        /* 用 processFile 后的结果（GD32 HEX→BIN 后的 prepared），不要再塞回原始 .hex */
+        var prepared = chip === 'gd32' ? window.gd32File : window.esp32File;
+        var handle = (chip === 'gd32' ? window.gd32FileHandle : window.esp32FileHandle) || capturedHandle;
+        if (prepared) {
+          window.sharedFirmwareFiles[chip] = { file: prepared, handle: handle || null };
+        } else if (capturedHandle) {
+          window.sharedFirmwareFiles[chip] = {
+            file: window.sharedFirmwareFiles[chip] && window.sharedFirmwareFiles[chip].file,
+            handle: capturedHandle
+          };
         }
-        capturedHandle.getFile().then(function (file) {
-          window.sharedFirmwareFiles[chip] = { file: file, handle: capturedHandle };
-          syncBleFileFromSelectedTarget();
-        }).catch(function () {
-          syncBleFileFromSelectedTarget();
-        });
+        syncBleFileFromSelectedTarget();
       }).catch(function (err) {
-        window.showOpenFilePicker = nativePicker;
         if (err && err.name !== 'AbortError' && typeof window.addLog === 'function') {
-          window.addLog('W', '文件', 'FSAPI 选择失败: ' + err.message);
+          window.addLog('W', '文件', 'FSAPI 选择失败: ' + (err.message || err));
         }
+      }).then(function () {
+        /* 无论成败都还原原生 picker，避免二次选择失效 */
+        window.showOpenFilePicker = nativePicker;
       });
     } else {
       var input = document.getElementById(chip === 'gd32' ? 'fileInputGd32' : 'fileInputEsp32');
@@ -184,60 +195,83 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
     }
   };
 
+  /**
+   * 按 flashTarget 把「该芯片一路」固件绑到 BLE 会话（复刻 WiFi：两路独立、切换不串文件）。
+   * 优先 window.esp32File/gd32File（含 HEX→BIN 结果），其次 sharedFirmwareFiles / input。
+   * 当前目标无文件时清空 BLE 会话，禁止继续显示/上传另一芯片固件。
+   */
   window.syncBleFileFromSelectedTarget = function () {
-    if (window.connectionMode !== 'ble' || !window.bleOta || typeof window.bleOta.notifyFileChange !== 'function') {
+    if (window.connectionMode !== 'ble' || !window.bleOta) {
       return;
     }
-    var isGd32 = window.flashTarget === 'gd32';
-    var chip = isGd32 ? 'gd32' : 'esp32';
-    var suffix = isGd32 ? 'Gd32' : 'Esp32';
-    var stored = window.sharedFirmwareFiles[chip];
-    if (stored && stored.handle && typeof stored.handle.getFile === 'function') {
-      stored.handle.getFile().then(function (file) {
-        stored.file = file;
-        setBleFirmwareInputFile(file);
-        window.bleOta.notifyFileChange(file, stored.handle);
-      }).catch(function () {
-        if (stored.file) {
-          setBleFirmwareInputFile(stored.file);
-          window.bleOta.notifyFileChange(stored.file, stored.handle);
+    if (window.bleOta.isUploading && window.bleOta.isUploading()) {
+      return;
+    }
+    var chip = window.flashTarget === 'gd32' ? 'gd32' : 'esp32';
+    var file = chip === 'gd32' ? window.gd32File : window.esp32File;
+    var handle = chip === 'gd32' ? window.gd32FileHandle : window.esp32FileHandle;
+    var stored = window.sharedFirmwareFiles && window.sharedFirmwareFiles[chip]
+      ? window.sharedFirmwareFiles[chip]
+      : null;
+    if (!handle && stored && stored.handle) handle = stored.handle;
+    if (!file && stored && stored.file) file = stored.file;
+
+    function bindBle(f, h) {
+      setBleFirmwareInputFile(f);
+      if (typeof window.bleOta.notifyFileChange === 'function') {
+        window.bleOta.notifyFileChange(f, h || null);
+      }
+      /* 会话 SHA 与对应芯片槽对齐（不跨芯片） */
+      var slot = chip === 'gd32' ? window._gd32FileSha256 : window._esp32FileSha256;
+      if (window.bleOta.state) {
+        if (slot) window.bleOta.state.fileSha256 = slot;
+      }
+    }
+    function clearBleSession() {
+      if (typeof window.bleOta.clearFile === 'function') {
+        window.bleOta.clearFile();
+      } else if (typeof window.bleOta.notifyFileChange === 'function') {
+        window.bleOta.notifyFileChange(null, null);
+      }
+    }
+
+    if (file) {
+      bindBle(file, handle);
+      return;
+    }
+    if (handle && typeof handle.getFile === 'function') {
+      handle.getFile().then(function (fresh) {
+        if (chip === 'gd32' && fresh.name.toLowerCase().endsWith('.hex') &&
+            typeof window.processFile === 'function') {
+          return Promise.resolve(window.processFile(fresh, 'gd32', {
+            silent: true,
+            skipHandlePersist: true
+          })).then(function () {
+            if (window.gd32File) bindBle(window.gd32File, handle);
+            else bindBle(fresh, handle);
+          });
         }
+        if (chip === 'esp32') window.esp32File = fresh;
+        else window.gd32File = fresh;
+        if (stored) stored.file = chip === 'gd32' ? window.gd32File : window.esp32File;
+        bindBle(chip === 'gd32' ? window.gd32File : window.esp32File, handle);
+      }).catch(function () {
+        if (stored && stored.file) bindBle(stored.file, handle);
+        else clearBleSession();
       });
       return;
     }
-    if (stored && stored.file) {
-      setBleFirmwareInputFile(stored.file);
-      window.bleOta.notifyFileChange(stored.file, stored.handle || null);
-      return;
-    }
+    var suffix = chip === 'gd32' ? 'Gd32' : 'Esp32';
     var input = document.getElementById('fileInput' + suffix);
-    var info = document.getElementById('fileInfo' + suffix);
-    var hasInfo = info && info.classList.contains('show');
-    var file = input && input.files && input.files[0] ? input.files[0] : null;
-    if (file) {
-      window.sharedFirmwareFiles[chip] = { file: file, handle: null };
-      setBleFirmwareInputFile(file);
-      window.bleOta.notifyFileChange(file, null);
+    var inputFile = input && input.files && input.files[0] ? input.files[0] : null;
+    if (inputFile) {
+      if (window.sharedFirmwareFiles) {
+        window.sharedFirmwareFiles[chip] = { file: inputFile, handle: null };
+      }
+      bindBle(inputFile, null);
       return;
     }
-    if (!hasInfo) {
-      return;
-    }
-    var nameEl = document.getElementById('fileName' + suffix);
-    var typeEl = document.getElementById('fileType' + suffix);
-    var sizeEl = document.getElementById('fileSize' + suffix);
-    var bleInfo = document.getElementById('fileInfo');
-    var bleName = document.getElementById('fileName');
-    var bleType = document.getElementById('fileType');
-    var bleSize = document.getElementById('fileSize');
-    if (bleInfo) bleInfo.classList.add('show');
-    if (bleName && nameEl) bleName.textContent = nameEl.textContent;
-    if (bleType && typeEl) bleType.textContent = typeEl.textContent;
-    if (bleSize && sizeEl) bleSize.textContent = sizeEl.textContent;
-    var packetCount = document.getElementById('packetCount');
-    var sentCount = document.getElementById('sentCount');
-    if (packetCount) packetCount.textContent = '-';
-    if (sentCount) sentCount.textContent = '0';
+    clearBleSession();
   };
 
   window.applySharedModeUi = function () {
@@ -260,9 +294,15 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
       if (el) el.style.display = ids[id] ? '' : 'none';
     });
     var hint = document.getElementById('readyHint');
+    var autoBtn = document.getElementById('autoFlashBtn');
+    if (autoBtn && isBle) {
+      autoBtn.textContent = isGd32 ? '一键刷写 GD32' : '一键刷写 ESP32';
+    }
     if (hint) {
       if (isBle) {
-        hint.innerHTML = 'BLE 模式：连接设备 → 选择固件 → 一键刷写。';
+        hint.innerHTML = isGd32
+          ? 'BLE 模式 · 目标 GD32：连接设备 → 选择 GD32 固件 → 一键刷写。'
+          : 'BLE 模式 · 目标 ESP32：连接设备 → 选择 ESP32 固件 → 一键刷写。';
       } else if (isGd32) {
         hint.innerHTML = 'WiFi 模式：上传 GD32 固件后自动执行 SPI OTA。';
       } else {

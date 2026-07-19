@@ -139,8 +139,8 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
     size_t aligned_len = (total + 3) & ~(size_t)3;
 
     if (aligned_offset + aligned_len > part->size) {
-        DEBUG_ERR("OTA", "flashWriteChunk越界: offset=%" PRIu32 " len=%zu aligned_off=%" PRIu32 " aligned_len=%zu part=%" PRIu32,
-                  offset, len, aligned_offset, aligned_len, part->size);
+        DEBUG_ERR("OTA", "flashWrite越界 off=%" PRIu32 " n=%zu part=%" PRIu32,
+                  offset, len, part->size);
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -156,8 +156,8 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
     }
 
     if (head_pad > 0 || len % 4 != 0) {
-        DEBUG_WARN("OTA", "flashWriteChunk 非对齐: offset=%" PRIu32 " len=%zu head=%zu aligned_len=%zu",
-                   offset, len, head_pad, aligned_len);
+        DEBUG_WARN("OTA", "flashWrite非对齐 off=%" PRIu32 " n=%zu head=%zu",
+                   offset, len, head_pad);
     }
 
     uint8_t *aligned_buf = (uint8_t *)malloc(aligned_len);
@@ -485,7 +485,7 @@ esp_err_t Gd32FlashStore::metaVerifyChecksum()
     // 若直接返回 OK 跳过校验，meta 被意外清零时会掩盖固件损坏。
     static const uint8_t kZeroSha[32] = {0};
     if (memcmp(meta.checksum, kZeroSha, sizeof(meta.checksum)) == 0) {
-        DEBUG_WARN("OTA", "metaVerify: checksum 未计算，返回 INVALID_STATE（调用方决定容忍或失败）");
+        DEBUG_WARN("OTA", "metaVerify: checksum未算→INVALID_STATE");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -517,14 +517,20 @@ esp_err_t Gd32FlashStore::verifyFrontendSha(const uint8_t frontend_sha32[32],
 {
     if (!frontend_sha32) return ESP_ERR_INVALID_ARG;
 
-    // 1) 计算设备端 SHA 并写入 meta.checksum
-    esp_err_t err = metaFinalizeChecksum();
+    /* 上传收尾 finishGd32StorageAfterReceive 通常已 metaFinalizeChecksum（并打过 SHA 日志）。
+     * relay 触发时若 checksum 已有，直接比对，避免整盘重算 + 再打一遍「固件 SHA-256」。 */
+    ota_meta_t meta;
+    esp_err_t err = metaLoad(&meta);
     if (err != ESP_OK) return err;
 
-    // 2) 读回 meta 拿到 checksum
-    ota_meta_t meta;
-    err = metaLoad(&meta);
-    if (err != ESP_OK) return err;
+    static const uint8_t kZeroSha[32] = {0};
+    if (memcmp(meta.checksum, kZeroSha, sizeof(meta.checksum)) == 0) {
+        err = metaFinalizeChecksum();
+        if (err != ESP_OK) return err;
+        err = metaLoad(&meta);
+        if (err != ESP_OK) return err;
+    }
+
     if (out_device_sha) memcpy(out_device_sha, meta.checksum, 32);
 
     // 3) 比对前端 SHA 与设备端 SHA

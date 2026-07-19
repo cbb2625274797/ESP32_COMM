@@ -327,7 +327,7 @@ ESP32 通过 SPI 转发 CAN 帧到 GD32（GD32 端驱动外部 CAN 收发器）�
 | POST | `/ota/relay` | 触发 GD32 中继 | - | `{"status":"ok"}` |
 | GET | `/system/status` | 系统状态 JSON | - | 含版本/WiFi/OTA/温度/堆/GD32 版本及**OtaCoordinator 系统级状态**等 |
 | GET | `/logs` | 拉取调试日志 | - | JSON 数组字符串 |
-| POST | `/can/send` | 发送 CAN 帧 | `{"ch":0,"id":123,"dlc":8,"data":"0102..."}` | `{"status":"ok","recv":"..."}` |
+| POST | `/can/send_batch` | CAN 发送（1~N 帧，单帧即 length=1） | `{"ch":0,"frames":[{"id":123,"dlc":8,"data":"0102..."}]}` | `{"status":"ok","results":[...]}` |
 | POST | `/spi/send` | SPI 直接发送 | `{"type":"01","data":"00AC","timeout_ms":1000}` | `{"status":"ok","resp_type":".."}` |
 | POST | `/restart` | 重启 ESP32 | - | 500ms 后 `esp_restart()` |
 
@@ -354,10 +354,10 @@ ESP32 通过 SPI 转发 CAN 帧到 GD32（GD32 端驱动外部 CAN 收发器）�
 # 查询系统状态
 curl http://192.168.31.1/system/status | jq
 
-# 发送 CAN 帧
-curl -X POST http://192.168.31.1/can/send \
+# 发送 CAN 帧（单帧也走 send_batch）
+curl -X POST http://192.168.31.1/can/send_batch \
   -H "Content-Type: application/json" \
-  -d '{"ch":0,"id":0x18DA00F1,"dlc":8,"data":"0102030405060708"}'
+  -d '{"ch":0,"frames":[{"id":0x18DA00F1,"dlc":8,"data":"0102030405060708"}]}'
 
 # SPI 直接发送
 curl -X POST http://192.168.31.1/spi/send \

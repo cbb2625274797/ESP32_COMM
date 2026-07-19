@@ -156,6 +156,8 @@ function markEsp32RebootComplete(source) {
   if (!window.isEsp32Rebooting) return;
   window.isEsp32Rebooting = false;
   window.rebootObservedDown = false;
+  /* 重启后重新拉 memory.layout（换固件后静态段可能变化） */
+  window._memLayout = null;
   window.updateEsp32StagesFromPhase(6);  // 启动完成
   addLog('I', '系统', source ? 'ESP32 已恢复在线（' + source + '）' : 'ESP32 已恢复在线');
   showToast('ESP32 已恢复在线', 'success');
@@ -187,7 +189,11 @@ export async function pollStatus() {
   statusAbortCtrl = new AbortController();
   var pollTimer = setTimeout(function() { try { statusAbortCtrl.abort(); } catch(_e) {} }, 5000);
   try {
-    var resp = await fetch(window.getBaseUrl() + '/system/status', {
+    /* 首次/无缓存：?layout=1 取静态内存布局；之后只轮询动态字段 */
+    var statusUrl = (window.systemStatusUrl
+      ? window.systemStatusUrl(false)
+      : (window.getBaseUrl() + '/system/status' + (window._memLayout ? '' : '?layout=1')));
+    var resp = await fetch(statusUrl, {
       signal: statusAbortCtrl.signal
     });
     if (resp.ok) {
@@ -229,24 +235,41 @@ export async function pollStatus() {
     clearTimeout(pollTimer);
     // 自身 AbortController 触发的取消不算失败，静默返回
     if (e && e.name === "AbortError") return;
+    // 先判定 OTA 是否进行中：OTA 期间所有失败都不计入 consecutivePollFailures，
+    //   也不触发诊断。避免"上传完成→finalize→重启"窗口期失败计数累积，
+    //   切回 IDLE 瞬间立即触发 5-fail 诊断，干扰进度显示。
+    var lastDeviceBusy0 = isLastDeviceBusy();
+    var sessionActive0 = window.otaSessionActive();
+    var sessionFailed0 = window.otaSessionState === window.OtaSessionState.FAILED;
+    var otaOngoing0 = window.pollingPausedForUpload ||
+                      sessionActive0 || sessionFailed0 ||
+                      window.isEsp32Rebooting || !!window.currentOtaTarget || lastDeviceBusy0;
     // 后台期间 setInterval 会被 Chrome/Edge 节流到最低 1 分钟/次，
     // 因此后台累积的失败计数不应递增，避免切回前台瞬间误触发 5-fail 诊断。
-    if (pageVisible) window.consecutivePollFailures++;
-    var lastDeviceBusy = isLastDeviceBusy();
+    // OTA 期间也不递增：设备忙/重启无法响应是正常的，不该计入"诊断触发计数"。
+    if (pageVisible && !otaOngoing0) window.consecutivePollFailures++;
+    var lastDeviceBusy = lastDeviceBusy0;
     // OTA/传输/重启中屏蔽网关无响应的检测功能（设备忙或正在重启，无法响应轮询是正常的）
     // 设备已知忙时：保持 1s 轮询，不触发降速诊断，避免错过设备恢复的即时反馈
     // ★ 状态机：用统一的会话活跃/失败判断替代散布的标志。
     //   FAILED 态不触发诊断降速（让用户尽快看到设备恢复），但也不覆盖失败 UI。
-    var sessionActive = window.otaSessionActive();
-    var sessionFailed = window.otaSessionState === window.OtaSessionState.FAILED;
-    if (pageVisible && window.consecutivePollFailures >= 5 && !sessionActive && !window.isEsp32Rebooting && !window.currentOtaTarget && !lastDeviceBusy && !sessionFailed) {
+    var sessionActive = sessionActive0;
+    var sessionFailed = sessionFailed0;
+    // ★ OTA 期间（含暂停轮询、会话活跃、设备忙、正在重启、FAILED、当前 OTA 目标存在）
+    //   一律不触发诊断日志/UI 覆盖。这些 W 级日志会刷在日志区，与"上传 xx/xx" "重启中 Xs"
+    //   "中继 N/M" 等进度行混在一起，用户反馈干扰 OTA 进度显示。
+    //   之前条件漏了 pollingPausedForUpload，且 sessionActive 可能在 finalize/reboot 短窗口
+    //   翻 false，导致 5 次失败后误触发诊断。这里把所有 OTA 相关态统一兜底。
+    var otaOngoing = window.pollingPausedForUpload ||
+                     sessionActive || sessionFailed ||
+                     window.isEsp32Rebooting || !!window.currentOtaTarget || lastDeviceBusy;
+    if (pageVisible && window.consecutivePollFailures >= 5 && !otaOngoing) {
       addLog('W', '诊断', '设备连续 5 次无响应，正在诊断网络...');
       var diag = await diagnoseNetwork();
       addLog('W', '诊断', diag);
-      updateConnectionUi(false, '未连接');
+      updateConnectionUi(false, '诊断中');
       window.applyDisconnectedRuntimeState();
-      var cst = document.getElementById('connStatusTxt');
-      if (cst) cst.textContent = '诊断中: ' + diag;
+      addLog('W', '诊断', '诊断结果: ' + diag);
     }
     // ★ 状态机优先：会话已 FAILED → 保持失败 UI，仅标连接胶囊为"设备忙/未连接"
     if (sessionFailed) {

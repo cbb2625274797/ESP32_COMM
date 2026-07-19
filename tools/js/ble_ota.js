@@ -24,6 +24,7 @@ window.bleOta = {
     resetBleStages();
     bleLog('SYS', `Web Bluetooth 刷写控制台已就绪 (${UI_BUILD})`);
   },
+  state: state,
   disconnect: disconnectBle,
   showToast: showToast,
   notifyFileChange: notifyFileChange,

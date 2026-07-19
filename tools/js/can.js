@@ -43,7 +43,7 @@ import {
   sendManualFrame,
   resetManualFields,
   loadPreviewToManual
-} from './can/send.js?v=20260717x';
+} from './can/send.js?v=20260720b';
 import {
   scheduleCanPersist,
   loadCanSession,
@@ -51,7 +51,7 @@ import {
 } from './can/persist.js?v=20260717x';
 import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js?v=20260717x';
 import { showToast } from './common/toast.js?v=20260717x';
-import { initCanMonitor } from './can_monitor.js?v=20260717x';
+import { initCanMonitor } from './can_monitor.js?v=20260719s';
 
 // ==================== 本地工具 ====================
 // 原 can.js 的 formatUptime 输出格式与 common/utils.js 略有差异（d>0 时只到 h），

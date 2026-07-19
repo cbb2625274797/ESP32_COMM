@@ -69,7 +69,7 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
         static int s_last_spi_err = 0;
         const int err_i = static_cast<int>(ret);
         if (s_spi_fail_n == 0U || err_i != s_last_spi_err || (s_spi_fail_n % 32U) == 0U) {
-            DEBUG_WARN("CAN", "CAN_SEND SPI失败: ch=%u id=0x%08lX err=%s (x%lu)",
+            DEBUG_WARN("CAN", "SEND SPI fail ch=%u id=%08lX %s x%lu",
                        (unsigned)channel, (unsigned long)ext_id, esp_err_to_name(ret),
                        (unsigned long)(s_spi_fail_n + 1U));
         }
@@ -100,7 +100,7 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
         static uint32_t s_rej_n = 0U;
         static uint8_t s_last_rej = 0xFFU;
         if (s_rej_n == 0U || gd32_err != s_last_rej || (s_rej_n % 32U) == 0U) {
-            DEBUG_WARN("CAN", "CAN_SEND GD32拒绝: ch=%u id=0x%08lX resp=0x%02X err=0x%02X (x%lu)",
+            DEBUG_WARN("CAN", "SEND拒 ch=%u id=%08lX r=%02X e=%02X x%lu",
                        (unsigned)channel, (unsigned long)ext_id, resp_type, gd32_err,
                        (unsigned long)(s_rej_n + 1U));
         }
@@ -280,7 +280,7 @@ int canFdSetRxMode(can_rx_mode_t mode,
         return 0;
     }
 
-    DEBUG_WARN("CAN", "SET_MODE 失败: want=%u spi=%s resp=0x%02X len=%u",
+    DEBUG_WARN("CAN", "SET_MODE fail want=%u %s r=0x%02X n=%u",
                (unsigned)mode,
                esp_err_to_name(ret),
                (unsigned)resp_type,

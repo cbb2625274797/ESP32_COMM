@@ -30,7 +30,7 @@ import {
   startUploadWaitHeartbeat
 } from './session.js';
 import { updateEsp32StagesFromPhase, switchStageFlow, setActivePhase, setProgress, markPhaseDone, cleanupAfterOtaFailure } from './progress.js';
-import { ensureFileShaCached } from './file-handle.js';
+import { computeFileSha } from './file-handle.js';
 
 function isOtaBusyError(status, detail) {
   var text = (detail || '').toLowerCase();
@@ -151,40 +151,30 @@ export async function startUpload(chip) {
       break;
     }
   }
-  // 每次上传前尝试重新从本地读取文件
+  // 热重载：有 FSAPI handle 则重新读盘（本地编译会改同路径固件）
   var handle = chip === 'esp32' ? window.esp32FileHandle : window.gd32FileHandle;
   if (handle) {
-    // 有 FileSystemFileHandle，调用 getFile() 获取最新内容
     try {
       var freshFile = await handle.getFile();
-      if (chip === 'esp32') {
-        window.esp32File = freshFile;
-        file = freshFile;
+      if (chip === 'gd32' && freshFile.name.toLowerCase().endsWith('.hex')) {
+        /* HEX 必须按最新源文件再转 BIN，不能用选文件时的旧 prepared */
+        await window.processFile(freshFile, 'gd32', { silent: true, skipHandlePersist: true });
+        file = window.gd32File;
       } else {
-        if (freshFile.name.toLowerCase().endsWith('.hex')) {
-          // processFile 现已返回 Promise，await 即可拿到转换后的 gd32File，
-          // 不再用 setTimeout 硬等（避免 HEX 稍大时拿到 null）。
-          await window.processFile(freshFile, 'gd32');
-          file = window.gd32File;
-        } else {
-          window.gd32File = freshFile;
-          file = freshFile;
-        }
+        if (chip === 'esp32') window.esp32File = freshFile;
+        else window.gd32File = freshFile;
+        file = freshFile;
       }
-      addLog('I', '文件', '已重新读取本地文件: ' + file.name + ' (' + formatBytes(file.size) + ')');
     } catch (e) {
       addLog('W', '文件', '重新读取文件失败: ' + e.message + '，将使用缓存版本');
     }
   } else {
-    // 没有 handle，尝试直接读取当前 File 对象
     try {
       await file.arrayBuffer();
     } catch (e) {
-      // File 引用已失效，提示用户重新选择
       addLog('E', '文件', '本地文件已变更或失效，请重新选择文件');
       showToast('文件已变更，请重新选择', 'error');
       window.clearFile(chip);
-      // ★ 状态机：文件失效属于会话失败
       cleanupAfterOtaFailure('本地文件失效');
       return;
     }
@@ -209,10 +199,14 @@ export async function startUpload(chip) {
   showToast('开始上传固件到 ' + chip.toUpperCase(), 'success');
   try {
     var arrayBuffer = await file.arrayBuffer();
-    // SHA-256：processFile 阶段已算好并缓存；这里若 handle.getFile() 拿回的
-    // fresh file meta 未变就直接复用（命中 30–100ms/MB 的计算）；
-    // 用户 rebuild 使 lastModified 变化时 ensureFileShaCached 自动 fallback 到重算。
-    await ensureFileShaCached(file, chip, arrayBuffer);
+    /* 上传前始终按本次内容重算 SHA（本地固件会改，不能沿用选文件时的旧值） */
+    var savedSha = await computeFileSha(file, chip, arrayBuffer);
+    if (!savedSha) {
+      addLog('E', '文件', chip.toUpperCase() + ' SHA-256 计算失败');
+      showToast('SHA-256 计算失败', 'error');
+      cleanupAfterOtaFailure('SHA-256 计算失败');
+      return;
+    }
     var fileSize = file.size;
     var body, url = window.getBaseUrl() + '/ota/upload';
     if (chip === 'esp32') {

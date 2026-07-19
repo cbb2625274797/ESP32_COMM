@@ -187,7 +187,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     esp_err_t err = esp_ota_begin(m_partition, OTA_WITH_SEQUENTIAL_WRITES, &m_handle);
     const int64_t t1 = esp_timer_get_time();
     if (err != ESP_OK) {
-        DEBUG_ERR(TAG, "esp_ota_begin(SEQUENTIAL) 失败: %s (耗时 %lld ms)",
+        DEBUG_ERR(TAG, "ota_begin fail:%s %lldms",
                   esp_err_to_name(err), (long long)((t1 - t0) / 1000));
         return beginCleanupAndReturn(err);
     }
@@ -201,7 +201,7 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     m_ended = false;
     memset(m_sha256, 0, sizeof(m_sha256));
 
-    DEBUG_DBG(TAG, "ESP32 OTA 开始，目标分区: %s, 声明大小: %u 字节 (sequential erase-on-write)",
+    DEBUG_DBG(TAG, "ESP32 OTA begin part=%s size=%u (erase-on-write)",
                m_partition->label, (unsigned)total_size);
     return ESP_OK;
 }
@@ -224,9 +224,8 @@ esp_err_t Esp32OtaCore::write(const uint8_t *data, size_t len)
     if (err == ESP_OK) {
         m_received += len;
     } else {
-        DEBUG_ERR(TAG, "esp_ota_write 失败: %s (len=%u offset=%u free=%lu)",
-                  esp_err_to_name(err), (unsigned)len, (unsigned)m_received,
-                  (unsigned long)esp_get_free_heap_size());
+        DEBUG_ERR(TAG, "ota_write %s n=%u off=%u",
+                  esp_err_to_name(err), (unsigned)len, (unsigned)m_received);
     }
     return err;
 }
@@ -257,7 +256,7 @@ esp_err_t Esp32OtaCore::computeShaFromPartition()
         if (to_read > sizeof(s_sha_read_buf)) to_read = sizeof(s_sha_read_buf);
         esp_err_t rd_err = esp_partition_read(m_partition, offset, s_sha_read_buf, to_read);
         if (rd_err != ESP_OK) {
-            DEBUG_ERR(TAG, "SHA 计算: 分区读失败 @offset %u: %s",
+            DEBUG_ERR(TAG, "SHA读失败 off=%u %s",
                       (unsigned)offset, esp_err_to_name(rd_err));
             mbedtls_sha256_free(&s_sha_ctx);
             return rd_err;
@@ -327,7 +326,7 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         DEBUG_DBG(TAG, "ESP32 OTA 校验 SHA-256...");
         esp_err_t sha_err = computeShaFromPartition();
         if (sha_err != ESP_OK) {
-            DEBUG_ERR(TAG, "SHA 计算失败: %s，中止", esp_err_to_name(sha_err));
+            DEBUG_ERR(TAG, "SHA失败:%s 中止", esp_err_to_name(sha_err));
             return finalizeCleanupAndReturn(sha_err);
         }
 
@@ -353,8 +352,10 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
         if (sha_match) {
             DEBUG_DBG(TAG, "SHA-256 校验通过");
         } else {
-            DEBUG_ERR(TAG, "SHA-256 不匹配: frontend=%s device=%s",
-                      frontend_sha_hex, device_hex);
+            /* 与正常刷写失败一致：先报异常，再分 2 行打两个 SHA-256 */
+            DEBUG_ERR(TAG, "SHA-256 不匹配");
+            DEBUG_ERR(TAG, "frontend=%s", frontend_sha_hex);
+            DEBUG_ERR(TAG, "device=%s", device_hex);
             return finalizeCleanupAndReturn(ESP_ERR_INVALID_VERSION);
         }
     } else if (out_device_sha_hex) {

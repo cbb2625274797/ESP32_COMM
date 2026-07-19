@@ -97,11 +97,19 @@ SpiMaster& SpiMaster::instance()
 // SPI Worker：唯一持 SPI 的任务；ISR 只通知本任务
 // ============================================================
 
+/** @brief 当前任务是否为 SPI worker（仅 worker 可直接走无锁路径）。 */
 bool SpiMaster::onWorker() const
 {
     return m_workerTask != nullptr && xTaskGetCurrentTaskHandle() == m_workerTask;
 }
 
+/**
+ * @brief 将 GD32 EVENT 帧入队（worker 上下文）。
+ * @param type     业务 TYPE（如 0xC1/0xC4）
+ * @param payload  载荷指针，可为 nullptr
+ * @param len      载荷长度
+ * @return 始终 true；队列满时丢最旧一帧再写入
+ */
 bool SpiMaster::pushEvent(uint8_t type, const uint8_t *payload, size_t len)
 {
     if (m_eventCount >= kEventSlots) {
@@ -126,6 +134,14 @@ bool SpiMaster::pushEvent(uint8_t type, const uint8_t *payload, size_t len)
     return true;
 }
 
+/**
+ * @brief 从事件队列弹出一帧（非阻塞）。
+ * @param[out] type     业务 TYPE
+ * @param[out] payload  拷贝载荷；可为 nullptr
+ * @param max_len       payload 缓冲容量
+ * @param[out] len      实际拷贝长度
+ * @return true 取到一帧；false 队列空
+ */
 bool SpiMaster::popEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len)
 {
     if (m_eventCount == 0U) {
@@ -150,6 +166,10 @@ bool SpiMaster::popEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_t
     return true;
 }
 
+/**
+ * @brief 暂停/恢复对 GD32 主动按铃的 serviceRing 处理。
+ * @param suppress true=OTA 等关键路径禁止偷读 PB6；false=恢复
+ */
 void SpiMaster::setSuppressRingService(bool suppress)
 {
     m_suppressRingService = suppress;
@@ -159,6 +179,10 @@ void SpiMaster::setSuppressRingService(bool suppress)
     }
 }
 
+/**
+ * @brief 业务侧确认本端 TX 序号已被对端接受，推进 m_txSeq。
+ * @note  在收到明确业务 ACK 后调用，避免重发与序号失配。
+ */
 void SpiMaster::confirmTxSeqAccepted()
 {
     /* 业务 ACK 已确认：保证下一包使用 lastSentSeq+1，即使头 ack_seq 曾失配 */
@@ -167,6 +191,10 @@ void SpiMaster::confirmTxSeqAccepted()
     m_lastRxAckMatched = true;
 }
 
+/**
+ * @brief worker 单次服务 GD32 按铃：读一帧并入 EVENT 队列。
+ * @return ESP_OK 入队成功；ESP_ERR_NOT_FOUND 无线/被抑制；其它为读失败
+ */
 esp_err_t SpiMaster::serviceRingOnce()
 {
     /* OTA 中继期间禁止按铃读：OTA ACK/WAIT 也拉低 PB6，偷读会导致 poll 空等。 */
@@ -230,6 +258,10 @@ esp_err_t SpiMaster::serviceRingOnce()
     return ESP_OK;
 }
 
+/**
+ * @brief worker 执行一条排队 Job（Transact/Hello/Ping/EnterBoot 等）。
+ * @param job  入出参：写入 job.result
+ */
 void SpiMaster::executeJob(Job &job)
 {
     /* 已在 worker 上下文；下列 public API 见 onWorker() 后走实现体，不再二次入队。 */
@@ -263,6 +295,10 @@ void SpiMaster::executeJob(Job &job)
     }
 }
 
+/**
+ * @brief worker 完成堆上 Job 后的收尾：释放完成信号量，超时放弃时由 worker free。
+ * @param job  堆分配的 Job 指针
+ */
 void SpiMaster::finishHeapJob(Job *job)
 {
     if (job == nullptr) {
@@ -288,6 +324,11 @@ void SpiMaster::finishHeapJob(Job *job)
     }
 }
 
+/**
+ * @brief 将 Job 提交给 SPI worker 串行执行（非 worker 线程走队列）。
+ * @param job  任务描述（栈上 Job 会拷到堆上再排队）
+ * @return 业务结果码；队列满/超时返回 ESP_ERR_TIMEOUT
+ */
 esp_err_t SpiMaster::submitJob(Job &job)
 {
     if (m_jobQueue == nullptr || m_workerTask == nullptr || onWorker()) {
@@ -363,11 +404,16 @@ esp_err_t SpiMaster::submitJob(Job &job)
     return ESP_ERR_TIMEOUT;
 }
 
+/** @brief FreeRTOS 任务入口，转到 workerLoop。 */
 void SpiMaster::workerEntry(void *arg)
 {
     static_cast<SpiMaster *>(arg)->workerLoop();
 }
 
+/**
+ * @brief SPI worker 主循环：处理按铃 EVENT + 执行 job 队列。
+ * @note  全栈唯一允许直接访问 SPI 总线的任务上下文。
+ */
 void SpiMaster::workerLoop()
 {
     m_workerTask = xTaskGetCurrentTaskHandle();
@@ -490,7 +536,7 @@ esp_err_t SpiMaster::transferClockedFlags(const uint8_t *tx_buf, size_t tx_len,
     }
 
     if ((tx_len > 0U && tx_buf == NULL) || (rx_len > 0U && rx_buf == NULL)) {
-        DEBUG_WARN("SPI", "transferClocked INVALID_ARG: tx_len=%u tx_buf=%p rx_len=%u rx_buf=%p dev=%p",
+        DEBUG_WARN("SPI", "xfer INVALID_ARG tx=%u rx=%u dev=%p",
                    (unsigned)tx_len, tx_buf, (unsigned)rx_len, rx_buf, m_spiDevice);
         return ESP_ERR_INVALID_ARG;
     }
@@ -556,7 +602,7 @@ esp_err_t SpiMaster::transferClockedFlags(const uint8_t *tx_buf, size_t tx_len,
                    esp_err_to_name(ret), (unsigned)(total_len * 8U));
         ret = spi_device_get_trans_result(m_spiDevice, &ret_trans, pdMS_TO_TICKS(1000));
         if (ret != ESP_OK) {
-            DEBUG_ERR("SPI", "spi_device_get_trans_result 放弃: %s（可能需复位 SPI）",
+            DEBUG_ERR("SPI", "trans_result放弃:%s 或复位SPI",
                       esp_err_to_name(ret));
             /* 尽力排空 ret_queue，避免后续 queue_trans 永久堵死 */
             spi_transaction_t *junk = nullptr;
@@ -690,7 +736,7 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
             if (!is_event) {
                 static uint32_t s_sess_mm_logs = 0U;
                 if ((++s_sess_mm_logs % 32U) == 1U) {
-                    DEBUG_WARN("SPI", "v2 SESSION mismatch: got=0x%08lX expected=0x%08lX type=0x%02X (log#%lu)",
+                    DEBUG_WARN("SPI", "v2 SES mismatch got=%08lX exp=%08lX t=%02X #%lu",
                                (unsigned long)hdr.session_id, (unsigned long)self.m_sessionId,
                                hdr.type, (unsigned long)s_sess_mm_logs);
                 }
@@ -714,7 +760,7 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
             if (!self.m_lastRxAckMatched) {
                 static uint32_t s_stale_logs = 0U;
                 if ((++s_stale_logs % 32U) == 1U) {
-                    DEBUG_DBG("SPI", "v2 stale RESPONSE delivered: type=0x%02X ack_seq=%u expected=%u (log#%lu)",
+                    DEBUG_DBG("SPI", "v2 stale rsp t=0x%02X ack=%u exp=%u #%lu",
                               hdr.type, hdr.ack_seq, self.m_lastSentSeq,
                               (unsigned long)s_stale_logs);
                 }
@@ -791,7 +837,7 @@ esp_err_t SpiMaster::init()
         return ret;
     }
 
-    DEBUG_INFO("SPI", "SPI2 总线初始化完成: MOSI=GPIO5, MISO=GPIO7, SCLK=GPIO6, CS=GPIO%d, CLK=%d Hz",
+    DEBUG_INFO("SPI", "SPI2 ok CS=GPIO%d CLK=%dHz",
                SPI_MASTER_CS_GPIO, SPI_CLOCK_HZ);
 
     /* 配置 SPI Ready 握手引脚(GPIO10)，v2 DATA_READY 模式：仅输入。
@@ -873,12 +919,20 @@ esp_err_t SpiMaster::init()
     return ESP_OK;
 }
 
+/**
+ * @brief L0 本机自检：SPI 设备、互斥、worker、job 队列是否就绪。
+ * @return true 本机 SPI 栈可用
+ */
 bool SpiMaster::selfTestL0() const
 {
     return (m_spiDevice != nullptr) && (m_mutex != nullptr) &&
            (m_workerTask != nullptr) && (m_jobQueue != nullptr);
 }
 
+/**
+ * @brief L0 对端轻检：短超时 HELLO，确认链路可达 GD32。
+ * @return true 至少一次 HELLO 成功
+ */
 bool SpiMaster::selfTestPeerL0()
 {
     /* 短超时、最多 2 次；不拉长整体启动 */
@@ -1415,7 +1469,7 @@ esp_err_t SpiMaster::appRequestBootloader()
             } else if (hdr.type == V2_TYPE_LINK_ERROR) {
                 const uint8_t errc = (hdr.payload_len > 0U && pload) ? pload[0] : 0xFFU;
                 const uint8_t exp  = (hdr.payload_len > 1U && pload) ? pload[1] : 0xFFU;
-                DEBUG_WARN("SPI", "ENTER_BOOT 被拒 LINK_ERROR code=0x%02X expected_seq=%u last_sent=%u",
+                DEBUG_WARN("SPI", "ENTER_BOOT拒 code=0x%02X exp=%u last=%u",
                            errc, exp, (unsigned)m_lastSentSeq);
                 break;
             } else if (hdr.type == SPI_OTA_RSP_ERROR) {
@@ -1441,7 +1495,7 @@ esp_err_t SpiMaster::appRequestBootloader()
         /* 静默：APP 擦配置页(可达数十 ms) + 软复位 + BOOT 起机。
          * 此间禁止 HELLO，否则 role 会一直像卡在 APP。 */
         const uint32_t kQuietMs = got_ack ? 100U : 30U;
-        DEBUG_INFO("SPI", "ENTER_BOOT 已上总线 (ack=%s)，静默 %lums 等待 APP 复位...",
+        DEBUG_INFO("SPI", "ENTER_BOOT ok ack=%s waitAPP %lums",
                    got_ack ? "yes" : "no", (unsigned long)kQuietMs);
         vTaskDelay(pdMS_TO_TICKS(kQuietMs));
         return got_ack ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
@@ -1515,17 +1569,92 @@ esp_err_t SpiMaster::waitForBootloaderReady(uint32_t timeout_ms)
         vTaskDelay(miss_gap);
     }
 
-    DEBUG_WARN("SPI", "Bootloader 就绪超时 (%lums, rounds=%lu, app_hits=%lu)",
+    DEBUG_WARN("SPI", "BOOT就绪超时 %lums r=%lu app=%lu",
                (unsigned long)timeout_ms, (unsigned long)rounds, (unsigned long)app_hits);
     return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief 解析 GD32 APP 身份 16B 并写入本端缓存。
+ *
+ * 布局与 HELLO_ACK 附加块 / APP PING body 相同（见 spi_link_v2.h V2_APP_IDENTITY_LEN）：
+ *   [0..3] APP ver · [4..7] BOOT ver · [8..11] uptime_ms LE
+ *   [12] feat_map_ver · [13..14] feature_flags LE · [15] rsv
+ *
+ * @param id             身份块指针（至少 16 字节）
+ * @param out_version    可选，输出解析后的版本结构
+ * @param out_uptime_sec 可选，输出 uptime（秒）
+ */
+void SpiMaster::applyAppIdentity16(const uint8_t *id, gd32_version_t *out_version,
+                                   uint32_t *out_uptime_sec)
+{
+    if (!id) {
+        return;
+    }
+    gd32_version_t ver{};
+    ver.app_major = id[0];
+    ver.app_minor = id[1];
+    ver.app_patch = id[2];
+    ver.app_build = id[3];
+    ver.boot_major = id[4];
+    ver.boot_minor = id[5];
+    ver.boot_patch = id[6];
+    ver.boot_build = id[7];
+
+    const uint32_t uptime_ms = (uint32_t)id[8]
+                             | ((uint32_t)id[9] << 8)
+                             | ((uint32_t)id[10] << 16)
+                             | ((uint32_t)id[11] << 24);
+    if (out_uptime_sec) {
+        *out_uptime_sec = uptime_ms / 1000U;
+    }
+
+    uint16_t feat_flags = 0U;
+    bool feat_known = false;
+    if (id[12] == V2_FEAT_MAP_VER) {
+        feat_flags = v2_get_u16le(&id[13]);
+        feat_known = true;
+    }
+
+    /* HELLO 与 PING 都会带同一份 16B 身份：仅版本/feat 变化时打 INFO，避免连打两遍 */
+    const bool ver_changed =
+        !m_gd32IdKnown ||
+        m_gd32Version.app_major != ver.app_major ||
+        m_gd32Version.app_minor != ver.app_minor ||
+        m_gd32Version.app_patch != ver.app_patch ||
+        m_gd32Version.app_build != ver.app_build ||
+        m_gd32Version.boot_major != ver.boot_major ||
+        m_gd32Version.boot_minor != ver.boot_minor ||
+        m_gd32Version.boot_patch != ver.boot_patch ||
+        m_gd32Version.boot_build != ver.boot_build ||
+        m_gd32FeatKnown != feat_known ||
+        (feat_known && m_gd32FeatFlags != feat_flags);
+
+    m_gd32Version = ver;
+    m_gd32IdKnown = true;
+    if (out_version) {
+        *out_version = ver;
+    }
+    m_gd32FeatKnown = feat_known;
+    m_gd32FeatFlags = feat_known ? feat_flags : 0U;
+
+    if (ver_changed && feat_known) {
+        DEBUG_INFO("SPI", "ID APP=%u.%u.%u.%u feat=%04lX",
+                   (unsigned)ver.app_major, (unsigned)ver.app_minor,
+                   (unsigned)ver.app_patch, (unsigned)ver.app_build,
+                   (unsigned long)m_gd32FeatFlags);
+        DEBUG_INFO("SPI", "ID BOOT=%u.%u.%u.%u ch=%u",
+                   (unsigned)ver.boot_major, (unsigned)ver.boot_minor,
+                   (unsigned)ver.boot_patch, (unsigned)ver.boot_build,
+                   (unsigned)((m_gd32FeatFlags & V2_FEAT_CAN_CH_MASK) >> V2_FEAT_CAN_CH_SHIFT));
+    }
 }
 
 /**
  * @brief 向 GD32 APP 发送存活探测（帧长发送 + DATA_READY 变长读）。
  *
  * 两步法（持锁）：otaTransferUnlocked(expect_stale) + otaPollResponseUnlocked。
- * GD32 App PING 响应 type=kRspAck(0x80)，
- * payload 16B = APP ver(4) + BOOT ver(4) + uptime_ms(4) + build_hash(4)。
+ * 成功时 body 为身份 16B，与 HELLO_ACK 附加块同布局，经 applyAppIdentity16 入库。
  */
 esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version)
 {
@@ -1576,34 +1705,26 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
     }
 
     const uint8_t *pload = resp_payload;
-    if (version) {
+    if (resp_len >= V2_APP_IDENTITY_LEN) {
+        applyAppIdentity16(pload, version, uptime_sec);
+    } else if (version) {
         memset(version, 0, sizeof(gd32_version_t));
         version->app_major = pload[0];
         version->app_minor = pload[1];
         version->app_patch = pload[2];
         version->app_build = pload[3];
-        if (resp_len >= 16U) {
-            version->boot_major = pload[4];
-            version->boot_minor = pload[5];
-            version->boot_patch = pload[6];
-            version->boot_build = pload[7];
-        }
     }
-    if (uptime_sec) {
-        const uint8_t *ut = (resp_len >= 16U) ? &pload[8] : &pload[4];
-        const uint32_t uptime_ms = (uint32_t)ut[0]
-                                 | ((uint32_t)ut[1] << 8)
-                                 | ((uint32_t)ut[2] << 16)
-                                 | ((uint32_t)ut[3] << 24);
-        *uptime_sec = uptime_ms / 1000U;
-    }
-    DEBUG_DBG("SPI", "APP PING v2 成功");
+    DEBUG_DBG("SPI", "APP PING 成功 len=%u", (unsigned)resp_len);
     return ESP_OK;
 }
 
 // ============================================================
 // SPI Link v2 链路状态
 // ============================================================
+/**
+ * @brief 拷贝链路统计快照（有界取锁，失败返回零值）。
+ * @return 统计结构副本
+ */
 SpiMaster::SpiLinkStats SpiMaster::linkStats()
 {
     /* OTA 中继期间 SPI worker 在 otaSendAndPoll 全程持有 m_mutex（发送+轮询 ACK，
@@ -1618,6 +1739,10 @@ SpiMaster::SpiLinkStats SpiMaster::linkStats()
     return ret;
 }
 
+/**
+ * @brief 完整链路状态（session/role/credit + 统计），供 /system/status。
+ * @return 状态快照
+ */
 SpiMaster::SpiLinkStatus SpiMaster::linkStatus()
 {
     /* 状态字段为 volatile 单字节/双字读，原子性足够；统计复用 linkStats() 的有界取锁。 */
@@ -1631,6 +1756,12 @@ SpiMaster::SpiLinkStatus SpiMaster::linkStatus()
     return st;
 }
 
+/**
+ * @brief 发起 HELLO 建 session；APP 侧 ACK 可附带身份 16B（版本+开关）。
+ * @param timeout_ms  总超时
+ * @param role_hint   0=any，1=app，2=boot
+ * @return ESP_OK 成功；超时/坏响应见错误码
+ */
 esp_err_t SpiMaster::hello(uint32_t timeout_ms, uint8_t role_hint)
 {
     if (!onWorker() && m_workerTask != nullptr) {
@@ -1729,20 +1860,22 @@ esp_err_t SpiMaster::hello(uint32_t timeout_ms, uint8_t role_hint)
         /* payload[5]/hdr.credit 均为对端 credit_max → 写入 m_remoteCredit。
          * 勿写入 m_localCredit（本端 RX 窗口，init 为 8）。 */
         m_remoteCredit = (pload[5] != 0U) ? pload[5] : hdr.credit;
+        /* APP：HELLO_ACK 带 16B 身份 → 建连即完成开机身份（与 PING 同布局） */
+        if (m_gd32Role == V2_ROLE_APP &&
+            hdr.payload_len >= V2_HELLO_ACK_APP_LEN) {
+            applyAppIdentity16(&pload[V2_HELLO_ACK_BASE_LEN], nullptr, nullptr);
+        }
         m_v2Active = true;
         m_stats.resyncs++;
         return ESP_OK;
     }
 
     if (!saw_any_frame) {
+        /* 不打全包 hex：只记 attempts + 前 4 字节便于判 SOF */
         DEBUG_WARN("SPI",
-                   "HELLO: no valid v2 frame in response (attempts=%lu) rx[0..15]="
-                   "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                   "HELLO no v2 frame att=%lu rx0-3=%02X %02X %02X %02X",
                    (unsigned long)attempt,
-                   last_rx_head[0], last_rx_head[1], last_rx_head[2], last_rx_head[3],
-                   last_rx_head[4], last_rx_head[5], last_rx_head[6], last_rx_head[7],
-                   last_rx_head[8], last_rx_head[9], last_rx_head[10], last_rx_head[11],
-                   last_rx_head[12], last_rx_head[13], last_rx_head[14], last_rx_head[15]);
+                   last_rx_head[0], last_rx_head[1], last_rx_head[2], last_rx_head[3]);
     } else {
         DEBUG_WARN("SPI", "HELLO: bad/lag response type=0x%02X flags=0x%02X attempts=%lu",
                    last_type, last_flags, (unsigned long)attempt);

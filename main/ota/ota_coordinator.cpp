@@ -148,12 +148,12 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t ch
     //   RELAYING 是中继阶段，不可中断，也拒绝。
     if (h && m_sysState == OTA_SYS_GD32_STORING) {
         if (m_otaChannel != channel) {
-            DEBUG_WARN(TAG, "GD32 存储中（通道=%d），拒绝跨通道请求（通道=%d）",
+            DEBUG_WARN(TAG, "GD32存中 ch=%d 拒跨通道 ch=%d",
                        (int)m_otaChannel, (int)channel);
             unlock(h);
             return ESP_ERR_INVALID_STATE;
         }
-        DEBUG_WARN(TAG, "GD32 存储仍在进行中（同通道），中止旧存储并重新开始");
+        DEBUG_WARN(TAG, "GD32同通道重传:中止旧存储");
         doAbortLocked();  // 清 meta + IDLE，与 abort 路径一致
         // epoch 将在下方设置 GD32_STORING 后递增
     }
@@ -182,7 +182,7 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t ch
         m_sysState = OTA_SYS_GD32_STORING;
         m_gd32StorageDone = false;
         m_busySinceTick = xTaskGetTickCount();  // ★ 记录忙状态起始时刻
-        DEBUG_DBG(TAG, "GD32 固件存储开始: %" PRIu32 " 字节, 系统状态 → GD32_STORING (epoch=%u, channel=%d)",
+        DEBUG_DBG(TAG, "GD32存开始 %" PRIu32 "B →STORING ep=%u ch=%d",
                    total_size, m_otaEpoch, (int)channel);
     }
     unlock(h);
@@ -242,20 +242,18 @@ esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t 
 void OtaCoordinator::completeGd32Storage()
 {
     bool h = lock();
-    bool resume_ble = false;
     if (h && m_sysState == OTA_SYS_GD32_STORING) {
         m_sysState = OTA_SYS_GD32_STORED;
         m_gd32StorageDone = true;
         m_busySinceTick = 0;  // ★ STORED 是非忙状态
-        resume_ble = (m_otaChannel == OTA_CHANNEL_WIFI);
         DEBUG_DBG(TAG, "GD32 固件存储完成, 系统状态 → GD32_STORED");
+        /* WiFi 路径不在此处恢复 BLE：
+         * 旧逻辑 HTTP 一收完就 resume，55KB 极快时日志紧贴 raw upload start，
+         * 像「一刷新就共存恢复」。挂起到中继结束/中止（notifyRelayComplete、abort）。 */
     } else if (h) {
         DEBUG_WARN(TAG, "completeGd32Storage 在非预期状态: %d", (int)m_sysState);
     }
     unlock(h);
-    if (resume_ble) {
-        wifiOtaResumeBleIfNeeded();
-    }
 }
 
 esp_err_t OtaCoordinator::finishGd32StorageAfterReceive()
@@ -281,7 +279,7 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
     if (m_sysState != OTA_SYS_GD32_STORED &&
         m_sysState != OTA_SYS_IDLE &&
         m_sysState != OTA_SYS_GD32_COMPLETE) {
-        DEBUG_WARN(TAG, "拒绝触发中继: 当前状态 %s (%d) 不在白名单",
+        DEBUG_WARN(TAG, "拒中继 state=%s(%d)",
                    stateToString(m_sysState), (int)m_sysState);
         unlock(h);
         return ESP_ERR_INVALID_STATE;
@@ -419,12 +417,12 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
     //   跨通道（BLE→WiFi 或 WiFi→BLE）仍拒绝，保持互斥。
     if (h && m_sysState == OTA_SYS_ESP32_RECEIVING) {
         if (m_otaChannel != channel) {
-            DEBUG_WARN(TAG, "ESP32 OTA 接收中（通道=%d），拒绝跨通道请求（通道=%d）",
+            DEBUG_WARN(TAG, "ESP32收中 ch=%d 拒跨通道 ch=%d",
                        (int)m_otaChannel, (int)channel);
             unlock(h);
             return ESP_ERR_INVALID_STATE;
         }
-        DEBUG_WARN(TAG, "ESP32 OTA 仍在接收中（同通道），中止旧会话并重新开始");
+        DEBUG_WARN(TAG, "ESP32同通道重传:中止旧会话");
         doAbortLocked();  // abort core + IDLE + 恢复 CAN 反馈
         // epoch 将在下方 begin 成功后递增，自动使旧 handler 的清理代码失效
     }
@@ -434,7 +432,7 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
     //   core 仍 active ⇒ 真正在收尾，拒绝（不可 forceCleanup，防并发写分区）。
     if (h && m_sysState == OTA_SYS_ESP32_FINALIZING) {
         if (!Esp32OtaCore::instance().isActive()) {
-            DEBUG_WARN(TAG, "ESP32_FINALIZING 残留（core 已空闲），强制复位后允许新会话");
+            DEBUG_WARN(TAG, "FINALIZING残留(core空闲),强制复位");
             doAbortLocked();
         } else {
             DEBUG_WARN(TAG, "系统忙 (ESP32_FINALIZING, core 活跃)，拒绝 ESP32 OTA");
@@ -447,7 +445,7 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
     if (h && (m_sysState == OTA_SYS_GD32_STORING ||
               m_sysState == OTA_SYS_GD32_RELAYING ||
               m_sysState == OTA_SYS_ESP32_REBOOTING)) {
-        DEBUG_WARN(TAG, "系统忙 (state=%d, %s)，拒绝 ESP32 OTA",
+        DEBUG_WARN(TAG, "忙 state=%d(%s) 拒ESP32 OTA",
                    (int)m_sysState, stateToString(m_sysState));
         unlock(h);
         return ESP_ERR_INVALID_STATE;
@@ -488,7 +486,7 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
         //   避免连续 isIdle() + getSystemState() 各加锁一次（共 2 次锁）。
         ota_system_state_t cur = getSystemState();
         if (!isIdleState(cur) && cur != OTA_SYS_ERROR) {
-            DEBUG_WARN(TAG, "ESP32 OTA 被拒绝且系统非空闲 (state=%d)，不强制清理，直接失败",
+            DEBUG_WARN(TAG, "ESP32拒且非空闲 state=%d,不强制清",
                        (int)cur);
             if (channel == OTA_CHANNEL_WIFI) {
                 wifiOtaResumeBleIfNeeded();
@@ -497,9 +495,9 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
         }
 
         if (cur == OTA_SYS_ERROR) {
-            DEBUG_WARN(TAG, "ESP32 OTA 被拒绝但协调器处于 ERROR，清理底层残留句柄后重试");
+            DEBUG_WARN(TAG, "ESP32拒但ERROR,清残留后重试");
         } else {
-            DEBUG_WARN(TAG, "ESP32 OTA 被拒绝但系统空闲，判定为锁残留，强制清理状态机后重试");
+            DEBUG_WARN(TAG, "ESP32拒但空闲,判锁残留,强制清后重试");
         }
         Esp32OtaCore::instance().forceCleanup();
         err = beginEsp32Ota(total_size, channel);

@@ -596,18 +596,23 @@ void OtaRelay::logRespPayload(const char *stage, uint8_t resp_type, const uint8_
     if (DebugLog::instance().getLogLevel() < DEBUG_LOG_DBG) {
         return;
     }
-    char hex[193] = {0};
-    size_t n = (len > 32U) ? 32U : len;
+    char hx[17] = {0};
+    size_t n = (len > 8U) ? 8U : len;
     if (payload) {
         for (size_t i = 0; i < n; ++i) {
-            snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", payload[i]);
+            snprintf(&hx[i * 2], sizeof(hx) - i * 2, "%02X", payload[i]);
         }
     } else {
         n = 0;
     }
-    DEBUG_DBG("OTA", "%s resp: type=0x%02X len=%u payload[%u]=%s%s",
-              stage, resp_type, (unsigned)len, (unsigned)n,
-              n > 0 ? hex : "<empty>", len > n ? "..." : "");
+    /* stage 名截断，避免整行超 128B */
+    char stg[12];
+    snprintf(stg, sizeof(stg), "%.11s", stage ? stage : "?");
+    DEBUG_DBG("OTA", "%s rsp t=%02X n=%u",
+              stg, resp_type, (unsigned)len);
+    if (n > 0) {
+        DEBUG_DBG("OTA", "  hx=%s%s", hx, len > n ? ".." : "");
+    }
 }
 
 /**
@@ -858,10 +863,9 @@ esp_err_t OtaRelay::requestGd32AppEnterBootloader()
         DEBUG_WARN("OTA", "ENTER_BOOT 发送失败: %s", esp_err_to_name(boot_err));
     }
 
-    /* 3) 硬门控：HELLO role=boot（给 APP 擦页+复位+BOOT 起机更长时间） */
+    /* 3) 硬门控：HELLO role=boot（成功时 SPI waitForBootloaderReady 已打就绪日志） */
     esp_err_t wait_err = SpiMaster::instance().waitForBootloaderReady(12000);
     if (wait_err == ESP_OK) {
-        DEBUG_INFO("OTA", "Bootloader 已就绪 (HELLO role=boot)");
         return ESP_OK;
     }
 
@@ -882,7 +886,7 @@ esp_err_t OtaRelay::requestGd32AppEnterBootloader()
         DEBUG_ERR("OTA", "Bootloader HELLO 就绪失败(重试后): %s", esp_err_to_name(wait_err));
         return wait_err;
     }
-    DEBUG_INFO("OTA", "Bootloader 已就绪 (HELLO role=boot, 二次)");
+    /* 成功日志由 SPI waitForBootloaderReady 统一输出 */
     return ESP_OK;
 }
 
@@ -936,8 +940,8 @@ ota_result_t OtaRelay::doHandshakeReq(uint32_t attempts)
             }
         }
 
-        DEBUG_WARN("OTA", "HANDSHAKE_REQ 未就绪，重试 %" PRIu32 "/%" PRIu32 ": err=%d resp_type=0x%02X resp_len=%u",
-                   attempt + 1U, attempts, last_err, last_resp_type, (unsigned)last_resp_len);
+        DEBUG_WARN("OTA", "HANDSHAKE重试 %" PRIu32 "/%" PRIu32 " err=%d t=0x%02X",
+                   attempt + 1U, attempts, last_err, last_resp_type);
         vTaskDelay(pdMS_TO_TICKS(kHandshakeRetryGapMs));
     }
 
@@ -964,7 +968,7 @@ ota_result_t OtaRelay::sendAndWaitAckShape(const char *stage, uint8_t cmd,
     err = pollUntilExpectedAckShape(stage, &resp_type, resp_payload, resp_max, resp_len,
                                     poll_timeout_ms, wait_rounds, max_extra_polls, matcher);
     if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !matcher(resp_payload, *resp_len)) {
-        DEBUG_ERR("OTA", "%s 发送失败, err=%d, resp_type=0x%02X, resp_len=%zu",
+        DEBUG_ERR("OTA", "%s fail err=%d t=0x%02X n=%zu",
                   stage, err, resp_type, *resp_len);
         return OTA_RESULT_ERR_TIMEOUT;
     }
@@ -1019,14 +1023,7 @@ ota_result_t OtaRelay::doChallengeAndAuth()
                               OtaRelay::isConfirmPlainAck);
     if (res != OTA_RESULT_OK) return res;
 
-    {
-        char hex[73] = {0};
-        size_t n = (resp_len > 36U) ? 36U : resp_len;
-        for (size_t i = 0; i < n; ++i) {
-            snprintf(&hex[i * 2], sizeof(hex) - i * 2, "%02X", resp_payload[i]);
-        }
-        DEBUG_INFO("OTA", "CONFIRM 验证通过, resp_len=%zu, payload=%s", resp_len, hex);
-    }
+    DEBUG_INFO("OTA", "CONFIRM ok, resp_len=%zu", resp_len);
 
     Protocol::sessionKeyInit(&m_sessionCtx, m_kSession);
     return OTA_RESULT_OK;
@@ -1110,9 +1107,8 @@ ota_result_t OtaRelay::prepareRelayPacket(uint32_t seq, uint32_t flash_offset, c
     tx_buf[59] = (uint8_t)((if_end >> 24) & 0xFFU);
     calculateCrc32WithKey(m_kSession, plain48, &tx_buf[60]);
 
-    DEBUG_DBG("OTA", "包 %" PRIu32 ": chunk=%u if_end=0x%08" PRIX32 " crc32=%02X%02X%02X%02X",
-              seq, (unsigned)chunk_size, if_end,
-              tx_buf[60], tx_buf[61], tx_buf[62], tx_buf[63]);
+    DEBUG_DBG("OTA", "包%" PRIu32 " n=%u end=%08" PRIX32,
+              seq, (unsigned)chunk_size, if_end);
 
     /* 不在此写 m_transferCurrentSeq：预组下一包时不应污染“当前发送序号” */
     if (out_chunk_size) {
@@ -1188,8 +1184,8 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
         TickType_t last_hb = xTaskGetTickCount();
         while (xTaskGetTickCount() < poll_deadline) {
             if ((xTaskGetTickCount() - last_hb) >= pdMS_TO_TICKS(1000)) {
-                DEBUG_INFO("OTA", "包 %" PRIu32 " 等 ACK… send=%" PRIu32 " type=0x%02X wait=%d credit=%u",
-                           seq, send_i, resp_type, (int)saw_wait,
+                DEBUG_INFO("OTA", "包%" PRIu32 "等ACK send=%" PRIu32 " t=0x%02X cr=%u",
+                           seq, send_i, resp_type,
                            (unsigned)SpiMaster::instance().remoteCredit());
                 last_hb = xTaskGetTickCount();
             }
@@ -1244,11 +1240,11 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
         }
     }
 
-    DEBUG_ERR("OTA", "包 %" PRIu32 " 失败 (elapsed=%" PRIu32 " ms credit=%u type=0x%02X saw_wait=%d)",
+    DEBUG_ERR("OTA", "包%" PRIu32 "失败 el=%" PRIu32 "ms t=0x%02X cr=%u",
               seq,
               (uint32_t)((xTaskGetTickCount() - pkt_start) * portTICK_PERIOD_MS),
-              (unsigned)SpiMaster::instance().remoteCredit(),
-              resp_type, (int)saw_wait);
+              resp_type,
+              (unsigned)SpiMaster::instance().remoteCredit());
     *out_result = OTA_RESULT_ERR_TIMEOUT;
     return true;
 }
@@ -1369,10 +1365,9 @@ bool OtaRelay::probeAndCacheAppAlive(uint32_t timeout_ms, uint32_t *out_uptime)
         gd32Version  = ver;
         if (out_uptime) *out_uptime = uptime;
         // 启动探测等场景用 DBG；OTA 成功路径由 doWaitForAppAlive 统一 INFO 总结
-        DEBUG_DBG("OTA", "GD32 APP 存活: uptime=%" PRIu32 "s APP=v%d.%d.%d.%d BOOT=v%d.%d.%d.%d",
+        DEBUG_DBG("OTA", "GD32 APP up=%" PRIu32 "s APP=v%d.%d.%d.%d",
                   uptime,
-                  ver.app_major, ver.app_minor, ver.app_patch, ver.app_build,
-                  ver.boot_major, ver.boot_minor, ver.boot_patch, ver.boot_build);
+                  ver.app_major, ver.app_minor, ver.app_patch, ver.app_build);
         return true;
     }
     if (out_uptime) *out_uptime = 0;
@@ -1432,7 +1427,7 @@ ota_result_t OtaRelay::doSendFinishOta()
             continue;
         }
 
-        DEBUG_WARN("OTA", "FINISH_OTA 响应异常, resp_type=0x%02X, resp_len=%zu, retry=%" PRIu32 "/10",
+        DEBUG_WARN("OTA", "FINISH_OTA异常 t=0x%02X n=%zu r=%" PRIu32,
                    resp_type, resp_len, retry + 1);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -1482,10 +1477,8 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
         return OTA_RESULT_ERR_GD32;
     }
 
-    gd32_version_t ver = getSnapshot().version;
-    DEBUG_INFO("OTA", "GD32 OTA 完成: APP=v%d.%d.%d.%d, BOOT=v%d.%d.%d.%d",
-               ver.app_major, ver.app_minor, ver.app_patch, ver.app_build,
-               ver.boot_major, ver.boot_minor, ver.boot_patch, ver.boot_build);
+    /* 版本已在 HELLO/PING 身份（SPI ID APP/BOOT）打印，此处不重复 */
+    DEBUG_INFO("OTA", "GD32 OTA完成");
     return OTA_RESULT_OK;
 }
 
@@ -1539,11 +1532,26 @@ void OtaRelay::taskEntry(void *pvParameters)
                 if (SpiMaster::instance().hello(1500U, V2_ROLE_APP) == ESP_OK &&
                     SpiMaster::instance().gd32Role() == V2_ROLE_APP) {
                     session_ok = true;
+                    /* HELLO 已带身份时直接缓存版本/开关，无需再等 PING 才亮版本 */
+                    if (SpiMaster::instance().gd32IdKnown()) {
+                        StateLockGuard lock;
+                        gd32Version  = SpiMaster::instance().gd32VersionCached();
+                        gd32AppAlive = true;
+                        alive = true;
+                        DEBUG_INFO("OTA", "HELLO就绪 APP=v%d.%d.%d.%d",
+                                   gd32Version.app_major, gd32Version.app_minor,
+                                   gd32Version.app_patch, gd32Version.app_build);
+                        DEBUG_INFO("OTA", "HELLO就绪 BOOT=v%d.%d.%d.%d",
+                                   gd32Version.boot_major, gd32Version.boot_minor,
+                                   gd32Version.boot_patch, gd32Version.boot_build);
+                        break;
+                    }
                 } else {
                     DEBUG_INFO("OTA", "等待 GD32 APP... (%" PRIu32 "/20)", attempt + 1U);
                     continue;
                 }
             }
+            /* 旧固件无 HELLO 身份：回退 APP PING */
             if (probeAndCacheAppAlive(2000)) {
                 alive = true;
                 break;
@@ -1576,7 +1584,7 @@ void OtaRelay::taskEntry(void *pvParameters)
             // 成功日志已在 doWaitForAppAlive 输出，此处不再重复
             vTaskDelay(pdMS_TO_TICKS(3000));
         } else if (result == OTA_RESULT_ERR_TIMEOUT) {
-            DEBUG_ERR("OTA", "OTA 超时中止 (TIMEOUT=%d，含全局预算/停刷/单包)", (int)result);
+            DEBUG_ERR("OTA", "OTA超时中止 TIMEOUT=%d", (int)result);
         } else if (result == OTA_RESULT_ERR_USER_ABORT) {
             DEBUG_ERR("OTA", "OTA 用户中止 (USER_ABORT=%d)", (int)result);
         } else {

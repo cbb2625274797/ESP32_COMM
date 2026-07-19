@@ -99,6 +99,10 @@ public:
     /** @brief SPI worker 任务句柄（栈水位 /system/status 与 health 巡检用）。 */
     TaskHandle_t getWorkerTaskHandle() const { return m_workerTask; }
 
+    /** @brief SPI 任务队列当前待处理 job 数（每个堆 Job 持有 calloc 的 Job 结构）。
+     *        供 /system/heap_low_log 堆低水位快照采样，定位"低谷是不是 SPI 队列堆积引起"。 */
+    UBaseType_t getPendingJobCount() const { return m_jobQueue ? uxQueueMessagesWaiting(m_jobQueue) : 0; }
+
     /**
      * @brief OTA 中继期间禁止 worker 将 DATA_READY 当 EVENT 读取。
      * 中继开始设 true，结束/复位设 false。
@@ -159,6 +163,26 @@ public:
 
     /** @brief 最近一次 HELLO 得到的 GD32 角色（0=unknown, 1=app, 2=boot）。 */
     uint8_t gd32Role() const { return m_gd32Role; }
+
+    /**
+     * @brief 是否已从 HELLO_ACK/PING 身份块拿到功能位图。
+     * @note  false=尚未建连身份或旧固件。
+     */
+    bool gd32FeatKnown() const { return m_gd32FeatKnown; }
+
+    /** @brief GD32 功能位图（V2_FEAT_*）；未知时为 0。 */
+    uint32_t gd32FeatFlags() const { return m_gd32FeatFlags; }
+
+    /** @brief 便捷：GD32 是否开启 ADC 0xC4（需 gd32FeatKnown）。 */
+    bool gd32FeatAdcFeedback() const {
+        return m_gd32FeatKnown && (m_gd32FeatFlags & V2_FEAT_ADC_FEEDBACK) != 0U;
+    }
+
+    /** @brief 是否已从 HELLO_ACK/PING 拿到 APP/BOOT 版本。 */
+    bool gd32IdKnown() const { return m_gd32IdKnown; }
+
+    /** @brief 最近身份块中的版本（HELLO 或 PING）。 */
+    gd32_version_t gd32VersionCached() const { return m_gd32Version; }
 
     /** @brief 获取链路统计快照（线程安全，持锁读取）。 */
     SpiLinkStats linkStats();
@@ -315,11 +339,24 @@ private:
     void executeJob(Job &job);
     /** @brief worker 完成堆 Job 后的生命周期收尾（give done + 可能 free）。 */
     void finishHeapJob(Job *job);
+    /** @brief FreeRTOS 任务入口，转到 workerLoop。 */
     static void workerEntry(void *arg);
+    /** @brief SPI worker 主循环：EVENT 按铃 + Job 队列。 */
     void workerLoop();
+    /** @brief 单次服务 GD32 按铃读帧并入 EVENT 队列。 */
     esp_err_t serviceRingOnce();
+    /** @brief EVENT 入队（队列满丢最旧）。 */
     bool pushEvent(uint8_t type, const uint8_t *payload, size_t len);
+    /** @brief EVENT 出队（非阻塞）。 */
     bool popEvent(uint8_t *type, uint8_t *payload, size_t max_len, size_t *len);
+    /**
+     * @brief 解析并缓存 APP 身份 16B（HELLO_ACK 附加块 / PING body 同布局）。
+     * @param id              身份块
+     * @param out_version     可选输出版本
+     * @param out_uptime_sec  可选输出 uptime 秒
+     */
+    void applyAppIdentity16(const uint8_t *id, gd32_version_t *out_version,
+                            uint32_t *out_uptime_sec);
 
     // ── 帧内同步状态机 ──
     volatile uint8_t  m_localCredit = 8;  ///< 本端剩余可接收帧数（信用窗口）
@@ -332,6 +369,10 @@ private:
     volatile uint8_t  m_rxAckedSeq = 0;     ///< 已确认的对端最新序号
     volatile uint8_t  m_expectedRxSeq = 0;  ///< 期望收到的对端序号
     volatile uint8_t  m_gd32Role = 0;       ///< GD32 角色（0=unknown, 1=app, 2=boot）
+    volatile bool     m_gd32FeatKnown = false; ///< HELLO/PING 身份是否带 feat_map
+    volatile uint32_t m_gd32FeatFlags = 0;  ///< V2_FEAT_*
+    volatile bool     m_gd32IdKnown = false;   ///< 是否已缓存版本号
+    gd32_version_t    m_gd32Version = {};      ///< HELLO/PING 缓存的版本
     volatile bool     m_v2Active = false;   ///< v2 session 是否激活
     /** 最近一次 otaFindFrame 解析到的 RESPONSE 是否与 m_lastSentSeq 归属匹配 */
     volatile bool     m_lastRxAckMatched = false;

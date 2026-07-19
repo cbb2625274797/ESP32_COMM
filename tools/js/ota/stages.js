@@ -19,7 +19,7 @@
  *   window.markGd32OtaUiComplete / window.cleanupAfterOtaFailure / window.otaSessionReset
  *   window.stopRelayProgressWatch / window.pollLogs / window.emitRelayProgress
  */
-import { formatBytes, formatUptime } from '../common/utils.js';
+import { formatUptime } from '../common/utils.js';
 import { updateConnectionUi, updateHealthUi, updateHeapAndTaskStatusUi } from '../common/connection.js';
 import { setActivePhase, setProgress } from './progress.js';
 import { otaSessionReset, OtaSessionState } from './session.js';
@@ -107,7 +107,7 @@ function setDisplayedRelayState(rs) {
 }
 
 /**
- * 常驻仪表盘：堆、连接、健康、版本、温湿度、IP/RSSI、OTA cache。
+ * 常驻仪表盘：堆、连接、健康、版本、温度、IP/RSSI。
  * @param {object} data  /system/status JSON
  * @param {object} ota   data.ota
  * @param {object} wifi  data.wifi
@@ -150,8 +150,87 @@ function applyDashboardUi(data, ota, wifi) {
 
   var mTempEl = document.getElementById('mTemp');
   if (mTempEl) {
-    mTempEl.textContent =
-      Number.isFinite(data.temperature) ? data.temperature.toFixed(1) + '\u00B0C' : '--';
+    /* 与固件 app_config：TEMP_WARNING=80 / TEMP_CRITICAL=100 对齐 */
+    if (Number.isFinite(data.temperature)) {
+      var tC = data.temperature;
+      mTempEl.textContent = tC.toFixed(1) + '\u00B0C';
+      if (tC >= 100) {
+        mTempEl.className = 'v err';
+      } else if (tC >= 80) {
+        mTempEl.className = 'v warn';
+      } else {
+        mTempEl.className = 'v ok';
+      }
+      mTempEl.title = 'ESP32 片内温度传感器（警告≥80°C，危险≥100°C）';
+    } else {
+      mTempEl.textContent = '--';
+      mTempEl.className = 'v';
+      mTempEl.title = '温度无效或未采样';
+    }
+  }
+  /* GD32 ADC：enabled 来自 HELLO_ACK 功能位（GD32 编译开关），ESP32 无本地开关 */
+  var ga = data.gd32_adc || null;
+  var feat = data.gd32_features || null;
+  var mGd32TempEl = document.getElementById('mGd32Temp');
+  var mVccEl = document.getElementById('mVcc');
+  var mVddaEl = document.getElementById('mVdda');
+
+  function setMetricUi(el, text, cls, title) {
+    if (!el) return;
+    el.textContent = text;
+    el.className = cls || 'v';
+    if (title) el.title = title;
+  }
+
+  if (mGd32TempEl || mVccEl || mVddaEl) {
+    if (ga && ga.enabled === false) {
+      var offTitle = 'GD32 CONFIG_SPI_ADC_FEEDBACK_ENABLE=0（HELLO/PING 身份）';
+      setMetricUi(mGd32TempEl, '关闭', 'v', offTitle);
+      setMetricUi(mVccEl, '关闭', 'v', offTitle);
+      setMetricUi(mVddaEl, '关闭', 'v', offTitle);
+    } else if (ga && Number.isFinite(ga.temperature) && ga.fresh) {
+      setMetricUi(mGd32TempEl, ga.temperature.toFixed(1) + '\u00B0C',
+        ga.valid ? 'v ok' : 'v warn',
+        '片内温度 · seq=' + (ga.seq || 0) + ' age=' + (ga.age_ms || 0) + 'ms'
+          + (ga.valid ? '' : ' (valid=0)'));
+      /* VCC：status 已带 vcc；旧固件仅 vin_adc 时本地 *11（47k/4.7k） */
+      var vcc = Number.isFinite(ga.vcc) ? ga.vcc
+        : (Number.isFinite(ga.vin_adc) ? ga.vin_adc * 11.0 : NaN);
+      if (Number.isFinite(vcc) && vcc > 0.5) {
+        setMetricUi(mVccEl, vcc.toFixed(1) + 'V', ga.valid ? 'v ok' : 'v warn',
+          '输入母线 VCC（PA6 分压反推）· vin_adc='
+          + (Number.isFinite(ga.vin_adc) ? ga.vin_adc.toFixed(3) + 'V' : '--'));
+      } else {
+        setMetricUi(mVccEl, '--', 'v', '无 VIN 采样');
+      }
+      if (Number.isFinite(ga.vdda) && ga.vdda > 0.5) {
+        setMetricUi(mVddaEl, ga.vdda.toFixed(2) + 'V', ga.valid ? 'v ok' : 'v warn',
+          'MCU 模拟供电 VDDA（片内 VREFINT 反推）');
+      } else {
+        setMetricUi(mVddaEl, '--', 'v', '无 VDDA 采样');
+      }
+    } else if (ga && Number.isFinite(ga.temperature)) {
+      setMetricUi(mGd32TempEl, ga.temperature.toFixed(1) + '\u00B0C (旧)', 'v warn', '超过 5s 未更新');
+      var vccOld = Number.isFinite(ga.vcc) ? ga.vcc
+        : (Number.isFinite(ga.vin_adc) ? ga.vin_adc * 11.0 : NaN);
+      setMetricUi(mVccEl, Number.isFinite(vccOld) ? (vccOld.toFixed(1) + 'V (旧)') : '--',
+        'v warn', '超过 5s 未更新');
+      setMetricUi(mVddaEl,
+        Number.isFinite(ga.vdda) ? (ga.vdda.toFixed(2) + 'V (旧)') : '--',
+        'v warn', '超过 5s 未更新');
+    } else if (ga && ga.enabled === true) {
+      var waitTitle = 'GD32 已开 0xC4，等待首帧';
+      setMetricUi(mGd32TempEl, '等待…', 'v', waitTitle);
+      setMetricUi(mVccEl, '等待…', 'v', waitTitle);
+      setMetricUi(mVddaEl, '等待…', 'v', waitTitle);
+    } else {
+      var idleTitle = feat && feat.known === false
+        ? '尚未 HELLO 身份或旧 GD32（无 feat_map）'
+        : '等待 HELLO / 0xC4';
+      setMetricUi(mGd32TempEl, '--', 'v', idleTitle);
+      setMetricUi(mVccEl, '--', 'v', idleTitle);
+      setMetricUi(mVddaEl, '--', 'v', idleTitle);
+    }
   }
   var uptimeEl = document.getElementById('pillUptime');
   if (uptimeEl) uptimeEl.textContent = '\u23F1 ' + formatUptime(data.uptime_sec);
@@ -160,18 +239,6 @@ function applyDashboardUi(data, ota, wifi) {
   var rssi = (wifi.rssi !== undefined && wifi.rssi !== -127) ? wifi.rssi + ' dBm' : '--';
   var pillRSSIEl = document.getElementById('pillRSSI');
   if (pillRSSIEl) pillRSSIEl.textContent = rssi;
-
-  var mOtaCache = document.getElementById('mOtaCache');
-  var otaStored = ota.stored_size || 0;
-  if (mOtaCache) {
-    if (otaStored > 0) {
-      mOtaCache.textContent = formatBytes(otaStored) + ' / 216 KB';
-      mOtaCache.className = 'v ok';
-    } else {
-      mOtaCache.textContent = '0 / 216 KB';
-      mOtaCache.className = 'v';
-    }
-  }
 }
 
 /**
@@ -183,14 +250,11 @@ function applyGd32OtaSessionUi(ota) {
   var rs = ota.relay_state;
   var sysState = ota.sys_state || '';
   var sysStateCode = Number.isFinite(ota.sys_state_code) ? ota.sys_state_code : -1;
-  var isGd32Storing = sysState === 'GD32_STORING' || sysStateCode === 1;
   var isGd32Relaying = sysState === 'GD32_RELAYING' || sysStateCode === 3;
   var isGd32Complete = sysState === 'GD32_COMPLETE' || sysStateCode === 4;
   var isGd32Error = sysState === 'ERROR' || sysStateCode === 8 || rs === 255;
 
-  var total = ota.total_size || 0;
-  var stored = ota.stored_size || 0;
-  var storageProgress = total > 0 ? Math.min(100, Math.round(stored * 100 / total)) : 0;
+  /* 进度以 relay_seq/relay_total 为准；不再用 stored_size 做「OTA 缓存」展示 */
   var relaySeq = ota.relay_seq || 0;
   var relayTotal = ota.relay_total_packets || 0;
   var relayProgress = relayTotal > 0 ? Math.min(100, Math.round(relaySeq * 100 / relayTotal)) : 0;
@@ -321,15 +385,7 @@ function applyGd32OtaSessionUi(ota) {
     return;
   }
 
-  if (isGd32Storing || (total > 0 && stored < total && !window.isUploading &&
-      window.otaSessionState !== OtaSessionState.DONE &&
-      window.otaSessionState !== OtaSessionState.IDLE)) {
-    setActivePhase('gd32Ota');
-    var storeOverall = Math.min(45, Math.round(storageProgress * 0.45));
-    if (!window.isUploading) {
-      setProgress(storeOverall, '已缓存 ' + formatBytes(stored) + ' / ' + formatBytes(total));
-    }
-  }
+  /* 不再用 stored_size 做「OTA 缓存」展示；上传走 XHR，中继走 relay_seq。 */
 }
 
 /**

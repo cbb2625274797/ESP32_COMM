@@ -228,16 +228,6 @@ export function clearOtaSessionResiduals(opts) {
       : '待机';
   }
 
-  // 设备侧缓存展示：失败后不要继续显示“已满缓存像成功”
-  var mOtaCache = document.getElementById('mOtaCache');
-  if (mOtaCache && opts.clearCacheDisplay) {
-    mOtaCache.textContent = '0 / 216 KB';
-    mOtaCache.className = 'v';
-  }
-  var sOtaStored = document.getElementById('sOtaStored');
-  if (sOtaStored && opts.clearCacheDisplay) {
-    sOtaStored.textContent = '--';
-  }
 }
 
 /** @description 将会话从 FAILED/DONE 复位到 IDLE（用户发起新上传或设备空闲时调用）。 */
@@ -245,8 +235,7 @@ export function otaSessionReset() {
   clearOtaSessionResiduals({
     keepErrorStages: false,
     statusText: '待机',
-    errorStyle: false,
-    clearCacheDisplay: false
+    errorStyle: false
   });
   if (otaSessionState !== OtaSessionState.IDLE) {
     otaSessionState = OtaSessionState.IDLE;

@@ -14,10 +14,10 @@ idf_component_register(
         "server/ble_ota_host.cpp"      # BLE OTA GATT/GAP/广播/Host
         "monitor/health_monitor.cpp"   # 系统健康监控（温度/RSSI/堆内存/栈水位主动巡检）
         "monitor/cpu_stats.cpp"        # 1Hz FreeRTOS CPU 占用采样任务
-        "monitor/can_feedback_task.cpp" # CAN 反馈被动监听（0xC1 takeEvent）
+        "monitor/can_feedback_task.cpp" # CAN 反馈被动监听（0xC1 takeEvent）+ 分发 0xC4
+        "monitor/gd32_adc_feedback.cpp" # GD32 ADC 调试反馈缓存（0xC4）
         "monitor/debug_log.cpp"        # 三路调试日志（UART/UDP/环形缓冲）
-        "monitor/task_stack_check.cpp" # 任务栈水位指标收集（health_mon 巡检 + /system/status 共享）
-        "monitor/stack_overflow_hook.cpp" # FreeRTOS 栈溢出钩子（canary 触发时 UART 硬写告警）
+        "monitor/task_stack.cpp"       # 任务栈水位收集 + 溢出钩子
     INCLUDE_DIRS
         "."
         "core"

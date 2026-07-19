@@ -1,8 +1,8 @@
 /**
  * send.js - CAN 帧构建与发送（DBC 报文 / 原始帧 / 批量发送 / 发送历史）
  *
- * 包含：sendCanRequest、响应框、历史、批量/选中/手动发送、
- * 手动帧校验/重置/载入预览、CAN_SEND_ERR_DESC / GD32_ERR_DESC / buildSendResponseText。
+ * 包含：sendCanBatchRequest / sendCanOneFrame（仅 /can/send_batch）、响应框、历史、
+ * 批量/选中/手动发送、手动帧校验/重置/载入预览、错误码说明。
  *
  * 依赖：dbc.js（state/el/getBaseUrl/padHex/bytesToHex/parseNumericId）、
  *       common/toast.js（showToast）、common/utils.js（escapeHtml）、
@@ -27,6 +27,9 @@ function formatTime(date) {
   var ss = String(d.getSeconds()).padStart(2, '0');
   return hh + ':' + mm + ':' + ss;
 }
+
+/** 简单延时 helper，用于批次间间隔 */
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
 // ==================== 发送错误码描述 ====================
 var CAN_SEND_ERR_DESC = {
@@ -64,54 +67,36 @@ function buildSendResponseText(result) {
   return '发送失败: ' + desc + ' (code=' + result.code + ')';
 }
 
-// ==================== HTTP 请求 ====================
-async function sendCanRequest(payload) {
-  var resp = await fetch(getBaseUrl() + '/can/send', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(5000)
-  });
-  var text = await resp.text();
-  var json = {};
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch (err) {
-    throw new Error('响应不是合法 JSON: ' + text);
-  }
-  if (!resp.ok) {
-    throw new Error('HTTP ' + resp.status + ': ' + (json.message || text || '请求失败'));
-  }
-  return json;
-}
-
+// ==================== HTTP 请求（唯一入口 /can/send_batch）====================
 /**
- * @description 一次 HTTP 连续发送多帧（设备 /can/send_batch）。
+ * @description 同通道发送 1~N 帧。单帧也走 batch（frames 长度 1）。
  * @returns {Promise<object[]>} 与 frames 等长的 results
  */
 async function sendCanBatchRequest(channel, frames) {
+  var n = frames && frames.length ? frames.length : 0;
+  /* 单帧设备侧 timeout 2s；多帧按帧数留余量 */
+  var timeoutMs = (n <= 1) ? 8000 : Math.max(15000, n * 500);
   var resp = await fetch(getBaseUrl() + '/can/send_batch', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ch: channel, frames: frames }),
-    signal: AbortSignal.timeout(Math.max(15000, frames.length * 500))
+    signal: AbortSignal.timeout(timeoutMs)
   });
   var text = await resp.text();
   var json = {};
   try {
     json = text ? JSON.parse(text) : {};
   } catch (err) {
-    throw new Error('批量响应不是合法 JSON: ' + text);
+    throw new Error('CAN 响应不是合法 JSON: ' + text);
   }
   if (!resp.ok) {
-    throw new Error('HTTP ' + resp.status + ': ' + (json.message || text || '批量请求失败'));
+    throw new Error('HTTP ' + resp.status + ': ' + (json.message || text || '发送失败'));
   }
   if (!json.results || !Array.isArray(json.results)) {
-    throw new Error('批量响应缺少 results');
+    throw new Error('响应缺少 results');
   }
-  /* 设备可能返回 skipped；补齐与 frames 等长的 results */
   var results = json.results.slice();
-  var need = frames.length - results.length;
+  var need = n - results.length;
   if (need > 0) {
     var pad = {
       status: 'error',
@@ -121,6 +106,12 @@ async function sendCanBatchRequest(channel, frames) {
     for (var p = 0; p < need; p++) results.push(pad);
   }
   return results;
+}
+
+/** 单帧便捷封装：POST /can/send_batch，取 results[0] */
+async function sendCanOneFrame(channel, frame) {
+  var results = await sendCanBatchRequest(channel, [frame]);
+  return results[0] || { status: 'error', code: -3 };
 }
 
 // ==================== 响应框 ====================
@@ -188,12 +179,16 @@ export function renderHistory() {
 }
 
 // ==================== 批量发送 ====================
-/** 单批最多帧数（与设备 /can/send_batch 上限一致） */
-var BATCH_CHUNK = 128;
+/**
+ * 单批最多帧数。实测一次发送 >9 帧失败率明显上升，故按 9 帧分批；
+ * 批次之间留 BATCH_INTER_CHUNK_DELAY_MS 间隔，给 CAN/SPI 总线喘息时间。
+ */
+var BATCH_CHUNK = 32;
+/** 批次间延时（ms），仅在还有后续批次时等待 */
+var BATCH_INTER_CHUNK_DELAY_MS = 200;
 
 /**
- * @description 批量发送所有勾选的报文。
- * 优先 POST /can/send_batch；不支持时回退逐帧 /can/send。
+ * @description 批量发送所有勾选的报文（仅 /can/send_batch）。
  * 批量过程中不重绘历史，结束后统一刷新。
  */
 export async function sendCheckedMessages() {
@@ -246,28 +241,12 @@ export async function sendCheckedMessages() {
       });
     }
 
-    /* 分块批量接口；不支持时整段回退为无间隔单帧 */
-    var useBatchApi = true;
     for (var off = 0; off < prepared.length; ) {
       var chunk = prepared.slice(off, off + BATCH_CHUNK);
       off += chunk.length;
       var frames = chunk.map(function (p) { return p.frame; });
-      var results = null;
-
-      if (useBatchApi) {
-        try {
-          results = await sendCanBatchRequest(channel, frames);
-          if (results.length !== chunk.length) {
-            throw new Error('results 长度不匹配');
-          }
-        } catch (err) {
-          useBatchApi = false;
-          results = null;
-          /* 本 chunk 改单帧紧接 */
-        }
-      }
-
-      if (results) {
+      try {
+        var results = await sendCanBatchRequest(channel, frames);
         for (var r = 0; r < chunk.length; r++) {
           var item = chunk[r];
           var result = results[r] || { status: 'error', code: -3 };
@@ -278,33 +257,21 @@ export async function sendCheckedMessages() {
             resultText: item.msg.name + ' · ' + buildSendResponseText(result)
           }), silent);
         }
-        continue;
-      }
-
-      /* 回退：逐帧 HTTP，帧间无 sleep、无重试 */
-      for (var s = 0; s < chunk.length; s++) {
-        var one = chunk[s];
-        try {
-          var oneResult = await sendCanRequest({
-            ch: channel,
-            id: one.frame.id,
-            dlc: one.frame.dlc,
-            data: one.frame.data
-          });
-          if (oneResult.status === 'ok') ok++; else fail++;
-          addHistoryEntry(makeHistoryEntry({
-            mode: 'BATCH', ok: oneResult.status === 'ok', channel: channel,
-            idHex: one.idHex, dlc: one.dlc, dataHex: one.dataHex,
-            resultText: one.msg.name + ' · ' + buildSendResponseText(oneResult)
-          }), silent);
-        } catch (err) {
+      } catch (err) {
+        for (var s = 0; s < chunk.length; s++) {
           fail++;
+          var one = chunk[s];
           addHistoryEntry(makeHistoryEntry({
             mode: 'BATCH', ok: false, channel: channel,
             idHex: one.idHex, dlc: one.dlc, dataHex: one.dataHex,
             resultText: one.msg.name + ' · ' + err.message
           }), silent);
         }
+      }
+
+      /* 批次间间隔：还有下一批时等待，给 CAN/SPI 总线喘息时间 */
+      if (off < prepared.length) {
+        await sleep(BATCH_INTER_CHUNK_DELAY_MS);
       }
     }
 
@@ -319,7 +286,7 @@ export async function sendCheckedMessages() {
 }
 
 // ==================== 选中报文发送 ====================
-/** @description 发送当前选中报文（DBC 编码后 POST /can/send）。 */
+/** @description 发送当前选中报文（DBC 编码后 POST /can/send_batch，1 帧）。 */
 export async function sendSelectedMessage() {
   var msg = getSelectedMessage();
   if (!msg) {
@@ -332,19 +299,18 @@ export async function sendSelectedMessage() {
     return;
   }
   var channel = parseInt(el.defaultChannel.value, 10) || 0;
-  var payload = {
-    ch: channel,
-    id: msg.id,
-    dlc: msg.dlc,
-    data: bytesToHex(state.generatedData)
-  };
+  var dataHex = bytesToHex(state.generatedData);
   try {
-    var result = await sendCanRequest(payload);
+    var result = await sendCanOneFrame(channel, {
+      id: msg.id,
+      dlc: msg.dlc,
+      data: dataHex
+    });
     updateResponseBox(el.dbcResp, el.dbcRespText, result, 'dbc');
     addHistoryEntry(makeHistoryEntry({
       mode: 'DBC', ok: result.status === 'ok', channel: channel,
       idHex: '0x' + padHex(msg.id, msg.isExtended ? 8 : 3),
-      dlc: msg.dlc, dataHex: bytesToHex(state.generatedData),
+      dlc: msg.dlc, dataHex: dataHex,
       resultText: buildSendResponseText(result)
     }));
     showToast(result.status === 'ok' ? 'DBC 报文发送成功' : '发送失败', result.status === 'ok' ? 'success' : 'error');
@@ -357,7 +323,7 @@ export async function sendSelectedMessage() {
     addHistoryEntry(makeHistoryEntry({
       mode: 'DBC', ok: false, channel: channel,
       idHex: '0x' + padHex(msg.id, msg.isExtended ? 8 : 3),
-      dlc: msg.dlc, dataHex: bytesToHex(state.generatedData),
+      dlc: msg.dlc, dataHex: dataHex,
       resultText: err.message
     }));
     showToast('发送失败: ' + err.message, 'error');
@@ -415,8 +381,7 @@ export async function sendManualFrame() {
   }
 
   try {
-    var result = await sendCanRequest({
-      ch: channel,
+    var result = await sendCanOneFrame(channel, {
       id: id,
       dlc: dlc,
       data: dataHex

@@ -22,11 +22,10 @@ CONFIG_DCU_SPI_CLOCK_HZ=4000000
 # 原值 7 与 httpd max_open_sockets=4 仅余 3 个 socket,一旦 handler 阻塞即 accept(EMFILE)
 # 提到 12 留足缓冲,配合 can_feedback_task 退避从根本上避免 socket 饥荒
 CONFIG_LWIP_MAX_SOCKETS=12
-# C3 堆紧：WiFi+BLE 双栈时 TCP 窗口过大 → OTA 收流 free 压到 ~5KB → 卡半/堆爆。
-# 6144=6KB≈4*MSS：优先压峰值堆；OTA 瓶颈多在 Flash 擦写，吞吐损失通常可接受。
+# C3 堆紧：窗口过大 OTA 峰值易顶；8KB≈5*MSS，在 4KB OTA 块下吞吐更好，仍比 12KB+ 保守。
 # 注意：仅改 defaults 不会覆盖已有 sdkconfig，构建前须同步写入 sdkconfig。
-CONFIG_LWIP_TCP_WND_DEFAULT=6144
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=6144
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
 # 乱序队列 pbuf：4→2，少占堆；HTTP 顺序上传基本不需要大 OOSEQ
 CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2
 
@@ -36,8 +35,17 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 
+# ── 固件体积裁剪（P0，2026-07）：仅三项，WPA2-PSK / 本地 HTTP / IPv4 OTA 不受影响 ──
+# 关闭企业 WiFi（802.1X），家用 WPA2-PSK 不受影响
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+# 无 HTTPS 出站客户端，本地 HTTP OTA 不需要 WiFi 内嵌 mbedTLS TLS client
+CONFIG_ESP_WIFI_MBEDTLS_TLS_CLIENT=n
+# 仅 IPv4；关 IPv6 可去掉 nd6 等路径
+CONFIG_LWIP_IPV6=n
+
 # FreeRTOS runtime stats -- /system/status CPU usage
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
 CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U32=y

@@ -156,8 +156,7 @@ export function cleanupAfterOtaFailure(reason) {
   window.clearOtaSessionResiduals({
     keepErrorStages: true,
     statusText: reason || '失败',
-    errorStyle: true,
-    clearCacheDisplay: true
+    errorStyle: true
   });
 
   // 2. 阶段指示器标错

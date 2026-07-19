@@ -38,7 +38,7 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         }
 
         if (len < 35) {
-            DEBUG_WARN(TAG, "CTRL 0xF7 数据长度不足 35（前端 SHA-256 必传），拒绝触发 GD32 中继");
+            DEBUG_WARN(TAG, "CTRL 0xF7 len<35 缺SHA,拒GD32中继");
             sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH,
                             packBleFinishValue(session_id, 1));
             return 0;
@@ -60,22 +60,21 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
             err = OtaCoordinator::instance().verifyGd32Firmware(frontend_sha, device_sha);
             shaBytesToHexUpper(device_sha, device_sha_hex);
             sendSha256Notify(device_sha, session_id);
-            DEBUG_DBG(TAG, "GD32 前端 SHA-256: %s, session=%u", frontend_sha_hex, session_id);
-            DEBUG_DBG(TAG, "GD32 缓存 SHA-256: %s", device_sha_hex);
-
             if (err == ESP_ERR_INVALID_CRC) {
-                DEBUG_ERR(TAG, "GD32 缓存 SHA-256 与前端文件不匹配，拒绝触发 SPI 中继");
+                DEBUG_ERR(TAG, "GD32 SHA-256 不匹配");
+                DEBUG_ERR(TAG, "frontend=%s", frontend_sha_hex);
+                DEBUG_ERR(TAG, "device=%s", device_sha_hex);
                 sendFinishEvent(BLE_OTA_FINISH_ERR_SHA_MISMATCH,
                                 packBleFinishValue(session_id, 0));
                 return 0;
             } else if (err != ESP_OK) {
-                DEBUG_ERR(TAG, "GD32 SHA-256 计算/读取失败: %s", esp_err_to_name(err));
+                DEBUG_ERR(TAG, "GD32 SHA 失败: %s", esp_err_to_name(err));
                 sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
                                 packBleFinishValue(session_id, 3));
                 return 0;
             }
 
-            DEBUG_INFO(TAG, "GD32 固件就绪且 SHA-256 匹配 (%" PRIu32 " / %" PRIu32 " 字节)，通过协调器触发中继",
+            DEBUG_INFO(TAG, "GD32就绪 SHA匹配 %" PRIu32 "/%" PRIu32 ",触发中继",
                        meta.stored_size, meta.total_size);
             if (OtaRelay::getResultQueue()) {
                 uint32_t stale = 0;
@@ -93,7 +92,7 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
 
             sendFinishEvent(BLE_OTA_FINISH_GD32_RELAY_START,
                             packBleFinishValue(session_id, 0));
-            DEBUG_INFO(TAG, "已通知前端: GD32 中继已开始 (stage=0x10, session=%u)", session_id);
+            DEBUG_INFO(TAG, "GD32中继开始 stage=0x10 sess=%u", session_id);
 
             BleGd32RelayWaitCtx *ctx = (BleGd32RelayWaitCtx *)malloc(sizeof(BleGd32RelayWaitCtx));
             if (!ctx) {
@@ -142,7 +141,7 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         // 强制要求 32B 前端 SHA-256：与 WiFi 流程对齐，设备端读回分区计算并比对，
         // 一致走 end+set_boot+reboot，不一致返回 0x85 ERR_SHA_MISMATCH。
         if (len < 33) {
-            DEBUG_WARN(TAG, "CTRL 0xF8 数据长度不足 33（前端 SHA-256 必传），拒绝触发");
+            DEBUG_WARN(TAG, "CTRL 0xF8 len<33 缺SHA,拒绝");
             sendFinishEvent(BLE_OTA_FINISH_ERR_FINALIZE, (uint32_t)ESP_ERR_INVALID_ARG);
             return 0;
         }
@@ -159,7 +158,7 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         }
         finish_ctx->sha_hex[64] = '\0';
         finish_ctx->session_id = session_id;
-        DEBUG_DBG(TAG, "前端 SHA-256: %s, session=%u", finish_ctx->sha_hex, session_id);
+        DEBUG_DBG(TAG, "feSHA=%s sess=%u", finish_ctx->sha_hex, session_id);
 
         BleOta::instance().m_esp32RebootPending = true;
         BaseType_t ok = xTaskCreate(ble_esp32_finish_and_reboot_task,
@@ -179,7 +178,7 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         }
     } else if (buf[0] == BLE_OTA_CTRL_RESTART_ESP32) {
         // 重启 ESP32：GATT 回调中仅推送 FINISH，延时 + 重启交给独立 task，避免卡 NimBLE host
-        DEBUG_INFO(TAG, "收到 0xFA 重启请求，创建 restart task（500ms 后 esp_restart()）");
+        DEBUG_INFO(TAG, "0xFA重启,建restart task(500ms)");
         if (BleOta::instance().m_esp32RebootPending) {
             DEBUG_WARN(TAG, "0xFA 重启已在进行中，忽略重复 CTRL");
             return 0;
@@ -207,11 +206,11 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
         }
 
         ota_system_state_t cur_state = OtaCoordinator::instance().getSystemState();
-        DEBUG_WARN(TAG, "收到 0xFB 中止请求: state=%s session=%u",
+        DEBUG_WARN(TAG, "0xFB abort state=%s sess=%u",
                    OtaCoordinator::stateToString(cur_state), session_id);
 
         if (cur_state == OTA_SYS_GD32_RELAYING) {
-            DEBUG_WARN(TAG, "GD32 SPI 中继进行中，无法中止（请等待完成或断开 BLE）");
+            DEBUG_WARN(TAG, "GD32 SPI中继中,无法中止,请等待");
             sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,
                             packBleFinishValue(session_id, 2));
             return 0;
@@ -466,7 +465,7 @@ int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
         {
             ota_system_state_t cur = OtaCoordinator::instance().getSystemState();
             if (cur == OTA_SYS_GD32_RELAYING || cur == OTA_SYS_ESP32_REBOOTING) {
-                DEBUG_WARN(TAG, "BLE 断开但 %s 进行中，保留状态等待自然结束",
+                DEBUG_WARN(TAG, "BLE断但%s进行中,保留状态",
                            OtaCoordinator::stateToString(cur));
             } else if (cur == OTA_SYS_ESP32_RECEIVING ||
                        cur == OTA_SYS_ESP32_FINALIZING ||
@@ -479,7 +478,7 @@ int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
                     ch = snap.channel;
                 }
                 if (ch == OTA_CHANNEL_BLE) {
-                    DEBUG_WARN(TAG, "BLE 断开，中止 BLE 通道 OTA (state=%s)",
+                    DEBUG_WARN(TAG, "BLE断,中止OTA state=%s",
                                OtaCoordinator::stateToString(cur));
                     ble_ota_session_reset();
                 } else {
@@ -502,7 +501,7 @@ int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        DEBUG_INFO(TAG, "CCC 描述符更新: conn=%d attr=%d notify=%d indicate=%d",
+        DEBUG_INFO(TAG, "CCC upd conn=%d attr=%d n=%d i=%d",
                    event->subscribe.conn_handle,
                    event->subscribe.attr_handle,
                    event->subscribe.cur_notify,
@@ -543,7 +542,7 @@ int ble_ota_gap_event(struct ble_gap_event *event, void *arg)
         const char *tx_phy = (tx == BLE_GAP_LE_PHY_2M) ? "2M" :
                              (tx == BLE_GAP_LE_PHY_1M) ? "1M" :
                              (tx == BLE_GAP_LE_PHY_CODED) ? "CODED" : "?";
-        DEBUG_INFO(TAG, "PHY 更新: status=%d rx=%s tx=%s",
+        DEBUG_INFO(TAG, "PHY %d %s/%s",
                    event->phy_updated.status, rx_phy, tx_phy);
         return 0;
     }
@@ -573,18 +572,18 @@ void ble_ota_start_advertising(void)  // kept as free function for BLE callback 
     uint8_t own_addr_type;
     rc = ble_hs_id_infer_auto(0, &own_addr_type);
     if (rc != 0) {
-        DEBUG_ERR(TAG, "推断地址类型失败: rc=%d, 尝试生成随机地址", rc);
+        DEBUG_ERR(TAG, "推断地址失败 rc=%d,试随机地址", rc);
         // 生成不可解析随机地址作为 fallback
         ble_addr_t rnd_addr;
         rc = ble_hs_id_gen_rnd(0, &rnd_addr);
         if (rc != 0) {
-            DEBUG_ERR(TAG, "生成随机地址也失败: rc=%d, BLE 广播无法启动", rc);
+            DEBUG_ERR(TAG, "随机地址失败 rc=%d", rc);
             return;
         }
         own_addr_type = rnd_addr.type;
     }
 
-    DEBUG_INFO(TAG, "使用地址类型: %s", own_addr_type == BLE_OWN_ADDR_PUBLIC ? "Public" : "Random");
+    DEBUG_DBG(TAG, "BLE addr type: %s", own_addr_type == BLE_OWN_ADDR_PUBLIC ? "Public" : "Random");
 
     // --- 构建广播数据 ---
     uint8_t adv_data[31] = {0};
@@ -640,7 +639,8 @@ void ble_ota_start_advertising(void)  // kept as free function for BLE callback 
     if (rc != 0) {
         DEBUG_ERR(TAG, "启动广播失败: %d", rc);
     } else {
-        DEBUG_INFO(TAG, "BLE 广播已启动: \"%s\"", name);
+        /* 冷启动与 WiFi 共存恢复都会走这里；常态 INFO 不刷，避免上传日志夹杂 BLE */
+        DEBUG_DBG(TAG, "BLE广播就绪: \"%s\"", name);
     }
 }
 

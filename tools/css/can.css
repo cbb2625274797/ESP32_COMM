@@ -1039,6 +1039,13 @@ body.can-page {
   background: transparent;
   border: none;
 }
+.feedback-channel.ch-disabled {
+  opacity: 0.45;
+  filter: grayscale(0.35);
+}
+.feedback-channel.ch-disabled .feedback-ch-head {
+  cursor: default;
+}
 .feedback-channel {
   background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.07);
   border-radius: 10px; padding: 14px 16px;

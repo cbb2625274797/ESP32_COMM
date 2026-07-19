@@ -397,9 +397,26 @@ esp_err_t WifiOta::httpServerStart()
     config.server_port = HTTP_SERVER_PORT;
     config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
-    /* LWIP_MAX_SOCKETS=12；HTTP 内部约占 3 + UDP 日志 1；业务连接上限 7 */
-    config.max_open_sockets = 7;
-    /* 满连接时淘汰最久未用的空闲 socket */
+    /* Socket 预算（无法“合并” httpd 内部 3 个 fd：listen + ctrl 对）：
+     *
+     *   LWIP 总池 CONFIG_LWIP_MAX_SOCKETS
+     *     ├─ httpd 内部固定 3
+     *     ├─ max_open_sockets = 业务并发（下面 want）
+     *     └─ 余量：UDP 调试日志 1 + 偶发其它
+     *
+     * 约束：max_open_sockets <= LWIP_MAX_SOCKETS - 3
+     *
+     * 业务并发压到 4（tools 单浏览器已足够）：
+     *   1× /system/status 轮询 + 1× /logs 轮询 + 1× 操作(OTA/CAN) + 1× 余量
+     * OTA 大上传期间前端 pausePolling，只占 1 条长连接，不与轮询抢槽。
+     * lru_purge：满槽时踢最久空闲连接，避免 EMFILE 卡死。
+     * 硬编码 7 在 LWIP=8 时会 ESP_ERR_INVALID_ARG → HTTP 起不来。 */
+    {
+        const int lwip_cap = CONFIG_LWIP_MAX_SOCKETS - 3;  // httpd 硬上限
+        const int want = 4;  // 合并并发需求后的业务槽位（原 7 偏松）
+        config.max_open_sockets = (lwip_cap < want) ? ((lwip_cap > 1) ? lwip_cap : 1) : want;
+    }
+    /* 满连接时淘汰最久未用的空闲 socket（相当于“复用/腾挪”槽位） */
     config.lru_purge_enable = true;
     /* idle 收发超时（秒）；进行中的 handler 连接不受此 idle 检测踢掉 */
     config.recv_wait_timeout = 10;
@@ -437,7 +454,7 @@ esp_err_t WifiOta::httpServerStart()
         {"/logs",          HTTP_GET,  logs_handler},
         {"/system/status", HTTP_GET,  system_status_handler},
         {"/system/probe",  HTTP_GET,  system_probe_handler},
-        {"/can/send",      HTTP_POST, can_send_handler},
+        {"/system/heap_low_log", HTTP_GET,  system_heap_low_log_handler},
         {"/can/send_batch", HTTP_POST, can_send_batch_handler},
         {"/can/feedback",  HTTP_GET,  can_feedback_handler},
         {"/can/mode",      HTTP_GET,  can_mode_handler},
@@ -445,7 +462,10 @@ esp_err_t WifiOta::httpServerStart()
         {"/spi/send",      HTTP_POST, spi_send_handler},
     };
 
-    for (const auto &r : kHttpRoutes) {
+    /* 同一 path 可有多 method（如 GET+POST）；OPTIONS 每个 path 只注册一次，
+     * 否则 httpd 报 “handler ... method 6 already registered”。 */
+    for (size_t i = 0; i < sizeof(kHttpRoutes) / sizeof(kHttpRoutes[0]); ++i) {
+        const UriEntry &r = kHttpRoutes[i];
         httpd_uri_t main_uri = {};
         main_uri.uri = r.uri;
         main_uri.method = r.method;
@@ -453,15 +473,24 @@ esp_err_t WifiOta::httpServerStart()
         main_uri.user_ctx = NULL;
         httpd_register_uri_handler(WifiOta::instance().m_httpServer, &main_uri);
 
-        httpd_uri_t opts_uri = {};
-        opts_uri.uri = r.uri;
-        opts_uri.method = HTTP_OPTIONS;
-        opts_uri.handler = http_options_handler;
-        opts_uri.user_ctx = NULL;
-        httpd_register_uri_handler(WifiOta::instance().m_httpServer, &opts_uri);
+        bool need_opts = true;
+        for (size_t j = 0; j < i; ++j) {
+            if (strcmp(kHttpRoutes[j].uri, r.uri) == 0) {
+                need_opts = false;
+                break;
+            }
+        }
+        if (need_opts) {
+            httpd_uri_t opts_uri = {};
+            opts_uri.uri = r.uri;
+            opts_uri.method = HTTP_OPTIONS;
+            opts_uri.handler = http_options_handler;
+            opts_uri.user_ctx = NULL;
+            httpd_register_uri_handler(WifiOta::instance().m_httpServer, &opts_uri);
+        }
     }
 
-    DEBUG_INFO("WIFI", "注册端点: /ota/upload, /ota/relay, /ota/update, /restart, /logs, /system/status, /system/probe, /can/send, /can/send_batch, /spi/send, /can/feedback, /can/mode");
+    DEBUG_INFO("WIFI", "HTTP端点已注册 (ota/can/spi/logs/status)");
 
     return ESP_OK;
 }
@@ -562,7 +591,7 @@ bool WifiOta::earlyInit()
         DEBUG_ERR("WIFI", "NVS 初始化失败: %s", esp_err_to_name(err));
     } else {
         if (nvs_erased) {
-            DEBUG_WARN("WIFI", "NVS 已擦除重建，WiFi PHY 校准数据已清除，将重新校准");
+            DEBUG_WARN("WIFI", "NVS重建,PHY校准已清,将重校");
         }
         DEBUG_INFO("WIFI", "NVS 初始化成功");
     }
@@ -721,7 +750,7 @@ void WifiOta::taskEntry(void *pvParameters)
         ota_meta_t boot_meta;
         if (OtaCoordinator::instance().loadGd32Meta(&boot_meta) == ESP_OK &&
             boot_meta.total_size > 0 && boot_meta.stored_size < boot_meta.total_size) {
-            DEBUG_WARN("WIFI", "检测到不完整 OTA 缓存 (stored=%u total=%u)，清除残留状态",
+            DEBUG_WARN("WIFI", "不完整OTA缓存 stored=%u total=%u,清残留",
                        (unsigned)boot_meta.stored_size, (unsigned)boot_meta.total_size);
             OtaCoordinator::instance().clearGd32Meta();
             OtaCoordinator::instance().abortCurrent();
@@ -742,21 +771,21 @@ void WifiOta::taskEntry(void *pvParameters)
     // 等待网络栈稳定（ARP 表建立、路由就绪），避免首批 UDP 包丢失
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 启动摘要，发两遍确保上位机收到（第一包可能触发 ARP 被丢）
+    // 启动摘要（单次；前面已 delay 等网络/ARP 稳定）
     esp_chip_info_t chip;
     esp_chip_info(&chip);
-    for (int i = 0; i < 2; i++) {
-        DEBUG_INFO("WIFI", "========================================");
-        DEBUG_INFO("WIFI", "[启动摘要] ESP32-C3 OTA Relay v%s", FW_VERSION);
-        DEBUG_INFO("WIFI", "[启动摘要] Chip: %s, Rev %d", CONFIG_IDF_TARGET, chip.revision);
-        DEBUG_INFO("WIFI", "[启动摘要] Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
-        DEBUG_INFO("WIFI", "[启动摘要] WiFi: %s", WifiOta::getMode() == OTA_WIFI_MODE_STA ? "STA" : "AP");
-        DEBUG_INFO("WIFI", "[启动摘要] NVS + WiFi driver + netif + event handler 初始化完成");
-        DEBUG_INFO("WIFI", "[启动摘要] HTTP 服务器端口: %d", HTTP_SERVER_PORT);
-        DEBUG_INFO("WIFI", "========================================");
-        DEBUG_INFO("WIFI", "=== WiFi OTA 服务器就绪 ===");
-        if (i == 0) vTaskDelay(pdMS_TO_TICKS(200));
-    }
+    DEBUG_INFO("WIFI", "========================================");
+    DEBUG_INFO("WIFI", "[启动摘要] ESP32-C3 OTA Relay v%s", FW_VERSION);
+    DEBUG_INFO("WIFI", "[启动摘要] Chip: %s, Rev %d", CONFIG_IDF_TARGET, chip.revision);
+    DEBUG_INFO("WIFI", "[启动摘要] Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    DEBUG_INFO("WIFI", "[启动摘要] WiFi: %s", WifiOta::getMode() == OTA_WIFI_MODE_STA ? "STA" : "AP");
+    DEBUG_INFO("WIFI", "[启动摘要] NVS + WiFi driver + netif + event handler 初始化完成");
+    DEBUG_INFO("WIFI", "[启动摘要] HTTP 服务器端口: %d", HTTP_SERVER_PORT);
+    DEBUG_INFO("WIFI", "========================================");
+    DEBUG_INFO("WIFI", "=== WiFi OTA 服务器就绪 ===");
+
+    /* 启动日志 burst 已过：环 64→16 槽，释放大约 7.5KB 给业务堆 */
+    DebugLog::instance().shrinkRingAfterBoot();
 
     // WiFi 状态监控
     // 每秒一次循环：每 10 秒检查 RSSI

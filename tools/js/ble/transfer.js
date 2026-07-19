@@ -6,6 +6,7 @@ import { showBleVerifyInfo, hideBleVerifyInfo } from './verify.js';
 import { clearOtaResultWaiter, waitForOtaResult, nextOtaSessionId } from './session.js';
 import { enableNotifications } from './gatt.js';
 import { syncSelectedFileFromInput, updateFileInfo } from './file.js';
+import { computeFileSha } from '../ota/file-handle.js';
 import { formatBytes } from '../common/utils.js';
 import { showToast } from '../common/toast.js';
 
@@ -105,17 +106,15 @@ export function waitForAck(cmd, expectedSeq, timeoutMs = 8000, opts = {}) {
 
 /** @description 分块上传固件到 ESP32（通过 BLE GATT 写入）。 */
 export async function uploadFirmware() {
-  // 每次刷写前尝试重新从本地读取文件
+  // 热重载：有 handle 则重新读盘（本地编译会改同路径固件）；否则用已选/input
   if (state.selectedFileHandle) {
     try {
       const freshFile = await state.selectedFileHandle.getFile();
       await updateFileInfo(freshFile);
-      var actualFile = state.selectedFile || freshFile;
-      bleLog('FILE', '已重新读取本地文件: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')', 'D');
     } catch (e) {
       bleLog('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
     }
-  } else {
+  } else if (!state.selectedFile) {
     await syncSelectedFileFromInput();
   }
   if (!state.selectedFile || !state.dataInChar) return false;
@@ -172,22 +171,14 @@ export async function uploadFirmware() {
       bleLog('OTA', `⚠️ file.size(${file.size}) ≠ arrayBuffer(${totalSize})，以 arrayBuffer 为准，请确认页面已 Ctrl+F5 刷新`, 'W');
     }
 
-    // SHA-256 已在文件选择时（updateFileInfo）计算并存入 state.fileSha256。
-    // 此处不再重复打日志（避免与 [FILE] SHA-256 重复），仅保证 fileSha256 变量有值。
-    var fileSha256;
-    if (state.fileSha256) {
-      fileSha256 = state.fileSha256.toLowerCase();
-    } else {
-      // 极端兜底：state.fileSha256 未初始化（理论上 updateFileInfo 总会先设置）
-      bleLog('OTA', '正在计算文件 SHA-256 哈希...', 'D');
-      const hashBuffer = await crypto.subtle.digest('SHA-256', fileBytes.buffer);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      fileSha256 = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-      state.fileSha256 = fileSha256.toUpperCase();
-    }
-    // Update SHA display in file info
+    /* 上传前始终按本次读到的内容重算 SHA，不沿用选文件时的旧值 */
+    var chipKey = (cfg.label === 'GD32') ? 'gd32' : 'esp32';
+    var shaHex = await computeFileSha(file, chipKey, fileBytes.buffer);
+    if (!shaHex) throw new Error('SHA-256 计算失败');
+    state.fileSha256 = shaHex;
+    var fileSha256 = shaHex.toLowerCase();
     var shaElem = document.getElementById('fileSha256');
-    if (shaElem) shaElem.textContent = fileSha256.toUpperCase();
+    if (shaElem) shaElem.textContent = shaHex.toUpperCase();
 
     setBleStage(4, '写入中...', null);
     setBleStageText(`正在写入 ${packetTotal} 包数据...`);
@@ -464,29 +455,15 @@ export async function uploadFirmware() {
 
 /** @description 自动刷写流程：上传 ESP32 固件 → SHA验证 → 触发 GD32 中继。 */
 export async function autoFlash() {
-  // 每次刷写前尝试重新从本地读取文件（支持热重载：用户重新编译后无需重新选择）
+  /* 与 uploadFirmware 一致：有 handle 则重新读盘，SHA 在 upload 内按内容重算 */
   if (state.selectedFileHandle) {
     try {
       const freshFile = await state.selectedFileHandle.getFile();
-      // 仅在文件变化时才刷新元数据并重算 SHA-256
-      // （name/size/lastModified 任一不同即视为变化）
-      // 避免对同一文件重复触发 updateFileInfo → 产生重复的 [FILE] SHA-256 日志
-      const cached = state.selectedFile;
-      // HEX 文件转换后 cached.name 是 .bin 而 freshFile.name 是 .hex，
-      // 因此 HEX 文件用 lastModified 判断是否变化，避免每次都重新转换
-      const isHex = freshFile.name.toLowerCase().endsWith('.hex');
-      const changed = !cached ||
-                      (isHex ? false : (cached.name !== freshFile.name || cached.size !== freshFile.size)) ||
-                      cached.lastModified !== freshFile.lastModified;
-      if (changed) {
-        await updateFileInfo(freshFile);
-        var actualFile = state.selectedFile || freshFile;
-        bleLog('FILE', '已重新读取本地文件（已变更）: ' + actualFile.name + ' (' + formatBytes(actualFile.size) + ')', 'D');
-      }
+      await updateFileInfo(freshFile);
     } catch (e) {
       bleLog('FILE', '重新读取文件失败: ' + e.message + '，将使用缓存版本', 'W');
     }
-  } else {
+  } else if (!state.selectedFile) {
     await syncSelectedFileFromInput();
   }
   if (!state.selectedFile || !state.server) return;

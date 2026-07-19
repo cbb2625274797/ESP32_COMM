@@ -11,8 +11,8 @@
 <title>ESP32 OTA 中继控制台</title>
 <link rel="stylesheet" href="css/base.css?v=20260718b">
 <link rel="stylesheet" href="css/layout.css?v=20260718b">
-<link rel="stylesheet" href="css/components.css?v=20260718b">
-<link rel="stylesheet" href="css/can.css?v=20260718f">
+<link rel="stylesheet" href="css/components.css?v=20260719x">
+<link rel="stylesheet" href="css/can.css?v=20260719s">
 <link rel="stylesheet" href="css/responsive.css?v=20260718b">
 </head>
 <body>
@@ -65,10 +65,7 @@
             </div>
           </div>
           </div>
-          <div class="conn-indicator err" id="connStatus" style="margin-top:12px;">
-            <span class="light"></span>
-            <span id="connStatusTxt">等待连接</span>
-          </div>
+          <!-- 连接文案只在顶栏 #pillConnTxt 显示，此处不再重复 -->
         </div>
       </div>
 
@@ -118,6 +115,10 @@
             <div class="file-info-grid">
               <div class="file-meta-item"><span>类型</span><b id="fileTypeGd32">-</b></div>
               <div class="file-meta-item"><span>大小</span><b id="fileSizeGd32">-</b></div>
+            </div>
+            <div class="file-meta-item" style="margin-top:6px;">
+              <span>SHA-256</span>
+              <b id="fileSha256Gd32" style="font-size:10px;word-break:break-all;font-family:monospace;">-</b>
             </div>
           </div>
           </div>
@@ -276,10 +277,12 @@
         <div class="card-head"><span class="ico">📊</span> 运行指标</div>
         <div class="card-body">
           <div class="metric-grid">
-            <div class="metric"><div class="k">温度</div><div class="v" id="mTemp">--</div></div>
-            <div class="metric"><div class="k">GD32 APP</div><div class="v" id="mGd32App" style="font-size:14px;">--</div></div>
-            <div class="metric"><div class="k">GD32 BOOT</div><div class="v" id="mGd32Boot" style="font-size:14px;">--</div></div>
-            <div class="metric"><div class="k">OTA 缓存</div><div class="v" id="mOtaCache" style="font-size:13px;">--</div></div>
+            <div class="metric"><div class="k">ESP32 温度</div><div class="v" id="mTemp">--</div></div>
+            <div class="metric"><div class="k">GD32 温度</div><div class="v" id="mGd32Temp" title="SPI 0xC4；片内温度">--</div></div>
+            <div class="metric"><div class="k">输入 VCC</div><div class="v" id="mVcc" title="PA6 分压反推：VCC—47k—ADC—4.7k—GND">--</div></div>
+            <div class="metric"><div class="k">VDDA</div><div class="v" id="mVdda" title="片内 VREFINT 反推的 MCU 模拟供电">--</div></div>
+            <div class="metric"><div class="k">GD32 APP</div><div class="v" id="mGd32App">--</div></div>
+            <div class="metric"><div class="k">GD32 BOOT</div><div class="v" id="mGd32Boot">--</div></div>
           </div>
         </div>
       </div>
@@ -293,7 +296,6 @@
           <div class="status-kv-grid">
             <div class="status-kv"><span class="k">OTA 状态</span><b id="sOtaState">--</b></div>
             <div class="status-kv"><span class="k">Relay 状态</span><b id="sRelayState">--</b></div>
-            <div class="status-kv"><span class="k">缓存进度</span><b id="sOtaStored">--</b></div>
             <div class="status-kv"><span class="k">刷新时间</span><b id="sStatusUpdated">--</b></div>
           </div>
         </div>
@@ -315,7 +317,7 @@
                 </div>
                 <span class="can-launch-badge">DBC / HEX</span>
               </div>
-              <p class="can-launch-desc">导入 DBC 后自动读取报文和信号，按物理值实时组帧，并复用现有 <code>/can/send</code> 接口直接发送。</p>
+              <p class="can-launch-desc">导入 DBC 后自动读取报文和信号，按物理值实时组帧，经 <code>/can/send_batch</code> 发送（单帧或多帧）。</p>
               <div class="can-launch-points">
                 <span class="can-launch-point">自动解析 DBC</span>
                 <span class="can-launch-point">信号实时组帧</span>
@@ -396,9 +398,35 @@
         <div class="status-empty">等待下一次状态刷新...</div>
       </div>
 
-      <div class="status-section-title">堆概况</div>
+      <div class="status-section-title">内存概况</div>
       <div class="heap-group">
-        <div class="heap-group-title">内部 DRAM <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(数据堆)</span></div>
+        <div class="heap-group-title">芯片 SRAM 总览 <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(ESP32-C3 · 静态段可拆分)</span></div>
+        <div class="heap-bar-row">
+          <span class="heap-bar-text" id="memSramUsage">--</span>
+          <span class="heap-bar-track mem-sram-track" id="memSramTrack" title="紫=IRAM · 橙=.data · 灰=.bss · 青=堆已用 · 暗=堆空闲">
+            <span class="mem-seg mem-seg-iram" id="memSegIram"></span>
+            <span class="mem-seg mem-seg-data" id="memSegData"></span>
+            <span class="mem-seg mem-seg-bss" id="memSegBss"></span>
+            <span class="mem-seg mem-seg-used" id="memSegUsed"></span>
+            <span class="mem-seg mem-seg-free" id="memSegFree"></span>
+          </span>
+          <span class="heap-bar-pct" id="memSramPct">--</span>
+        </div>
+        <div class="heap-legend">
+          <span class="heap-legend-item"><i class="mem-dot mem-dot-iram"></i>IRAM <b id="mIram">--</b></span>
+          <span class="heap-legend-item"><i class="mem-dot mem-dot-data"></i>.data <b id="mData">--</b></span>
+          <span class="heap-legend-item"><i class="mem-dot mem-dot-bss"></i>.bss <b id="mBss">--</b></span>
+          <span class="heap-legend-item"><i class="mem-dot mem-dot-used"></i>堆已用 <b id="mHeapUsed">--</b></span>
+          <span class="heap-legend-item"><i class="mem-dot mem-dot-free"></i>堆空闲 <b id="mHeapFree">--</b></span>
+        </div>
+        <div class="heap-detail-row">
+          <span>SOC 窗口: <b id="mSramSoc">--</b></span>
+          <span>尾部保留: <b id="mReservedTail">--</b></span>
+          <span>任务栈合计: <b id="mTaskStackTotal">--</b></span>
+        </div>
+      </div>
+      <div class="heap-group">
+        <div class="heap-group-title">内部 DRAM 堆 <span style="font-weight:400;color:var(--text-dim);font-size:10px;">(malloc 数据堆)</span></div>
         <div class="heap-bar-row">
           <span class="heap-bar-text" id="memInternalUsage">--</span>
           <span class="heap-bar-track"><span class="heap-bar-fill" id="memInternalFill"></span></span>
@@ -408,6 +436,11 @@
           <span>空闲: <b id="mInternalHeap">--</b></span>
           <span>最低空闲: <b id="mInternalMinHeap">--</b></span>
           <span>最大块: <b id="mInternalLargestBlock">--</b></span>
+        </div>
+        <div class="heap-detail-row">
+          <span>DMA 空闲: <b id="mDmaFree">--</b></span>
+          <span>RTC 堆空闲: <b id="mRtcFree">--</b></span>
+          <span>分配块数: <b id="mAllocBlocks">--</b></span>
         </div>
       </div>
 
@@ -436,8 +469,8 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script type="module" src="js/app.js?v=20260719b"></script>
-<script type="module" src="js/ota/console-mode.js?v=20260719b"></script>
-<script type="module" src="js/ble_ota.js?v=20260719b"></script>
+<script type="module" src="js/app.js?v=20260720ae"></script>
+<script type="module" src="js/ota/console-mode.js?v=20260720ae"></script>
+<script type="module" src="js/ble_ota.js?v=20260720ae"></script>
 </body>
 </html>

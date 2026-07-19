@@ -21,6 +21,8 @@
 #include "transport/spi_master.h"
 #include "monitor/debug_log.h"
 #include "monitor/can_feedback_task.h"
+#include "monitor/gd32_adc_feedback.h"
+#include "app_config.h"
 #include "esp_system.h"
 
 #include <string.h>
@@ -30,6 +32,7 @@ namespace {
 constexpr uint32_t kWaitRingMs      = 500U;    ///< 单次等待 GD32 按铃超时
 constexpr uint32_t kPauseDelayMs    = 100U;    ///< 暂停时的轮询间隔
 constexpr uint8_t  kSpiCanFeedbackType = 0xC1U;
+constexpr uint8_t  kSpiAdcFeedbackType = 0xC4U;  ///< GD32 ADC 调试反馈
 constexpr size_t   kRingPayloadMax  = SPI_OTA_FRAME_MAX;  ///< 与变长读一致，避免截断
 constexpr const char *kTag           = "CAN_FB";
 
@@ -43,6 +46,11 @@ static can_feedback_result_t s_work  [CAN_CHANNEL_MAX];
 static uint8_t               s_workIdx[CAN_CHANNEL_MAX];
 static uint32_t              s_lastLoggedError[CAN_CHANNEL_MAX];
 
+/**
+ * @brief 将某通道完整反馈发布到 s_latest（线程安全）。
+ * @param ch  通道 0..2
+ * @param fb  解析后的快照
+ */
 static void publish(uint8_t ch, const can_feedback_result_t &fb)
 {
     if (s_mutex == nullptr) return;
@@ -53,6 +61,9 @@ static void publish(uint8_t ch, const can_feedback_result_t &fb)
     }
 }
 
+/**
+ * @brief can_fb 任务主循环：takeEvent 分发 0xC1 CAN / 0xC4 ADC。
+ */
 static void taskLoop(void *)
 {
     DEBUG_INFO(kTag, "CAN 反馈被动监听任务启动 (GD32 主动推送, 0xC1)");
@@ -85,6 +96,12 @@ static void taskLoop(void *)
             continue;
         }
 
+        /* 0xC4 ADC 调试反馈：GD32 关开关则不推；ESP32 始终可解析（无本地开关） */
+        if (ring_type == kSpiAdcFeedbackType) {
+            (void)onGd32AdcFeedbackEvent(ring_payload, ring_len);
+            continue;
+        }
+
         if (ring_type != kSpiCanFeedbackType || ring_len < 28U) {
             continue;
         }
@@ -103,13 +120,11 @@ static void taskLoop(void *)
             if (s_work[ch].stats.error_count != 0U
                 && s_work[ch].stats.error_count != s_lastLoggedError[ch]) {
                 DEBUG_WARN(kTag,
-                    "CH%u seq=%lu err=%lu TEC=%u REC=%u state=0x%02X",
+                    "CH%u err=%lu TEC=%u REC=%u",
                     static_cast<unsigned>(ch),
-                    static_cast<unsigned long>(s_work[ch].stats.snapshot_seq),
                     static_cast<unsigned long>(s_work[ch].stats.error_count),
                     static_cast<unsigned>(s_work[ch].stats.tec),
-                    static_cast<unsigned>(s_work[ch].stats.rec),
-                    static_cast<unsigned>(s_work[ch].stats.bus_state));
+                    static_cast<unsigned>(s_work[ch].stats.rec));
                 s_lastLoggedError[ch] = s_work[ch].stats.error_count;
             }
         }
@@ -156,6 +171,10 @@ bool startCanFeedbackTask()
     return true;
 }
 
+/**
+ * @brief 暂停/恢复 CAN（及同任务分发的 ADC）事件监听。
+ * @param pause true=OTA 期间暂停；false=恢复
+ */
 void pauseCanFeedbackTask(bool pause)
 {
     if (s_paused == pause) return;  // 幂等：状态未变时不重复日志

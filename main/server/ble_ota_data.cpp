@@ -62,15 +62,14 @@ uint16_t ble_ota_log_conn_params(uint16_t conn_handle, const char *phase)
     struct ble_gap_conn_desc desc = {};
     int rc = ble_gap_conn_find(conn_handle, &desc);
     if (rc != 0) {
-        DEBUG_WARN(TAG, "%s读取 BLE 连接参数失败: rc=%d", phase, rc);
+        DEBUG_WARN(TAG, "%sBLE param读失败 rc=%d", phase, rc);
         return 0;
     }
 
-    DEBUG_DBG(TAG, "%sBLE 连接参数: interval=%.2fms latency=%u supervision=%ums",
+    DEBUG_DBG(TAG, "%sitv=%.2f lat=%u",
                phase,
                desc.conn_itvl * 1.25f,
-               (unsigned)desc.conn_latency,
-               (unsigned)desc.supervision_timeout * 10U);
+               (unsigned)desc.conn_latency);
     return desc.conn_itvl;
 }
 
@@ -97,12 +96,10 @@ int ble_ota_request_conn_params(uint16_t conn_handle, bool windows_compatible)
     params.supervision_timeout = 200;
 
     int rc = ble_gap_update_params(conn_handle, &params);
-    DEBUG_DBG(TAG, "请求 BLE 连接参数(%s): interval=%.1f..%.1fms ce=%u..%u rc=%d",
-               windows_compatible ? "Windows兼容" : "高速",
+    DEBUG_DBG(TAG, "BLEp(%s) %.1f-%.1f rc=%d",
+               windows_compatible ? "Win" : "Hi",
                params.itvl_min * 1.25f,
                params.itvl_max * 1.25f,
-               (unsigned)params.min_ce_len,
-               (unsigned)params.max_ce_len,
                rc);
     return rc;
 }
@@ -129,11 +126,8 @@ void esp32_reorder_alloc()
     s_fallback_ooo_count  = 0;
 
     if (!s_reorder.slots || !s_reorder.lens) {
-        DEBUG_WARN(TAG, "Reorder buffer 分配失败 (slots=%p lens=%p)，回退到丢弃策略。"
-                   "heap: free=%u min=%u",
-                   s_reorder.slots, s_reorder.lens,
-                   (unsigned)esp_get_free_heap_size(),
-                   (unsigned)esp_get_minimum_free_heap_size());
+        DEBUG_WARN(TAG, "Reorder分配失败,回退丢弃 free=%u",
+                   (unsigned)esp_get_free_heap_size());
         // 释放可能部分成功的分配
         free(s_reorder.slots); s_reorder.slots = nullptr;
         free(s_reorder.lens);  s_reorder.lens  = nullptr;
@@ -143,7 +137,7 @@ void esp32_reorder_alloc()
     }
     s_reorder.active   = true;
     s_reorder.fallback = false;
-    DEBUG_DBG(TAG, "Reorder buffer 已启用: window=%u payloadCap=%u heap=%u",
+    DEBUG_DBG(TAG, "Reorder ok win=%u cap=%u heap=%u",
                (unsigned)s_reorder.windowSize, (unsigned)s_reorder.payloadCap,
                (unsigned)esp_get_free_heap_size());
 }
@@ -176,6 +170,16 @@ void esp32_reorder_free()
     s_reorder.payloadCap  = 0;
     s_reorder.cachedCount = 0;
     s_fallback_ooo_count  = 0;
+}
+
+/**
+ * @brief 取当前 reorder buffer 已缓存的乱序包数（每个 slot 持有 malloc 的 payload）。
+ *        供堆低水位快照采样，定位"OTA 期低谷是不是 BLE reorder 引起"。
+ *        非 OTA 期 active=false，返回 0。
+ */
+uint32_t ble_ota_get_reorder_cached_count()
+{
+    return s_reorder.active ? s_reorder.cachedCount : 0;
 }
 
 /**
@@ -249,14 +253,14 @@ static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
                 ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U);
             if (shouldAck) {
                 uint32_t curReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
-                DEBUG_WARN(TAG, "ESP32 乱序包跳过(回退): seq=%u (expected=%u)，节流 ACK bytes=%u (ooo=%u)",
+                DEBUG_WARN(TAG, "乱序 s=%u e=%u ACK=%u ooo=%u",
                            seq, (unsigned)s_reorder.expected, (unsigned)curReceived,
                            (unsigned)s_fallback_ooo_count);
                 sendWindowAck(cmd, s_reorder.expected > 0 ? (uint16_t)(s_reorder.expected - 1) : 0,
                               curReceived);
                 s_fallback_ooo_count = 0;
             } else {
-                DEBUG_DBG(TAG, "ESP32 乱序包跳过(回退): seq=%u (expected=%u)，抑制 ACK (ooo=%u)",
+                DEBUG_DBG(TAG, "ESP32乱序 s=%u e=%u 抑ACK ooo=%u",
                           seq, (unsigned)s_reorder.expected,
                           (unsigned)s_fallback_ooo_count);
             }
@@ -289,7 +293,7 @@ static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
         s_reorder.expected++;
         uint32_t flushed = esp32_reorder_flush();
         if (flushed > 0) {
-            DEBUG_INFO(TAG, "Reorder 缺口已补齐: seq=%u，连续 flush=%u 包，expected→%u",
+            DEBUG_INFO(TAG, "Reorder补齐 seq=%u flush=%u exp→%u",
                        seq, (unsigned)flushed, (unsigned)s_reorder.expected);
         }
         return ESP_OK;
@@ -300,7 +304,7 @@ static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
     if (idx < s_reorder.windowSize) {
         if (s_reorder.slots[idx]) {
             // 该 slot 已被占用（重复的乱序包），跳过
-            DEBUG_DBG(TAG, "Reorder slot 已占: seq=%u idx=%u，跳过重复包",
+            DEBUG_DBG(TAG, "Reorder占 s=%u i=%u 跳过",
                       seq, (unsigned)idx);
             return ESP_OK;
         }
@@ -309,8 +313,7 @@ static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
         uint8_t *copy = (uint8_t *)malloc(data_len);
         if (!copy) {
             uint32_t curReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
-            DEBUG_ERR(TAG, "Reorder slot malloc 失败: seq=%u expected=%u bytes=%u，"
-                       "ACK 报告缺口并 abort",
+            DEBUG_ERR(TAG, "Reorder OOM s=%u e=%u n=%u ACK+abort",
                        seq, (unsigned)s_reorder.expected, (unsigned)curReceived);
             sendWindowAck(cmd,
                           s_reorder.expected > 0 ? (uint16_t)(s_reorder.expected - 1) : 0,
@@ -322,18 +325,18 @@ static esp_err_t esp32_write_ordered(uint16_t seq, uint8_t cmd,
         s_reorder.lens[idx]  = data_len;
         s_reorder.cachedCount++;
         if (s_reorder.cachedCount == 1U) {
-            DEBUG_INFO(TAG, "Reorder 检测到缺口: expected=%u，开始缓存 seq=%u",
+            DEBUG_INFO(TAG, "Reorder缺口 exp=%u cache seq=%u",
                        (unsigned)s_reorder.expected, seq);
         }
-        DEBUG_DBG(TAG, "Reorder 缓存乱序包: seq=%u idx=%u (expected=%u)",
+        DEBUG_DBG(TAG, "Reorder cache s=%u i=%u exp=%u",
                   seq, (unsigned)idx, (unsigned)s_reorder.expected);
         return ESP_OK;
     }
 
     // seq 超出窗口范围（防御性，理论不会发生）
     uint32_t curReceived = (uint32_t)Esp32OtaCore::instance().getReceived();
-    DEBUG_WARN(TAG, "ESP32 包超出 reorder 窗口: seq=%u (expected=%u base=%u win=%u)，ACK bytes=%u",
-               seq, (unsigned)s_reorder.expected, (unsigned)s_reorder.windowBase,
+    DEBUG_WARN(TAG, "超窗 s=%u e=%u w=%u ACK=%u",
+               seq, (unsigned)s_reorder.expected,
                (unsigned)s_reorder.windowSize, (unsigned)curReceived);
     sendWindowAck(cmd, s_reorder.expected > 0 ? (uint16_t)(s_reorder.expected - 1) : 0,
                   curReceived);
@@ -448,7 +451,7 @@ void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes)
 
     esp_err_t err = BleOta::instance().notifyResponse(ack, sizeof(ack));
     if (err != ESP_OK) {
-        DEBUG_WARN(TAG, "发送 ACK 失败: cmd=0x%02X seq=%u err=%s",
+        DEBUG_WARN(TAG, "ACK失败 cmd=0x%02X seq=%u %s",
                    cmd, seq, esp_err_to_name(err));
     } else {
         DEBUG_DBG(TAG, "已发送 ACK: cmd=0x%02X seq=%u bytes=%lu",
@@ -530,7 +533,7 @@ void ble_gd32_relay_wait_task(void *pvParameters)
 
     ota_result_t result = (ota_result_t)((int32_t)result_msg);
     if (result == OTA_RESULT_OK) {
-        DEBUG_INFO(TAG, "GD32 BLE OTA 中继完成，通知前端 (stage=0x11, session=%u)", session_id);
+        DEBUG_INFO(TAG, "GD32中继完成 stage=0x11 sess=%u", session_id);
         sendFinishEvent(BLE_OTA_FINISH_GD32_RELAY_DONE,
                         packBleFinishValue(session_id, 0));
     } else {
@@ -596,7 +599,7 @@ int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
             memcpy(heap_buf, buf, (size_t)recv_len);
             BleOtaDataBatch item = { heap_buf, (size_t)recv_len };
             if (xQueueSend(s_otaDataQueue, &item, 0) != pdTRUE) {
-                DEBUG_WARN(TAG, "DATA_IN 工作队列满，丢弃 %d 字节（等待客户端重传）", recv_len);
+                DEBUG_WARN(TAG, "DATA_IN满 丢%dB 等重传", recv_len);
                 free(heap_buf);
             }
         } else {
@@ -626,12 +629,12 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
         if (Esp32OtaCore::instance().isActive()) {
             ota_channel_t curCh = OtaCoordinator::instance().getOtaChannel();
             if (curCh != OTA_CHANNEL_BLE) {
-                DEBUG_WARN(TAG, "ESP32 OTA 被其他通道占用(ch=%d)，BLE 拒绝抢占",
+                DEBUG_WARN(TAG, "ESP32被ch=%d占用,BLE拒抢",
                            (int)curCh);
                 sendFinishEvent(BLE_OTA_FINISH_ERR_MUTEX, 0);
                 return true;
             }
-            DEBUG_INFO(TAG, "ESP32 OTA 会话已激活，seq=0 视为重传，保留 reorder 状态");
+            DEBUG_INFO(TAG, "ESP32已激活 seq=0重传,保留reorder");
         } else {
             // 分区选择/大小校验/互斥由 Esp32OtaCore::begin 内部完成
             esp_err_t err = ble_esp32_ota_begin(total_size);
@@ -696,7 +699,7 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
          isLastPacket ||
          firstPacketReady)) {
         if (isLastPacket || transferComplete) {
-            DEBUG_DBG(TAG, "ESP32 尾包/完成检测: seq=%u data_len=%zu received=%u total=%" PRIu32,
+            DEBUG_DBG(TAG, "ESP32尾包 s=%u n=%zu rx=%u tot=%" PRIu32,
                        seq, data_len, (unsigned int)afterReceived, total_size);
         } else if (firstPacketReady) {
             DEBUG_DBG(TAG, "ESP32 begin 就绪 ACK: seq=0 received=%u total=%" PRIu32,
@@ -709,7 +712,7 @@ static bool process_esp32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
     }
 
     if (transferComplete) {
-        DEBUG_INFO(TAG, "★ ESP32 固件接收完毕: %u / %" PRIu32 " 字节 (共 %u 块)",
+        DEBUG_INFO(TAG, "ESP32收完 %u/%" PRIu32 "B chunks=%u",
                    (unsigned int)Esp32OtaCore::instance().getReceived(), total_size, seq + 1);
         OtaCoordinator::instance().notifyEsp32ReceiveComplete();
         BleOta::instance().m_esp32LastCmd = cmd;
@@ -743,12 +746,12 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
         // （否则会 erase 分区、清 meta，毁掉已写入进度）。
         if (s_ble_gd32_meta_active && s_ble_gd32_meta.total_size == total_size) {
             if (s_ble_gd32_meta.stored_size > 0) {
-                DEBUG_INFO(TAG, "GD32 会话已激活，seq=0 视为重传，跳过写入 stored=%" PRIu32,
+                DEBUG_INFO(TAG, "GD32已激活 seq=0重传 skip stored=%" PRIu32,
                            s_ble_gd32_meta.stored_size);
                 sendWindowAck(cmd, 0, s_ble_gd32_meta.stored_size);
                 return false;
             }
-            DEBUG_INFO(TAG, "GD32 会话已激活且未落盘，seq=0 重传首块（不重新 prepare）");
+            DEBUG_INFO(TAG, "GD32未落盘 seq=0重传首块(不prepare)");
             // fall through：stored_size==0 时重写 offset 0
         } else {
             // 与 WiFi 共用 prepareGd32Storage：validate + begin + erase + clearMeta + saveMeta
@@ -810,12 +813,12 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
             (s_gd32_ooo_count >= BLE_OTA_ACK_WINDOW) ||
             ((((uint32_t)seq + 1U) % BLE_OTA_ACK_WINDOW) == 0U);
         if (shouldAck) {
-            DEBUG_WARN(TAG, "GD32 乱序包跳过: seq=%u (last_seq=%" PRIu32 ")，节流 ACK bytes=%" PRIu32 " (ooo=%u)",
+            DEBUG_WARN(TAG, "GD32乱序 s=%u last=%" PRIu32 " ACK=%" PRIu32 " ooo=%u",
                        seq, meta.last_seq, meta.stored_size, (unsigned)s_gd32_ooo_count);
             sendWindowAck(cmd, (uint16_t)meta.last_seq, meta.stored_size);
             s_gd32_ooo_count = 0;
         } else {
-            DEBUG_DBG(TAG, "GD32 乱序包跳过: seq=%u (last_seq=%" PRIu32 ")，抑制 ACK (ooo=%u)",
+            DEBUG_DBG(TAG, "GD32乱序 s=%u last=%" PRIu32 " 抑ACK ooo=%u",
                       seq, meta.last_seq, (unsigned)s_gd32_ooo_count);
         }
         return false;  // 外层推进 offset，继续下一包
@@ -881,14 +884,14 @@ static bool process_gd32_packet(uint8_t cmd, uint16_t seq, uint32_t total_size,
 
     // --- 检查 GD32 固件是否接收完毕 ---
     if (transfer_complete) {
-        DEBUG_INFO(TAG, "★ GD32 固件接收完毕: %" PRIu32 " / %" PRIu32 " 字节 (共 %u 块)",
+        DEBUG_INFO(TAG, "GD32收完 %" PRIu32 "/%" PRIu32 "B chunks=%u",
                    meta.stored_size, meta.total_size, seq + 1);
         s_ble_gd32_meta_active = false;
         ble_ota_restore_wifi_ps();
         // 与 WiFi 共用 finishGd32StorageAfterReceive：complete + SHA
         esp_err_t sha_err = OtaCoordinator::instance().finishGd32StorageAfterReceive();
         if (sha_err != ESP_OK) {
-            DEBUG_ERR(TAG, "GD32 固件 SHA-256 计算失败: %s", esp_err_to_name(sha_err));
+            DEBUG_ERR(TAG, "GD32 SHA失败:%s", esp_err_to_name(sha_err));
         }
     }
     return false;
@@ -937,8 +940,8 @@ void ble_ota_process_data_batch(const uint8_t *buf, size_t recv_len)
         // 当前包总长度: header(7) + payload(data_len)
         size_t packet_len = 7 + data_len;
 
-        DEBUG_DBG(TAG, "DATA_IN: cmd=0x%02X seq=%u total=%" PRIu32 " payload=%zu offset=%zu",
-                  cmd, seq, total_size, data_len, offset);
+        DEBUG_DBG(TAG, "DATA_IN c=0x%02X s=%u tot=%" PRIu32 " n=%zu",
+                  cmd, seq, total_size, data_len);
 
         // 分发到对应通道的包处理器
         bool abort_batch = false;
@@ -985,7 +988,7 @@ void ble_ota_data_worker_task(void *pvParameters)
             // 若 BLE 已断开或 WiFi OTA 挂起，丢弃队列中的残留数据
             if (!BleOta::instance().isConnected() ||
                 BleOta::instance().isSuspendedForWifiOta()) {
-                DEBUG_DBG(TAG, "BLE 不可用/挂起，丢弃 %zu 字节队列数据", item.len);
+                DEBUG_DBG(TAG, "BLE不可用 丢%zuB队列", item.len);
                 free(item.data);
                 continue;
             }

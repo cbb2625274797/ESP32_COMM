@@ -9,8 +9,9 @@ import { state, els, bleLog, currentTarget, currentPayloadSize, setConnectionSta
 import { setBleStage, setBleStageText, resetBleStages } from './stages.js';
 import { setProgress } from './transfer.js';
 import { hideBleVerifyInfo } from './verify.js';
-import { formatBytes, bytesToHex } from '../common/utils.js';
+import { formatBytes } from '../common/utils.js';
 import { showToast } from '../common/toast.js';
+import { computeFileSha } from '../ota/file-handle.js';
 
 /** 任一通道上传中（BLE 或 WiFi）。focus/change 等不分通道的事件用此判定。 */
 function isAnyChannelUploading() {
@@ -18,11 +19,8 @@ function isAnyChannelUploading() {
 }
 
 export function updateFileInfo(file) {
-  // ★ 上传进行中禁止重置进度/阶段：目标切换、模式切换、syncBleFileFromSelectedTarget
-  //   等事件会在上传期间调用本函数，若不拦截会触发 finalizeFileInfo → setProgress(0, ...)
-  //   把进度条从"已确认 N/M 包"错误地刷回"等待选择文件 0%"。
+  // ★ 上传进行中禁止重置进度/阶段
   if (isBleUploading() && file && state.selectedFile) {
-    // 上传中且文件未变：仅刷新元数据（文件名/大小等），不碰进度条和阶段
     bleLog('FILE', '上传进行中，跳过 updateFileInfo 进度重置', 'D');
     return Promise.resolve();
   }
@@ -43,9 +41,9 @@ export function updateFileInfo(file) {
     else els.fileInfo.classList.remove('show');
   }
 
-  // ★ HEX → BIN 自动转换：复用 app.js 公共函数 window.convertHexFileToBin
+  // ★ HEX → BIN：必须用 window.convertHexFileToBin（本模块未 import，裸名会 ReferenceError）
   if (file && file.name.toLowerCase().endsWith('.hex') && typeof window.convertHexFileToBin === 'function') {
-    return convertHexFileToBin(file).then(function(result) {
+    return window.convertHexFileToBin(file).then(function(result) {
       if (!result.converted) {
         bleLog('FILE', file.name + ' 扩展名为 .hex 但内容不像 HEX 格式，按原始文件处理', 'W');
         finalizeAndHash(file);
@@ -55,7 +53,6 @@ export function updateFileInfo(file) {
       var baseHex = '0x' + result.baseAddr.toString(16).toUpperCase().padStart(8, '0');
       bleLog('FILE', 'HEX → BIN 转换完成: ' + file.name + ' → ' + result.file.name + ' (基地址 ' + baseHex + ', ' + formatBytes(result.file.size) + ')');
       showToast('HEX 已自动转换为 BIN', 'success');
-      // 更新 UI 显示转换后的信息
       els.fileName.textContent = result.file.name + ' (由 ' + file.name + ' 转换)';
       els.fileType.textContent = 'Binary (HEX转换)';
       els.fileSize.textContent = formatBytes(result.file.size);
@@ -72,20 +69,16 @@ export function updateFileInfo(file) {
     });
   }
 
-  // 非 HEX 文件直接完成
   finalizeAndHash(file);
   return Promise.resolve();
 }
 
-/** finalizeFileInfo + computeFileSha256 的统一出口：HEX 转换完成分支与非 HEX 分支共用。 */
 function finalizeAndHash(file) {
   finalizeFileInfo(file);
-  computeFileSha256(file);
+  computeBleFileSha(file);
 }
 
 function finalizeFileInfo(file) {
-  // ★ 上传进行中禁止重置进度条/阶段：防止目标切换等事件在上传期间
-  //   通过 finalizeFileInfo → setProgress(0, '等待选择文件') 覆盖上传进度。
   if (isBleUploading()) {
     bleLog('FILE', '上传进行中，跳过 finalizeFileInfo 进度重置', 'D');
     return;
@@ -105,40 +98,43 @@ function finalizeFileInfo(file) {
 }
 
 /**
- * 计算文件 SHA-256 并推进 BLE stage 流。
- * stage 推进逻辑收敛在此函数内，避免与 finalizeFileInfo 隐式耦合：
- *   - 已连接且 file 非空：进入「计算中」态（stage 3 active + 状态栏文案）
- *   - 哈希算完：stage 3 done + 推进 stage 4 + 状态栏「文件就绪」
- *   - file 为空 / 未连接：不碰 stage（由 finalizeFileInfo 的 else 分支 + clearSelectedFile 负责）
+ * BLE 侧：读对应芯片槽；槽里已有则直接用，没有才算一次。
+ * 不跨芯片、不互切。
  */
-function computeFileSha256(file) {
+function computeBleFileSha(file) {
   var shaElem = document.getElementById('fileSha256');
-  if (!file || !shaElem) {
+  if (!file) {
     if (shaElem) shaElem.textContent = '-';
     state.fileSha256 = null;
     return;
   }
-  // 已连接：进入「计算中」态（旧逻辑放在 finalizeFileInfo 里，现收敛至此）
-  if (state.server) {
-    setBleStage(3, '计算哈希...', 'active');
-    setBleStageText('正在计算文件 SHA-256...');
-  }
-  shaElem.textContent = '计算中...';
-  file.arrayBuffer().then(function(buf) {
-    return crypto.subtle.digest('SHA-256', buf);
-  }).then(function(hashBuffer) {
-    var hashHex = bytesToHex(new Uint8Array(hashBuffer)).toUpperCase();
-    shaElem.textContent = hashHex;
-    state.fileSha256 = hashHex;
-    bleLog('FILE', 'SHA-256: ' + hashHex);
+  var chip = (window.flashTarget === 'gd32') ? 'gd32' : 'esp32';
+  var existing = chip === 'gd32' ? window._gd32FileSha256 : window._esp32FileSha256;
+  if (existing) {
+    state.fileSha256 = existing;
+    if (shaElem) shaElem.textContent = existing;
     if (state.server) {
       setBleStage(3, 'SHA-256 已计算', null);
       setBleStage(4, '', null);
       setBleStageText('文件就绪，可以开始刷写');
     }
-  }).catch(function(err) {
-    shaElem.textContent = '计算失败: ' + err.message;
-    state.fileSha256 = null;
+    return;
+  }
+  if (state.server) {
+    setBleStage(3, '计算哈希...', 'active');
+    setBleStageText('正在计算文件 SHA-256...');
+  }
+  computeFileSha(file, chip).then(function(hashHex) {
+    if (!hashHex) {
+      state.fileSha256 = null;
+      return;
+    }
+    state.fileSha256 = hashHex;
+    if (state.server) {
+      setBleStage(3, 'SHA-256 已计算', null);
+      setBleStage(4, '', null);
+      setBleStageText('文件就绪，可以开始刷写');
+    }
   });
 }
 
@@ -219,7 +215,11 @@ export async function notifyFileChange(file, handle) {
     return;
   }
   if (file) {
-    if (handle) state.selectedFileHandle = handle;
+    /* 始终更新 handle（含 null），避免切目标后仍热重载到上一芯片的文件 */
+    state.selectedFileHandle = handle || null;
     await updateFileInfo(file);
+  } else {
+    state.selectedFileHandle = null;
+    await updateFileInfo(null);
   }
 }

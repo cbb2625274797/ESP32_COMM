@@ -15,6 +15,11 @@ void drainOtaDataQueue()
     }
 }
 
+uint32_t ble_ota_get_data_queue_depth()
+{
+    return s_otaDataQueue ? (uint32_t)uxQueueMessagesWaiting(s_otaDataQueue) : 0;
+}
+
 BleOta& BleOta::instance()
 {
     static BleOta inst;
@@ -145,7 +150,7 @@ void ble_ota_boost_wifi_ps()
     s_wifi_ps_boosted = true;
     // 通过协调器通知 WiFi 层
     OtaCoordinator::instance().notifyBleCoexStart();
-    DEBUG_DBG(TAG, "BLE OTA 数据传输进行中：暂停 WiFi RSSI 轮询（保持 WIFI_PS_NONE，STA 仍可响应 HTTP）");
+    DEBUG_DBG(TAG, "BLE OTA中:暂停RSSI,保持PS_NONE");
 }
 
 /**
@@ -157,7 +162,7 @@ void ble_ota_restore_wifi_ps()
     s_wifi_ps_boosted = false;
     // 通过协调器通知 WiFi 层
     OtaCoordinator::instance().notifyBleCoexEnd();
-    DEBUG_DBG(TAG, "BLE OTA 数据传输结束：恢复 WiFi RSSI 轮询（GD32 中继仍可能进行中）");
+    DEBUG_DBG(TAG, "BLE OTA数据结束:恢复RSSI轮询");
 }
 
 // ============================================================
@@ -286,8 +291,8 @@ esp_err_t BleOta::resumeStack()
 
     if (!m_stackRunning) {
         /* 仅当曾 hard-deinit 过才需要完整 serverStart */
-        DEBUG_INFO(TAG, "WiFi OTA 结束：BLE 栈未运行，尝试 serverStart free=%lu",
-                   (unsigned long)esp_get_free_heap_size());
+        DEBUG_DBG(TAG, "WiFi共存:BLE栈未运行,serverStart free=%lu",
+                  (unsigned long)esp_get_free_heap_size());
         esp_err_t err = serverStart();
         if (err != ESP_OK) {
             DEBUG_ERR(TAG, "resumeStack/serverStart 失败: %s", esp_err_to_name(err));
@@ -297,9 +302,9 @@ esp_err_t BleOta::resumeStack()
         return ESP_OK;
     }
 
-    /* 软挂起恢复：重新开广播即可 */
-    DEBUG_INFO(TAG, "WiFi OTA 结束：恢复 BLE 广播 free=%lu",
-               (unsigned long)esp_get_free_heap_size());
+    /* 软挂起恢复：重新开广播即可（非 BLE OTA 会话，仅射频共存；默认 INFO 不刷） */
+    DEBUG_DBG(TAG, "WiFi共存:恢复BLE广播 free=%lu",
+              (unsigned long)esp_get_free_heap_size());
     m_bleReady = true;
     ble_ota_start_advertising();
     return ESP_OK;
@@ -375,17 +380,17 @@ void BleOta::taskEntry(void *pvParameters)
                                        12,     // 略提高：尽快排空队列，减少 withoutResponse 连发丢包
                                        NULL);
         if (wk_ok != pdPASS) {
-            DEBUG_ERR(TAG, "OTA 数据工作线程创建失败，BLE OTA 数据传输不可用");
+            DEBUG_ERR(TAG, "OTA工作线程创建失败,BLE不可用");
             vQueueDelete(s_otaDataQueue);
             s_otaDataQueue = nullptr;
         }
     } else {
-        DEBUG_ERR(TAG, "OTA 数据队列创建失败，BLE OTA 数据传输不可用");
+        DEBUG_ERR(TAG, "OTA队列创建失败,BLE不可用");
     }
 
     esp_err_t err = BleOta::instance().serverStart();
     if (err != ESP_OK) {
-        DEBUG_ERR(TAG, "BLE 服务器启动失败: %s → BLE OTA 不可用",
+        DEBUG_ERR(TAG, "BLE serverStart失败:%s",
                   esp_err_to_name(err));
     }
 

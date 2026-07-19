@@ -8,6 +8,8 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -20,9 +22,107 @@
 
 #include "health_monitor.h"
 #include "debug_log.h"
-#include "task_stack_check.h"
-#include "stack_overflow_hook.h"
+#include "task_stack.h"
 #include "ota/ota_coordinator.h"
+#include "ble_ota.h"
+#include "wifi_ota.h"
+#include "spi_master.h"
+#include "esp_event.h"
+#include "esp_netif_types.h"
+
+// ============================================================
+// heap hook：捕获"破新低时的最后一次 alloc"（最后一击，未必是主因）
+// ============================================================
+// CONFIG_HEAP_USE_HOOKS=y 时，每次 malloc 成功后进入本弱符号。
+//
+// ★ 为何不能记任务名（用户看到"每次都是 WiFi"的根因）：
+//   1) WiFi IRAM 路径禁止在 hook 里调 FreeRTOS/pcTaskGetName（会搞挂 STA）。
+//   2) 即便能取任务名：HTTP/UDP **发送前** lwip 仍会为 pbuf/TX 再 malloc，
+//      芯片 minimum free 往往在这条"最后一击"上被压低，任务名就会是 wifi/tiT/httpd，
+//      看起来像"WiFi 吃堆"，实际只是发送路径的末包分配。
+//   因此 hook **永不写任务名**；只记 size + caller 地址（addr2line）。
+//   前端诊断应标明「最后一击 / 可能网络发送」，勿把连接列的 WiFi 当成触发任务。
+//
+// ★ 记录策略：health_mon 周期把真实 free 同步进 g_est_free；
+//   hook 内仅做 g_est_free -= size（C3 单核，无锁可接受漂移）。
+//   当 est 创新低时更新 hook 快照。free hook 不知 size，靠周期 resync 纠偏。
+namespace {
+volatile uint32_t g_hook_min_est        = 0xFFFFFFFFu;  ///< hook 见过的最低 est free
+volatile uint32_t g_hook_alloc_size     = 0;            ///< 触发 est 新低的那次 alloc 大小
+volatile uint32_t g_hook_caller_addr    = 0;            ///< 调用者返回地址
+volatile uint32_t g_hook_free_after     = 0;            ///< 那次后的 est free（非精确实测）
+volatile uint32_t g_hook_fired          = 0;
+volatile uint32_t g_hook_armed          = 0;
+volatile uint32_t g_est_free            = 0;            ///< 近似空闲，任务上下文 resync
+volatile uint32_t g_ip_event_count      = 0;
+
+/** 最近若干次「值得关注」的 alloc（size≥阈值），供破新低时对照。 */
+struct RecentAllocSnap {
+    uint32_t size;
+    uint32_t caller;
+};
+static constexpr uint32_t kHookInterestingMin = 48;   ///< 忽略极小碎片分配
+static constexpr size_t   kRecentAllocCap     = 4;
+RecentAllocSnap           g_recent_allocs[kRecentAllocCap] = {};
+volatile uint32_t         g_recent_alloc_w    = 0;
+volatile uint32_t         g_recent_alloc_n    = 0;
+
+void hookResyncEstFree(uint32_t real_free)
+{
+    g_est_free = real_free;
+}
+}  // namespace
+
+// ESP-IDF heap alloc hook：仅 DRAM 标量 + 内联 return address，禁止 FreeRTOS/flash 长函数。
+extern "C"
+void esp_heap_trace_alloc_hook(void *ptr, size_t size, uint32_t caps)
+{
+    (void)caps;
+    if (!ptr || size == 0 || g_hook_armed == 0) {
+        return;
+    }
+    const uint32_t sz = (uint32_t)size;
+
+    /* 近似空闲：只减不增（free 路径不在此修正），health_mon 周期 resync。 */
+    uint32_t est = g_est_free;
+    if (est >= sz) {
+        est -= sz;
+    } else {
+        est = 0;
+    }
+    g_est_free = est;
+
+    /* 环形记下近期「有意义」分配，破新低时可读到发送路径小包之前的大块。 */
+    if (sz >= kHookInterestingMin) {
+        const uint32_t w = g_recent_alloc_w % (uint32_t)kRecentAllocCap;
+        g_recent_allocs[w].size   = sz;
+        g_recent_allocs[w].caller = (uint32_t)(uintptr_t)__builtin_return_address(0);
+        g_recent_alloc_w = w + 1U;
+        if (g_recent_alloc_n < (uint32_t)kRecentAllocCap) {
+            g_recent_alloc_n = g_recent_alloc_n + 1U;
+        }
+    }
+
+    /* est 创新低 → 记「最后一击」alloc（常为网络 pbuf，任务若可读会是 wifi） */
+    if (est < g_hook_min_est) {
+        g_hook_min_est     = est;
+        g_hook_alloc_size  = sz;
+        g_hook_caller_addr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+        g_hook_free_after  = est;
+        g_hook_fired       = 1;
+        /* 不采任务名（WiFi IRAM 路径禁止 FreeRTOS 调用） */
+    }
+}
+
+// IP 事件 handler：STA 获得 IP（含 DHCP 续约）时计数 +1
+void ipEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg; (void)event_base; (void)event_id; (void)event_data;
+    if (event_base == IP_EVENT && (event_id == IP_EVENT_STA_GOT_IP || event_id == IP_EVENT_ETH_GOT_IP)) {
+        uint32_t cur = g_ip_event_count;
+        g_ip_event_count = cur + 1;
+    }
+}
 
 // ============================================================
 // 栈水位主动巡检
@@ -60,6 +160,18 @@ void HealthMonitor::init()
     if (m_mutex == NULL) {
         DEBUG_ERR("HEALTH", "创建健康状态互斥锁失败");
     }
+
+    // 注册 IP 事件 handler，统计 STA 获得 IP（含 DHCP 续约）次数。
+    //   配合 heap_low_log 快照的 ip_event_count 字段，可验证"低谷是不是 DHCP 续约引起"。
+    //   失败仅告警，不致命（计数器保持 0，快照里 ip_event_count 永远 0）。
+    esp_err_t ev = esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, ipEventHandler, nullptr);
+    if (ev != ESP_OK) {
+        DEBUG_WARN("HEALTH", "IP 事件 handler 注册失败: %s", esp_err_to_name(ev));
+    }
+
+    // 武装 heap alloc hook：init() 在 app_main 之后调用。armed=0 时 hook 直接 return。
+    // hook 本身禁止任何 FreeRTOS/flash 调用（见 esp_heap_trace_alloc_hook 注释）。
+    g_hook_armed = 1;
 }
 
 // ============================================================
@@ -159,7 +271,7 @@ void HealthMonitor::tempMonitorCallback(void *arg)
 
     if (temp >= TEMP_CRITICAL) {
         self.setState(SYS_SAFE_SHUTDOWN);
-        DEBUG_ERR("TEMP", "!!! 危险 !!! 温度 %.1f°C >= %d°C，触发安全关机", temp, TEMP_CRITICAL);
+        DEBUG_ERR("TEMP", "过热 %.1fC>=%dC 安全关机", temp, TEMP_CRITICAL);
         DEBUG_ERR("TEMP", "健康状态变更为: SYS_SAFE_SHUTDOWN");
     } else if (temp >= TEMP_WARNING) {
         health_state_t cur = self.getState();
@@ -213,12 +325,19 @@ void HealthMonitor::taskEntry(void *pvParameters)
         //   在 health_mon 完好栈上用 DEBUG_ERR 经 UDP/UART 发详细告警。
         //   标志只在置位后告警一次，不自动清除（canary 触发即不可逆，需重启恢复）。
         if (g_stackOverflowDetected) {
-            DEBUG_ERR("MON", "!!! 栈溢出已被内核 canary 检测到，请检查任务栈大小 !!!");
+            DEBUG_ERR("MON", "栈溢出(canary),检查任务栈");
             // 告警一次后清标志，避免 5 秒刷屏；后续若再次触发会重新置位
             g_stackOverflowDetected = false;
         }
 
         uint32_t free_heap = esp_get_free_heap_size();
+        /* 同步 hook 近似空闲：纠正 free 路径未记账造成的向下漂移。
+         * 必须在 maybeRecord 之前，否则 est 长期偏低会误触发 hook 快照。 */
+        hookResyncEstFree(free_heap);
+
+        // 堆低水位快照：仅在"最低空闲"创新低时记录一条上下文（5s 检测足够）
+        self.maybeRecordHeapLowWater();
+
         if (free_heap < HEAP_WARNING_MIN) {
             /* 堆告警节流：OTA 期间阈值更低、间隔更长 */
             static TickType_t s_last_heap_warn = 0;
@@ -231,7 +350,7 @@ void HealthMonitor::taskEntry(void *pvParameters)
                 (now - s_last_heap_warn) >= pdMS_TO_TICKS(interval_ms)) {
                 s_last_heap_warn = now;
                 uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-                DEBUG_WARN("MON", "堆内存偏紧%s: free=%lu min=%lu largest_blk=%lu",
+                DEBUG_WARN("MON", "堆紧%s free=%lu min=%lu big=%lu",
                            ota_busy ? "(OTA中)" : "",
                            (unsigned long)free_heap,
                            (unsigned long)esp_get_minimum_free_heap_size(),
@@ -255,11 +374,10 @@ void HealthMonitor::taskEntry(void *pvParameters)
             size_t warn_bytes = (size_t)(metrics[i].stack_size_bytes * STACK_WARN_RATIO);
             if (hw < (UBaseType_t)warn_bytes) {
                 if (!s_stackWarned[i]) {
-                    DEBUG_ERR("MON", "!!! 栈水位过低 !!! 任务=%s 剩余=%luB 阈值=%luB(%.0f%%) 栈大小=%luB",
+                    DEBUG_ERR("MON", "栈低 task=%s left=%lu thr=%lu sz=%lu",
                               metrics[i].name,
                               (unsigned long)hw,
                               (unsigned long)warn_bytes,
-                              STACK_WARN_RATIO * 100.0f,
                               (unsigned long)metrics[i].stack_size_bytes);
                     s_stackWarned[i] = true;
                 }
@@ -313,14 +431,14 @@ health_status_t HealthMonitor::checkBeforeOta()
     if (getLastWifiRssi(&last_rssi, &age_ms)) {
         if (age_ms <= OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS) {
             if (last_rssi < OTA_WIFI_RSSI_CRITICAL) {
-                DEBUG_WARN("HEALTH", "OTA 前检查: 最近 RSSI %d < %d (样本年龄 %lu ms)",
+                DEBUG_WARN("HEALTH", "OTA前 RSSI %d<%d age=%lums",
                            last_rssi, OTA_WIFI_RSSI_CRITICAL, (unsigned long)age_ms);
                 return HEALTH_MON_CRITICAL;
             } else if (last_rssi < WIFI_RSSI_NORMAL) {
                 if (status < HEALTH_MON_WARNING) {
                     status = HEALTH_MON_WARNING;
                 }
-                DEBUG_WARN("HEALTH", "OTA 前检查: 最近 RSSI %d < %d (样本年龄 %lu ms)",
+                DEBUG_WARN("HEALTH", "OTA前 RSSI %d<%d age=%lums",
                            last_rssi, WIFI_RSSI_NORMAL, (unsigned long)age_ms);
             }
         }
@@ -409,7 +527,7 @@ health_status_t HealthMonitor::updateFromWifiRssi(int8_t rssi)
             DEBUG_WARN("HEALTH", "WiFi RSSI 警告: %d dBm < %d dBm", rssi, WIFI_RSSI_NORMAL);
         } else { // next == SYS_NORMAL，从 WARNING/CRITICAL 恢复
             setState(SYS_NORMAL);
-            DEBUG_INFO("HEALTH", "WiFi RSSI 恢复: %d dBm >= %d dBm (从 %d 降级)", rssi, WIFI_RSSI_NORMAL, (int)cur);
+            DEBUG_INFO("HEALTH", "RSSI恢复 %d>=%d (lv%d)", rssi, WIFI_RSSI_NORMAL, (int)cur);
         }
     }
 
@@ -418,3 +536,274 @@ health_status_t HealthMonitor::updateFromWifiRssi(int8_t rssi)
 
     return HEALTH_MON_OK;
 }
+
+// ============================================================
+// 堆低水位快照（"最低空闲"创新低时记录上下文）
+// ============================================================
+namespace {
+/** @brief snprintf 追加到 buf 的安全封装：截断但不越界，返回新 offset。 */
+int appendJsonfSafe(char *buf, size_t cap, int offset, const char *fmt, ...)
+{
+    if (offset < 0 || (size_t)offset >= cap) return offset;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + offset, cap - (size_t)offset, fmt, ap);
+    va_end(ap);
+    if (n < 0) return offset;
+    if ((size_t)n >= cap - (size_t)offset) {
+        // 被截断：vsnprintf 返回的是"本应写入"的长度，按截断后修正 offset
+        return (int)cap - 1;
+    }
+    return offset + n;
+}
+} // namespace
+
+/**
+ * @brief 检测"内部堆最低空闲"是否创新低，是则覆盖写入唯一快照槽。
+ *
+ * 调用方：health_mon 5s 巡检任务。仅在"新低"时写一条，避免每 5s 刷一条无意义记录。
+ * 上下文字段：OTA 系统状态、通道、RSSI、温度、栈剩余最少的任务名+剩余字节。
+ * 所有外部读取（OtaCoordinator::getSnapshot / collectTaskStackMetrics / rssi / temp）
+ * 都先在锁外取，避免持锁期间嵌套调用其它模块的锁；持锁后只做字段拷贝。
+ */
+void HealthMonitor::maybeRecordHeapLowWater()
+{
+    // 与 http_handlers.cpp 同口径：内部 DRAM 数据堆
+    static constexpr uint32_t CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+
+    const uint32_t cur_min = (uint32_t)heap_caps_get_minimum_free_size(CAPS);
+
+    // 不创新低则直接返回（不持锁）
+    if (cur_min >= m_heapLowWaterLastMin) {
+        return;
+    }
+
+    // ── 锁外收集上下文 ──
+    const uint32_t free_heap       = (uint32_t)esp_get_free_heap_size();
+    const uint32_t largest_block   = (uint32_t)heap_caps_get_largest_free_block(CAPS);
+
+    OtaSnapshot snap = OtaCoordinator::instance().getSnapshot();
+    const uint8_t  sys_state  = (uint8_t)snap.sys_state;
+    const uint8_t  ota_channel = (uint8_t)snap.channel;
+    const uint32_t ota_stored   = (uint32_t)snap.meta.stored_size;
+    const uint32_t ota_total    = (uint32_t)snap.meta.total_size;
+
+    int8_t  rssi = -127;
+    {
+        int8_t  r;
+        uint32_t age_ms;
+        if (getLastWifiRssi(&r, &age_ms)) {
+            rssi = r;
+        }
+    }
+    const float temperature = getLastTemperature();
+
+    /* current_task = 采样者，不是触发者。固定写 health_mon，避免误解为“谁 alloc”。 */
+    char current_task[16] = "health_mon";
+
+    // 连接状态
+    const uint8_t ble_connected  = BleOta::instance().isConnected() ? 1 : 0;
+    const uint8_t wifi_connected = WifiOta::instance().getStaConnected() ? 1 : 0;
+
+    // 嫌疑资源水位：定位"哪个子系统吃堆"
+    const uint16_t ble_queue_depth = (uint16_t)ble_ota_get_data_queue_depth();
+    const uint16_t ble_reorder     = (uint16_t)ble_ota_get_reorder_cached_count();
+    const uint16_t spi_pending     = (uint16_t)SpiMaster::instance().getPendingJobCount();
+
+    // 内存全景：default 含 PSRAM，与 internal 对比可判断"是内部碎片 vs 系统级紧"
+    const uint32_t default_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    uint32_t alloc_count = 0;
+    {
+        multi_heap_info_t info = {};
+        heap_caps_get_info(&info, CAPS);
+        alloc_count = (uint32_t)info.allocated_blocks;
+    }
+
+    // 收集所有受监控任务栈水位，按"剩余升序"取前 8 个
+    HeapLowTaskStack stacks[8];
+    uint8_t stack_count = 0;
+    {
+        TaskStackMetric metrics[STACK_TASK_MAX];
+        size_t count = collectTaskStackMetrics(metrics, STACK_TASK_MAX);
+        // 先全部采集
+        struct Item { char name[16]; uint32_t rem; };
+        Item items[STACK_TASK_MAX];
+        size_t item_n = 0;
+        for (size_t i = 0; i < count && i < STACK_TASK_MAX; ++i) {
+            if (metrics[i].handle == NULL || metrics[i].stack_size_bytes == 0) {
+                continue;
+            }
+            UBaseType_t hw = uxTaskGetStackHighWaterMark(metrics[i].handle);
+            Item &it = items[item_n++];
+            it.rem = (uint32_t)hw * sizeof(StackType_t);
+            strncpy(it.name, metrics[i].name ? metrics[i].name : "?", sizeof(it.name) - 1);
+            it.name[sizeof(it.name) - 1] = '\0';
+        }
+        // 冒泡排序按 rem 升序（item_n ≤ 9，开销小）
+        for (size_t i = 0; i + 1 < item_n; ++i) {
+            for (size_t j = i + 1; j < item_n; ++j) {
+                if (items[j].rem < items[i].rem) {
+                    Item t = items[i]; items[i] = items[j]; items[j] = t;
+                }
+            }
+        }
+        // 取前 8
+        for (size_t i = 0; i < item_n && stack_count < 8; ++i) {
+            strncpy(stacks[stack_count].name, items[i].name, sizeof(stacks[stack_count].name) - 1);
+            stacks[stack_count].name[sizeof(stacks[stack_count].name) - 1] = '\0';
+            stacks[stack_count].remaining = items[i].rem;
+            ++stack_count;
+        }
+    }
+
+    // ── 持锁覆盖写唯一槽 ──
+    LockGuard lock(m_mutex);
+
+    HeapLowWaterRecord &rec = m_heapLowWater;
+    rec = {};
+    rec.ts_ms                  = (uint64_t)(esp_timer_get_time() / 1000);
+    rec.free_heap              = free_heap;
+    rec.min_free_heap          = cur_min;
+    rec.largest_free_block     = largest_block;
+    rec.sys_state              = sys_state;
+    rec.ota_channel            = ota_channel;
+    rec.rssi                   = rssi;
+    rec.temperature            = temperature;
+    rec.task_stack_count       = stack_count;
+    for (uint8_t i = 0; i < stack_count && i < 8; ++i) {
+        rec.task_stacks[i] = stacks[i];
+    }
+    strncpy(rec.current_task, current_task, sizeof(rec.current_task) - 1);
+    rec.current_task[sizeof(rec.current_task) - 1] = '\0';
+    rec.ble_connected   = ble_connected;
+    rec.wifi_connected  = wifi_connected;
+    rec.ota_stored_size = ota_stored;
+    rec.ota_total_size  = ota_total;
+    rec.ble_data_queue_depth = ble_queue_depth;
+    rec.ble_reorder_cached   = ble_reorder;
+    rec.spi_pending_jobs     = spi_pending;
+    rec.reserved             = 0;
+    rec.default_free_heap    = default_free;
+    rec.alloc_count          = alloc_count;
+    // heap hook：「最后一击」alloc（无任务名；见文件头注释）
+    {
+        uint32_t hook_size   = g_hook_alloc_size;
+        uint32_t hook_caller = g_hook_caller_addr;
+        uint32_t hook_after  = g_hook_free_after;
+        uint32_t hook_fired  = g_hook_fired;
+
+        /* 窗口内更大块（若存在）：发送前小 pbuf 压低水位时，主因更可能是此前 bulk */
+        uint32_t big_size = 0;
+        uint32_t big_caller = 0;
+        const uint32_t n = g_recent_alloc_n;
+        for (uint32_t i = 0; i < n && i < (uint32_t)kRecentAllocCap; ++i) {
+            if (g_recent_allocs[i].size > big_size) {
+                big_size = g_recent_allocs[i].size;
+                big_caller = g_recent_allocs[i].caller;
+            }
+        }
+
+        rec.hook_alloc_size   = hook_size;
+        rec.hook_caller_addr  = hook_caller;
+        rec.hook_free_after   = hook_after;
+        rec.hook_fired        = hook_fired;
+        /* hook_task 存类别：net? / net?+big / bulk / tiny（非 FreeRTOS 任务名） */
+        rec.hook_task[0] = '\0';
+        if (hook_fired) {
+            const char *cls = "tiny";
+            if (hook_size >= 2048U) {
+                cls = "bulk";
+            } else if (hook_size >= kHookInterestingMin) {
+                if (big_size > hook_size && big_size >= 2048U) {
+                    cls = "net?+big";
+                    rec.hook_caller_addr = big_caller;
+                } else {
+                    cls = "net?";
+                }
+            }
+            strncpy(rec.hook_task, cls, sizeof(rec.hook_task) - 1);
+            rec.hook_task[sizeof(rec.hook_task) - 1] = '\0';
+        }
+
+        g_hook_min_est = g_est_free;
+        g_hook_fired   = 0;
+    }
+    rec.ip_event_count = g_ip_event_count;
+
+    m_heapLowWaterValid   = true;
+    m_heapLowWaterLastMin = cur_min;
+}
+
+/**
+ * @brief 输出设备唯一快照槽：{"count":0|1,"records":[...]}。
+ *        cap 不够装下整条时退回 count=0，避免半截 JSON。
+ */
+int HealthMonitor::dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const
+{
+    LockGuard lock(m_mutex);
+
+    if (!m_heapLowWaterValid) {
+        return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+    }
+
+    const HeapLowWaterRecord &r = m_heapLowWater;
+    int pos = appendJsonfSafe(buf, cap, offset,
+        "{\"count\":1,\"records\":[{"
+        "\"ts_ms\":%llu,\"free_heap\":%lu,\"min_free_heap\":%lu,"
+        "\"largest_free_block\":%lu,\"sys_state\":%u,\"ota_channel\":%u,"
+        "\"rssi\":%d,\"temperature\":%.1f,"
+        "\"current_task\":\"%s\",\"ble_connected\":%u,\"wifi_connected\":%u,"
+        "\"ota_stored_size\":%lu,\"ota_total_size\":%lu,"
+        "\"ble_data_queue_depth\":%u,\"ble_reorder_cached\":%u,"
+        "\"spi_pending_jobs\":%u,\"default_free_heap\":%lu,\"alloc_count\":%lu,"
+        "\"hook_task\":\"%s\",\"hook_alloc_size\":%lu,\"hook_caller_addr\":%lu,"
+        "\"hook_free_after\":%lu,\"hook_fired\":%lu,\"ip_event_count\":%lu,"
+        "\"task_stacks\":[",
+        (unsigned long long)r.ts_ms,
+        (unsigned long)r.free_heap,
+        (unsigned long)r.min_free_heap,
+        (unsigned long)r.largest_free_block,
+        (unsigned)r.sys_state,
+        (unsigned)r.ota_channel,
+        (int)r.rssi,
+        (double)r.temperature,
+        r.current_task,
+        (unsigned)r.ble_connected,
+        (unsigned)r.wifi_connected,
+        (unsigned long)r.ota_stored_size,
+        (unsigned long)r.ota_total_size,
+        (unsigned)r.ble_data_queue_depth,
+        (unsigned)r.ble_reorder_cached,
+        (unsigned)r.spi_pending_jobs,
+        (unsigned long)r.default_free_heap,
+        (unsigned long)r.alloc_count,
+        r.hook_task,
+        (unsigned long)r.hook_alloc_size,
+        (unsigned long)r.hook_caller_addr,
+        (unsigned long)r.hook_free_after,
+        (unsigned long)r.hook_fired,
+        (unsigned long)r.ip_event_count);
+    if (pos == offset) {
+        return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+    }
+
+    for (uint8_t k = 0; k < r.task_stack_count && k < 8; ++k) {
+        int after = appendJsonfSafe(buf, cap, pos,
+            "%s{\"name\":\"%s\",\"remaining\":%lu}",
+            k == 0 ? "" : ",",
+            r.task_stacks[k].name,
+            (unsigned long)r.task_stacks[k].remaining);
+        if (after == pos) {
+            return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+        }
+        pos = after;
+    }
+
+    int closed = appendJsonfSafe(buf, cap, pos, "]}]}");
+    if (closed == pos) {
+        return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+    }
+    return closed;
+}
+
+

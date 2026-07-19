@@ -3,8 +3,6 @@ import { TARGETS } from './constants.js';
 import { addLog } from '../common/log.js';
 import { updateBleStageLabels, resetBleStages } from './stages.js';
 import { hideBleVerifyInfo } from './verify.js';
-import { updateFileInfo } from './file.js';
-
 export const state = {
   device: null,
   server: null,
@@ -28,7 +26,7 @@ export const state = {
   otaResultWaiter: null,
   otaRunId: 0,
   lastEsp32DoneSession: null,
-  fileSha256: null,
+  fileSha256: null,       // 当前 BLE 会话用的 SHA（与对应芯片槽同步）
   deviceSha256: null,
   expectedReboot: false,        // 发送 0xFA 后置 true，重连后清
   reconnecting: false,          // 自动重连中
@@ -46,8 +44,6 @@ export const els = {
   abortBtn: $('abortBtn'),
   uploadZone: $('uploadZone'),
   firmwareFile: $('firmwareFile'),
-  connStatus: $('connStatus'),          // 共享连接指示器
-  connStatusTxt: $('connStatusTxt'),    // 共享连接指示器文本
   connState: $('connState'),
   connBadge: $('connBadge'),
   deviceName: $('deviceName'),
@@ -115,10 +111,12 @@ export function setReadyHint(html) {
 
 export function setConnectionState(connected) {
   const idle = connected && state.selectedFile && !state.uploading;
-  // 仅在 BLE 模式下更新共享连接指示器与 BLE 专用徽章，避免覆盖 WiFi 轮询的状态
+  // BLE 模式：连接状态只写顶栏胶囊，避免下方重复文案
   if (typeof connectionMode !== 'undefined' && connectionMode === 'ble') {
-    if (els.connStatus) els.connStatus.className = connected ? 'conn-indicator ok' : 'conn-indicator err';
-    if (els.connStatusTxt) els.connStatusTxt.textContent = connected ? 'BLE 已连接' : 'BLE 未连接';
+    var pc = document.getElementById('pillConn');
+    var pct = document.getElementById('pillConnTxt');
+    if (pc) pc.className = connected ? 'pill online' : 'pill offline';
+    if (pct) pct.textContent = connected ? 'BLE 已连接' : 'BLE 未连接';
     if (els.connState) {
       els.connState.textContent = connected ? '已连接' : '未连接';
       if (els.connState.parentElement) {
@@ -174,17 +172,21 @@ export function resetUiAfterDisconnect() {
 export function refreshTargetUi() {
   const cfg = currentTarget();
   updateBleStageLabels(cfg);
-  // ★ 上传进行中不调用 updateFileInfo：避免目标切换时进度条被重置。
-  //   阶段标签更新（updateBleStageLabels）安全，不碰进度条。
-  if (state.selectedFile && !state.uploading && !state.autoFlashing) {
-    updateFileInfo(state.selectedFile);
+  /* 与 WiFi 一致：文件由 syncBleFileFromSelectedTarget 按 flashTarget 绑定；
+   * 此处只刷新标签/包数/阶段说明。 */
+  if (state.selectedFile) {
+    const payloadSize = currentPayloadSize();
+    const packets = Math.ceil(state.selectedFile.size / payloadSize);
+    if (els.packetCount) els.packetCount.textContent = String(packets);
   }
   setConnectionState(!!state.server);
-  // 同步目标胶囊标签
   var espTab = document.getElementById('targetEsp32Tab');
   var gdTab = document.getElementById('targetGd32Tab');
   var isEsp = cfg.label === 'ESP32';
   if (espTab) espTab.classList.toggle('active', isEsp);
   if (gdTab) gdTab.classList.toggle('active', !isEsp);
-  bleLog('CFG', `目标切换为 ${cfg.label}: packetCmd=0x${cfg.packetCmd.toString(16).padStart(2, '0').toUpperCase()}, payload=${cfg.recommendedPayload}`);
+  var autoBtn = document.getElementById('autoFlashBtn');
+  if (autoBtn && !state.uploading && !state.autoFlashing) {
+    autoBtn.textContent = isEsp ? '一键刷写 ESP32' : '一键刷写 GD32';
+  }
 }

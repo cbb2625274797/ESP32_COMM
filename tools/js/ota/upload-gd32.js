@@ -105,7 +105,7 @@ export function markGd32OtaUiComplete(msg) {
   if (typeof window.updateUploadButtonLabel === 'function') {
     window.updateUploadButtonLabel();
   }
-  addLog('I', 'OTA', msg || 'GD32 刷写完成');
+  /* 完成文案以设备 [I][OTA] GD32 OTA完成 为准，前端只 toast/进度，避免日志双份 */
   showToast(msg || 'GD32 刷写完成', 'success');
 }
 

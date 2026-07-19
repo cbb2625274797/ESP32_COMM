@@ -12,7 +12,7 @@ import { showToast } from './common/toast.js';
 import { addLog, clearLogs, setLogFilter, toggleAutoScroll } from './common/log.js';
 import {
   updateConnectionUi, updateHealthUi, updateHeapAndTaskStatusUi,
-  testConnection, refreshSystemStatusNow, diagnoseNetwork
+  testConnection, refreshSystemStatusNow, diagnoseNetwork, systemStatusUrl
 } from './common/connection.js';
 import {
   scheduleStatusPoll, startPolling, pausePollingForUpload,
@@ -103,10 +103,6 @@ function applyRebootingRuntimeState() {
     var elapsed = Math.round((Date.now() - window.rebootStartTime) / 1000);
     pct.textContent = '重启中 ' + elapsed + 's';
   }
-  var cs = document.getElementById('connStatus');
-  var cst = document.getElementById('connStatusTxt');
-  if (cs) cs.className = 'conn-indicator warn';
-  if (cst) cst.textContent = 'ESP32 正在重启...';
   var bc = document.getElementById('bConn');
   if (bc) bc.textContent = '重启中';
   if (bc) bc.className = 'v warn';
@@ -122,25 +118,16 @@ function applyUploadingRuntimeState() {
   var pct = document.getElementById('pillConnTxt');
   if (pc) pc.className = 'pill processing';
   if (pct) pct.textContent = '上传中';
-  var cs = document.getElementById('connStatus');
-  var cst = document.getElementById('connStatusTxt');
-  if (cs) cs.className = 'conn-indicator warn';
-  if (cst) cst.textContent = '固件上传中，设备忙...';
   var bc = document.getElementById('bConn');
   if (bc) bc.textContent = '上传中';
   if (bc) bc.className = 'v warn';
 }
-/** 设备忙（OTA/中继/重启期间不响应轮询）的连接胶囊/状态条运行时态。
- *  与上面三兄弟同模式，区别是不改进度/阶段，只标记连接胶囊为 processing + warn。 */
+/** 设备忙：只更新顶栏连接胶囊 + 系统状态徽章，不写下方重复文案。 */
 function applyDeviceBusyRuntimeState(pillText, statusText, badgeText) {
   var pc = document.getElementById('pillConn');
   var pct = document.getElementById('pillConnTxt');
   if (pc) pc.className = 'pill processing';
   if (pct) pct.textContent = pillText || '设备忙';
-  var cs = document.getElementById('connStatus');
-  var cst = document.getElementById('connStatusTxt');
-  if (cs) cs.className = 'conn-indicator warn';
-  if (cst) cst.textContent = statusText || '设备忙（OTA/重启中），保持 1s 轮询';
   var bc = document.getElementById('bConn');
   if (bc) bc.textContent = badgeText || '设备忙';
   if (bc) bc.className = 'v warn';
@@ -205,6 +192,7 @@ window.updateHealthUi = updateHealthUi;
 window.updateHeapAndTaskStatusUi = updateHeapAndTaskStatusUi;
 window.testConnection = testConnection;
 window.refreshSystemStatusNow = refreshSystemStatusNow;
+window.systemStatusUrl = systemStatusUrl;
 window.scheduleStatusPoll = scheduleStatusPoll;
 window.setStatusPollIntervalMs = setStatusPollIntervalMs;
 window.startPolling = startPolling;
