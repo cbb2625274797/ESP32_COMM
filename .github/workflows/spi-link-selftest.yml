@@ -1,0 +1,58 @@
+# SPI Link v2 PC 自测 CI 门禁
+#
+# 当 spi_link 协议实现变更时，在 PC 上编译运行 SPI_LINK_V2_SELFTEST 自测，
+# 自动阻断帧格式 / CRC / 最大 payload / 版本回归。
+#
+# 布局约定：spi_link/ 是三工程（ESP32_COMM、DCU_APP、GD32E50X_BOOT）的共享
+# 协议兄弟目录，与各仓库同级。本仓库通过相对路径 ../../../spi_link/ 引用它。
+# 因此本 workflow 检出本仓库后，需在同一次检出中提供 spi_link/。
+#
+# 触发：push / PR 触及 spi_link 兄弟目录（由调用方检出）或本仓库内的 SPI Link
+# 相关文件。由于 spi_link 在本仓库之外，路径过滤仅能覆盖本仓库侧的引用改动。
+name: SPI Link v2 Self-Test
+
+on:
+  push:
+    paths:
+      - 'components/transport/**'
+      - '.github/workflows/spi-link-selftest.yml'
+  pull_request:
+    paths:
+      - 'components/transport/**'
+      - '.github/workflows/spi-link-selftest.yml'
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ESP32_COMM
+        uses: actions/checkout@v4
+
+      - name: Checkout shared spi_link（兄弟协议目录）
+        # spi_link/ 是独立维护的共享协议源，与三工程同级。
+        # 在 CI 中通过同源仓库的另一路径提供；若 spi_link 独立成仓，请改为
+        # actions/checkout 指向该仓库并放到 ../spi_link。
+        run: |
+          # 期望运行器在 checkout 本仓前已将 spi_link 放到上级目录；
+          # 退路：若上级无 spi_link，则从本仓 components 引用的相对路径复制一份
+          # 到 ../spi_link（本仓不直接含 spi_link 源，故此处仅做存在性检查）。
+          if [ ! -d ../spi_link ]; then
+            echo "::warning::spi_link 兄弟目录不存在；CI 无法运行自测。请确保 spi_link 与本仓同级。"
+            exit 1
+          fi
+          ls -la ../spi_link/golden_vectors.h ../spi_link/spi_link_v2.cpp ../spi_link/spi_link_v2.h
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+
+      - name: Configure host test
+        run: cmake -S ../spi_link/test -B build/host_test
+
+      - name: Build host test
+        run: cmake --build build/host_test
+
+      - name: Run self-test
+        run: ctest --test-dir build/host_test --output-on-failure

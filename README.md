@@ -243,6 +243,26 @@ ESP32_COMM/
 | 0x82 | RSP_ERROR | 响应：错误 |
 | 0xC0~C3 | CAN 业务 | 发送 / 反馈 / 模式 / ID 快照 |
 
+#### SPI Link v2 PC 自测（兼容性回归门禁）
+
+`spi_link_v2.cpp` 内置 `SPI_LINK_V2_SELFTEST` PC 端自测，以 `golden_vectors.h`
+中冻结的帧字节为交叉校验基准，覆盖 HELLO / OTA / CAN / PING / ENTER_BOOT /
+响应类型、最大 payload、CRC 翻转、错误版本、前导垃圾字节偏移解析等场景。
+向量字节由 `v2_build_frame` 现算后冻结，与协议实现互为交叉校验——任何一方
+漂移都会被对方测试捕获。
+
+独立 host CMake target（与 ESP-IDF 构建隔离，不影响固件构建）：
+
+```bash
+cmake -S spi_link/test -B build/host_test
+cmake --build build/host_test
+ctest --test-dir build/host_test --output-on-failure   # 期望 Passed: 10  Failed: 0
+```
+
+CI：`.github/workflows/spi-link-selftest.yml` 在触及 SPI Link 相关文件时自动
+运行自测。`spi_link/` 是三工程共享的兄弟协议目录（与 `ESP32_COMM` 同级，本仓
+通过 `../../../spi_link/` 相对路径引用），CI 检出需确保该兄弟目录就位。
+
 ### CANFD 3 通道 SPI 协议
 
 ESP32 通过 SPI 转发 CAN 帧到 GD32（GD32 端驱动外部 CAN 收发器）：

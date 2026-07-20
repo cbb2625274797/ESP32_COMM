@@ -46,16 +46,15 @@
 // ★ 记录策略：health_mon 周期把真实 free 同步进 g_est_free；
 //   hook 内仅做 g_est_free -= size（C3 单核，无锁可接受漂移）。
 //   当 est 创新低时更新 hook 快照。free hook 不知 size，靠周期 resync 纠偏。
+//
+// ★ 采样协议（消除多字段撕裂读）：
+//   hook 写「最后一击」快照的多个字段（min_est/alloc_size/caller/free_after/fired
+//   + recent_allocs[]）虽各自是字宽 volatile，但 reader 跨字段组合可撕裂
+//   （fired=1 配上上一次的 alloc_size）。reader（maybeRecordHeapLowWater）在
+//   portENTER_CRITICAL(&s_hookMux) 内一次性拷出全部字段——单核禁中断即与 hook
+//   （在 heap 临界区内写）互斥。m_mutex 不参与此互斥（hook 不获取它）。
+//   reader 临界区仅做 volatile 拷贝，不分配、不调 FreeRTOS/flash，保持极短。
 namespace {
-volatile uint32_t g_hook_min_est        = 0xFFFFFFFFu;  ///< hook 见过的最低 est free
-volatile uint32_t g_hook_alloc_size     = 0;            ///< 触发 est 新低的那次 alloc 大小
-volatile uint32_t g_hook_caller_addr    = 0;            ///< 调用者返回地址
-volatile uint32_t g_hook_free_after     = 0;            ///< 那次后的 est free（非精确实测）
-volatile uint32_t g_hook_fired          = 0;
-volatile uint32_t g_hook_armed          = 0;
-volatile uint32_t g_est_free            = 0;            ///< 近似空闲，任务上下文 resync
-volatile uint32_t g_ip_event_count      = 0;
-
 /** 最近若干次「值得关注」的 alloc（size≥阈值），供破新低时对照。 */
 struct RecentAllocSnap {
     uint32_t size;
@@ -63,17 +62,82 @@ struct RecentAllocSnap {
 };
 static constexpr uint32_t kHookInterestingMin = 48;   ///< 忽略极小碎片分配
 static constexpr size_t   kRecentAllocCap     = 4;
+
+volatile uint32_t g_hook_min_est        = 0xFFFFFFFFu;  ///< hook 见过的最低 est free
+volatile uint32_t g_hook_alloc_size     = 0;            ///< 触发 est 新低的那次 alloc 大小
+volatile uint32_t g_hook_caller_addr    = 0;            ///< 调用者返回地址
+volatile uint32_t g_hook_free_after     = 0;            ///< 那次后的 est free（estimated，非精确实测）
+volatile uint32_t g_hook_fired          = 0;
+volatile uint32_t g_hook_armed          = 0;
+volatile uint32_t g_est_free            = 0;            ///< estimated 近似空闲（只减不增），health_mon 周期用 esp_get_free_heap_size() 实测 resync 纠偏；误差上界 ≈ resync 周期(5s)内总 alloc 字节
+volatile uint32_t g_ip_event_count      = 0;
+
 RecentAllocSnap           g_recent_allocs[kRecentAllocCap] = {};
 volatile uint32_t         g_recent_alloc_w    = 0;
 volatile uint32_t         g_recent_alloc_n    = 0;
+
+/* s_hookMux：reader（maybeRecordHeapLowWater，任务上下文）取多字段一致快照用的
+ * portMUX（单核 = 禁中断）。hook 端不加锁——它在 heap 临界区内写，与 reader 的
+ * 禁中断互斥。仅用于消除「最后一击」快照多字段撕裂读，不保护 m_heapLowWater
+ * （后者由 m_mutex 保护）。 */
+static portMUX_TYPE s_hookMux = portMUX_INITIALIZER_UNLOCKED;
 
 void hookResyncEstFree(uint32_t real_free)
 {
     g_est_free = real_free;
 }
+
+/** @brief reader 一次性拷出的 hook 共享状态一致快照（任务上下文，禁中断极短临界区）。 */
+struct HookSnap {
+    uint32_t        alloc_size;
+    uint32_t        caller_addr;
+    uint32_t        free_after;     ///< estimated（非实测）
+    uint32_t        fired;
+    uint32_t        est_free;
+    uint32_t        min_est;
+    uint32_t        recent_n;
+    RecentAllocSnap recent[kRecentAllocCap];
+};
+
+/** @brief 任务上下文用：禁中断拷出 hook 共享状态一致快照。仅 volatile 拷贝，不分配/不调 FreeRTOS。 */
+HookSnap captureHookSnapshot()
+{
+    HookSnap s = {};
+    portENTER_CRITICAL(&s_hookMux);
+    s.alloc_size  = g_hook_alloc_size;
+    s.caller_addr = g_hook_caller_addr;
+    s.free_after  = g_hook_free_after;
+    s.fired       = g_hook_fired;
+    s.est_free    = g_est_free;
+    s.min_est     = g_hook_min_est;
+    s.recent_n    = g_recent_alloc_n;
+    for (uint32_t i = 0; i < s.recent_n && i < (uint32_t)kRecentAllocCap; ++i) {
+        s.recent[i] = g_recent_allocs[i];
+    }
+    portEXIT_CRITICAL(&s_hookMux);
+    return s;
+}
+
+/** @brief 在 s_hookMux 临界区内调用：消费已记录的 hook 命中，重置 min_est/fired。
+ *  必须由 reader 在写完 HeapLowWaterRecord 后调用，避免同一窗口重复记。 */
+void consumeHookFiredInLock()
+{
+    /* min_est 抬到当前 est：本次已记下低谷，下次需更低才会再次触发。
+     * g_est_free 在此读以与 hook 写一致（s_hookMux 内）。 */
+    g_hook_min_est = g_est_free;
+    g_hook_fired   = 0;
+}
 }  // namespace
 
 // ESP-IDF heap alloc hook：仅 DRAM 标量 + 内联 return address，禁止 FreeRTOS/flash 长函数。
+//
+// ★ hook 可调用约束（IRAM 安全契约）：
+//   - 禁止：FreeRTOS API、flash/rodata 访问、mutex/semaphore、长函数。
+//   - 允许：DRAM volatile 标量读写、__builtin_return_address、纯算术。
+//   - 写共享状态天然原子：hook 已在 heap 临界区内（禁中断），reader 用 s_hookMux
+//     禁中断取一致快照，二者互斥；hook 端不加锁、保持 IRAM 安全。
+//   - 嵌套分配：hook 内禁止任何可能触发 malloc 的调用（否则递归进 hook，armed
+//     标志不防递归——当前 hook 体内无分配调用，保持之）。
 extern "C"
 void esp_heap_trace_alloc_hook(void *ptr, size_t size, uint32_t caps)
 {
@@ -582,6 +646,10 @@ void HealthMonitor::maybeRecordHeapLowWater()
     const uint32_t free_heap       = (uint32_t)esp_get_free_heap_size();
     const uint32_t largest_block   = (uint32_t)heap_caps_get_largest_free_block(CAPS);
 
+    /* hook 共享状态一致快照：禁中断一次性拷出，避免多字段撕裂读。
+     * 必须在 m_mutex 外取——s_hookMux 与 m_mutex 不可嵌套持锁。 */
+    const HookSnap hs = captureHookSnapshot();
+
     OtaSnapshot snap = OtaCoordinator::instance().getSnapshot();
     const uint8_t  sys_state  = (uint8_t)snap.sys_state;
     const uint8_t  ota_channel = (uint8_t)snap.channel;
@@ -686,20 +754,22 @@ void HealthMonitor::maybeRecordHeapLowWater()
     rec.default_free_heap    = default_free;
     rec.alloc_count          = alloc_count;
     // heap hook：「最后一击」alloc（无任务名；见文件头注释）
+    // 字段取自锁外已取的一致快照 hs（captureHookSnapshot），不再裸读 volatile，
+    // 消除 fired/size/caller/free_after 多字段撕裂读。
     {
-        uint32_t hook_size   = g_hook_alloc_size;
-        uint32_t hook_caller = g_hook_caller_addr;
-        uint32_t hook_after  = g_hook_free_after;
-        uint32_t hook_fired  = g_hook_fired;
+        const uint32_t hook_size   = hs.alloc_size;
+        const uint32_t hook_caller = hs.caller_addr;
+        const uint32_t hook_after  = hs.free_after;
+        const uint32_t hook_fired  = hs.fired;
 
         /* 窗口内更大块（若存在）：发送前小 pbuf 压低水位时，主因更可能是此前 bulk */
         uint32_t big_size = 0;
         uint32_t big_caller = 0;
-        const uint32_t n = g_recent_alloc_n;
+        const uint32_t n = hs.recent_n;
         for (uint32_t i = 0; i < n && i < (uint32_t)kRecentAllocCap; ++i) {
-            if (g_recent_allocs[i].size > big_size) {
-                big_size = g_recent_allocs[i].size;
-                big_caller = g_recent_allocs[i].caller;
+            if (hs.recent[i].size > big_size) {
+                big_size = hs.recent[i].size;
+                big_caller = hs.recent[i].caller;
             }
         }
 
@@ -725,8 +795,11 @@ void HealthMonitor::maybeRecordHeapLowWater()
             rec.hook_task[sizeof(rec.hook_task) - 1] = '\0';
         }
 
-        g_hook_min_est = g_est_free;
-        g_hook_fired   = 0;
+        /* 消费已记录的 hook 命中：在 s_hookMux 内重置 min_est/fired，避免同一窗口
+         * 重复记。与 hook 写互斥（禁中断），不持 m_mutex 同时持 s_hookMux。 */
+        portENTER_CRITICAL(&s_hookMux);
+        consumeHookFiredInLock();
+        portEXIT_CRITICAL(&s_hookMux);
     }
     rec.ip_event_count = g_ip_event_count;
 
@@ -747,6 +820,10 @@ int HealthMonitor::dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const
     }
 
     const HeapLowWaterRecord &r = m_heapLowWater;
+    /* hook_free_after 是 estimated（hook 只减不增近似值），JSON 字段名显式标注 est，
+     * hook_confidence 告知前端置信度：hook 命中=est_low_watermark，未命中=none。
+     * 前端应据此区分 estimated 与 measured（free_heap/min_free_heap 为实测）。 */
+    const char *hook_confidence = r.hook_fired ? "est_low_watermark" : "none";
     int pos = appendJsonfSafe(buf, cap, offset,
         "{\"count\":1,\"records\":[{"
         "\"ts_ms\":%llu,\"free_heap\":%lu,\"min_free_heap\":%lu,"
@@ -757,7 +834,8 @@ int HealthMonitor::dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const
         "\"ble_data_queue_depth\":%u,\"ble_reorder_cached\":%u,"
         "\"spi_pending_jobs\":%u,\"default_free_heap\":%lu,\"alloc_count\":%lu,"
         "\"hook_task\":\"%s\",\"hook_alloc_size\":%lu,\"hook_caller_addr\":%lu,"
-        "\"hook_free_after\":%lu,\"hook_fired\":%lu,\"ip_event_count\":%lu,"
+        "\"hook_est_free_after\":%lu,\"hook_confidence\":\"%s\",\"hook_fired\":%lu,"
+        "\"ip_event_count\":%lu,"
         "\"task_stacks\":[",
         (unsigned long long)r.ts_ms,
         (unsigned long)r.free_heap,
@@ -781,6 +859,7 @@ int HealthMonitor::dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const
         (unsigned long)r.hook_alloc_size,
         (unsigned long)r.hook_caller_addr,
         (unsigned long)r.hook_free_after,
+        hook_confidence,
         (unsigned long)r.hook_fired,
         (unsigned long)r.ip_event_count);
     if (pos == offset) {

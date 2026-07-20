@@ -4,11 +4,11 @@
 // 固件版本
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 52
-#define FW_VERSION_STRING "0.3.52"
+#define FW_VERSION_PATCH 53
+#define FW_VERSION_STRING "0.3.53"
 
 // 编译时间
-#define BUILD_TIME "2026-07-20 02:50:38"
+#define BUILD_TIME "2026-07-21 00:23:44"
 
 // Git 信息
-#define GIT_HASH "b807645"
+#define GIT_HASH "00b716c"

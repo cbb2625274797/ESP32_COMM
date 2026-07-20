@@ -741,7 +741,7 @@ function buildHeapLowRowHtml(r, idx, segTag) {
       '</div>' +
       '<span>分配类别: <b>' + escapeHtml(r.hook_task || '--') + '</b> <span class="heap-low-caller-hint">net?=小中块/疑网络 · bulk=大块 · tiny=更小</span></span>' +
       '<span>本次alloc: <b>' + (Number.isFinite(r.hook_alloc_size) && Number(r.hook_alloc_size) > 0 ? formatBytes(r.hook_alloc_size) : '--') + '</b></span>' +
-      '<span>alloc后est空闲: <b>' + (Number.isFinite(r.hook_free_after) && Number(r.hook_free_after) > 0 ? formatBytes(r.hook_free_after) : '--') + '</b></span>' +
+      '<span>alloc后est空闲: <b>' + (Number.isFinite(r.hook_est_free_after) && Number(r.hook_est_free_after) > 0 ? formatBytes(r.hook_est_free_after) : (Number.isFinite(r.hook_free_after) && Number(r.hook_free_after) > 0 ? formatBytes(r.hook_free_after) : '--')) + '</b>' + (r.hook_confidence === 'est_low_watermark' ? ' <span class="heap-low-caller-hint">（estimated 低水位近似）</span>' : '') + '</span>' +
       '<span>调用者地址: <b class="heap-low-caller">0x' + (Number.isFinite(r.hook_caller_addr) && Number(r.hook_caller_addr) > 0 ? r.hook_caller_addr.toString(16).toUpperCase() : '--') + '</b>' +
         ' <span class="heap-low-caller-hint">（addr2line）</span></span>' +
     '</div>' +

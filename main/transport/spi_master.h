@@ -99,7 +99,7 @@ public:
     /** @brief SPI worker 任务句柄（栈水位 /system/status 与 health 巡检用）。 */
     TaskHandle_t getWorkerTaskHandle() const { return m_workerTask; }
 
-    /** @brief SPI 任务队列当前待处理 job 数（每个堆 Job 持有 calloc 的 Job 结构）。
+    /** @brief SPI 任务队列当前待处理 job 数（固定 Job pool 槽，无堆分配）。
      *        供 /system/heap_low_log 堆低水位快照采样，定位"低谷是不是 SPI 队列堆积引起"。 */
     UBaseType_t getPendingJobCount() const { return m_jobQueue ? uxQueueMessagesWaiting(m_jobQueue) : 0; }
 
@@ -302,7 +302,7 @@ private:
     uint8_t m_eventTail = 0;
     uint8_t m_eventCount = 0;
 
-    // ── 作业提交（跨任务：堆 Job + binary done；worker 串行执行）──
+    // ── 作业提交（跨任务：固定 Job pool + 静态 binary done；worker 串行执行）──
     enum class JobKind : uint8_t {
         Transact = 0,
         Poll,
@@ -326,19 +326,27 @@ private:
         uint32_t *out_uptime = nullptr;
         gd32_version_t *out_version = nullptr;
         esp_err_t result = ESP_FAIL;
-        SemaphoreHandle_t done = nullptr;
-        /** submitJob 堆分配的 Job：超时放弃后由 worker 释放，成功路径由提交方释放。 */
-        bool heap_allocated = false;
+        SemaphoreHandle_t done = nullptr; ///< 池槽静态 binary，init 创建，永不 delete
         volatile bool finished = false;   ///< worker 已 execute + give
-        volatile bool abandoned = false;  ///< 提交方已超时返回，worker 负责 free
+        volatile bool abandoned = false;  ///< 提交方已超时返回，worker 负责 release 槽
+        bool in_use = false;              ///< 池槽占用（critical 保护）
     };
+    /** 队列深度；池 = 队列 + 1（在途执行槽），覆盖 queued + executing。 */
     static constexpr UBaseType_t kJobQueueLen = 6;
+    static constexpr UBaseType_t kJobPoolSize = kJobQueueLen + 1U;
+
+    Job m_jobPool[kJobPoolSize] = {};
+    bool m_jobPoolReady = false;
 
     bool onWorker() const;
+    /** @brief 从固定池取空闲 Job；池耗尽返回 nullptr（ESP_ERR_NO_MEM）。 */
+    Job *acquireJobSlot();
+    /** @brief 归还池槽（清空业务字段/标志，drain done 信号量）。 */
+    void releaseJobSlot(Job *job);
     esp_err_t submitJob(Job &job);
     void executeJob(Job &job);
-    /** @brief worker 完成堆 Job 后的生命周期收尾（give done + 可能 free）。 */
-    void finishHeapJob(Job *job);
+    /** @brief worker 完成池 Job 后的收尾（give done；abandoned 时 release 槽）。 */
+    void finishPoolJob(Job *job);
     /** @brief FreeRTOS 任务入口，转到 workerLoop。 */
     static void workerEntry(void *arg);
     /** @brief SPI worker 主循环：EVENT 按铃 + Job 队列。 */

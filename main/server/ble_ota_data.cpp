@@ -54,6 +54,33 @@ ota_meta_t s_ble_gd32_meta = {};
 bool s_ble_gd32_meta_active = false;
 bool s_conn_fallback_requested = false;
 
+// ============================================================
+// DATA_IN 丢包负反馈：把 malloc 失败 / 队列满从"静默丢包"变成
+// "主动发缺口 ACK 让前端按 completed_bytes 续传退避"。
+//
+// 现状：writeValueWithoutResponse 窗口内丢包时，NimBLE 不会向对端
+//       回 ATT Error Response（即发即忘），返回非零 ATT 错误对窗口内
+//       包无效，只能走 DATA_OUT 通知通道发窗口 ACK。
+//       静默丢包会让前端等满 8s 窗口超时后整窗口重发 → 重传风暴叠加
+//       低堆时可能二次失败。这里在丢包路径补发一次缺口 ACK（seq 取
+//       s_reorder.expected-1，completed 取实际落盘字节），让前端立刻
+//       从 lastAckBytes 续传，客户端已有续传语义无需改动。
+//
+// 节流：丢包路径无"进度/窗口边界"可复用，用"丢包计数 ≥ ACK_WINDOW
+//       或距上次 ≥ NEG_ACK_MIN_INTERVAL_US"双约束，防止重传叠加时
+//       ACK 通知打爆 NimBLE mbuf 池（与现有正常路径节流同动机）。
+//       状态仅在 NimBLE host task 回调中读写（单线程），无需锁。
+// ============================================================
+static uint32_t s_ota_drop_malloc_fail = 0;  // DATA_IN malloc 失败累计
+static uint32_t s_ota_drop_queue_full  = 0;  // DATA_IN 队列满累计
+static uint32_t s_neg_ack_sent         = 0;  // 负 ACK 发送累计
+static uint32_t s_neg_ack_drop_count   = 0;  // 自上次发负 ACK 以来累计丢包数
+static int64_t  s_last_neg_ack_us      = 0;  // 上次负 ACK 时刻（esp_timer_get_time）
+// 节流常量：与正常 ACK 路径同窗口量级（BLE_OTA_ACK_WINDOW=64），
+// 最小间隔 200ms 兜底，避免极端低堆时负 ACK 抖动。
+static constexpr uint32_t NEG_ACK_DROP_WINDOW   = 64;       // 丢包数阈值
+static constexpr int64_t  NEG_ACK_MIN_INTERVAL_US = 200 * 1000;  // 200ms
+
 // 前向声明（alloc/free 互相引用）
 void esp32_reorder_free();
 
@@ -416,6 +443,12 @@ void ble_ota_session_reset()
     s_gd32_ooo_count = 0;
     s_ble_gd32_meta = {};
     s_ble_gd32_meta_active = false;
+    // 复位 DATA_IN 丢包负反馈计数/节流状态，下次会话从干净状态开始
+    s_ota_drop_malloc_fail = 0;
+    s_ota_drop_queue_full  = 0;
+    s_neg_ack_sent         = 0;
+    s_neg_ack_drop_count   = 0;
+    s_last_neg_ack_us      = 0;
 }
 
 /**
@@ -457,6 +490,79 @@ void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes)
         DEBUG_DBG(TAG, "已发送 ACK: cmd=0x%02X seq=%u bytes=%lu",
                   cmd, seq, (unsigned long)completed_bytes);
     }
+}
+
+/**
+ * @brief 从 DATA_IN batch 头部解析 cmd 字节。
+ *
+ * DATA_IN 回调只把 mbuf 拷到 buf，未解析协议头；负 ACK 需要 cmd 字节
+ * 区分 ESP32/GD32 续传分支，避免误报让前端走错路径。与 worker 中
+ * ble_ota_process_data_batch 的包头解析保持一致（buf[0] = cmd）。
+ *
+ * @param buf      数据缓冲区。
+ * @param recv_len 数据长度。
+ * @return cmd 字节；非法长度返回 0（GD32 命令），调用方据此不发误导性 ACK。
+ */
+static uint8_t parse_cmd_from_batch(const uint8_t *buf, size_t recv_len)
+{
+    // 与 ble_ota_process_data_batch 一致：至少 7 字节头才算合法包
+    if (recv_len < 7 || buf == nullptr) {
+        return 0;
+    }
+    return buf[0];
+}
+
+/**
+ * @brief 丢包路径负 ACK：发缺口 ACK 让前端按 completed_bytes 续传退避。
+ *
+ * 触发于 DATA_IN 回调中 malloc 失败 / 队列满。窗口内包用
+ * writeValueWithoutResponse（即发即忘），收不到 ATT Error Response，
+ * 只能走 DATA_OUT 通知通道。负 ACK 复用 sendWindowAck，seq 取
+ * s_reorder.expected-1（最近连续落盘序号），completed 取实际落盘字节，
+ * 前端 resumeSeq = ceil(bytes/payloadSize) 续传，无需改客户端。
+ *
+ * 节流：丢包数 ≥ NEG_ACK_DROP_WINDOW 或距上次 ≥ NEG_ACK_MIN_INTERVAL_US
+ *       才发一次，防止重传风暴期间 ACK 通知打爆 NimBLE mbuf 池。
+ *       状态仅在 NimBLE host task 回调中读写，无需锁。
+ *
+ * 仅 ESP32 路径发负 ACK（s_reorder 状态在此文件内可见）；GD32 中继转发
+ * 的缺口反馈由 GD32 侧自行处理，本函数对 GD32 cmd 仅累计不发送。
+ */
+static void sendNegativeAckIfDue(uint8_t cmd)
+{
+    // 累计丢包（无论是否发送，计数都增长，供可观测性）
+    s_neg_ack_drop_count += 1;
+
+    // 节流判定：丢包数达阈值 或 距上次发送超过最小间隔
+    const int64_t now_us = esp_timer_get_time();
+    bool by_count = (s_neg_ack_drop_count >= NEG_ACK_DROP_WINDOW);
+    bool by_time  = ((now_us - s_last_neg_ack_us) >= NEG_ACK_MIN_INTERVAL_US);
+    // 首次（s_last_neg_ack_us==0）也允许立即发，避免低堆首包丢就憋住
+    bool first_time = (s_last_neg_ack_us == 0);
+    if (!(by_count || by_time || first_time)) {
+        return;
+    }
+
+    // 仅 ESP32 路径发负 ACK；GD32 中继缺口由 GD32 侧反馈，这里只计不发
+    if (cmd == BLE_OTA_CMD_ESP32_DATA) {
+        // expected>0：已落盘过包，ackSeq=expected-1，completed=实际落盘字节
+        // expected==0：首包都没落盘，发 ackSeq=0/completed=0，等价"从头续发"
+        //   （客户端 seq=0 用 write-with-response，本就等首包 ACK，不会误导）
+        uint16_t ackSeq = (s_reorder.expected > 0U)
+                        ? (uint16_t)(s_reorder.expected - 1U)
+                        : 0U;
+        uint32_t completed = (s_reorder.expected > 0U)
+                           ? (uint32_t)Esp32OtaCore::instance().getReceived()
+                           : 0U;
+        sendWindowAck(cmd, ackSeq, completed);
+        s_neg_ack_sent += 1;
+        DEBUG_WARN(TAG, "DATA_IN 负ACK cmd=0x%02X seq=%u bytes=%lu (drop:malloc=%u qfull=%u)",
+                   cmd, ackSeq, (unsigned long)completed,
+                   (unsigned)s_ota_drop_malloc_fail, (unsigned)s_ota_drop_queue_full);
+    }
+    // 复位节流状态
+    s_neg_ack_drop_count = 0;
+    s_last_neg_ack_us = now_us;
 }
 
 /**
@@ -594,16 +700,25 @@ int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
     // 将数据拷贝到堆上并送入工作队列，避免在 NimBLE host task 中执行
     // 耗时的 flash 操作（esp_ota_begin / esp_ota_write）导致 BLE 连接断开。
     if (s_otaDataQueue) {
+        // 解析 cmd 字节供负 ACK 区分 ESP32/GD32 续传分支（与 worker 解析一致）
+        uint8_t cmd = parse_cmd_from_batch(buf, (size_t)recv_len);
         uint8_t *heap_buf = (uint8_t *)malloc((size_t)recv_len);
         if (heap_buf) {
             memcpy(heap_buf, buf, (size_t)recv_len);
             BleOtaDataBatch item = { heap_buf, (size_t)recv_len };
             if (xQueueSend(s_otaDataQueue, &item, 0) != pdTRUE) {
+                // 队列满：发缺口 ACK 让前端按 completed_bytes 续传退避，
+                // 而非等满 8s 窗口超时后整窗口重发 → 重传风暴叠加低堆二次失败
+                s_ota_drop_queue_full += 1;
                 DEBUG_WARN(TAG, "DATA_IN满 丢%dB 等重传", recv_len);
                 free(heap_buf);
+                sendNegativeAckIfDue(cmd);
             }
         } else {
+            // malloc 失败：同上，发缺口 ACK 形成可恢复协议反馈，避免静默丢包
+            s_ota_drop_malloc_fail += 1;
             DEBUG_ERR(TAG, "DATA_IN 堆内存不足 (%d 字节)，丢弃", recv_len);
+            sendNegativeAckIfDue(cmd);
         }
     }
 

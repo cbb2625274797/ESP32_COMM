@@ -1,28 +1,74 @@
-/* === base.css — 基础变量与容器 === */
-/* ===== ESP32 OTA 控制台 — 工业调试台风格 ===== */
+/* ============================================================
+   base.css — DCU Mission Control · 设计令牌与全局基底
+   风格：深色测控台（deep blue-slate），多色子系统语义配色
+   子系统色：ESP32=青绿 · GD32=琥珀 · BLE=蓝 · CAN=绿 · 内存/调试=紫
+   ============================================================ */
 
 :root {
-  --bg-root: #090e15;
-  --bg-panel: #0f161f;
-  --bg-card: #141d28;
-  --bg-elevated: #1a2432;
-  --bg-input: #0d131b;
-  --border: #1d2a3a;
-  --border-focus: #22d3ee;
-  --text: #e2e8f0;
-  --text-dim: #7b8fa8;
-  --text-label: #5a6d82;
-  --accent: #22d3ee;
-  --accent-dim: rgba(34,211,238,.15);
-  --green: #22c55e;
-  --amber: #f59e0b;
-  --red: #ef4444;
-  --radius-sm: 6px;
-  --radius: 10px;
-  --radius-lg: 14px;
+  /* ---- 底色层次：深蓝灰，层层抬升，拒绝纯黑 ---- */
+  --bg-root:     #0a0f1a;
+  --bg-panel:    #0e1624;
+  --bg-card:     #131d2e;
+  --bg-elevated: #1a2740;
+  --bg-input:    #0b1220;
+  --bg-hover:    #20304c;
+
+  /* ---- 边框 ---- */
+  --border:        #21304a;
+  --border-strong: #2e4262;
+  --border-subtle: #1a2740;
+
+  /* ---- 文字 ---- */
+  --text:       #e9f0fa;
+  --text-dim:   #93a8c4;
+  --text-label: #617a99;
+
+  /* ---- 子系统语义色 ---- */
+  --esp32:     #2fd8c1;  /* 青绿：ESP32 / 主操作 / WiFi OTA */
+  --esp32-hi:  #6ff2e0;
+  --esp32-dim: rgba(47,216,193,.14);
+  --gd32:      #fcbf3f;  /* 琥珀：GD32 / 中继 OTA */
+  --gd32-hi:   #ffd97a;
+  --gd32-dim:  rgba(252,191,63,.14);
+  --ble:       #5fa8ff;  /* 蓝：BLE 蓝牙通道 */
+  --ble-hi:    #93c6ff;
+  --ble-dim:   rgba(95,168,255,.14);
+  --can:       #43d97b;  /* 绿：CAN 总线 / 健康 */
+  --can-hi:    #7deda6;
+  --can-dim:   rgba(67,217,123,.14);
+  --mem:       #a88bfa;  /* 紫：内存 / 调试 / 日志 */
+  --mem-hi:    #c7b3ff;
+  --mem-dim:   rgba(168,139,250,.14);
+
+  /* ---- 状态语义色 ---- */
+  --green: #3ddc8e;
+  --amber: #fcbf3f;
+  --red:   #ff6b6b;
+  --red-dim: rgba(255,107,107,.14);
+
+  /* ---- 兼容旧令牌（大量旧样式引用，勿删）---- */
+  --accent:     var(--esp32);
+  --accent-dim: var(--esp32-dim);
+  --border-focus: var(--esp32);
+
+  /* ---- 圆角 ---- */
+  --radius-sm: 8px;
+  --radius:    12px;
+  --radius-lg: 16px;
+
+  /* ---- 字体 ----
+     display：Chakra Petch（棱角科技感，用于标题/大数字/按钮；
+              无中文字形，中文自动回退苹方/雅黑）
+     mono：JetBrains Mono（SHA / HEX / 日志 / 数值）
+     body：系统中文字体优先，保证正文可读性 */
+  --font-display: "Chakra Petch","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
   --font: "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
-  --font-mono: "SF Mono","Fira Code","Cascadia Code","Consolas",monospace;
-  --gap: 16px;
+  --font-mono: "JetBrains Mono","SF Mono","Cascadia Code","Consolas",monospace;
+
+  /* ---- 间距 / 阴影 ---- */
+  --gap: 18px;
+  --shadow-card: 0 10px 30px rgba(3,7,16,.45), 0 1px 0 rgba(255,255,255,.03) inset;
+  --shadow-pop:  0 18px 48px rgba(3,7,16,.6);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -33,23 +79,55 @@ html, body {
   color: var(--text);
   font-family: var(--font);
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
 }
 
-/* subtle noise-grid background */
+/* ---- 环境光背景：细网格 + 双色氛围辉光 + 顶部扫光 ----
+   网格提供"工程图纸"质感；左上青绿、右下琥珀的两团极淡辉光
+   暗示 ESP32 / GD32 双核子系统，随视口固定，营造纵深。 */
 body::before {
   content: "";
   position: fixed; inset: 0; z-index: 0; pointer-events: none;
   background-image:
-    linear-gradient(rgba(255,255,255,.015) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,.015) 1px, transparent 1px);
-  background-size: 40px 40px;
-  mask-image: radial-gradient(ellipse at 50% 0%, black 40%, transparent 70%);
+    linear-gradient(rgba(148,180,226,.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148,180,226,.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 120% 90% at 50% -8%, black 30%, transparent 78%);
+}
+body::after {
+  content: "";
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(900px 520px at 8% -10%, rgba(47,216,193,.10), transparent 60%),
+    radial-gradient(820px 560px at 100% 112%, rgba(252,191,63,.07), transparent 62%),
+    radial-gradient(700px 480px at 88% -6%, rgba(95,168,255,.06), transparent 60%);
 }
 
 .container {
   position: relative; z-index: 1;
-  max-width: 1480px; margin: 0 auto; padding: 24px 32px 40px;
+  max-width: 1480px; margin: 0 auto; padding: 26px 32px 44px;
+}
+
+/* ---- 全局滚动条 ---- */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong); border-radius: 99px;
+  border: 2px solid var(--bg-root);
+}
+::-webkit-scrollbar-thumb:hover { background: #3a5378; }
+
+/* ---- 选区 ---- */
+::selection { background: rgba(47,216,193,.28); color: #eafffb; }
+
+/* ---- 通用等宽数字（让指标/百分比对齐、不跳动）---- */
+.tabular { font-variant-numeric: tabular-nums; }
+
+/* ---- focus 可见性（键盘可达性）---- */
+:focus-visible {
+  outline: 2px solid var(--esp32);
+  outline-offset: 2px;
+  border-radius: 4px;
 }

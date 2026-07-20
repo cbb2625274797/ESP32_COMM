@@ -8,7 +8,6 @@
  */
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include "freertos/task.h"
@@ -30,7 +29,7 @@
 
 static constexpr size_t kSpiTransferMaxBytes = 256U;
 
-/** @brief submitJob 堆 Job 与 worker 之间的 finished/abandoned 交接。 */
+/** @brief submitJob 池 Job 与 worker 之间的 finished/abandoned/in_use 交接。 */
 static portMUX_TYPE s_spiJobMux = portMUX_INITIALIZER_UNLOCKED;
 
 /**
@@ -296,38 +295,105 @@ void SpiMaster::executeJob(Job &job)
 }
 
 /**
- * @brief worker 完成堆上 Job 后的收尾：释放完成信号量，超时放弃时由 worker free。
- * @param job  堆分配的 Job 指针
+ * @brief 从固定 Job 池取空闲槽；池耗尽返回 nullptr。
+ * @note  in_use 在 critical 内置 true 并保持，禁止整体 Job{} 赋值清掉占用标志。
  */
-void SpiMaster::finishHeapJob(Job *job)
+SpiMaster::Job *SpiMaster::acquireJobSlot()
+{
+    if (!m_jobPoolReady) {
+        return nullptr;
+    }
+    Job *slot = nullptr;
+    taskENTER_CRITICAL(&s_spiJobMux);
+    for (UBaseType_t i = 0; i < kJobPoolSize; ++i) {
+        if (!m_jobPool[i].in_use) {
+            slot = &m_jobPool[i];
+            /* 清业务字段但 in_use 全程 true，避免与其它 acquire 竞态 */
+            SemaphoreHandle_t done = slot->done;
+            slot->kind = JobKind::Transact;
+            slot->timeout_ms = 0U;
+            slot->type = 0U;
+            slot->expected_type = 0xFFU;
+            slot->role_hint = 0U;
+            slot->payload_len = 0U;
+            slot->out_type = nullptr;
+            slot->out_payload = nullptr;
+            slot->out_max = 0U;
+            slot->out_len = nullptr;
+            slot->out_uptime = nullptr;
+            slot->out_version = nullptr;
+            slot->result = ESP_FAIL;
+            slot->done = done;
+            slot->finished = false;
+            slot->abandoned = false;
+            slot->in_use = true;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_spiJobMux);
+    if (slot == nullptr) {
+        return nullptr;
+    }
+    /* 仅本槽所有者 drain；不可在 critical 内 take */
+    if (slot->done != nullptr) {
+        while (xSemaphoreTake(slot->done, 0) == pdTRUE) {
+        }
+    }
+    return slot;
+}
+
+/**
+ * @brief 归还池槽（调用方已独占该 Job，不再与 worker 共享）。
+ */
+void SpiMaster::releaseJobSlot(Job *job)
 {
     if (job == nullptr) {
         return;
     }
-    /* 先 give，再标 finished；提交方 take 成功后会 spin 等 finished 再 free。 */
+    if (job->done != nullptr) {
+        while (xSemaphoreTake(job->done, 0) == pdTRUE) {
+        }
+    }
+    job->out_type = nullptr;
+    job->out_payload = nullptr;
+    job->out_len = nullptr;
+    job->out_uptime = nullptr;
+    job->out_version = nullptr;
+    job->payload_len = 0U;
+    job->result = ESP_FAIL;
+    taskENTER_CRITICAL(&s_spiJobMux);
+    job->finished = false;
+    job->abandoned = false;
+    job->in_use = false;
+    taskEXIT_CRITICAL(&s_spiJobMux);
+}
+
+/**
+ * @brief worker 完成池 Job 后的收尾：give done；abandoned 时由 worker release 槽。
+ * @param job  池内 Job 指针
+ */
+void SpiMaster::finishPoolJob(Job *job)
+{
+    if (job == nullptr) {
+        return;
+    }
+    /* 先 give，再标 finished；提交方 take 成功后会 spin 等 finished 再 release。 */
     if (job->done) {
         (void)xSemaphoreGive(job->done);
     }
-    if (!job->heap_allocated) {
-        return;
-    }
     taskENTER_CRITICAL(&s_spiJobMux);
     job->finished = true;
-    const bool free_it = job->abandoned;
+    const bool release_it = job->abandoned;
     taskEXIT_CRITICAL(&s_spiJobMux);
-    if (free_it) {
-        if (job->done) {
-            vSemaphoreDelete(job->done);
-            job->done = nullptr;
-        }
-        free(job);
+    if (release_it) {
+        releaseJobSlot(job);
     }
 }
 
 /**
  * @brief 将 Job 提交给 SPI worker 串行执行（非 worker 线程走队列）。
- * @param job  任务描述（栈上 Job 会拷到堆上再排队）
- * @return 业务结果码；队列满/超时返回 ESP_ERR_TIMEOUT
+ * @param job  任务描述（栈上字段拷入固定池槽再排队）
+ * @return 业务结果码；池耗尽 ESP_ERR_NO_MEM；队列满/超时 ESP_ERR_TIMEOUT
  */
 esp_err_t SpiMaster::submitJob(Job &job)
 {
@@ -336,70 +402,81 @@ esp_err_t SpiMaster::submitJob(Job &job)
         return job.result;
     }
 
-    /* 跨任务作业：堆上 Job + binary 完成信号量 */
-    Job *heap_job = static_cast<Job *>(calloc(1, sizeof(Job)));
-    if (heap_job == nullptr) {
-        DEBUG_ERR("SPI", "submitJob: calloc failed kind=%u", (unsigned)job.kind);
-        return ESP_ERR_NO_MEM;
-    }
-    *heap_job = job;
-    heap_job->heap_allocated = true;
-    heap_job->finished = false;
-    heap_job->abandoned = false;
-    heap_job->result = ESP_FAIL;
-    heap_job->done = xSemaphoreCreateBinary();
-    if (heap_job->done == nullptr) {
-        free(heap_job);
-        DEBUG_ERR("SPI", "submitJob: done sem create failed");
+    /* 跨任务：固定池 Job + 静态 binary 完成信号量（无 calloc/xSemaphoreCreate） */
+    Job *pool_job = acquireJobSlot();
+    if (pool_job == nullptr) {
+        DEBUG_ERR("SPI", "submitJob: job pool exhausted kind=%u", (unsigned)job.kind);
         return ESP_ERR_NO_MEM;
     }
 
+    /* 逐字段拷贝业务参数；禁止整体赋值覆盖 done/in_use */
+    pool_job->kind = job.kind;
+    pool_job->timeout_ms = job.timeout_ms;
+    pool_job->type = job.type;
+    pool_job->expected_type = job.expected_type;
+    pool_job->role_hint = job.role_hint;
+    pool_job->payload_len = job.payload_len;
+    if (job.payload_len > 0U) {
+        const size_t n = (job.payload_len > sizeof(pool_job->payload))
+                             ? sizeof(pool_job->payload)
+                             : job.payload_len;
+        memcpy(pool_job->payload, job.payload, n);
+        pool_job->payload_len = n;
+    } else {
+        pool_job->payload_len = 0U;
+    }
+    pool_job->out_type = job.out_type;
+    pool_job->out_payload = job.out_payload;
+    pool_job->out_max = job.out_max;
+    pool_job->out_len = job.out_len;
+    pool_job->out_uptime = job.out_uptime;
+    pool_job->out_version = job.out_version;
+    pool_job->result = ESP_FAIL;
+    pool_job->finished = false;
+    pool_job->abandoned = false;
+    /* done / in_use 保持 acquire 时状态 */
+
     const TickType_t qwait = pdMS_TO_TICKS(
         (job.timeout_ms > 0U ? job.timeout_ms : 1000U) + 2000U);
-    if (xQueueSend(m_jobQueue, &heap_job, qwait) != pdTRUE) {
+    if (xQueueSend(m_jobQueue, &pool_job, qwait) != pdTRUE) {
         DEBUG_WARN("SPI", "worker job queue full/timeout kind=%u", (unsigned)job.kind);
-        vSemaphoreDelete(heap_job->done);
-        free(heap_job);
+        releaseJobSlot(pool_job);
         return ESP_ERR_TIMEOUT;
     }
     xTaskNotify(m_workerTask, 0x10U, eSetBits);
 
     const TickType_t dwait = pdMS_TO_TICKS(
         (job.timeout_ms > 0U ? job.timeout_ms : 1000U) + 10000U);
-    if (xSemaphoreTake(heap_job->done, dwait) == pdTRUE) {
-        const esp_err_t result = heap_job->result;
-        /* worker 在 give 后才写 finished；等其退出临界区后再由本侧独占 free。 */
+    if (xSemaphoreTake(pool_job->done, dwait) == pdTRUE) {
+        const esp_err_t result = pool_job->result;
+        /* worker 在 give 后才写 finished；等其退出临界区后再由本侧独占 release。 */
         for (;;) {
             taskENTER_CRITICAL(&s_spiJobMux);
-            const bool fin = heap_job->finished;
+            const bool fin = pool_job->finished;
             taskEXIT_CRITICAL(&s_spiJobMux);
             if (fin) {
                 break;
             }
             vTaskDelay(1);
         }
-        vSemaphoreDelete(heap_job->done);
-        heap_job->done = nullptr;
-        free(heap_job);
+        releaseJobSlot(pool_job);
         return result;
     }
 
-    /* 超时：标记 abandoned；若 worker 已跑完则本侧 free，否则 worker finishHeapJob free。 */
+    /* 超时：标记 abandoned；若 worker 已跑完则本侧 release，否则 finishPoolJob release。 */
     taskENTER_CRITICAL(&s_spiJobMux);
-    heap_job->abandoned = true;
-    const bool already_done = heap_job->finished;
+    pool_job->abandoned = true;
+    const bool already_done = pool_job->finished;
     taskEXIT_CRITICAL(&s_spiJobMux);
 
     if (already_done) {
-        (void)xSemaphoreTake(heap_job->done, 0);
-        const esp_err_t result = heap_job->result;
-        vSemaphoreDelete(heap_job->done);
-        heap_job->done = nullptr;
-        free(heap_job);
+        (void)xSemaphoreTake(pool_job->done, 0);
+        const esp_err_t result = pool_job->result;
+        releaseJobSlot(pool_job);
         return result;
     }
 
-    DEBUG_ERR("SPI", "worker job done timeout kind=%u（堆 Job 交 worker 释放）",
+    DEBUG_ERR("SPI", "worker job done timeout kind=%u（池槽交 worker 释放）",
               (unsigned)job.kind);
     return ESP_ERR_TIMEOUT;
 }
@@ -434,7 +511,7 @@ void SpiMaster::workerLoop()
         Job *job = nullptr;
         if (xQueueReceive(m_jobQueue, &job, pdMS_TO_TICKS(1)) == pdTRUE && job != nullptr) {
             executeJob(*job);
-            finishHeapJob(job);
+            finishPoolJob(job);
             continue;
         }
 
@@ -890,13 +967,32 @@ esp_err_t SpiMaster::init()
     m_stats = SpiLinkStats{};
     m_eventHead = m_eventTail = m_eventCount = 0;
 
-    /* 创建 job 队列、事件信号量与 SPI worker（init 仍持 m_mutex） */
+    /* 创建 job 队列、固定 Job pool（静态 done 信号量）、事件信号量与 SPI worker */
     if (m_jobQueue == nullptr) {
         m_jobQueue = xQueueCreate(kJobQueueLen, sizeof(Job *));
         if (m_jobQueue == nullptr) {
             DEBUG_ERR("SPI", "SPI job queue create failed");
             return ESP_ERR_NO_MEM;
         }
+    }
+    if (!m_jobPoolReady) {
+        for (UBaseType_t i = 0; i < kJobPoolSize; ++i) {
+            m_jobPool[i] = Job{};
+            m_jobPool[i].done = xSemaphoreCreateBinary();
+            if (m_jobPool[i].done == nullptr) {
+                DEBUG_ERR("SPI", "SPI job pool done sem create failed idx=%u",
+                          (unsigned)i);
+                for (UBaseType_t j = 0; j < i; ++j) {
+                    vSemaphoreDelete(m_jobPool[j].done);
+                    m_jobPool[j].done = nullptr;
+                }
+                return ESP_ERR_NO_MEM;
+            }
+            m_jobPool[i].in_use = false;
+        }
+        m_jobPoolReady = true;
+        DEBUG_INFO("SPI", "SPI job pool ready size=%u queue=%u",
+                   (unsigned)kJobPoolSize, (unsigned)kJobQueueLen);
     }
     if (m_eventSem == nullptr) {
         m_eventSem = xSemaphoreCreateCounting(kEventSlots, 0);

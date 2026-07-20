@@ -81,7 +81,7 @@ struct HeapLowWaterRecord {
     char     hook_task[16];        ///< 分配类别 net?/bulk/tiny，不是任务名
     uint32_t hook_alloc_size;      ///< 最后一击 alloc 字节数
     uint32_t hook_caller_addr;     ///< 调用者返回地址（addr2line）
-    uint32_t hook_free_after;      ///< 该次后的近似 free（est，非精确实测）
+    uint32_t hook_free_after;      ///< 该次后的近似 free（**estimated 低水位近似值**，非精确实测；JSON 输出为 hook_est_free_after + hook_confidence，前端应标注 estimated）
     uint32_t hook_fired;           ///< 0=本窗口 hook 未命中
     /* DHCP/IP 事件计数：每次 STA GOT_IP（含续约）+1。
      * 对比两次低谷记录的计数差，确认低谷是不是 DHCP 续约引起。 */
