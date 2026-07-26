@@ -12,12 +12,12 @@
  * 注意：formatTime 保留本地实现（HH:MM:SS，不含毫秒），与 common/utils.js
  * 的 formatTime（含毫秒）不同，以保证发送历史时间戳输出格式一致。
  */
-import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js?v=20260717x';
-import { escapeHtml } from '../common/utils.js?v=20260717x';
-import { showToast } from '../common/toast.js?v=20260717x';
-import { updateBatchUi } from './messages.js?v=20260717x';
-import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js?v=20260717x';
-import { scheduleCanPersist } from './persist.js?v=20260717x';
+import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js';
+import { escapeHtml } from '../common/utils.js';
+import { showToast } from '../common/toast.js';
+import { updateBatchUi } from './messages.js';
+import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js';
+import { scheduleCanPersist } from './persist.js';
 
 // ==================== 本地工具（保持与原 can.js 一致） ====================
 function formatTime(date) {

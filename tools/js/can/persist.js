@@ -6,7 +6,7 @@
  *
  * 依赖：dbc.js（state/el/parseDbc/rebuildMergedDbc）
  */
-import { state, el, parseDbc, rebuildMergedDbc } from './dbc.js?v=20260717x';
+import { state, el, parseDbc, rebuildMergedDbc } from './dbc.js';
 
 var LS_KEY = 'dcu_can_session_v1';
 var MAX_HISTORY = 200;

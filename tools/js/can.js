@@ -16,11 +16,12 @@
  *       （操作不同的 DOM 元素集），此处保留原 can.js 版本以保证行为一致。
  */
 
-/* 子模块 import 带同一 ?v=，避免浏览器缓存旧 dbc.js（无 getDeviceIp）且保证单例 state */
+/* JS 间 import 一律不带 ?v=，版本戳只出现在 HTML 入口标签上，
+ * 避免同一模块因 query 不同被浏览器实例化两次（state/toast 单例分裂） */
 import {
   state, el, getBaseUrl, getDeviceIp, setDeviceIp, parseDbc, readDbcText, buildSummary,
   rebuildMergedDbc, makeDbcSourceId
-} from './can/dbc.js?v=20260717x';
+} from './can/dbc.js';
 import {
   updateDbcFileInfo,
   filterMessages,
@@ -30,11 +31,11 @@ import {
   recomputeTransmitterFilterEmpty,
   updateNodeFilterLabel,
   updateBatchUi
-} from './can/messages.js?v=20260717x';
+} from './can/messages.js';
 import {
   ensureMessageDefaults,
   updateEncodedPreview
-} from './can/signals.js?v=20260717x';
+} from './can/signals.js';
 import {
   renderHistory,
   sendSelectedMessage,
@@ -43,15 +44,15 @@ import {
   sendManualFrame,
   resetManualFields,
   loadPreviewToManual
-} from './can/send.js?v=20260720b';
+} from './can/send.js';
 import {
   scheduleCanPersist,
   loadCanSession,
   bindCanPersistLifecycle
-} from './can/persist.js?v=20260717x';
-import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js?v=20260717x';
-import { showToast } from './common/toast.js?v=20260717x';
-import { initCanMonitor } from './can_monitor.js?v=20260719s';
+} from './can/persist.js';
+import { escapeHtml as sanitizeHtml, formatUptime } from './common/utils.js';
+import { showToast } from './common/toast.js';
+import { initCanMonitor } from './can_monitor.js';
 
 // ==================== 本地工具 ====================
 // 原 can.js 的 formatUptime 输出格式与 common/utils.js 略有差异（d>0 时只到 h），

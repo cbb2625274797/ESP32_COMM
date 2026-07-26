@@ -1,7 +1,7 @@
 /**
  * can_monitor.js - CAN 接收监控（独立页 can_monitor.html 与 can.html 右侧抽屉共用）
  */
-import { showToast } from './common/toast.js?v=20260717x';
+import { showToast } from './common/toast.js';
 import { escapeHtml } from './common/utils.js';
 
 var state = { fbTimer: null, fbInFlight: false };

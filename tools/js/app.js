@@ -212,6 +212,55 @@ window.applyRebootingRuntimeState = applyRebootingRuntimeState;
 window.applyUploadingRuntimeState = applyUploadingRuntimeState;
 window.applyDeviceBusyRuntimeState = applyDeviceBusyRuntimeState;
 
+// ==================== data-action 事件委托（替代 HTML 内联 onclick） ====================
+// 处理函数分散在 app.js / ota/console-mode.js / ble_ota.js 三个入口，均挂载在
+// window 上；委托在点击时才解引用，天然规避模块加载顺序问题。
+document.addEventListener('click', function (ev) {
+  var target = ev.target.closest('[data-action]');
+  if (!target) return;
+  var arg = target.getAttribute('data-arg');
+  switch (target.getAttribute('data-action')) {
+    case 'set-console-mode': if (window.setConsoleMode) window.setConsoleMode(arg); break;
+    case 'test-connection': testConnection(); break;
+    case 'select-flash-target': if (window.selectFlashTarget) window.selectFlashTarget(arg); break;
+    case 'pick-shared-firmware': if (window.pickSharedFirmware) window.pickSharedFirmware(arg); break;
+    case 'clear-shared-firmware': if (window.clearSharedFirmware) window.clearSharedFirmware(arg); break;
+    case 'ble-pick-file': var fi = document.getElementById('firmwareFile'); if (fi) fi.click(); break;
+    case 'ble-clear-file': if (window.bleOta) window.bleOta.clearFile(); break;
+    case 'start-upload': startUpload(arg); break;
+    case 'restart-esp32': restartEsp32(); break;
+    case 'refresh-system-status': refreshSystemStatusNow(ev); break;
+  }
+});
+
+// 共享固件文件选择（原内联 onchange="handleSharedFileSelect(event, chip)"）
+['esp32', 'gd32'].forEach(function (chip) {
+  var input = document.getElementById(chip === 'esp32' ? 'fileInputEsp32' : 'fileInputGd32');
+  if (input) {
+    input.addEventListener('change', function (ev) {
+      if (window.handleSharedFileSelect) window.handleSharedFileSelect(ev, chip);
+    });
+  }
+});
+
+// BLE 上传区拖拽（原内联 ondragover/ondragleave/ondrop）
+var bleZone = document.getElementById('uploadZone');
+if (bleZone) {
+  bleZone.addEventListener('dragover', function (ev) {
+    ev.preventDefault();
+    bleZone.classList.add('dragover');
+  });
+  bleZone.addEventListener('dragleave', function () {
+    bleZone.classList.remove('dragover');
+  });
+  bleZone.addEventListener('drop', function (ev) {
+    ev.preventDefault();
+    bleZone.classList.remove('dragover');
+    var f = ev.dataTransfer.files[0];
+    if (f && window.bleOta) window.bleOta.notifyFileChange(f, null);
+  });
+}
+
 // ==================== 顶层副作用（原 app.js 末尾的初始化） ====================
 setupDropZone('uploadZoneEsp32', 'esp32');
 setupDropZone('uploadZoneGd32', 'gd32');

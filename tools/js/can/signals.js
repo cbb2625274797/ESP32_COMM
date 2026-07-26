@@ -5,9 +5,9 @@
  *
  * 依赖：dbc.js（state/el/padHex/bytesToHex/cssEscape/findSignal）、common/utils.js（escapeHtml）。
  */
-import { state, el, padHex, bytesToHex, cssEscape, findSignal, findMessageByKey } from './dbc.js?v=20260717x';
-import { escapeHtml as sanitizeHtml } from '../common/utils.js?v=20260717x';
-import { scheduleCanPersist } from './persist.js?v=20260717x';
+import { state, el, padHex, bytesToHex, cssEscape, findSignal, findMessageByKey } from './dbc.js';
+import { escapeHtml as sanitizeHtml } from '../common/utils.js';
+import { scheduleCanPersist } from './persist.js';
 
 // ==================== 信号值存取 ====================
 /** @description 确保报文有 signalValues bag，并为每个信号填充默认值。返回 bag。 */

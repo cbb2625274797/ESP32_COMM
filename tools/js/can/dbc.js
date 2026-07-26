@@ -6,6 +6,9 @@
  * 本模块是 can 子系统的基础层，不依赖其他 can 子模块；state/el 在此导出，
  * 供 messages/signals/send 共享（ES Module 的 live binding 保证引用一致）。
  */
+import {
+  DEFAULT_ESP_IP, getSavedDeviceIp, saveDeviceIp
+} from '../common/base-url.js';
 
 // ==================== 共享状态 ====================
 export var state = {
@@ -31,15 +34,12 @@ export var state = {
 export var el = {};
 
 // ==================== 基础工具 ====================
-var LS_ESP_IP = 'dcu_esp_ip';
-var DEFAULT_ESP_IP = '192.168.31.127';
+// IP 存取通用实现在 common/base-url.js，此处包装 CAN 页特有的 el.toolIp 回退。
 
-/** @description 设备 IP：优先 localStorage（与 OTA 页共用），否则默认。 */
+/** @description 设备 IP：优先 localStorage（与 OTA 页共用），其次页面输入框，否则默认。 */
 export function getDeviceIp() {
-  try {
-    var saved = localStorage.getItem(LS_ESP_IP);
-    if (saved && saved.trim()) return saved.trim();
-  } catch (_) {}
+  var saved = getSavedDeviceIp();
+  if (saved) return saved;
   if (el.toolIp && el.toolIp.value && el.toolIp.value.trim()) {
     return el.toolIp.value.trim();
   }
@@ -50,7 +50,7 @@ export function getDeviceIp() {
 export function setDeviceIp(ip) {
   if (!ip || !String(ip).trim()) return;
   var v = String(ip).trim();
-  try { localStorage.setItem(LS_ESP_IP, v); } catch (_) {}
+  saveDeviceIp(v);
   if (el.toolIp) el.toolIp.value = v;
 }
 

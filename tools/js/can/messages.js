@@ -7,10 +7,10 @@
  *       common/utils.js（escapeHtml/formatBytes）、
  *       signals.js（renderInlineSignalGrid/ensureMessageDefaults/updateEncodedPreview）。
  */
-import { state, el, padHex, normalizeWhitespace, cssEscape, findMessageByKey } from './dbc.js?v=20260717x';
-import { escapeHtml, formatBytes } from '../common/utils.js?v=20260717x';
-import { renderInlineSignalGrid, ensureMessageDefaults, updateEncodedPreview } from './signals.js?v=20260717x';
-import { scheduleCanPersist } from './persist.js?v=20260717x';
+import { state, el, padHex, normalizeWhitespace, cssEscape, findMessageByKey } from './dbc.js';
+import { escapeHtml, formatBytes } from '../common/utils.js';
+import { renderInlineSignalGrid, ensureMessageDefaults, updateEncodedPreview } from './signals.js';
+import { scheduleCanPersist } from './persist.js';
 
 // ==================== DBC 文件信息 ====================
 /** @description 更新 DBC 文件信息卡片（文件名/报文数/信号数/节点数/大小），并刷新多 DBC 摘要条与文件 chip 列表。 */

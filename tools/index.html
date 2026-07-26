@@ -63,15 +63,15 @@
         </div>
         <div class="card-body">
           <div style="display:flex;gap:6px;margin-bottom:14px;">
-            <button id="modeWifiBtn" class="btn btn-primary" style="flex:1;font-size:12px;padding:7px 10px;" onclick="setConsoleMode('wifi')">WiFi OTA</button>
-            <button id="modeBleBtn" class="btn btn-outline" style="flex:1;font-size:12px;padding:7px 10px;" onclick="setConsoleMode('ble')">BLE 蓝牙</button>
+            <button id="modeWifiBtn" class="btn btn-primary" style="flex:1;font-size:12px;padding:7px 10px;" data-action="set-console-mode" data-arg="wifi">WiFi OTA</button>
+            <button id="modeBleBtn" class="btn btn-outline" style="flex:1;font-size:12px;padding:7px 10px;" data-action="set-console-mode" data-arg="ble">BLE 蓝牙</button>
           </div>
           <div id="wifiModeCards">
           <div class="form-row">
             <label class="form-label" for="espIp">ESP32 IP 地址</label>
             <div class="input-group">
               <input class="input" type="text" id="espIp" value="192.168.31.127" placeholder="输入 IP 地址">
-              <button class="btn btn-outline" onclick="testConnection()">测试</button>
+              <button id="testConnBtn" class="btn btn-outline" data-action="test-connection">测试</button>
             </div>
           </div>
           </div>
@@ -84,20 +84,20 @@
         <div class="card-head"><span class="ico">🎯</span> 升级目标、固件文件与执行操作</div>
         <div class="card-body">
           <div style="display:flex;gap:6px;margin-bottom:14px;">
-            <button id="targetGd32Tab" class="btn btn-outline" style="flex:1;font-size:12px;padding:7px 10px;" onclick="selectFlashTarget('gd32')">GD32</button>
-            <button id="targetEsp32Tab" class="btn btn-primary" style="flex:1;font-size:12px;padding:7px 10px;" onclick="selectFlashTarget('esp32')">ESP32</button>
+            <button id="targetGd32Tab" class="btn btn-outline" style="flex:1;font-size:12px;padding:7px 10px;" data-action="select-flash-target" data-arg="gd32">GD32</button>
+            <button id="targetEsp32Tab" class="btn btn-primary" style="flex:1;font-size:12px;padding:7px 10px;" data-action="select-flash-target" data-arg="esp32">ESP32</button>
           </div>
           <div style="border-top:1px solid var(--border);margin:0 -16px 14px;padding-top:14px;padding-left:16px;padding-right:16px;">
           <div id="wifiEsp32UploadPane">
-          <div class="upload-zone upload-zone-sm" id="uploadZoneEsp32" onclick="pickSharedFirmware('esp32')">
+          <div class="upload-zone upload-zone-sm" id="uploadZoneEsp32" data-action="pick-shared-firmware" data-arg="esp32">
             <div class="upload-ico">📤</div>
             <h4>点击或拖拽 ESP32 固件</h4>
           </div>
-          <input type="file" id="fileInputEsp32" accept=".bin" onchange="handleSharedFileSelect(event, 'esp32')" style="display:none;">
+          <input type="file" id="fileInputEsp32" accept=".bin" style="display:none;">
           <div class="file-info" id="fileInfoEsp32">
             <div class="file-info-row">
               <span style="font-weight:600;">📄 <span id="fileNameEsp32">-</span></span>
-              <button class="btn btn-ghost btn-sm" onclick="clearSharedFirmware('esp32')">清除</button>
+              <button class="btn btn-ghost btn-sm" data-action="clear-shared-firmware" data-arg="esp32">清除</button>
             </div>
             <div class="file-info-grid">
               <div class="file-meta-item"><span>类型</span><b id="fileTypeEsp32">-</b></div>
@@ -111,16 +111,16 @@
           </div>
 
           <div id="wifiGd32UploadPane" style="display:none;">
-          <div class="upload-zone upload-zone-sm" id="uploadZoneGd32" onclick="pickSharedFirmware('gd32')">
+          <div class="upload-zone upload-zone-sm" id="uploadZoneGd32" data-action="pick-shared-firmware" data-arg="gd32">
             <div class="upload-ico">📤</div>
             <h4>点击或拖拽 GD32 固件</h4>
             <p>支持 .bin 和 .hex（自动转换）</p>
           </div>
-          <input type="file" id="fileInputGd32" accept=".hex,.bin" onchange="handleSharedFileSelect(event, 'gd32')" style="display:none;">
+          <input type="file" id="fileInputGd32" accept=".hex,.bin" style="display:none;">
           <div class="file-info" id="fileInfoGd32">
             <div class="file-info-row">
               <span style="font-weight:600;">📄 <span id="fileNameGd32">-</span></span>
-              <button class="btn btn-ghost btn-sm" onclick="clearSharedFirmware('gd32')">清除</button>
+              <button class="btn btn-ghost btn-sm" data-action="clear-shared-firmware" data-arg="gd32">清除</button>
             </div>
             <div class="file-info-grid">
               <div class="file-meta-item"><span>类型</span><b id="fileTypeGd32">-</b></div>
@@ -134,11 +134,7 @@
           </div>
 
           <div id="bleUploadPane" style="display:none;">
-          <div class="upload-zone upload-zone-sm" id="uploadZone" style="margin-bottom:12px;"
-               onclick="document.getElementById('firmwareFile').click()"
-               ondragover="event.preventDefault();this.classList.add('dragover')"
-               ondragleave="this.classList.remove('dragover')"
-               ondrop="event.preventDefault();this.classList.remove('dragover');var f=event.dataTransfer.files[0];if(f&&window.bleOta)window.bleOta.notifyFileChange(f,null);">
+          <div class="upload-zone upload-zone-sm" id="uploadZone" style="margin-bottom:12px;" data-action="ble-pick-file">
             <div class="upload-ico">📤</div>
             <h4>点击或拖拽文件到此处</h4>
             <p>支持 .bin 和 .hex 格式</p>
@@ -147,7 +143,7 @@
           <div class="file-info" id="fileInfo">
             <div class="file-info-row">
               <span style="font-weight:600;">📄 <span id="fileName">-</span></span>
-              <button id="clearFileBtn" class="btn btn-outline btn-sm" onclick="if(window.bleOta)window.bleOta.clearFile()">清除</button>
+              <button id="clearFileBtn" class="btn btn-outline btn-sm" data-action="ble-clear-file">清除</button>
             </div>
             <div class="file-info-grid">
               <div class="file-meta-item"><span>类型</span><b id="fileType">-</b></div>
@@ -164,12 +160,12 @@
           </div>
           <div style="height:12px"></div>
           <div id="wifiEsp32ActionPane">
-            <button class="btn btn-primary btn-block" id="uploadEsp32Btn" onclick="startUpload('esp32')" disabled>
+            <button class="btn btn-primary btn-block" id="uploadEsp32Btn" data-action="start-upload" data-arg="esp32" disabled>
               上传并升级 ESP32
             </button>
           </div>
           <div id="wifiGd32ActionPane" style="display:none;">
-            <button class="btn btn-success btn-block" id="uploadGd32Btn" onclick="startUpload('gd32')" disabled>
+            <button class="btn btn-success btn-block" id="uploadGd32Btn" data-action="start-upload" data-arg="gd32" disabled>
               GD32 OTA
             </button>
           </div>
@@ -236,7 +232,7 @@
             <div class="svi-row"><span class="svi-key">校验结果</span><span class="svi-val" id="sviResult">-</span></div>
           </div>
           <div style="margin-top:12px;">
-            <button class="btn btn-outline btn-block" onclick="restartEsp32()">重启 ESP32</button>
+            <button class="btn btn-outline btn-block" data-action="restart-esp32">重启 ESP32</button>
           </div>
         </div>
       </div>
@@ -300,7 +296,7 @@
       <div class="card card--mem" style="display:none">
         <div class="card-head">
           <span class="ico">🧾</span> 系统状态 (/system/status)
-          <button class="btn btn-ghost btn-sm card-head-btn" onclick="refreshSystemStatusNow(event)">刷新</button>
+          <button class="btn btn-ghost btn-sm card-head-btn" data-action="refresh-system-status">刷新</button>
         </div>
         <div class="card-body">
           <div class="status-kv-grid">
@@ -514,7 +510,7 @@
   <span id="toastMsg">操作成功</span>
 </div>
 
-<script type="module" src="js/app.js?v=953c41e9"></script>
+<script type="module" src="js/app.js?v=20260727a"></script>
 <script type="module" src="js/ota/console-mode.js?v=06b7189e"></script>
 <script type="module" src="js/ble_ota.js?v=01d3cb4e"></script>
 </body>
