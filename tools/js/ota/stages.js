@@ -106,6 +106,18 @@ function setDisplayedRelayState(rs) {
   updateStagesFromRelayState(rs);
 }
 
+/* 写前比较小工具：每秒轮询里大部分仪表盘字段不变，
+ * 无条件写 textContent/className/title 会白白触发样式失效。 */
+function setNodeText(el, txt) {
+  if (el && el.textContent !== txt) el.textContent = txt;
+}
+function setNodeClass(el, cls) {
+  if (el && el.className !== cls) el.className = cls;
+}
+function setNodeTitle(el, title) {
+  if (el && el.title !== title) el.title = title;
+}
+
 /**
  * 常驻仪表盘：堆、连接、健康、版本、温度、IP/RSSI。
  * @param {object} data  /system/status JSON
@@ -122,28 +134,29 @@ function applyDashboardUi(data, ota, wifi) {
   if (data.version) {
     var pillVerEl = document.getElementById('pillVer');
     if (pillVerEl) {
-      pillVerEl.textContent = 'v' + data.version;
-      pillVerEl.dataset.tooltip = data.build_time ? ('编译: ' + data.build_time) : '';
+      setNodeText(pillVerEl, 'v' + data.version);
+      var verTip = data.build_time ? ('编译: ' + data.build_time) : '';
+      if (pillVerEl.dataset.tooltip !== verTip) pillVerEl.dataset.tooltip = verTip;
     }
     var mGd32App = document.getElementById('mGd32App');
     var mGd32Boot = document.getElementById('mGd32Boot');
     if (mGd32App) {
       if (ota.gd32_app && ota.gd32_app !== 'v0.0.0.0') {
-        mGd32App.textContent = ota.gd32_app;
-        mGd32App.className = 'v ok';
+        setNodeText(mGd32App, ota.gd32_app);
+        setNodeClass(mGd32App, 'v ok');
       } else {
-        mGd32App.textContent = ota.gd32_app_alive ? '未知' : '离线';
-        mGd32App.className = 'v';
+        setNodeText(mGd32App, ota.gd32_app_alive ? '未知' : '离线');
+        setNodeClass(mGd32App, 'v');
       }
     }
     if (mGd32Boot) {
       if (ota.gd32_boot && ota.gd32_boot !== 'v0.0.0.0') {
-        mGd32Boot.textContent = ota.gd32_boot;
-        mGd32Boot.className = 'v ok';
+        setNodeText(mGd32Boot, ota.gd32_boot);
+        setNodeClass(mGd32Boot, 'v ok');
       } else {
         /* BOOT 版本与 APP alive 无直接关系，无版本时统一「未知」 */
-        mGd32Boot.textContent = '未知';
-        mGd32Boot.className = 'v';
+        setNodeText(mGd32Boot, '未知');
+        setNodeClass(mGd32Boot, 'v');
       }
     }
   }
@@ -153,19 +166,19 @@ function applyDashboardUi(data, ota, wifi) {
     /* 与固件 app_config：TEMP_WARNING=80 / TEMP_CRITICAL=100 对齐 */
     if (Number.isFinite(data.temperature)) {
       var tC = data.temperature;
-      mTempEl.textContent = tC.toFixed(1) + '\u00B0C';
+      setNodeText(mTempEl, tC.toFixed(1) + '\u00B0C');
       if (tC >= 100) {
-        mTempEl.className = 'v err';
+        setNodeClass(mTempEl, 'v err');
       } else if (tC >= 80) {
-        mTempEl.className = 'v warn';
+        setNodeClass(mTempEl, 'v warn');
       } else {
-        mTempEl.className = 'v ok';
+        setNodeClass(mTempEl, 'v ok');
       }
-      mTempEl.title = 'ESP32 片内温度传感器（警告≥80°C，危险≥100°C）';
+      setNodeTitle(mTempEl, 'ESP32 片内温度传感器（警告≥80°C，危险≥100°C）');
     } else {
-      mTempEl.textContent = '--';
-      mTempEl.className = 'v';
-      mTempEl.title = '温度无效或未采样';
+      setNodeText(mTempEl, '--');
+      setNodeClass(mTempEl, 'v');
+      setNodeTitle(mTempEl, '温度无效或未采样');
     }
   }
   /* GD32 ADC：enabled 来自 HELLO_ACK 功能位（GD32 编译开关），ESP32 无本地开关 */
@@ -177,9 +190,9 @@ function applyDashboardUi(data, ota, wifi) {
 
   function setMetricUi(el, text, cls, title) {
     if (!el) return;
-    el.textContent = text;
-    el.className = cls || 'v';
-    if (title) el.title = title;
+    setNodeText(el, text);
+    setNodeClass(el, cls || 'v');
+    if (title) setNodeTitle(el, title);
   }
 
   if (mGd32TempEl || mVccEl || mVddaEl) {
@@ -233,12 +246,12 @@ function applyDashboardUi(data, ota, wifi) {
     }
   }
   var uptimeEl = document.getElementById('pillUptime');
-  if (uptimeEl) uptimeEl.textContent = '\u23F1 ' + formatUptime(data.uptime_sec);
+  if (uptimeEl) setNodeText(uptimeEl, '\u23F1 ' + formatUptime(data.uptime_sec));
   var pillIPEl = document.getElementById('pillIP');
-  if (pillIPEl) pillIPEl.textContent = wifi.ip || '--';
+  if (pillIPEl) setNodeText(pillIPEl, wifi.ip || '--');
   var rssi = (wifi.rssi !== undefined && wifi.rssi !== -127) ? wifi.rssi + ' dBm' : '--';
   var pillRSSIEl = document.getElementById('pillRSSI');
-  if (pillRSSIEl) pillRSSIEl.textContent = rssi;
+  if (pillRSSIEl) setNodeText(pillRSSIEl, rssi);
 }
 
 /**

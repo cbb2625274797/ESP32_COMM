@@ -16,6 +16,9 @@ idf_component_register(
         "monitor/cpu_stats.cpp"        # 1Hz FreeRTOS CPU 占用采样任务
         "monitor/can_feedback_task.cpp" # CAN 反馈被动监听（0xC1 takeEvent）+ 分发 0xC4
         "monitor/gd32_adc_feedback.cpp" # GD32 ADC 调试反馈缓存（0xC4）
+        "monitor/motor_state.cpp"      # GD32 多电机状态缓存（0xC5）
+        "monitor/motor_version.cpp"    # GD32 多电机版本缓存（0xC6，事件驱动）
+        "monitor/motor_ota_relay.cpp"  # 电机 OTA relay（0xD0~0xD2）
         "monitor/debug_log.cpp"        # 三路调试日志（UART/UDP/环形缓冲）
         "monitor/task_stack.cpp"       # 任务栈水位收集 + 溢出钩子
     INCLUDE_DIRS
@@ -46,12 +49,3 @@ idf_component_register(
         bt                            # NimBLE BLE 协议栈
 )
 
-# 每次构建时自动刷新 version.h（BUILD_TIME / GIT_HASH）
-add_custom_target(version_header ALL
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
-        -DOUTPUT_FILE=${CMAKE_CURRENT_SOURCE_DIR}/include/version.h
-        -P ${CMAKE_SOURCE_DIR}/cmake/gen_version_script.cmake
-    COMMENT "Refreshing version.h"
-    VERBATIM
-)

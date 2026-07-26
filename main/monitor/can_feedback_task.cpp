@@ -22,6 +22,9 @@
 #include "monitor/debug_log.h"
 #include "monitor/can_feedback_task.h"
 #include "monitor/gd32_adc_feedback.h"
+#include "monitor/motor_state.h"
+#include "monitor/motor_version.h"
+#include "monitor/motor_ota_relay.h"
 #include "app_config.h"
 #include "esp_system.h"
 
@@ -33,6 +36,9 @@ constexpr uint32_t kWaitRingMs      = 500U;    ///< 单次等待 GD32 按铃超�
 constexpr uint32_t kPauseDelayMs    = 100U;    ///< 暂停时的轮询间隔
 constexpr uint8_t  kSpiCanFeedbackType = 0xC1U;
 constexpr uint8_t  kSpiAdcFeedbackType = 0xC4U;  ///< GD32 ADC 调试反馈
+constexpr uint8_t  kSpiMotorStateType  = 0xC5U;  ///< GD32 多电机状态推送
+constexpr uint8_t  kSpiMotorVersionType = 0xC6U; ///< GD32 多电机版本推送（事件驱动）
+constexpr uint8_t  kSpiMotorOtaStatusType = 0xD2U; ///< GD32 电机 OTA relay 进度推送
 constexpr size_t   kRingPayloadMax  = SPI_OTA_FRAME_MAX;  ///< 与变长读一致，避免截断
 constexpr const char *kTag           = "CAN_FB";
 
@@ -99,6 +105,24 @@ static void taskLoop(void *)
         /* 0xC4 ADC 调试反馈：GD32 关开关则不推；ESP32 始终可解析（无本地开关） */
         if (ring_type == kSpiAdcFeedbackType) {
             (void)onGd32AdcFeedbackEvent(ring_payload, ring_len);
+            continue;
+        }
+
+        /* 0xC5 多电机状态推送：GD32 250ms 分页推送，ESP32 解析入缓存 */
+        if (ring_type == kSpiMotorStateType) {
+            (void)onMotorStateEvent(ring_payload, ring_len);
+            continue;
+        }
+
+        /* 0xC6 多电机版本推送：GD32 收到电机版本应答(0x00FF)后事件驱动推送 */
+        if (ring_type == kSpiMotorVersionType) {
+            (void)onMotorVersionEvent(ring_payload, ring_len);
+            continue;
+        }
+
+        /* 0xD2 电机 OTA relay 进度推送 */
+        if (ring_type == kSpiMotorOtaStatusType) {
+            onMotorOtaStatusPush(ring_payload, ring_len);
             continue;
         }
 

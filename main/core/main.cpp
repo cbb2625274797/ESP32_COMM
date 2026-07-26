@@ -34,6 +34,7 @@
 #include "app_config.h"
 #include "ota/esp32_ota_core.h"
 #include "monitor/can_feedback_task.h"
+#include "monitor/motor_ota_relay.h"
 
 /** @brief 创建关键任务；成功返回 true。 */
 static bool createCriticalTask(TaskFunction_t entry, const char *name,
@@ -124,6 +125,8 @@ extern "C" void app_main(void)
     if (spi_l0_ok && startCanFeedbackTask()) {
         SystemBoot::mark(BOOT_CAN_FB_TASK);
     }
+
+    motorOtaRelayInit();
 
     if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
         SystemBoot::mark(BOOT_OTA_VALID);

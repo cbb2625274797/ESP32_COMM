@@ -5,6 +5,9 @@
 
 // HTTP CORS and options
 void http_set_cors_headers(httpd_req_t *req);
+/** @brief 给 GET 轮询接口加 Connection: keep-alive，让浏览器复用 TCP 连接，
+ *         省 4Hz 轮询的握手开销。OTA/relay 等需 close 的 handler 不要调用。 */
+void http_set_keepalive_hdr(httpd_req_t *req);
 esp_err_t http_options_handler(httpd_req_t *req);
 
 // OTA handlers
@@ -27,5 +30,15 @@ esp_err_t system_heap_low_log_handler(httpd_req_t *req);
 // CAN 反馈快照（被动 0xC1）与接收模式
 esp_err_t can_feedback_handler(httpd_req_t *req);
 esp_err_t can_mode_handler(httpd_req_t *req);
+
+// 多电机状态（被动 0xC5）
+esp_err_t motor_state_handler(httpd_req_t *req);
+
+// 多电机版本（被动 0xC6，事件驱动）
+esp_err_t motor_version_handler(httpd_req_t *req);
+esp_err_t motor_ota_upload_handler(httpd_req_t *req);
+esp_err_t motor_ota_relay_handler(httpd_req_t *req);
+esp_err_t motor_ota_status_handler(httpd_req_t *req);
+esp_err_t motor_ota_cancel_handler(httpd_req_t *req);
 
 #endif // HTTP_HANDLERS_H

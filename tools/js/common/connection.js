@@ -19,21 +19,55 @@ import {
   appendHeapLowRecords, loadHeapLowHistory, clearHeapLowHistory, HEAP_HISTORY_MAX
 } from './heap-low-history.js';
 
+// ==================== 渲染缓存（性能） ====================
+// /system/status 每 1s（中继期 400ms）刷一次 UI。此前每轮全量 innerHTML 重建
+// CPU/任务栈列表 + 无条件写几十个节点，引发周期性样式重算/重排/重绘掉帧。
+// 这里统一三条策略：静态元素只查一次、文本/宽度/类名写前比较、列表增量更新。
+var elCache = {};   // id -> element（页面静态节点，仅首次 getElementById）
+function getEl(id) {
+  var el = elCache[id];
+  if (el === undefined || el === null) {
+    el = document.getElementById(id);
+    if (el) elCache[id] = el;   // 未找到不缓存，等节点出现后再查
+  }
+  return el || null;
+}
+/** 写前比较的 textContent 更新：值未变则不触碰 DOM，避免无谓样式失效。 */
+function setTextById(id, value) {
+  var el = getEl(id);
+  if (!el) return;
+  var v = String(value);
+  if (el.textContent !== v) el.textContent = v;
+}
+function setClassIfChanged(el, cls) {
+  if (el && el.className !== cls) el.className = cls;
+}
+function setTextIfChanged(el, txt) {
+  if (el && el.textContent !== txt) el.textContent = txt;
+}
+/** 写前比较的宽度更新：用元素上的 _lastW 缓存避免读回 style 字符串。 */
+function setWidthIfChanged(el, widthStr) {
+  if (el && el._lastW !== widthStr) {
+    el._lastW = widthStr;
+    el.style.width = widthStr;
+  }
+}
+
 // ==================== 连接管理 ====================
 export function updateConnectionUi(connected, text) {
   var label = text || (connected ? '已连接' : '未连接');
   // 仅顶栏连接胶囊（下方连接卡不再重复显示文案）
-  var pc = document.getElementById('pillConn');
-  var pct = document.getElementById('pillConnTxt');
+  var pc = getEl('pillConn');
+  var pct = getEl('pillConnTxt');
   if (pc) {
-    pc.className = connected ? 'pill online' : 'pill offline';
-    if (pct) pct.textContent = label;
+    setClassIfChanged(pc, connected ? 'pill online' : 'pill offline');
+    if (pct) setTextIfChanged(pct, label);
   }
   // 系统状态卡徽章
-  var bc = document.getElementById('bConn');
+  var bc = getEl('bConn');
   if (bc) {
-    bc.textContent = connected ? '在线' : '离线';
-    bc.className = 'v ' + (connected ? 'ok' : 'err');
+    setTextIfChanged(bc, connected ? '在线' : '离线');
+    setClassIfChanged(bc, 'v ' + (connected ? 'ok' : 'err'));
   }
 }
 export function updateHealthUi(healthCode, freeHeap) {
@@ -41,13 +75,12 @@ export function updateHealthUi(healthCode, freeHeap) {
   var health = healthCode !== undefined ? (healthNames[healthCode] || '未知') : '未知';
   /* 连接文案由 updateConnectionUi / 顶栏 pill 负责，不在此拼「设备在线 · 系统正常」 */
   if (freeHeap !== undefined) {
-    var mHeapEl = document.getElementById('mHeap');
-    if (mHeapEl) mHeapEl.textContent = formatBytes(freeHeap);
+    setTextById('mHeap', formatBytes(freeHeap));
   }
-  var mh = document.getElementById('mHealth');
+  var mh = getEl('mHealth');
   if (mh) {
-    mh.textContent = health;
-    mh.className = 'v ' + (healthCode === 0 ? 'ok' : healthCode === 1 ? 'warn' : 'err');
+    setTextIfChanged(mh, health);
+    setClassIfChanged(mh, 'v ' + (healthCode === 0 ? 'ok' : healthCode === 1 ? 'warn' : 'err'));
   }
   ensureHealthBootToggleBound();
 }
@@ -86,11 +119,22 @@ function ensureHealthBootToggleBound() {
 }
 
 /** 启动自检内容（/system/status.boot）；挂在健康状态展开区，非常驻。 */
+/** 启动自检渲染签名：boot 数据启动后不变，签名相同就跳过整段 DOM 重建。 */
+var bootUiSig = null;
+
 function updateBootInitUi(data) {
   var boot = data && data.boot ? data.boot : null;
-  var resultEl = document.getElementById('mBootResult');
-  var failedEl = document.getElementById('mBootFailed');
-  var listEl = document.getElementById('bootModuleList');
+  /* 签名 = 影响渲染的全部字段；每秒轮询里 boot 几乎永远不变，直接短路 */
+  var sig = boot
+    ? [boot.mask, boot.critical_ok, boot.all_ok, boot.summary, boot.failed,
+       Array.isArray(boot.modules) ? boot.modules.length : 0].join('|')
+    : 'none';
+  if (sig === bootUiSig) return;
+  bootUiSig = sig;
+
+  var resultEl = getEl('mBootResult');
+  var failedEl = getEl('mBootFailed');
+  var listEl = getEl('bootModuleList');
   if (!boot) {
     if (resultEl) {
       resultEl.textContent = '--';
@@ -146,23 +190,128 @@ function updateBootInitUi(data) {
   ensureHealthBootToggleBound();
 }
 
+/* ==================== 状态任务列表：增量渲染 ====================
+ * innerHTML 全量重建会重解析 HTML、重建每条 .status-task-bar（其 ::after 微光
+ * 动画随之重启、合成层反复创建销毁），是主页每秒掉帧的主要来源之一。
+ * 这里按 key（任务名）缓存行节点：集合不变时只改数字/宽度，排序变了仅移动节点。
+ * 行结构统一：head(名称/占比) + bar + 3 项 meta。
+ * items: [{ key, rowCls, pctText, width, fillCls, metaLabels[3], metas[3] }]
+ */
+function buildStatusTaskRowHtml(it) {
+  return '' +
+    '<div class="' + it.rowCls + '">' +
+      '<div class="status-task-head">' +
+        '<div class="status-task-name">' + escapeHtml(it.key) + '</div>' +
+        '<div class="status-task-ratio">' + escapeHtml(it.pctText) + '</div>' +
+      '</div>' +
+      '<div class="status-task-bar"><div class="' + it.fillCls + '" style="width:' + it.width + '"></div></div>' +
+      '<div class="status-task-meta">' +
+        '<div><span>' + it.metaLabels[0] + '</span><b>' + escapeHtml(it.metas[0]) + '</b></div>' +
+        '<div><span>' + it.metaLabels[1] + '</span><b>' + escapeHtml(it.metas[1]) + '</b></div>' +
+        '<div><span>' + it.metaLabels[2] + '</span><b>' + escapeHtml(it.metas[2]) + '</b></div>' +
+      '</div>' +
+    '</div>';
+}
+function updateStatusTaskRow(row, it) {
+  var refs = row._refs;
+  if (!refs) {
+    refs = row._refs = {
+      ratio: row.querySelector('.status-task-ratio'),
+      fill: row.querySelector('.status-task-bar > div'),
+      metas: row.querySelectorAll('.status-task-meta b')
+    };
+  }
+  setTextIfChanged(refs.ratio, it.pctText);
+  setClassIfChanged(refs.fill, it.fillCls);
+  setWidthIfChanged(refs.fill, it.width);
+  setTextIfChanged(refs.metas[0], it.metas[0]);
+  setTextIfChanged(refs.metas[1], it.metas[1]);
+  setTextIfChanged(refs.metas[2], it.metas[2]);
+}
+/** 空态提示：内容未变不重写，并清掉行缓存让下次有数据时重建。 */
+function setListEmpty(listEl, html) {
+  var cache = listEl._rowCache;
+  if (cache) { cache.rows = {}; cache.keys = null; }
+  if (listEl._emptyHtml !== html) {
+    listEl._emptyHtml = html;
+    listEl.innerHTML = html;
+  }
+}
+function renderStatusTaskList(listEl, items) {
+  listEl._emptyHtml = null;
+  var cache = listEl._rowCache || (listEl._rowCache = { keys: null, rows: {} });
+  var keys = [];
+  var seen = {};
+  var hasDup = false;
+  for (var i = 0; i < items.length; i++) {
+    var k = items[i].key;
+    if (seen[k]) hasDup = true;
+    seen[k] = true;
+    keys.push(k);
+  }
+  var keyStr = keys.join('\u0001');
+  var sameSet = !hasDup && keys.length === Object.keys(cache.rows).length &&
+    keys.every(function (k2) { return !!cache.rows[k2]; });
+  if (!sameSet) {
+    /* 集合变化（或同名任务无法索引）：一次性重建并缓存行引用 */
+    listEl.innerHTML = items.map(buildStatusTaskRowHtml).join('');
+    cache.rows = {};
+    cache.keys = null;
+    if (!hasDup) {
+      for (var c = 0; c < listEl.children.length; c++) cache.rows[keys[c]] = listEl.children[c];
+      cache.keys = keyStr;
+    }
+    return;
+  }
+  if (keyStr !== cache.keys) {
+    /* 集合相同仅排序变化：按新顺序移动既有节点，不重建、不解析 HTML */
+    for (var m = 0; m < keys.length; m++) listEl.appendChild(cache.rows[keys[m]]);
+    cache.keys = keyStr;
+  }
+  for (var u = 0; u < items.length; u++) updateStatusTaskRow(cache.rows[keys[u]], items[u]);
+}
+
+/* 原始 JSON 折叠面板：收起时跳过 JSON.stringify + 大段文本重排；
+ * 展开瞬间用 window.latestSystemStatus 补渲染，行为与之前一致。 */
+var statusJsonBound = false;
+function renderStatusJsonIfVisible(data) {
+  var statusJson = getEl('statusJson');
+  if (!statusJson) return;
+  var fold = getEl('statusJsonFold');
+  if (!statusJsonBound && fold) {
+    statusJsonBound = true;
+    var head = fold.querySelector('.status-subfold-head');
+    var renderLatest = function () {
+      /* 内联 onclick/onkeydown 已先切换 collapsed，这里只补展开后的内容 */
+      if (!fold.classList.contains('collapsed') && window.latestSystemStatus) {
+        statusJson.textContent = JSON.stringify(window.latestSystemStatus, null, 2);
+      }
+    };
+    if (head) {
+      head.addEventListener('click', renderLatest);
+      head.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') renderLatest();
+      });
+    }
+  }
+  if (fold && fold.classList.contains('collapsed')) return;
+  statusJson.textContent = JSON.stringify(data, null, 2);
+}
+
 export function updateHeapAndTaskStatusUi(data) {
   if (!data) return;
   var formatPercent = window.formatPercent;
   var ota = data.ota || {};
-  var setText = function (id, value) {
-    var el = document.getElementById(id);
-    if (el) el.textContent = value;
-  };
+  var setText = function (id, value) { setTextById(id, value); };
 
   updateBootInitUi(data);
 
   // ---- 堆概况：已用 / 总计 + 占用条 ----
   function setFill(id, pct) {
-    var el = document.getElementById(id);
+    var el = getEl(id);
     if (!el) return;
-    el.style.width = Math.max(0, Math.min(100, pct)) + '%';
-    el.className = 'heap-bar-fill' + (pct >= 85 ? ' danger' : pct >= 70 ? ' warn' : '');
+    setWidthIfChanged(el, Math.max(0, Math.min(100, pct)) + '%');
+    setClassIfChanged(el, 'heap-bar-fill' + (pct >= 85 ? ' danger' : pct >= 70 ? ' warn' : ''));
   }
   function setBar(usageId, fillId, pctId, free, total) {
     if (free === undefined || total === undefined) {
@@ -176,15 +325,15 @@ export function updateHeapAndTaskStatusUi(data) {
     setText(pctId, pct.toFixed(1) + '%');
   }
   function setCpuFill(pct) {
-    var el = document.getElementById('cpuUsageFill');
+    var el = getEl('cpuUsageFill');
     if (!el) return;
     var safePct = Math.max(0, Math.min(100, Number(pct) || 0));
-    el.style.width = safePct + '%';
-    el.className = 'heap-bar-fill cpu-fill' + (safePct >= 85 ? ' danger' : safePct >= 70 ? ' warn' : '');
+    setWidthIfChanged(el, safePct + '%');
+    setClassIfChanged(el, 'heap-bar-fill cpu-fill' + (safePct >= 85 ? ' danger' : safePct >= 70 ? ' warn' : ''));
   }
   function updateCpuUsageUi(cpuData) {
     cpuData = cpuData || {};
-    var taskList = document.getElementById('cpuTaskList');
+    var taskList = getEl('cpuTaskList');
     if (!cpuData.available) {
       setText('cpuUsageText', '未启用 FreeRTOS 统计');
       setText('cpuUsagePct', '--');
@@ -192,7 +341,7 @@ export function updateHeapAndTaskStatusUi(data) {
       setText('cpuSampleMs', '--');
       setText('cpuTaskCount', '--');
       setCpuFill(0);
-      if (taskList) taskList.innerHTML = '<div class="status-empty">固件未启用 CPU runtime stats</div>';
+      if (taskList) setListEmpty(taskList, '<div class="status-empty">固件未启用 CPU runtime stats</div>');
       return;
     }
     if (!cpuData.valid) {
@@ -202,15 +351,19 @@ export function updateHeapAndTaskStatusUi(data) {
       setText('cpuSampleMs', '--');
       setText('cpuTaskCount', '--');
       setCpuFill(0);
-      if (taskList) taskList.innerHTML = '<div class="status-empty">首次刷新只建立基线，下一次刷新后显示 CPU 占用</div>';
+      if (taskList) setListEmpty(taskList, '<div class="status-empty">首次刷新只建立基线，下一次刷新后显示 CPU 占用</div>');
       return;
     }
     var usagePct = Number(cpuData.usage_pct) || 0;
     var idlePct = Number(cpuData.idle_pct) || 0;
     var sampleMs = Number(cpuData.sample_ms) || 0;
     var tasks = Array.isArray(cpuData.tasks) ? cpuData.tasks.slice() : [];
+    /* 按占用率降序；占比相同再按任务号，保证排序稳定。
+     * renderStatusTaskList 在集合不变时只 appendChild 调序，不重建 DOM。 */
     tasks.sort(function (a, b) {
-      return (Number(b.usage_pct) || 0) - (Number(a.usage_pct) || 0);
+      var d = (Number(b.usage_pct) || 0) - (Number(a.usage_pct) || 0);
+      if (d !== 0) return d;
+      return (Number(a.task_number) || 0) - (Number(b.task_number) || 0);
     });
 
     setText('cpuUsageText', 'CPU 已用 ' + formatPercent(usagePct));
@@ -221,28 +374,24 @@ export function updateHeapAndTaskStatusUi(data) {
     setCpuFill(usagePct);
 
     if (taskList) {
-      /* 按占用降序渲染全部任务；列表容器 CSS 默认露出约 3 条，其余滚动 */
+      /* 按占用降序渲染全部任务；列表容器 CSS 默认露出约 3 条，其余滚动。
+       * 增量更新：集合不变时只改数字/宽度，避免每秒 innerHTML 全量重建 */
       if (!tasks.length) {
-        taskList.innerHTML = '<div class="status-empty">当前采样没有任务增量</div>';
+        setListEmpty(taskList, '<div class="status-empty">当前采样没有任务增量</div>');
       } else {
-        taskList.innerHTML = tasks.map(function (task) {
+        renderStatusTaskList(taskList, tasks.map(function (task) {
           var pct = Number(task.usage_pct) || 0;
           var delta = Number(task.runtime_delta) || 0;
-          var fillClass = pct >= 85 ? 'err' : pct >= 70 ? 'warn' : '';
-          return '' +
-            '<div class="status-task cpu-task">' +
-              '<div class="status-task-head">' +
-                '<div class="status-task-name">' + escapeHtml(task.name || 'task') + '</div>' +
-                '<div class="status-task-ratio">' + escapeHtml(formatPercent(pct)) + '</div>' +
-              '</div>' +
-              '<div class="status-task-bar"><div class="status-task-bar-fill ' + fillClass + '" style="width:' + Math.max(0, Math.min(100, pct)) + '%"></div></div>' +
-              '<div class="status-task-meta">' +
-                '<div><span>任务号</span><b>' + escapeHtml(task.task_number) + '</b></div>' +
-                '<div><span>增量</span><b>' + escapeHtml(delta) + '</b></div>' +
-                '<div><span>占比</span><b>' + escapeHtml(formatPercent(pct)) + '</b></div>' +
-              '</div>' +
-            '</div>';
-        }).join('');
+          return {
+            key: String(task.name || 'task'),
+            rowCls: 'status-task cpu-task',
+            pctText: formatPercent(pct),
+            width: Math.max(0, Math.min(100, pct)) + '%',
+            fillCls: 'status-task-bar-fill' + (pct >= 85 ? ' err' : pct >= 70 ? ' warn' : ''),
+            metaLabels: ['任务号', '增量', '占比'],
+            metas: [String(task.task_number), String(delta), formatPercent(pct)]
+          };
+        }));
       }
     }
   }
@@ -321,8 +470,8 @@ export function updateHeapAndTaskStatusUi(data) {
         setText('mRtcFree', '--');
         setText('mAllocBlocks', '--');
         ['memSegIram', 'memSegData', 'memSegBss', 'memSegUsed', 'memSegFree'].forEach(function (id) {
-          var el = document.getElementById(id);
-          if (el) el.style.width = '0%';
+          var el = getEl(id);
+          if (el) setWidthIfChanged(el, '0%');
         });
         return;
       }
@@ -365,10 +514,10 @@ export function updateHeapAndTaskStatusUi(data) {
       ? formatBytes(Number(mem.task_stack_total)) : '--');
 
     function setSeg(id, bytes) {
-      var el = document.getElementById(id);
+      var el = getEl(id);
       if (!el) return;
       var pct = sramTotal > 0 ? (bytes * 100 / sramTotal) : 0;
-      el.style.width = Math.max(0, Math.min(100, pct)) + '%';
+      setWidthIfChanged(el, Math.max(0, Math.min(100, pct)) + '%');
     }
     setSeg('memSegIram', iram);
     setSeg('memSegData', dataSz);
@@ -410,12 +559,12 @@ export function updateHeapAndTaskStatusUi(data) {
   if (Number.isFinite(ota.relay_state)) window.lastRelayState = ota.relay_state;
   setText('sStatusUpdated', formatTime(new Date()));
 
-  var taskList = document.getElementById('taskStackList');
+  var taskList = getEl('taskStackList');
   if (taskList) {
     var taskStack = data.task_stack || {};
     var names = Object.keys(taskStack);
     if (!names.length) {
-      taskList.innerHTML = '<div class="status-empty">当前状态未包含任务栈信息</div>';
+      setListEmpty(taskList, '<div class="status-empty">当前状态未包含任务栈信息</div>');
     } else {
       /* 峰值占用比例降序；容器默认露出最高 3 条，其余滚动 */
       names.sort(function (a, b) {
@@ -427,34 +576,28 @@ export function updateHeapAndTaskStatusUi(data) {
         var pb = sb > 0 ? ((Number(ib.peak_used_bytes) || 0) * 100 / sb) : 0;
         return pb - pa;
       });
-      taskList.innerHTML = names.map(function (name) {
+      /* 增量更新：任务集合稳定时仅改变化的数值，不重建 DOM */
+      renderStatusTaskList(taskList, names.map(function (name) {
         var item = taskStack[name] || {};
         var stackSize = Number(item.stack_size_bytes) || 0;
         var watermark = Number(item.high_watermark_bytes) || 0;
         var peakUsed = Number(item.peak_used_bytes) || 0;
         var usagePct = stackSize > 0 ? (peakUsed * 100 / stackSize) : 0;
-        var fillClass = usagePct >= 85 ? 'err' : usagePct >= 70 ? 'warn' : '';
-        return '' +
-          '<div class="status-task">' +
-            '<div class="status-task-head">' +
-              '<div class="status-task-name">' + escapeHtml(name) + '</div>' +
-              '<div class="status-task-ratio">' + escapeHtml(formatPercent(usagePct)) + '</div>' +
-            '</div>' +
-            '<div class="status-task-bar"><div class="status-task-bar-fill ' + fillClass + '" style="width:' + Math.max(0, Math.min(100, usagePct)) + '%"></div></div>' +
-            '<div class="status-task-meta">' +
-              '<div><span>栈大小</span><b>' + escapeHtml(formatBytes(stackSize)) + '</b></div>' +
-              '<div><span>剩余水位</span><b>' + escapeHtml(formatBytes(watermark)) + '</b></div>' +
-              '<div><span>峰值占用</span><b>' + escapeHtml(formatBytes(peakUsed)) + '</b></div>' +
-            '</div>' +
-          '</div>';
-      }).join('');
+        return {
+          key: name,
+          rowCls: 'status-task',
+          pctText: formatPercent(usagePct),
+          width: Math.max(0, Math.min(100, usagePct)) + '%',
+          fillCls: 'status-task-bar-fill' + (usagePct >= 85 ? ' err' : usagePct >= 70 ? ' warn' : ''),
+          metaLabels: ['栈大小', '剩余水位', '峰值占用'],
+          metas: [formatBytes(stackSize), formatBytes(watermark), formatBytes(peakUsed)]
+        };
+      }));
     }
   }
 
-  var statusJson = document.getElementById('statusJson');
-  if (statusJson) {
-    statusJson.textContent = JSON.stringify(data, null, 2);
-  }
+  /* 原始 JSON：折叠时跳过序列化与大段文本写入（展开瞬间自动补渲染） */
+  renderStatusJsonIfVisible(data);
 }
 /** 从设备 IP 推导网关 IP（取前三段 + .1） */
 function getGatewayIp() {

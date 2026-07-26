@@ -396,31 +396,48 @@ esp_err_t WifiOta::httpServerStart()
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_SERVER_PORT;
     config.stack_size = HTTP_SERVER_STACK_SIZE;
-    config.max_uri_handlers = 32;  // 现有业务端点 + 对应 OPTIONS 预检
-    /* Socket 预算（无法“合并” httpd 内部 3 个 fd：listen + ctrl 对）：
+    /* 路由上限：当前 18 个 main handler + 17 个唯一 path 的 OPTIONS = 35 次注册。
+     * max_uri_handlers 必须 ≥ 该总数，否则超出部分被 httpd 静默丢弃
+     *（httpd_register_uri_handler 返回 ESP_ERR_HTTPD_HANDLERS_FULL，下方已检查并报错）。
+     * 曾因 =32 导致按注册顺序排在末尾的 /motor/ota/cancel(POST) 未注册，
+     * 取消请求恒返回 404、httpd 其它读取被在途 SPI 事务短暂饿死后才回 404。
+     * 取 48 留足后续新增端点余量（每槽仅一个指针，内存开销可忽略）。 */
+    config.max_uri_handlers = 48;
+    /* Socket 预算（无法“合并”httpd 内部 3 个 fd：listen + ctrl 对）：
      *
-     *   LWIP 总池 CONFIG_LWIP_MAX_SOCKETS
-     *     ├─ httpd 内部固定 3
+     *   LWIP 总池 CONFIG_LWIP_MAX_SOCKETS = 12
+     *     ├─ httpd 内部固定 3（listen + ctrl socket 对）
      *     ├─ max_open_sockets = 业务并发（下面 want）
      *     └─ 余量：UDP 调试日志 1 + 偶发其它
      *
-     * 约束：max_open_sockets <= LWIP_MAX_SOCKETS - 3
+     * 约束：max_open_sockets <= LWIP_MAX_SOCKETS - 3 = 9
      *
-     * 业务并发压到 4（tools 单浏览器已足够）：
-     *   1× /system/status 轮询 + 1× /logs 轮询 + 1× 操作(OTA/CAN) + 1× 余量
-     * OTA 大上传期间前端 pausePolling，只占 1 条长连接，不与轮询抢槽。
+     * 业务并发需要 6（前端三链路 motor/feedback/status + OTA 上传 + 操作 + 余量）：
+     *   - motor.html 独立 3 条轮询链路（已剥离互不阻塞）
+     *   - OTA 大上传占 1 条长连接
+     *   - 双 tab / 偶发脚本 1 条
+     *   - 余量 1
+     * 4 太紧会触发 lru_purge 踢连接，表现为「请求挂起 + age 不动」。
      * lru_purge：满槽时踢最久空闲连接，避免 EMFILE 卡死。
      * 硬编码 7 在 LWIP=8 时会 ESP_ERR_INVALID_ARG → HTTP 起不来。 */
     {
         const int lwip_cap = CONFIG_LWIP_MAX_SOCKETS - 3;  // httpd 硬上限
-        const int want = 4;  // 合并并发需求后的业务槽位（原 7 偏松）
+        const int want = 6;  // 前端 3 链路 + OTA + 操作 + 余量
         config.max_open_sockets = (lwip_cap < want) ? ((lwip_cap > 1) ? lwip_cap : 1) : want;
     }
     /* 满连接时淘汰最久未用的空闲 socket（相当于“复用/腾挪”槽位） */
     config.lru_purge_enable = true;
-    /* idle 收发超时（秒）；进行中的 handler 连接不受此 idle 检测踢掉 */
-    config.recv_wait_timeout = 10;
-    config.send_wait_timeout = 10;
+    /* idle 收发超时（秒）；进行中的 handler 连接不受此 idle 检测踢掉。
+     * 缩到 5s：WiFi 暴断时挂死连接更快释放槽位，避免长时占满 6 槽导致卡顿。 */
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
+    /* TCP keep-alive 探针：5s idle 无数据 → 每 1s 探测 3 次失败立即踢。
+     * 不依赖 recv_wait_timeout（要等 socket 主动读失败），WiFi 半挂/暴断时
+     * 探针能更快感知，槽位早释放。原默认 false 会让断连占槽到 5s 超时。 */
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = 5;
+    config.keep_alive_interval = 1;
+    config.keep_alive_count = 3;
 
     DEBUG_INFO("WIFI", "=== 启动 HTTP OTA 服务器 ===");
     DEBUG_INFO("WIFI", "HTTP 服务器端口: %d", config.server_port);
@@ -460,6 +477,12 @@ esp_err_t WifiOta::httpServerStart()
         {"/can/mode",      HTTP_GET,  can_mode_handler},
         {"/can/mode",      HTTP_POST, can_mode_handler},
         {"/spi/send",      HTTP_POST, spi_send_handler},
+        {"/motor/state",   HTTP_GET,  motor_state_handler},
+        {"/motor/version", HTTP_GET,  motor_version_handler},
+        {"/motor/ota",       HTTP_POST, motor_ota_upload_handler},
+        {"/motor/ota/relay", HTTP_POST, motor_ota_relay_handler},
+        {"/motor/ota/status", HTTP_GET,  motor_ota_status_handler},
+        {"/motor/ota/cancel", HTTP_POST, motor_ota_cancel_handler},
     };
 
     /* 同一 path 可有多 method（如 GET+POST）；OPTIONS 每个 path 只注册一次，
@@ -471,7 +494,13 @@ esp_err_t WifiOta::httpServerStart()
         main_uri.method = r.method;
         main_uri.handler = r.handler;
         main_uri.user_ctx = NULL;
-        httpd_register_uri_handler(WifiOta::instance().m_httpServer, &main_uri);
+        esp_err_t reg_err = httpd_register_uri_handler(WifiOta::instance().m_httpServer, &main_uri);
+        if (reg_err != ESP_OK) {
+            /* 静默丢弃会导致对应端点 404（如曾经的 /motor/ota/cancel）。
+             * 明确报错，提示提高 max_uri_handlers。 */
+            DEBUG_ERR("WIFI", "URI 注册失败 %s method=%d: %s（提高 max_uri_handlers）",
+                      r.uri, (int)r.method, esp_err_to_name(reg_err));
+        }
 
         bool need_opts = true;
         for (size_t j = 0; j < i; ++j) {
@@ -486,7 +515,11 @@ esp_err_t WifiOta::httpServerStart()
             opts_uri.method = HTTP_OPTIONS;
             opts_uri.handler = http_options_handler;
             opts_uri.user_ctx = NULL;
-            httpd_register_uri_handler(WifiOta::instance().m_httpServer, &opts_uri);
+            esp_err_t opts_err = httpd_register_uri_handler(WifiOta::instance().m_httpServer, &opts_uri);
+            if (opts_err != ESP_OK) {
+                DEBUG_ERR("WIFI", "OPTIONS 注册失败 %s: %s（提高 max_uri_handlers）",
+                          r.uri, esp_err_to_name(opts_err));
+            }
         }
     }
 

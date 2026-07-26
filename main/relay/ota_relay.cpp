@@ -458,7 +458,7 @@ ota_result_t OtaRelay::forwardFirmware()
     if (meta.total_size == 0U || meta.stored_size < meta.total_size) {
         DEBUG_ERR("OTA", "固件未完整存储 stored=%" PRIu32 " total=%" PRIu32,
                   meta.stored_size, meta.total_size);
-        reset();
+        abortRemoteAndReset(true);  /* 顺带清上次远端半会话 */
         return OTA_RESULT_ERR_STORAGE;
     }
     {
@@ -468,7 +468,7 @@ ota_result_t OtaRelay::forwardFirmware()
             esp_err_t verify_err = Gd32FlashStore::instance().metaVerifyChecksum();
             if (verify_err != ESP_OK) {
                 DEBUG_ERR("OTA", "固件完整性校验失败，中止转发");
-                reset();
+                abortRemoteAndReset(true);
                 return OTA_RESULT_ERR_CRC;
             }
         } else {
@@ -498,7 +498,8 @@ ota_result_t OtaRelay::forwardFirmware()
 
     if (res != OTA_RESULT_OK) {
         DEBUG_ERR("OTA", "中继失败: result=%d, state=%d", (int)res, (int)getState());
-        reset();
+        /* 必须通知 GD32 CANCEL，否则远端停在 WAITING_* 半会话 */
+        abortRemoteAndReset(true);
     } else {
         /* 成功路径：解除按铃抑制（reset 也会做，成功时状态机可能停在 DONE） */
         SpiMaster::instance().setSuppressRingService(false);
@@ -545,6 +546,39 @@ void OtaRelay::reset()
     clearSessionCryptoState();
     SpiMaster::instance().setSuppressRingService(false);
     DEBUG_INFO("OTA", "状态机已复位 → IDLE");
+}
+
+/**
+ * @brief 向 GD32 发送 OTA CANCEL，驱动远端 resetToIdle（含 CREDIT/缓冲清理）。
+ *
+ * 失败路径必须调用：本端 reset() 只清 ESP32 状态机，GD32 仍可能停在
+ * WAITING_RANDOM / WAITING_CONFIRM 等半会话，导致下次握手/进度错乱。
+ */
+esp_err_t OtaRelay::sendRemoteCancel()
+{
+    uint8_t resp_type = 0;
+    uint8_t resp_payload[8] = {0};
+    size_t resp_len = 0;
+    /* payload 可空；GD32 CANCEL 分支无条件 resetToIdle 并 ACK 0x03 */
+    esp_err_t err = SpiMaster::instance().transact(
+        SPI_OTA_CMD_CANCEL, nullptr, 0,
+        &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
+        1500U);
+    if (err != ESP_OK) {
+        DEBUG_WARN("OTA", "远端 CANCEL 发送失败: %s（本端仍复位）", esp_err_to_name(err));
+        return err;
+    }
+    DEBUG_INFO("OTA", "远端 CANCEL 已发送, resp t=0x%02X n=%zu", resp_type, resp_len);
+    return ESP_OK;
+}
+
+void OtaRelay::abortRemoteAndReset(bool notify_remote)
+{
+    if (notify_remote) {
+        /* 中继失败时 suppress 可能仍为 true，CANCEL 需能走 SPI 事务 */
+        (void)sendRemoteCancel();
+    }
+    reset();
 }
 
 // ============================================================
@@ -965,8 +999,12 @@ ota_result_t OtaRelay::sendAndWaitAckShape(const char *stage, uint8_t cmd,
     esp_err_t err = SpiMaster::instance().transact(cmd, payload, payload_len,
                                                    &resp_type, resp_payload, resp_max, resp_len, transact_timeout_ms);
     logRespPayload(stage, resp_type, resp_payload, *resp_len);
-    err = pollUntilExpectedAckShape(stage, &resp_type, resp_payload, resp_max, resp_len,
-                                    poll_timeout_ms, wait_rounds, max_extra_polls, matcher);
+    /* transact 已超时/失败时勿再 pollUntil：否则 resp_type 仍为 0，会刷
+     * "unexpected type=0x00" 并二次空等，掩盖真实超时。 */
+    if (err == ESP_OK) {
+        err = pollUntilExpectedAckShape(stage, &resp_type, resp_payload, resp_max, resp_len,
+                                        poll_timeout_ms, wait_rounds, max_extra_polls, matcher);
+    }
     if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK || !matcher(resp_payload, *resp_len)) {
         DEBUG_ERR("OTA", "%s fail err=%d t=0x%02X n=%zu",
                   stage, err, resp_type, *resp_len);
@@ -1473,7 +1511,8 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
 
     if (!getGd32AppAlive()) {
         DEBUG_ERR("OTA", "GD32 APP 启动确认超时，OTA 失败");
-        reset();
+        /* APP 未起来时 CANCEL 可能无效，仍尽力清理 BOOT 半会话 */
+        abortRemoteAndReset(true);
         return OTA_RESULT_ERR_GD32;
     }
 
@@ -1581,16 +1620,19 @@ void OtaRelay::taskEntry(void *pvParameters)
         xQueueSend(resultQueue, &result_msg, pdMS_TO_TICKS(100));
 
         if (result == OTA_RESULT_OK) {
-            // 成功日志已在 doWaitForAppAlive 输出，此处不再重复
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            // 成功日志已在 doWaitForAppAlive 输出，立即通知协调器置完成态
+            instance().reset();  /* 本端清会话；GD32 已跳 APP */
         } else if (result == OTA_RESULT_ERR_TIMEOUT) {
             DEBUG_ERR("OTA", "OTA超时中止 TIMEOUT=%d", (int)result);
+            /* forwardFirmware 失败路径已 abortRemoteAndReset；再调一次无害（二次 CANCEL） */
+            instance().abortRemoteAndReset(true);
         } else if (result == OTA_RESULT_ERR_USER_ABORT) {
             DEBUG_ERR("OTA", "OTA 用户中止 (USER_ABORT=%d)", (int)result);
+            instance().abortRemoteAndReset(true);
         } else {
             DEBUG_ERR("OTA", "OTA 转发失败，错误码: %d", (int)result);
+            instance().abortRemoteAndReset(true);
         }
-        instance().reset();
         // 通过 IRelayListener 接口回调通知协调器中继结束
         listener = getRelayListener();
         if (listener) listener->onRelayComplete(result == OTA_RESULT_OK);

@@ -75,9 +75,37 @@ const esp_partition_t* Gd32FlashStore::getPartition()
 // Flash 分区读写
 // ============================================================
 
-void Gd32FlashStore::beginWriteSession()
+void Gd32FlashStore::beginWriteSession(bool full_erase)
 {
     m_erasedUpTo = 0;
+    if (!full_erase) {
+        return;  // GD32 OTA：保持原优化，由 flashWriteChunk 按需擦除与收流交织
+    }
+    /* ★ motor OTA：强制擦除整个 gd32_ota 分区，而不是只重置水位。
+     * 之前只重置 m_erasedUpTo=0，依赖 flashWriteChunk 按需擦除覆盖到的扇区，
+     * 导致两类隐患：
+     *   1. 上次刷的更大固件在高位扇区残留，本次若擦除位错误会与残留 AND 产生位翻转
+     *      （正是 0xAC20 处 0x19→0x18 单 bit 翻转的根因）。
+     *   2. ensureErasedForWrite 按水位推进，若某次擦除返回 OK 但物理失败，
+     *      旧数据残留 + AND 语义写入 = 静默位错误。
+     * 强制全擦（252KB ~200ms）确保每次上传从全 0xFF 干净状态开始，
+     * 即使新固件只覆盖前 44KB，剩余高位扇区也回到擦除态，杜绝残留干扰。
+     * 擦除失败立刻报错，不让坏状态继续。 */
+    const esp_partition_t *part = getPartition();
+    if (!part) {
+        DEBUG_ERR("OTA", "beginWriteSession: 分区未找到，无法预擦除");
+        return;
+    }
+    esp_err_t err = erasePartition(part->size);
+    if (err != ESP_OK) {
+        DEBUG_ERR("OTA", "beginWriteSession: 预擦除整个分区失败: %s", esp_err_to_name(err));
+        /* 不 return（void 函数）；后续 flashWriteChunk 的 ensureErasedForWrite
+         * 仍会尝试擦除目标扇区，给数据写入多一次机会。 */
+    } else {
+        m_erasedUpTo = part->size;  /* 全擦完成，后续 ensureErasedForWrite 全部跳过 */
+        DEBUG_INFO("OTA", "beginWriteSession: 已预擦除整个 gd32_ota 分区 (%lu B)",
+                   (unsigned long)part->size);
+    }
 }
 
 /** @brief 确保 [offset, offset+len) 覆盖的扇区已擦除（从 m_erasedUpTo 顺序推进）。 */

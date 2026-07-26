@@ -171,12 +171,15 @@ export function cleanupAfterOtaFailure(reason) {
   setActivePhase(null);
   window.currentOtaTarget = null;
 
-  // 4. 恢复上传按钮（两枚都解禁并恢复原文案，避免 chip 判错或一侧残留"上传中"）
-  ['uploadEsp32Btn', 'uploadGd32Btn'].forEach(function (btnId) {
+  // 4. 恢复上传按钮（两枚都解禁并恢复各自原文案，避免 chip 判错或一侧残留"上传中"）
+  //    ★ 按钮文案是固定的，绝不能用共享的 uploadBtnOrigText 回写两枚，否则最后
+  //      刷 GD32 后 ESP32 按钮会被错写成 "GD32 OTA"（反之亦然）。
+  var uploadBtnLabels = { uploadEsp32Btn: '上传并升级 ESP32', uploadGd32Btn: 'GD32 OTA' };
+  Object.keys(uploadBtnLabels).forEach(function (btnId) {
     var btn = document.getElementById(btnId);
     if (!btn) return;
     btn.disabled = false;
-    if (window.uploadBtnOrigText) btn.textContent = window.uploadBtnOrigText;
+    btn.textContent = uploadBtnLabels[btnId];
   });
   window.activeUploadChip = null;
   window.otaSessionTarget = null;

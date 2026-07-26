@@ -28,6 +28,7 @@
 // GD32 SPI 业务 TYPE（与 SpiDefs / v2 TYPE 字段一致）
 #define SPI_OTA_CMD_REQ       (0x01)
 #define SPI_OTA_CMD_DATA      (0x02)
+#define SPI_OTA_CMD_CANCEL    (0x03)  /* 中止 OTA 会话 → GD32 resetToIdle */
 #define SPI_APP_ENTER_BOOT_CMD (0xB0)
 #define SPI_APP_ENTER_BOOT_ACK_OK (0xB5)
 #define SPI_OTA_RSP_ACK       (0x80)
@@ -463,7 +464,7 @@ private:
                               uint8_t *out, size_t *out_len);
     static bool otaFindFrame(const uint8_t *buf, size_t buf_len,
                              uint8_t *type, const uint8_t **payload, size_t *payload_len,
-                             size_t *frame_offset);
+                             size_t *frame_offset, uint8_t *out_flags = nullptr);
 };
 
 #endif // SPI_MASTER_H

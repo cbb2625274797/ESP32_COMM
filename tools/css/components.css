@@ -136,14 +136,15 @@
   box-shadow: 0 8px 20px rgba(3,7,16,.4);
 }
 .metric .k {
-  font-family: var(--font-display);
-  font-size: 10px; color: var(--text-label);
-  text-transform: uppercase; letter-spacing: .13em; margin-bottom: 5px;
+  font-family: var(--font);
+  font-size: 11px; font-weight: 500; color: var(--text-label);
+  letter-spacing: .04em; margin-bottom: 6px;
 }
 .metric .v {
-  font-family: var(--font-display);
-  font-size: 21px; font-weight: 700; word-break: break-word;
-  font-variant-numeric: tabular-nums; letter-spacing: .01em;
+  font-family: var(--font);
+  font-size: 20px; font-weight: 700; line-height: 1.2;
+  word-break: break-word;
+  font-variant-numeric: tabular-nums;
 }
 .metric .v.highlight, .metric .v.accent { color: var(--esp32-hi); }
 .metric .v.ok   { color: var(--green); }

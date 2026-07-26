@@ -72,9 +72,10 @@ public:
 
     /**
      * @brief 新一轮 GD32 固件写入会话开始时调用：复位擦除水位。
-     *        后续 flashWriteChunk 经 ensureErasedForWrite 按需擦扇区。
+     * @param full_erase true=强制擦除整个分区（motor OTA 用，杜绝旧固件残留导致的位错误）；
+     *                   false=只重置水位，由 flashWriteChunk 按需擦扇区（GD32 OTA 用，与收流交织）。
      */
-    void beginWriteSession();
+    void beginWriteSession(bool full_erase = false);
 
     // ── NVS 元数据持久化 ──
 

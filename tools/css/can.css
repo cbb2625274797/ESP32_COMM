@@ -5,9 +5,9 @@
 }
 .can-launch-card {
   background:
-    radial-gradient(circle at top right, rgba(34,211,238,.18), transparent 28%),
+    radial-gradient(circle at top right, rgba(67,217,123,.16), transparent 28%),
     linear-gradient(138deg, rgba(18,29,41,.96), rgba(20,29,40,.92) 48%, rgba(14,21,31,.98) 100%);
-  border: 1px solid rgba(34,211,238,.14);
+  border: 1px solid rgba(67,217,123,.16);
   border-radius: 14px;
   padding: 20px;
   box-shadow:
@@ -21,7 +21,7 @@
   position: absolute;
   inset: 0 auto 0 0;
   width: 4px;
-  background: linear-gradient(180deg, rgba(34,211,238,.9), rgba(34,211,238,.18));
+  background: linear-gradient(180deg, rgba(67,217,123,.9), rgba(67,217,123,.18));
 }
 .can-launch-copy {
   position: relative;
@@ -46,7 +46,7 @@
   max-width: 700px;
 }
 .can-launch-kicker {
-  color: #88ecff;
+  color: #8ef0b4;
   font-size: 10px;
   letter-spacing: .18em;
   text-transform: uppercase;
@@ -57,9 +57,9 @@
   align-items: center;
   padding: 7px 12px;
   border-radius: 999px;
-  background: rgba(34,211,238,.08);
-  border: 1px solid rgba(34,211,238,.18);
-  color: #a9f4ff;
+  background: rgba(67,217,123,.09);
+  border: 1px solid rgba(67,217,123,.22);
+  color: #a9f5c8;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: .12em;
@@ -88,8 +88,8 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 10px rgba(34,211,238,.35);
+  background: var(--can);
+  box-shadow: 0 0 10px rgba(67,217,123,.35);
 }
 .can-launch-actions {
   display: grid;
@@ -104,7 +104,9 @@
   min-height: 42px;
 }
 .can-launch-primary {
-  box-shadow: 0 10px 24px rgba(34,211,238,.18);
+  background: linear-gradient(135deg, var(--can) 0%, #22b45f 100%);
+  color: #04240f;
+  box-shadow: 0 10px 24px rgba(67,217,123,.2);
 }
 .can-launch-secondary {
   color: #d5e4f4;
@@ -113,7 +115,7 @@
 }
 .can-launch-secondary:hover:not(:disabled) {
   background: rgba(255,255,255,.05);
-  border-color: rgba(34,211,238,.18);
+  border-color: rgba(67,217,123,.25);
 }
 .can-launch-foot {
   display: flex;
@@ -128,6 +130,35 @@
   position: relative;
   z-index: 1;
 }
+/* 电机入口：复用 can-launch 布局，换青色强调 */
+.motor-launch-card {
+  background:
+    radial-gradient(circle at top right, rgba(34,211,238,.16), transparent 28%),
+    linear-gradient(138deg, rgba(18,29,41,.96), rgba(20,29,40,.92) 48%, rgba(14,21,31,.98) 100%);
+  border-color: rgba(34,211,238,.16);
+}
+.motor-launch-card::before {
+  background: linear-gradient(180deg, rgba(34,211,238,.9), rgba(34,211,238,.18));
+}
+.motor-launch-card .can-launch-kicker { color: #67e8f9; }
+.motor-launch-card .can-launch-badge {
+  background: rgba(34,211,238,.09);
+  border-color: rgba(34,211,238,.22);
+  color: #a5f3fc;
+}
+.motor-launch-card .can-launch-point::before {
+  background: var(--motor, #22d3ee);
+  box-shadow: 0 0 10px rgba(34,211,238,.35);
+}
+.motor-launch-primary {
+  background: linear-gradient(135deg, var(--motor, #22d3ee) 0%, #0891b2 100%) !important;
+  color: #042f2e !important;
+  box-shadow: 0 10px 24px rgba(34,211,238,.2);
+}
+.motor-launch-card .can-launch-secondary:hover:not(:disabled) {
+  border-color: rgba(34,211,238,.25);
+}
+
 .can-launch-foot-label {
   flex: none;
   display: inline-flex;
@@ -160,7 +191,6 @@ body.can-page {
 .can-container {
   max-width: min(1700px, 100%);
   width: 100%;
-  overflow-x: hidden;
   box-sizing: border-box;
 }
 .can-header {
@@ -170,6 +200,9 @@ body.can-page {
   backdrop-filter: blur(14px);
   background: rgba(15,22,31,.86);
 }
+/* sticky+backdrop-filter 合成层冲突致 fadeInUp 卡首帧(translateY(10px)+opacity:0)，
+ * 禁用入场动画。选择器需 .header-bar.can-header 以胜过 responsive.css 的 .header-bar 规则 */
+.header-bar.can-header { animation: none; }
 .can-header-actions {
   margin-left: auto;
 }
@@ -942,9 +975,9 @@ body.can-page {
   grid-template-columns:
     auto
     56px
-    minmax(0, 0.9fr)
-    minmax(0, 1.4fr)
-    minmax(0, 0.8fr);
+    minmax(0, 0.7fr)
+    minmax(0, 0.8fr)
+    minmax(0, 1.6fr);
   align-items: center;
   gap: 8px 10px;
   min-width: 0;
@@ -1007,6 +1040,24 @@ body.can-page {
   text-overflow: ellipsis;
   min-width: 0;
   text-align: right;
+}
+/* Click-to-Copy 样式 */
+.history-item-row .copyable {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  transition: background .15s, color .15s;
+}
+.history-item-row .copyable:hover {
+  background: rgba(255,255,255,.08);
+}
+.history-item-row .copyable:active {
+  background: rgba(255,255,255,.14);
+}
+.history-item-row .copyable.copied {
+  background: rgba(34,197,94,.18);
+  color: #86efac;
 }
 
 /* === CAN 1Hz FEEDBACK === */
@@ -1095,7 +1146,10 @@ body.can-page {
 }
 .feedback-row:last-child { border-bottom: none; }
 .fb-label { color: var(--muted, #8892a4); }
-.fb-val { font-weight: 600; font-variant-numeric: tabular-nums; }
+.fb-val { font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; border-radius: 4px; padding: 1px 4px; margin: -1px -4px; transition: background .15s; }
+.fb-val:hover { background: rgba(255,255,255,.08); }
+.fb-val:active { background: rgba(255,255,255,.14); }
+.fb-val.copied { background: rgba(34,197,94,.18); color: #86efac; }
 .fb-val.mono { font-family: monospace; }
 .fb-val.ok  { color: #34d399; }
 .fb-val.warn { color: #f59e0b; }

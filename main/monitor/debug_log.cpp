@@ -6,7 +6,7 @@
  * 2. UDP 单播到指定上位机（独立 UDP 调试接收端可选）
  * 3. 内部环形缓冲区（供 HTTP /logs 拉取，WebUI 实际使用这一条）
  *
- * UART0: TX=GPIO21, RX=GPIO20, 115200 波特率
+ * UART0: TX=GPIO21, RX=GPIO20, 3000000 波特率
  * UDP:   <DEBUG_LOG_IP>:<DEBUG_LOG_PORT>
  *
  * 时序说明：
@@ -66,17 +66,6 @@ bool DebugLog::isKeepAliveTag(const char *tag)
         return true;
     }
     return false;
-}
-
-char *DebugLog::allocEmptyJson(int *out_len)
-{
-    /* 返回 nullptr 让 caller 走"[]"字面量分支，避免空环时每秒 malloc(3)/free(3)。
-     * ringDrainJson 的所有"返空"路径都调本函数，caller logs_handler 见 nullptr
-     * 后直接发 "[]" 字面量，零分配。 */
-    if (out_len) {
-        *out_len = 0;
-    }
-    return nullptr;
 }
 
 /**
@@ -384,97 +373,62 @@ void DebugLog::ringPush(const char *data, int len)
 }
 
 /**
- * 单次持锁：peek 元数据 →（可选）按堆缩小条数 → pop+转义拼 JSON。
- * capacity 按真实 raw 长度估算，避免 48×320 虚高导致 OTA 期返空。
+ * 流式导出：peek 快照条数 → 逐条 pop（仅 pop 期间持锁）转义拼 JSON →
+ * 攒满 512B 栈缓冲即经 sink 发一个 chunk。替代原 ~4KB 一次性 malloc，
+ * 把 /logs 发送路径的应用层瞬时峰值从几 KB 降到栈缓冲级别。
  */
-char *DebugLog::ringDrainJson(int *out_len)
+int DebugLog::ringDrainJsonStream(LogJsonSink sink, void *ctx)
 {
-    if (!out_len) {
-        return nullptr;
+    if (!sink) {
+        return 0;
     }
-    *out_len = 0;
 
     const uint32_t free_now = esp_get_free_heap_size();
     if (free_now < kDrainMinFree || !m_logRingMutex) {
-        return allocEmptyJson(out_len);
+        return 0;  /* 低堆/未就绪：caller 一次性发 "[]" */
     }
 
+    /* 先 peek 快照条数：无内容则让 caller 走 "[]" 一次性响应，不进 chunked 编码。 */
     xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
-
     int total_raw = 0;
     int drain_n = ringPeekDrainMetaLocked(LOG_DRAIN_MAX, &total_raw);
-    if (drain_n <= 0) {
-        xSemaphoreGive(m_logRingMutex);
-        return allocEmptyJson(out_len);
-    }
-
-    /* 转义最坏 ~2x + 每条 "" 与逗号 + 数组括号 */
-    auto calc_capacity = [](int n, int raw) -> int {
-        int cap = raw * 2 + n * 4 + 16;
-        if (cap < 16) {
-            cap = 16;
-        }
-        return cap;
-    };
-
-    int capacity = calc_capacity(drain_n, total_raw);
-    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-
-    /* 堆不够则减条数重估（仍持锁，peek 只读；减 n 时从最旧开始仍一致） */
-    while (drain_n > 0 && largest < (size_t)capacity) {
-        drain_n = drain_n / 2;
-        if (drain_n == 0) {
-            break;
-        }
-        total_raw = 0;
-        drain_n = ringPeekDrainMetaLocked(drain_n, &total_raw);
-        capacity = calc_capacity(drain_n, total_raw);
-    }
-
-    if (drain_n <= 0 || largest < (size_t)capacity) {
-        xSemaphoreGive(m_logRingMutex);
-        return allocEmptyJson(out_len);
-    }
-
-    /* 持锁期间尽量短：只 pop 到栈上临时区会爆栈；改为直接写入 malloc 缓冲。
-     * 先释放锁再 malloc，再二次持锁 pop——中间可能插入新日志，只 drain 最旧 N 条即可。 */
     xSemaphoreGive(m_logRingMutex);
-
-    char *buf = (char *)malloc((size_t)capacity);
-    if (!buf) {
-        return allocEmptyJson(out_len);
+    if (drain_n <= 0) {
+        return 0;
     }
 
-    xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
-
-    /* 重新核对：ring 可能变少 */
-    if (m_logRingCount <= 0) {
-        xSemaphoreGive(m_logRingMutex);
-        free(buf);
-        return allocEmptyJson(out_len);
-    }
-    if (drain_n > m_logRingCount) {
-        drain_n = m_logRingCount;
-    }
-    if (drain_n > LOG_DRAIN_MAX) {
-        drain_n = LOG_DRAIN_MAX;
-    }
+    /* 512B 栈缓冲替代原 ~4KB malloc。单条转义最坏 2×LOG_RING_SIZE，
+     * flush 后空缓冲须能容纳单条 + 括号余量（见 static_assert）。 */
+    static constexpr int STREAM_BUF_CAP = 512;
+    static_assert(STREAM_BUF_CAP >= LOG_RING_SIZE * 2 + 8,
+                  "stream buf must hold one worst-case escaped entry");
+    char buf[STREAM_BUF_CAP];
+    char entry[LOG_RING_SIZE];
 
     int pos = 0;
     buf[pos++] = '[';
     bool first = true;
-    char entry[LOG_RING_SIZE];
 
     for (int k = 0; k < drain_n; ++k) {
-        /* 先估空间再 pop，避免 pop 后写不下导致丢条 */
-        const int need_min = first ? 4 : 5; /* ,"x" 或 "x" 量级 + 闭合余量 */
-        if (pos + need_min >= capacity - 2) {
-            break;
+        /* 逐条 pop：仅在 pop 期间持锁，绝不在 sink（网络 I/O）时持锁，
+         * 避免阻塞其它任务写日志。 */
+        int entry_len = 0;
+        xSemaphoreTake(m_logRingMutex, portMAX_DELAY);
+        bool popped = ringPopOldestLocked(entry, sizeof(entry), &entry_len) && entry_len > 0;
+        xSemaphoreGive(m_logRingMutex);
+        if (!popped) {
+            break;  /* 环已空（并发被别处 drain） */
         }
 
-        int entry_len = 0;
-        if (!ringPopOldestLocked(entry, sizeof(entry), &entry_len) || entry_len <= 0) {
-            break;
+        /* 预留单条转义最坏占用再决定是否 flush：jsonEscapeAppend 内部把单条封顶在
+         * LOG_RING_SIZE*2（控制符 \u00XX 会 6× 膨胀），故按该上限 + 逗号/引号/收尾预留，
+         * 与 entry_len 无关；放不下先 flush，flush 后空缓冲必能完整容纳单条不被截断。 */
+        const int need = LOG_RING_SIZE * 2 + 8;
+        if (pos + need > STREAM_BUF_CAP) {
+            if (!sink(ctx, buf, pos)) {
+                return -1;
+            }
+            pos = 0;
         }
 
         if (!first) {
@@ -482,27 +436,26 @@ char *DebugLog::ringDrainJson(int *out_len)
         }
         first = false;
         buf[pos++] = '"';
-        pos = jsonEscapeAppend(buf, pos, capacity, entry, entry_len);
-        if (pos < capacity - 1) {
+        pos = jsonEscapeAppend(buf, pos, STREAM_BUF_CAP, entry, entry_len);
+        if (pos < STREAM_BUF_CAP - 1) {
             buf[pos++] = '"';
-        } else if (pos < capacity) {
-            buf[pos - 1] = '"'; /* 极端：覆盖末字节闭合 */
+        } else {
+            buf[pos - 1] = '"'; /* 极端兜底：覆盖末字节闭合 */
         }
     }
 
-    if (pos + 1 < capacity) {
-        buf[pos++] = ']';
-        buf[pos] = '\0';
-    } else if (capacity >= 3) {
-        buf[capacity - 2] = ']';
-        buf[capacity - 1] = '\0';
-        pos = capacity - 1;
+    /* 收尾 ']'：缓冲放不下先 flush，再单独发闭合。 */
+    if (pos + 1 > STREAM_BUF_CAP) {
+        if (!sink(ctx, buf, pos)) {
+            return -1;
+        }
+        pos = 0;
     }
-
-    xSemaphoreGive(m_logRingMutex);
-
-    *out_len = pos;
-    return buf;
+    buf[pos++] = ']';
+    if (!sink(ctx, buf, pos)) {
+        return -1;
+    }
+    return 1;
 }
 
 // ============================================================

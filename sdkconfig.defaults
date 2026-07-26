@@ -24,8 +24,12 @@ CONFIG_DCU_SPI_CLOCK_HZ=4000000
 CONFIG_LWIP_MAX_SOCKETS=12
 # C3 堆紧：窗口过大 OTA 峰值易顶；8KB≈5*MSS，在 4KB OTA 块下吞吐更好，仍比 12KB+ 保守。
 # 注意：仅改 defaults 不会覆盖已有 sdkconfig，构建前须同步写入 sdkconfig。
+# WND 保持 8192：OTA 上传走接收窗口，不动以保上传吞吐。
 CONFIG_LWIP_TCP_WND_DEFAULT=8192
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+# SND_BUF 8192→5760(=4*MSS)：发送侧(/logs、status、feedback 响应)每 socket 的
+# 瞬时 TX pbuf 上限从 ~8KB 降到 ~5.76KB；max_open_sockets=6 时聚合发送峰值明显下降。
+# 我方响应体均 ≤5KB，4*MSS 不损局域网 TX 吞吐；OTA 上传是 RX 侧，不受影响。
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 # 乱序队列 pbuf：4→2，少占堆；HTTP 顺序上传基本不需要大 OOSEQ
 CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2
 
@@ -95,3 +99,8 @@ CONFIG_BT_NIMBLE_SVC_GAP_PPCP_SUPERVISION_TMO=200
 # Brownout detector threshold (LVL5)
 CONFIG_ESP_BROWNOUT_DET=y
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5=y
+
+# ── 控制台/调试 UART 波特率 3M（debug_log.h UART_DEBUG_BAUD_RATE 与此对齐）──
+# 注意：仅改 defaults 不会覆盖已有 sdkconfig，构建前须同步写入 sdkconfig 或删 sdkconfig 重生。
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=3000000
+CONFIG_CONSOLE_UART_BAUDRATE=3000000

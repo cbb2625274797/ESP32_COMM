@@ -16,6 +16,18 @@ var autoScroll = true;
 // 缓存 DOM 引用，避免高频日志下重复 getElementById
 var scrollEl = document.getElementById('logScroll');
 var countEl = document.getElementById('logCount');
+var scrollPending = false;
+
+/** rAF 批量自动滚动：/logs 一轮可能追加几十行，逐行读 scrollHeight 会每行
+ *  触发一次强制布局；合并到下一帧只滚一次，行为不变。 */
+function scheduleAutoScroll() {
+  if (!autoScroll || !scrollEl || scrollPending) return;
+  scrollPending = true;
+  requestAnimationFrame(function () {
+    scrollPending = false;
+    if (autoScroll && scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+  });
+}
 
 // ==================== 日志系统 (带去重 + 自动滚动) ====================
 function makeLogHash(level, tag, message) {
@@ -65,7 +77,7 @@ export function addLog(level, tag, message) {
   entry.div = div;
   if (scrollEl) {
     scrollEl.appendChild(div);
-    if (autoScroll) scrollEl.scrollTop = scrollEl.scrollHeight;
+    scheduleAutoScroll();
   }
   syncCount();
 }
@@ -92,7 +104,7 @@ export function setLogFilter(level, btn) {
   });
   scrollEl.innerHTML = '';
   scrollEl.appendChild(frag);
-  if (autoScroll) scrollEl.scrollTop = scrollEl.scrollHeight;
+  scheduleAutoScroll();
 }
 export function toggleAutoScroll() {
   autoScroll = !autoScroll;

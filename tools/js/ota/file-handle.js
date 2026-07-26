@@ -397,7 +397,14 @@ export function setupDropZone(zoneId, chip) {
   zone.addEventListener('drop', function (e) {
     e.preventDefault(); e.currentTarget.classList.remove('dragover');
     var file = e.dataTransfer.files[0];
-    if (file) processFile(file, chip);
+    if (!file) return;
+    /* 拖拽拿不到 FSAPI 句柄：必须清掉旧句柄，否则热重载会把上一个文件读回来
+       覆盖本次拖入的文件（表现为"刷错固件"），并同步删除 IDB 持久化句柄 */
+    if (chip === 'esp32') window.esp32FileHandle = null;
+    else window.gd32FileHandle = null;
+    window._pendingFwHandles[chip] = null;
+    persistFileHandle(chip, null);
+    processFile(file, chip);
   });
 }
 

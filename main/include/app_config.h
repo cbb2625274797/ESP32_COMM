@@ -3,7 +3,7 @@
  * ESP32-C3 OTA 中继项目
  *
  * 使用 constexpr 代替 #define，提供类型安全
- * 版本号和编译时间由 version.h 自动生成
+ * 版本号和编译时间在 version.h 中手动维护
  */
 #pragma once
 #include <cstdint>
@@ -17,11 +17,11 @@
 inline constexpr uint8_t CONFIG_WIFI_MODE = 1;
 
 // ============================================================
-// 固件版本（由 version.h 自动生成，此处提供 C++ constexpr 访问）
+// 固件版本（在 version.h 中手动维护，此处提供 C++ constexpr 访问）
 // ============================================================
-inline constexpr const char *FW_VERSION = FW_VERSION_STRING;     ///< 固件版本字符串（自动生成）
-inline constexpr const char *FW_BUILD_TIME = BUILD_TIME;         ///< 编译时间字符串（自动生成）
-inline constexpr const char *FW_GIT_HASH = GIT_HASH;             ///< Git 提交哈希（自动生成）
+inline constexpr const char *FW_VERSION = FW_VERSION_STRING;     ///< 固件版本字符串（手动维护）
+inline constexpr const char *FW_BUILD_TIME = BUILD_TIME;         ///< 编译时间字符串（手动维护）
+inline constexpr const char *FW_GIT_HASH = GIT_HASH;             ///< Git 提交哈希（手动维护）
 
 // ============================================================
 // WiFi STA 模式配置（连接路由器）

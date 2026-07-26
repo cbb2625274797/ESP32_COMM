@@ -177,9 +177,17 @@ public:
     static TaskHandle_t getTaskHandle();
 
     /**
-     * @brief 重置状态机到 IDLE.
+     * @brief 重置本端中继状态机到 IDLE（不主动通知 GD32）。
+     *        中继失败/中止时请优先用 abortRemoteAndReset()。
      */
     void reset();
+
+    /**
+     * @brief 通知 GD32 取消 OTA 会话（SPI CANCEL），再复位本端到 IDLE。
+     *        失败路径必须调用，否则 GD32 可能停在 WAITING_RANDOM/CONFIRM 等半会话。
+     * @param notify_remote true 时尽力发送 CANCEL（默认 true）。
+     */
+    void abortRemoteAndReset(bool notify_remote = true);
 
     // ── 中继事件监听器 ──
     /**
@@ -313,6 +321,11 @@ private:
      * @return OTA_RESULT_OK 成功，OTA_RESULT_ERR_AUTH 认证失败。
      */
     ota_result_t doChallengeAndAuth();
+    /**
+     * @brief 向 GD32 发送 OTA CANCEL（0x03），请求远端完整 resetToIdle。
+     * @return ESP_OK 已发出并读到响应（或可忽略的链路错误已记录）。
+     */
+    esp_err_t sendRemoteCancel();
     /**
      * @brief 发送固件总大小.
      * @param size 固件总大小（字节）。

@@ -164,11 +164,23 @@ export async function startUpload(chip) {
         if (chip === 'esp32') window.esp32File = freshFile;
         else window.gd32File = freshFile;
         file = freshFile;
+        /* .bin 直读分支此前无任何日志，热重载是否生效不可观察，补一条 */
+        addLog('I', '文件', '热重载: 已重新读取 ' + freshFile.name +
+          ' (' + formatBytes(freshFile.size) + ')');
       }
     } catch (e) {
       addLog('W', '文件', '重新读取文件失败: ' + e.message + '，将使用缓存版本');
     }
   } else {
+    /* 无 FSAPI 句柄（拖拽/传统方式选择）：无法读盘，只能用缓存。
+       GD32 缓存是内存中转换出的 Blob，arrayBuffer 校验永远通过，
+       若不显式告知，本地重新编译后点上传会静默刷入旧固件 */
+    var cachedAt = file.lastModified
+      ? new Date(file.lastModified).toLocaleTimeString('zh-CN', { hour12: false })
+      : '未知时间';
+    addLog('W', '文件', '热重载不可用（无 FSAPI 句柄）：本次上传缓存文件 ' + file.name +
+      '（磁盘修改于 ' + cachedAt + '）。如需自动读取最新编译产物，请点击上传区重新选择');
+    showToast('热重载不可用，上传的是缓存文件', 'warning');
     try {
       await file.arrayBuffer();
     } catch (e) {

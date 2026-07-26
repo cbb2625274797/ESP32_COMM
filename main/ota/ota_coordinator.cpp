@@ -6,6 +6,7 @@
  */
 #include "ota_coordinator.h"
 #include "monitor/can_feedback_task.h"
+#include "monitor/motor_ota_relay.h"
 #include "esp32_ota_core.h"
 #include "relay/ota_relay.h"
 #include "storage/gd32_flash_store.h"
@@ -141,6 +142,14 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t ch
 
     // ★ 先做卡死自愈检查：若之前忙状态卡死，自动转 ERROR 继续后续流程
     if (h) watchdogCheckLocked();
+
+    // ★ 电机 OTA 互斥：电机喂数任务与 GD32 固件共用 gd32_ota 分区，
+    //   电机喂数期间禁止新的 GD32 存储，避免分区被并发覆写。
+    if (h && motorOtaIsActive()) {
+        DEBUG_WARN(TAG, "电机 OTA 进行中，拒绝 GD32 存储");
+        unlock(h);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // ★ 同类型重启：若上一次 GD32 存储仍在进行中（STORING）且来自同一通道，
     //   自动中止旧存储并重新开始。覆盖"上传过程中刷新网页再上传"场景。
@@ -412,6 +421,14 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
     // ★ 卡死自愈检查
     if (h) watchdogCheckLocked();
 
+    // ★ 电机 OTA 互斥：ESP32 自身 OTA 会重启设备，中断正在进行的电机喂数，
+    //   电机 OTA 期间拒绝 ESP32 OTA。
+    if (h && motorOtaIsActive()) {
+        DEBUG_WARN(TAG, "电机 OTA 进行中，拒绝 ESP32 OTA");
+        unlock(h);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // ★ 同类型重启：若上一次 ESP32 OTA 仍在接收中（RECEIVING）且来自同一通道，
     //   自动中止旧会话并重新开始。覆盖"上传完成后刷新网页再上传"场景。
     //   跨通道（BLE→WiFi 或 WiFi→BLE）仍拒绝，保持互斥。
@@ -498,6 +515,15 @@ esp_err_t OtaCoordinator::beginEsp32OtaWithRetry(uint32_t total_size, ota_channe
             DEBUG_WARN(TAG, "ESP32拒但ERROR,清残留后重试");
         } else {
             DEBUG_WARN(TAG, "ESP32拒但空闲,判锁残留,强制清后重试");
+        }
+        /* ★ 若 motor OTA 的 feedTask 残留活跃（s_feed_running 仍 true，
+         *   常见于 cancel 请求未送达或 feedTask 卡在 SPI transact），
+         *   必须先 motorOtaCancel() 让 feedTask 退出，否则 forceCleanup
+         *   只清 ESP32 锁、motorOtaIsActive() 仍 true，重试时又被拒，
+         *   形成日志里"强制清后重试→电机 OTA 进行中→再拒"的死循环。 */
+        if (motorOtaIsActive()) {
+            DEBUG_WARN(TAG, "强制清前先取消残留的电机 OTA feedTask");
+            motorOtaCancel();
         }
         Esp32OtaCore::instance().forceCleanup();
         err = beginEsp32Ota(total_size, channel);
@@ -597,7 +623,8 @@ void OtaCoordinator::doAbortLocked()
     if (m_sysState == OTA_SYS_GD32_STORING) {
         Gd32FlashStore::instance().metaClear();
     } else if (m_sysState == OTA_SYS_GD32_RELAYING) {
-        OtaRelay::instance().reset();
+        /* 中继中止必须 CANCEL 远端，否则 GD32 停在 WAITING_* 半会话 */
+        OtaRelay::instance().abortRemoteAndReset(true);
     } else if (m_sysState == OTA_SYS_ESP32_RECEIVING ||
                m_sysState == OTA_SYS_ESP32_FINALIZING) {
         Esp32OtaCore::instance().abort();

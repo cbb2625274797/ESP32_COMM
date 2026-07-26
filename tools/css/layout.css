@@ -5,14 +5,16 @@
 /* ================= HEADER — 命令栏 ================= */
 .header-bar {
   position: relative;
+  z-index: 20; /* 高于下方卡片，保证 pill tooltip 不被遮挡 */
   display: flex; align-items: center; gap: 16px;
   padding: 16px 22px; margin-bottom: 26px;
-  background: linear-gradient(160deg, var(--bg-panel) 0%, var(--bg-card) 70%);
+  background:
+    radial-gradient(620px 240px at 88% -40%, rgba(47,216,193,.12), transparent 60%),
+    linear-gradient(160deg, var(--bg-panel) 0%, var(--bg-card) 70%);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
   flex-wrap: wrap;
-  overflow: hidden;
 }
 /* 顶部三色霓虹描边：ESP32 青绿 → BLE 蓝 → GD32 琥珀，一条细线点出子系统谱系 */
 .header-bar::before {
@@ -21,15 +23,7 @@
   background: linear-gradient(90deg,
     var(--esp32) 0%, var(--ble) 38%, var(--gd32) 78%, transparent 100%);
   opacity: .85;
-}
-/* 右上角极淡的芯片电路装饰 */
-.header-bar::after {
-  content: "";
-  position: absolute; right: -40px; top: -40px;
-  width: 220px; height: 220px; pointer-events: none;
-  background:
-    radial-gradient(circle at 30% 30%, rgba(47,216,193,.10), transparent 55%);
-  border-radius: 50%;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
 }
 
 .header-brand {
@@ -139,6 +133,7 @@
 .card--gd32   { --card-accent: var(--gd32);  --card-accent-dim: var(--gd32-dim); }
 .card--ble    { --card-accent: var(--ble);   --card-accent-dim: var(--ble-dim); }
 .card--can    { --card-accent: var(--can);   --card-accent-dim: var(--can-dim); }
+.card--motor  { --card-accent: var(--motor); --card-accent-dim: var(--motor-dim); }
 .card--mem    { --card-accent: var(--mem);   --card-accent-dim: var(--mem-dim); }
 .card--status { --card-accent: var(--green); --card-accent-dim: var(--can-dim); }
 

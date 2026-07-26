@@ -8,6 +8,30 @@ var state = { fbTimer: null, fbInFlight: false };
 
 var el = {};
 
+// ── Click-to-Copy (feedback 值单元格) ──────────────────────
+function copyFbVal(text, target) {
+  if (!text || text === '--') return;
+  function onDone() {
+    target.classList.add('copied');
+    setTimeout(function () { target.classList.remove('copied'); }, 1200);
+    showToast('已复制', 'success');
+  }
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); onDone(); } catch (_) {}
+    document.body.removeChild(ta);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(onDone).catch(fallback);
+  } else {
+    fallback();
+  }
+}
+
 var ids = [
   'monIp', 'monTestBtn', 'monConnPill', 'monConnTxt',
   'monConnIndicator', 'monConnIndicatorTxt', 'monHelper',
@@ -292,6 +316,15 @@ export function initCanMonitor() {
     if (el.btnModeFilter) el.btnModeFilter.addEventListener('click', function () { setCanMode(1); });
     if (el.btnModeBridge) el.btnModeBridge.addEventListener('click', function () { setCanMode(2); });
     if (el.idsnapChannel) el.idsnapChannel.addEventListener('change', pollFeedback);
+
+    /* feedback 值 click-to-copy：在 grid 容器上事件代理 */
+    document.querySelectorAll('.feedback-grid').forEach(function (grid) {
+      grid.addEventListener('click', function (e) {
+        var target = e.target.closest('.fb-val');
+        if (!target) return;
+        copyFbVal(target.textContent.trim(), target);
+      });
+    });
 
     /* 通道卡：默认折叠详情，点标题展开/收起 */
     document.querySelectorAll('.feedback-channel .feedback-ch-head').forEach(function (head) {

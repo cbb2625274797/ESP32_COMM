@@ -14,6 +14,8 @@
 #include "canfd_bridge.h"
 #include "spi_master.h"
 #include "monitor/debug_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 
@@ -58,10 +60,24 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
 
     uint8_t resp_type = 0U;
     size_t resp_len = 0U;
-    esp_err_t ret = SpiMaster::instance().transact(
-        kSpiCanFrameType,
-        tx_buf, tx_len,
-        &resp_type, spi_rx, spi_rx_max, &resp_len, timeout_ms);
+    esp_err_t ret = ESP_OK;
+    /* CAN 发送只会收到 ACK(0x80) 或 ERROR(0x82)。若读到 WAIT(0x81)，必是上一轮电机 OTA
+     * 喂数(0xD1→WAIT)残留在 SPI 响应管道里的陈旧帧（0xC0 命令本身永不产生 WAIT）。
+     * 陈旧 WAIT 会被下方误判为 ERROR → resp_len=0 → gd32_err=0xFF → 无声拒绝发送（
+     * 表现为“失败一次就再也发不出去”）。此处最多重试几次排空陈旧帧，
+     * 直到读到本命令真正的 ACK/ERROR。 */
+    for (uint8_t attempt = 0U; attempt < 4U; ++attempt) {
+        resp_type = 0U;
+        resp_len = 0U;
+        ret = SpiMaster::instance().transact(
+            kSpiCanFrameType,
+            tx_buf, tx_len,
+            &resp_type, spi_rx, spi_rx_max, &resp_len, timeout_ms);
+        if (ret != ESP_OK || resp_type != SPI_OTA_RSP_WAIT) {
+            break;  /* SPI 失败或已拿到真正响应(ACK/ERROR) */
+        }
+        vTaskDelay(pdMS_TO_TICKS(3));  /* 让 GD32 更新响应，再读一次排空陈旧 WAIT */
+    }
 
     if (ret != ESP_OK) {
         /* 同类错误节流日志，降低高频失败时的日志开销 */

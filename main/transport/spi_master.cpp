@@ -54,9 +54,9 @@ static size_t spiXferBytes(size_t frame_len)
 
 /**
  * @brief 读响应时单 CS 时钟预算（按最近 HELLO 的 GD32 role 分支）。
- *  - BOOT：TX DMA 满缓冲 128 → 读 128，避免过长时钟 underrun
- *  - APP / unknown：TX DMA 满缓冲 256 → 读 256，避免 0xC1 等长 EVENT 被截断 CRC
- * unknown 偏 APP：宁长勿短（BOOT 短帧在 256 时钟下尾部 0xFF，仍可 parse）。
+ *  - BOOT：TX DMA 满缓冲 128 → 读 128（与 Git 稳定路径一致，避免 BOOT underrun）
+ *  - APP / unknown：TX DMA 满缓冲 256 → 读 256，避免 0xC1 等长 EVENT 被截断
+ * role 粘滞 boot 时靠 isAppOnlySpiType 纠正为 APP 后再走 256。
  */
 static size_t spiRespReadBudget(void)
 {
@@ -65,6 +65,24 @@ static size_t spiRespReadBudget(void)
         return SPI_BOOT_TX_BUF_SIZE;
     }
     return SPI_APP_TX_BUF_SIZE;
+}
+
+/** APP 独有业务 TYPE：见到即可纠正 m_gd32Role（BOOT 不会发这些）。 */
+static bool isAppOnlySpiType(uint8_t type)
+{
+    switch (type) {
+    case 0xC1U: /* CAN feedback */
+    case 0xC3U: /* ID snapshot */
+    case 0xC4U: /* ADC */
+    case 0xC5U: /* motor state */
+    case 0xC6U: /* motor version */
+    case 0xD0U: /* motor OTA cmd（APP relay） */
+    case 0xD1U:
+    case 0xD2U:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /** @brief ISR-safe GPIO 电平读取（不调用 Flash 中的 gpio_get_level）。
@@ -252,6 +270,12 @@ esp_err_t SpiMaster::serviceRingOnce()
     }
     {
         LockGuard lock(m_mutex);
+        /* APP 独有事件 → 纠正粘滞的 boot role（OTA 后 HELLO 未刷新时常见） */
+        if (isAppOnlySpiType(found_type) && m_gd32Role != V2_ROLE_APP) {
+            DEBUG_INFO("SPI", "role %u→APP (saw type=0x%02X)",
+                       (unsigned)m_gd32Role, found_type);
+            m_gd32Role = V2_ROLE_APP;
+        }
         (void)pushEvent(found_type, found_payload, found_len);
     }
     return ESP_OK;
@@ -787,7 +811,7 @@ bool SpiMaster::otaBuildFrame(uint8_t type, const uint8_t *payload, size_t paylo
  */
 bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
                              uint8_t *type, const uint8_t **payload, size_t *payload_len,
-                             size_t *frame_offset)
+                             size_t *frame_offset, uint8_t *out_flags)
 {
     if (!buf) return false;
 
@@ -807,10 +831,13 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
         if (hdr.session_id != self.m_sessionId) {
             self.m_stats.seq_errors++;
             const bool is_event = (hdr.flags & V2_FLAG_EVENT) != 0U;
-            /* EVENT 按铃帧在 GD32 session 未激活时 session_id=0（见 requestEsp32Read）。
-             * 若此处直接拒绝：按铃被读走却解析失败 → 狂刷 WARN，CAN 反馈全丢。
-             * 策略：EVENT 一律放行；REQUEST/RESPONSE 仍拒绝错 session。 */
-            if (!is_event) {
+            /* session_id==0：GD32 重启后 g_v2Active=false，响应帧 session 填 0
+             * （见 GD32 spi_build_frame）。典型场景：刷完 GD32 固件、ESP32 未重启。
+             * 若拒收：GD32 明明在回 ACK，ESP32 全丢 → OTA/命令全超时死循环
+             * （日志特征：v2 SES mismatch got=00000000 刷屏 + fed 卡首 chunk）。
+             * 放行并按 stale 语义交给上层（ack_seq 归属照常判定）。 */
+            const bool is_sess0 = (hdr.session_id == 0U);
+            if (!is_event && !is_sess0) {
                 static uint32_t s_sess_mm_logs = 0U;
                 if ((++s_sess_mm_logs % 32U) == 1U) {
                     DEBUG_WARN("SPI", "v2 SES mismatch got=%08lX exp=%08lX t=%02X #%lu",
@@ -819,8 +846,15 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
                 }
                 return false;
             }
+            if (is_sess0 && !is_event) {
+                static uint32_t s_sess0_logs = 0U;
+                if ((++s_sess0_logs % 64U) == 1U) {
+                    DEBUG_WARN("SPI", "GD32 session=0 (对端已重启?) 放行 RESPONSE t=0x%02X #%lu",
+                               hdr.type, (unsigned long)s_sess0_logs);
+                }
+            }
             static uint32_t s_evt_sess0_logs = 0U;
-            if ((++s_evt_sess0_logs % 64U) == 1U) {
+            if (is_event && (++s_evt_sess0_logs % 64U) == 1U) {
                 DEBUG_DBG("SPI", "EVENT session mismatch accepted: got=0x%08lX exp=0x%08lX type=0x%02X",
                           (unsigned long)hdr.session_id, (unsigned long)self.m_sessionId, hdr.type);
             }
@@ -858,6 +892,7 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
     if (payload)      *payload = pload;
     if (payload_len)  *payload_len = hdr.payload_len;
     if (frame_offset) *frame_offset = hdr.frame_offset;
+    if (out_flags)    *out_flags = hdr.flags;
     return true;
 }
 
@@ -1080,11 +1115,17 @@ esp_err_t SpiMaster::otaTransferUnlocked(uint8_t type, const uint8_t *payload, s
                     (void)otaFindFrame(drain, drain_len, nullptr, nullptr, nullptr, nullptr);
                 }
             } else {
-                vTaskDelay(pdMS_TO_TICKS(5));
+                /* PB6 高 = GD32 无待发数据 = 响应缓冲已释放、可接收新命令。
+                 * 此时 remoteCredit 仍为 0 是陈旧值：credit 只随帧头传递，GD32 转空闲后
+                 * 没有帧能把 credit=1 送回主机（典型为电机 OTA 取消后：一次瞬时 credit=0
+                 * 被锁存，GD32 转空闲再不发帧）→ 死锁，所有发送被拒。
+                 * PB6 高即证明对端可收，直接放行打破死锁；真忙时 PB6 会低、走上面 drain。 */
+                m_remoteCredit = 1U;
+                break;
             }
         }
         if (m_remoteCredit == 0U) {
-            DEBUG_WARN("SPI", "remoteCredit=0, refuse TX type=0x%02X", type);
+            DEBUG_WARN("SPI", "remoteCredit=0 且 PB6 持续低, refuse TX type=0x%02X", type);
             return ESP_ERR_INVALID_STATE;
         }
     }
@@ -1118,6 +1159,8 @@ esp_err_t SpiMaster::otaTransferUnlocked(uint8_t type, const uint8_t *payload, s
     const uint8_t *found_payload = nullptr;
     size_t found_len = 0;
     size_t frame_offset = 0;
+    /* 与 Git 稳定路径一致：step1 陈旧帧原样解析即可（otaSendAndPoll 传 nullptr 丢弃）。
+     * 勿在此处过滤 LINK/EVENT，否则改变 delayed-by-one 语义。 */
     if (otaFindFrame(rx_raw, xfer_len, &found_type, &found_payload, &found_len, &frame_offset)) {
         if (resp_type) *resp_type = found_type;
         if (resp_payload && resp_max > 0) {
@@ -1127,6 +1170,9 @@ esp_err_t SpiMaster::otaTransferUnlocked(uint8_t type, const uint8_t *payload, s
             }
         }
         if (resp_len) *resp_len = found_len;
+        if (isAppOnlySpiType(found_type) && m_gd32Role != V2_ROLE_APP) {
+            m_gd32Role = V2_ROLE_APP;
+        }
         /* expect_stale（两步法 step1）读到的是延迟一拍陈旧帧，序号由 poll 成功时推进。
          * 此处若自增会导致 job 间隙/超时后 resend 使用错误 TX_SEQ。 */
         if (!expect_stale) {
@@ -1256,10 +1302,25 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
         const uint8_t *found_payload = nullptr;
         size_t found_len = 0;
         size_t frame_offset = 0;
+        uint8_t found_flags = 0U;
 
-        if (otaFindFrame(rx_raw, rx_len, &found_type, &found_payload, &found_len, &frame_offset)) {
+        /* 恢复 Git 稳定 poll 语义（GD32 BOOT OTA 以此为准）。
+         * 仅额外：EVENT 帧跳过（电机 OTA 喂数时勿把 0xC1/0xC5 当 ACK）；
+         * APP 独有 TYPE 纠正 role 粘滞。不做 LINK/RESPONSE 额外过滤。 */
+        if (otaFindFrame(rx_raw, rx_len, &found_type, &found_payload, &found_len, &frame_offset, &found_flags)) {
             if (found_type == V2_TYPE_CREDIT_UPDATE) {
                 DEBUG_DBG("SPI", "poll got CREDIT_UPDATE credit=%u", (unsigned)m_remoteCredit);
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+
+            if ((found_flags & V2_FLAG_EVENT) != 0U) {
+                if (isAppOnlySpiType(found_type) && m_gd32Role != V2_ROLE_APP) {
+                    DEBUG_INFO("SPI", "role %u→APP (poll saw type=0x%02X)",
+                               (unsigned)m_gd32Role, found_type);
+                    m_gd32Role = V2_ROLE_APP;
+                }
+                DEBUG_DBG("SPI", "poll skip EVENT type=0x%02X", found_type);
                 vTaskDelay(pdMS_TO_TICKS(1));
                 continue;
             }
@@ -1283,16 +1344,16 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
             }
             if (resp_len) *resp_len = found_len;
 
-            /* WAIT 立刻返回，由 OTA 紧循环再 poll（勿在此空转） */
-            if (found_type == SPI_OTA_RSP_WAIT) {
-                m_linkState.exitBusy();
-                return ESP_OK;
-            }
-            if (m_lastRxAckMatched) {
-                m_txSeq = (uint8_t)(m_lastSentSeq + 1U);
-            }
-            m_linkState.exitBusy();
-            return ESP_OK;
+/* WAIT/ACK/ERROR：只要 ack_seq 匹配，GD32 已消费本 TX_SEQ，必须推进。
+	             * ★ 电机 OTA：feedData 缓冲满回 WAIT 时若不清 seq，ESP32 同 seq 重发
+	             *   → GD32 命中“重复请求”只回缓存 WAIT，feedData 永不再调用
+	             *   → fed 卡在首 chunk（日志 fed=232）、CAN 抽空后 0x01 超时。
+	             * BOOT OTA 见 WAIT 后只 poll 不重发 DATA，推进 seq 同样正确。 */
+	            if (m_lastRxAckMatched) {
+	                m_txSeq = (uint8_t)(m_lastSentSeq + 1U);
+	            }
+	            m_linkState.exitBusy();
+	            return ESP_OK;
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -1426,8 +1487,12 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         return send_ret;
     }
 
-    /* CS 释放后短延时，再 poll 应答 */
-    vTaskDelay(pdMS_TO_TICKS(5));
+    /* CS 释放后短延时，再 poll 应答。
+     * GD32 主控 OTA / HELLO 等：5ms（BOOT AES 路径需要）。
+     * 电机 OTA 数据 0xD1：1ms。每 chunk 固定 5ms 会把 SPI 喂速压到 ~47KB/s 边缘，
+     * CAN 5ms/包消费时环缓经常被掏空（日志「缓冲空,等ESP32喂」+ ACK 超时重发）。 */
+    const uint32_t post_cs_ms = (type == 0xD1U) ? 1U : 5U;
+    vTaskDelay(pdMS_TO_TICKS(post_cs_ms));
 
     /* 步骤 2: 轮询读取真实响应（变长读，不重发命令） */
     return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, poll_timeout,
@@ -1961,6 +2026,10 @@ esp_err_t SpiMaster::hello(uint32_t timeout_ms, uint8_t role_hint)
             hdr.payload_len >= V2_HELLO_ACK_APP_LEN) {
             applyAppIdentity16(&pload[V2_HELLO_ACK_BASE_LEN], nullptr, nullptr);
         }
+        /* HELLO 成功时打印 role，便于对照 /system/status 粘滞 boot 问题 */
+        DEBUG_INFO("SPI", "HELLO ok role=%u credit=%u sess=0x%08lX",
+                   (unsigned)m_gd32Role, (unsigned)m_remoteCredit,
+                   (unsigned long)m_sessionId);
         m_v2Active = true;
         m_stats.resyncs++;
         return ESP_OK;

@@ -36,6 +36,9 @@
   --can:       #43d97b;  /* 绿：CAN 总线 / 健康 */
   --can-hi:    #7deda6;
   --can-dim:   rgba(67,217,123,.14);
+  --motor:     #22d3ee;  /* 青：电机控制台 */
+  --motor-hi:  #67e8f9;
+  --motor-dim: rgba(34,211,238,.14);
   --mem:       #a88bfa;  /* 紫：内存 / 调试 / 日志 */
   --mem-hi:    #c7b3ff;
   --mem-dim:   rgba(168,139,250,.14);
@@ -57,13 +60,12 @@
   --radius-lg: 16px;
 
   /* ---- 字体 ----
-     display：Chakra Petch（棱角科技感，用于标题/大数字/按钮；
-              无中文字形，中文自动回退苹方/雅黑）
-     mono：JetBrains Mono（SHA / HEX / 日志 / 数值）
-     body：系统中文字体优先，保证正文可读性 */
-  --font-display: "Chakra Petch","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+     沿用原始系统字体方案：中文优先苹方/雅黑，西文 Segoe UI；
+     mono 用于 SHA / HEX / 日志 / 数值（SF Mono → Fira Code → Cascadia → Consolas）。
+     --font-display 保留变量名以兼容既有引用，指向同一系统栈。 */
+  --font-display: "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
   --font: "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
-  --font-mono: "JetBrains Mono","SF Mono","Cascadia Code","Consolas",monospace;
+  --font-mono: "SF Mono","Fira Code","Cascadia Code","Consolas",monospace;
 
   /* ---- 间距 / 阴影 ---- */
   --gap: 18px;

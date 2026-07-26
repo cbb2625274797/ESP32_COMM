@@ -31,6 +31,43 @@ function formatTime(date) {
 /** 简单延时 helper，用于批次间间隔 */
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
+// ==================== Click-to-Copy ====================
+/** 将文本写入剪贴板并在元素上闪烁 copied 提示 */
+function copyCell(text, target) {
+  if (!text) return;
+  function onDone() {
+    target.classList.add('copied');
+    setTimeout(function () { target.classList.remove('copied'); }, 1200);
+    showToast('已复制', 'success');
+  }
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); onDone(); } catch (_) {}
+    document.body.removeChild(ta);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(onDone).catch(fallback);
+  } else {
+    fallback();
+  }
+}
+
+/** 在 historyList 上绑定一次事件代理 */
+var _historyCopyBound = false;
+function ensureHistoryCopyHandler() {
+  if (_historyCopyBound || !el.historyList) return;
+  _historyCopyBound = true;
+  el.historyList.addEventListener('click', function (e) {
+    var target = e.target.closest('[data-copy]');
+    if (!target) return;
+    copyCell(target.getAttribute('data-copy'), target);
+  });
+}
+
 // ==================== 发送错误码描述 ====================
 var CAN_SEND_ERR_DESC = {
   '-1': '参数错误（通道/ID/DLC 无效）',
@@ -65,6 +102,17 @@ function buildSendResponseText(result) {
     }
   }
   return '发送失败: ' + desc + ' (code=' + result.code + ')';
+}
+
+/**
+ * @description 历史列表用的短文案：红色标签已表明失败，去掉「发送失败:」前缀、
+ * gd32_err 细分与 (code=) 尾巴，只保留核心原因，避免挤占空间（完整原因见 hover/复制）。
+ */
+function buildSendResponseShort(result) {
+  if (result.status === 'ok') {
+    return result.recv ? ('0x' + result.recv) : 'OK';
+  }
+  return CAN_SEND_ERR_DESC[String(result.code)] || ('code=' + result.code);
 }
 
 // ==================== HTTP 请求（唯一入口 /can/send_batch）====================
@@ -141,7 +189,9 @@ function makeHistoryEntry(opts) {
     idHex: opts.idHex,
     dlc: opts.dlc,
     dataHex: opts.dataHex || '',
-    resultText: opts.resultText
+    resultText: opts.resultText,
+    /* 列表显示用短文案；缺省回退到完整文案，兼容旧持久化数据 */
+    resultShort: opts.resultShort || opts.resultText
   };
 }
 
@@ -161,6 +211,7 @@ function addHistoryEntry(entry, opts) {
 /** @description 渲染发送历史列表（单行紧凑：状态|时间|CH·ID·DLC|HEX|结果）。 */
 export function renderHistory() {
   if (!el.historyList) return;
+  ensureHistoryCopyHandler();
   if (!state.history.length) {
     el.historyList.innerHTML = '<div class="status-empty">尚未发送任何 CAN 帧。</div>';
     return;
@@ -171,9 +222,9 @@ export function renderHistory() {
       '<div class="history-item history-item-row' + (item.ok ? '' : ' is-err') + '">' +
       '<span class="history-item-tag ' + (item.ok ? 'ok' : 'err') + '">' + escapeHtml(item.mode) + '</span>' +
       '<span class="history-item-time">' + escapeHtml(item.time) + '</span>' +
-      '<span class="history-item-main" title="' + escapeHtml(meta) + '">' + escapeHtml(meta) + '</span>' +
-      '<span class="history-item-hex" title="' + escapeHtml(item.dataHex || '') + '">' + escapeHtml(item.dataHex || '--') + '</span>' +
-      '<span class="history-item-foot" title="' + escapeHtml(item.resultText || '') + '">' + escapeHtml(item.resultText) + '</span>' +
+      '<span class="history-item-main copyable" data-copy="' + escapeHtml(meta) + '" title="点击复制">' + escapeHtml(meta) + '</span>' +
+      '<span class="history-item-hex copyable" data-copy="' + escapeHtml(item.dataHex || '') + '" title="点击复制">' + escapeHtml(item.dataHex || '--') + '</span>' +
+      '<span class="history-item-foot copyable" data-copy="' + escapeHtml(item.resultText || '') + '" title="' + escapeHtml(item.resultText || '点击复制') + '">' + escapeHtml(item.resultShort || item.resultText) + '</span>' +
       '</div>';
   }).join('');
 }
@@ -254,7 +305,8 @@ export async function sendCheckedMessages() {
           addHistoryEntry(makeHistoryEntry({
             mode: 'BATCH', ok: result.status === 'ok', channel: channel,
             idHex: item.idHex, dlc: item.dlc, dataHex: item.dataHex,
-            resultText: item.msg.name + ' · ' + buildSendResponseText(result)
+            resultText: item.msg.name + ' · ' + buildSendResponseText(result),
+            resultShort: item.msg.name + ' · ' + buildSendResponseShort(result)
           }), silent);
         }
       } catch (err) {
@@ -311,7 +363,8 @@ export async function sendSelectedMessage() {
       mode: 'DBC', ok: result.status === 'ok', channel: channel,
       idHex: '0x' + padHex(msg.id, msg.isExtended ? 8 : 3),
       dlc: msg.dlc, dataHex: dataHex,
-      resultText: buildSendResponseText(result)
+      resultText: buildSendResponseText(result),
+      resultShort: buildSendResponseShort(result)
     }));
     showToast(result.status === 'ok' ? 'DBC 报文发送成功' : '发送失败', result.status === 'ok' ? 'success' : 'error');
   } catch (err) {
@@ -391,7 +444,8 @@ export async function sendManualFrame() {
       mode: 'RAW', ok: result.status === 'ok', channel: channel,
       idHex: '0x' + padHex(id, id > 0x7FF ? 8 : 3),
       dlc: dlc, dataHex: dataHex,
-      resultText: buildSendResponseText(result)
+      resultText: buildSendResponseText(result),
+      resultShort: buildSendResponseShort(result)
     }));
     showToast(result.status === 'ok' ? '原始帧发送成功' : '发送失败', result.status === 'ok' ? 'success' : 'error');
   } catch (err) {

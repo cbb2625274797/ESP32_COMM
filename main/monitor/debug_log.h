@@ -9,7 +9,7 @@
  * 注意：当前 tools/WebUI 日志面板走的是 HTTP /logs，
  * 不是直接监听 UDP 6666。
  *
- * UART0: TX=GPIO21, RX=GPIO20, 115200 波特率
+ * UART0: TX=GPIO21, RX=GPIO20, 3000000 波特率
  *
  * 线程模型：DEBUG_* / log() / send() 仅允许在任务上下文调用
  * （内部使用 portMAX_DELAY 互斥锁，禁止 ISR）。
@@ -31,7 +31,7 @@
 // UART0 调试配置
 #define UART_DEBUG_TX_GPIO   21     ///< UART0 TX GPIO 引脚号
 #define UART_DEBUG_RX_GPIO   20     ///< UART0 RX GPIO 引脚号
-#define UART_DEBUG_BAUD_RATE 115200 ///< UART0 波特率
+#define UART_DEBUG_BAUD_RATE 3000000 ///< UART0 波特率
 
 // 日志级别
 typedef enum {
@@ -40,6 +40,12 @@ typedef enum {
     DEBUG_LOG_INFO  = 3,    // 信息
     DEBUG_LOG_DBG   = 4     // 调试
 } debug_log_level_t;
+
+/**
+ * @brief /logs 流式发送 sink：每个 chunk 回调一次；返回 false 表示发送失败需中止。
+ * @param ctx  透传上下文（如 httpd_req_t*）。
+ */
+typedef bool (*LogJsonSink)(void *ctx, const char *data, int len);
 
 /**
  * @brief 调试日志类（单例）
@@ -79,11 +85,15 @@ public:
     bool ringPopOldest(char *out, size_t out_size, int *out_len);
 
     /**
-     * @brief 将环形缓冲区日志导出为 JSON 数组字符串。
-     * @param out_len 输出 JSON 字符串长度。
-     * @return 动态分配的 JSON 字符串，调用者须 free()；失败返回 NULL。
+     * @brief 将环形日志以 chunked JSON 数组流式发送，消除一次性大块 malloc。
+     *        按条 pop（短持锁），512B 栈缓冲攒满即经 sink 发一个 chunk；
+     *        峰值从原 ~4KB malloc 降为栈缓冲 + 小 chunk。
+     * @param sink 每个 chunk 的发送回调；返回 false 表示发送失败。
+     * @param ctx  透传给 sink 的上下文。
+     * @return 1=已流式发送完整数组（调用方需补发终止 chunk）；
+     *         0=无日志/堆门控（调用方一次性发 "[]"）；-1=中途发送失败。
      */
-    char* ringDrainJson(int *out_len);
+    int ringDrainJsonStream(LogJsonSink sink, void *ctx);
 
     void setLogLevel(debug_log_level_t level) { m_logLevel = level; }
     debug_log_level_t getLogLevel() const { return m_logLevel; }
@@ -129,7 +139,7 @@ private:
      * free < kDropInfoFree → 非 keep-alive 丢 INFO/DBG；keep-alive 保留 INFO
      * free < kDropWarnFree → 全局丢 DBG
      * free < kSkipUdpFree  → 不 sendto（仍 UART+ring）
-     * free < kDrainMinFree → /logs 返 "[]" 避免大块 malloc
+     * free < kDrainMinFree → /logs 返 "[]"（低堆时连流式小 chunk 的 pbuf 也省）
      * keep-alive tag：OTA 前缀、SPI、WIFI */
     static constexpr uint32_t kDropWarnFree = 6U * 1024U;
     static constexpr uint32_t kDropInfoFree = 10U * 1024U;
@@ -151,7 +161,6 @@ private:
     int  ringPeekDrainMetaLocked(int max_n, int *total_raw_len) const;
 
     static bool isKeepAliveTag(const char *tag);
-    static char *allocEmptyJson(int *out_len);
     static int jsonEscapeAppend(char *buf, int pos, int capacity, const char *src, int src_len);
 };
 

@@ -35,6 +35,9 @@
 #include "canfd_bridge.h"
 #include "monitor/can_feedback_task.h"
 #include "monitor/gd32_adc_feedback.h"
+#include "monitor/motor_state.h"
+#include "monitor/motor_version.h"
+#include "monitor/motor_ota_relay.h"
 #include "monitor/task_stack.h"
 #include "ble_ota.h"
 #include "system_boot.h"
@@ -94,6 +97,19 @@ void http_set_cors_headers(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
     httpd_resp_set_hdr(req, "Access-Control-Max-Age", "600");
+}
+
+/* 显式声明 keep-alive，让浏览器明确复用 TCP 连接。
+ * ESP-IDF httpd 默认 HTTP/1.1 持久连接，但不发此头时部分客户端/代理
+ * 按 HTTP/1.0 语义关闭。4Hz motor 轮询每次新建 TCP 握手 ~10~30ms
+ * 纯开销；keep-alive 后复用同一 TCP，省全部握手时间。
+ *
+ * 不放在 http_set_cors_headers 里：OTA 上传/relay handler 需要 Connection: close
+ * （设备即将重启），它们仍调 cors_headers 但不应加 keep-alive，否则会与
+ * httpd_resp_set_hdr("Connection","close") 产生重复头。 */
+void http_set_keepalive_hdr(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
 }
 
 esp_err_t http_options_handler(httpd_req_t *req)
@@ -407,7 +423,8 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     }
     if (OtaRelay::getState() != RELAY_IDLE) {
         DEBUG_WARN("WIFI", "GD32 OTA 开始前复位中继状态: %d", OtaRelay::getState());
-        OtaRelay::instance().reset();
+        /* 上次失败可能残留本端状态；同时尽力 CANCEL 远端半会话 */
+        OtaRelay::instance().abortRemoteAndReset(true);
     }
 
     // 与 BLE 共用 prepareGd32Storage（内含 validateGd32Size + begin + erase + meta）
@@ -614,22 +631,32 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* /logs 分块流式 sink：每个 chunk 经 httpd_resp_send_chunk 发出。 */
+static bool logs_chunk_sink(void *ctx, const char *data, int len)
+{
+    httpd_req_t *req = static_cast<httpd_req_t *>(ctx);
+    return httpd_resp_send_chunk(req, data, len) == ESP_OK;
+}
+
 esp_err_t logs_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
+    httpd_resp_set_type(req, "application/json");
 
-    int json_len = 0;
-    char *json = DebugLog::instance().ringDrainJson(&json_len);
-
-    if (json && json_len > 0) {
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, json, json_len);
-        free(json);
-    } else {
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "[]", 2);
+    /* 流式发送：消除原 ~4KB 一次性 malloc，改为 512B 栈缓冲 + 分块。
+     * lwip TX pbuf 峰值与应用堆峰值同时下降。 */
+    int r = DebugLog::instance().ringDrainJsonStream(logs_chunk_sink, req);
+    if (r == 1) {
+        /* 各数据 chunk 已发完，补发终止空 chunk 结束 chunked 响应。 */
+        return httpd_resp_send_chunk(req, NULL, 0);
     }
-    return ESP_OK;
+    if (r == 0) {
+        /* 无日志：一次性小响应（不进 chunked 编码）。 */
+        return httpd_resp_send(req, "[]", 2);
+    }
+    /* r < 0：中途 send 失败，连接多半已断。 */
+    return ESP_FAIL;
 }
 
 
@@ -660,8 +687,12 @@ static SemaphoreHandle_t httpJsonWorkMutex(void)
 // 分块发送：复用 s_http_json_work，一次 HTTP 内按通道 send_chunk；
 // 前端仍一次 fetch 收完整 JSON。
 // ============================================================
-/** 监控预览：data hex 最多 8 字节（16 字符），避免 FD 64B 撑爆分块 */
-static constexpr uint8_t FEEDBACK_DATA_HEX_MAX = 8;
+/**
+ * 监控/业务共用：entry data hex 上限。
+ * 原 8B 只够 STATUS 预览，会截掉 GET_VERSION(0x00FF) 的 hard/boot（需 ≥22B）。
+ * 提到 64 与 CANFD_ID_SNAPSHOT_DATA_MAX 对齐，完整透出 FD 帧。
+ */
+static constexpr uint8_t FEEDBACK_DATA_HEX_MAX = 64;
 
 static int feedback_append(char *buf, size_t cap, int off, const char *fmt, ...)
 {
@@ -684,6 +715,22 @@ static int feedback_append(char *buf, size_t cap, int off, const char *fmt, ...)
 esp_err_t can_feedback_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
+
+    /* ?lite=1：轻量路径，跳过 entries 数组构造（~3KB → ~200B）。
+     * motor.html 的 onFeedback 只用 ch/enabled/valid/rx/tx/err/tec/rec/bus_state，
+     * 不需要 entries（CAN 帧快照，index.html/can.html 才用）。
+     * 跳过 entries 省掉 N×snprintf+hex 编码 + chunked 发送，handler 从 ~10ms 降到 <1ms。 */
+    bool want_lite = false;
+    {
+        char query[32];
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            char val[4] = {};
+            if (httpd_query_key_value(query, "lite", val, sizeof(val)) == ESP_OK) {
+                want_lite = (val[0] == '1' || val[0] == 'y' || val[0] == 't');
+            }
+        }
+    }
 
     can_feedback_result_t results[CAN_CHANNEL_MAX] = {};
     bool valid[CAN_CHANNEL_MAX] = {};
@@ -701,6 +748,80 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
     const unsigned ch_mask = feat_known
         ? (unsigned)((feat & V2_FEAT_CAN_CH_MASK) >> V2_FEAT_CAN_CH_SHIFT)
         : 0x7U;
+
+    /* lite 路径：一次性小响应，不走 chunked，不需要 httpJsonWorkMutex（用栈缓冲即可）。
+     * 体积上限：3 通道 × ~80B + header ~60B ≈ 300B，远小于 1024 栈预算。 */
+    if (want_lite) {
+        char resp[512];
+        int off = snprintf(resp, sizeof(resp),
+            "{\"feat_known\":%s,\"can_ch_mask\":%u,\"can_brs\":%s,\"channels\":[",
+            feat_known ? "true" : "false",
+            ch_mask,
+            (feat_known && (feat & V2_FEAT_CAN_BRS)) ? "true" : "false");
+        if (off < 0 || (size_t)off >= sizeof(resp)) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb lite hdr");
+            return ESP_FAIL;
+        }
+        for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
+            const can_feedback_result_t &r = results[i];
+            const char *stats_fmt;
+            if (valid[i] && ch_en[i]) {
+                stats_fmt = ",\"mode\":%u,\"seq\":%lu,\"rx\":%lu,\"tx\":%lu,"
+                            "\"drop\":%lu,\"err\":%lu,\"tec\":%u,\"rec\":%u,"
+                            "\"bus_state\":%u,\"count\":%u";
+            } else {
+                stats_fmt = "";
+            }
+            /* entries 省略，count 仍报真实 total，前端可据此判断有无快照 */
+            int n = snprintf(resp + off, sizeof(resp) - (size_t)off,
+                "%s{\"ch\":%u,\"enabled\":%s,\"valid\":%s",
+                i == 0 ? "" : ",",
+                (unsigned)i,
+                ch_en[i] ? "true" : "false",
+                valid[i] ? "true" : "false");
+            if (n < 0 || off + n >= (int)sizeof(resp)) {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb lite ch");
+                return ESP_FAIL;
+            }
+            off += n;
+            if (valid[i] && ch_en[i]) {
+                n = snprintf(resp + off, sizeof(resp) - (size_t)off,
+                    stats_fmt,
+                    (unsigned)r.stats.mode,
+                    (unsigned long)r.stats.snapshot_seq,
+                    (unsigned long)r.stats.rx_count,
+                    (unsigned long)r.stats.tx_count,
+                    (unsigned long)r.stats.rx_drop_count,
+                    (unsigned long)r.stats.error_count,
+                    (unsigned)r.stats.tec,
+                    (unsigned)r.stats.rec,
+                    (unsigned)r.stats.bus_state,
+                    (unsigned)r.total_count);
+                if (n < 0 || off + n >= (int)sizeof(resp)) {
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb lite stats");
+                    return ESP_FAIL;
+                }
+                off += n;
+            }
+            /* 闭合 channel 对象 */
+            n = snprintf(resp + off, sizeof(resp) - (size_t)off, "}");
+            if (n < 0 || off + n >= (int)sizeof(resp)) {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb lite close");
+                return ESP_FAIL;
+            }
+            off += n;
+        }
+        int n = snprintf(resp + off, sizeof(resp) - (size_t)off, "]}");
+        if (n < 0 || off + n >= (int)sizeof(resp)) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb lite end");
+            return ESP_FAIL;
+        }
+        off += n;
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, resp, off);
+    }
+
+    /* 完整路径（含 entries）：保留给 index.html / can.html 的 CAN 监控页 */
 
     SemaphoreHandle_t mux = httpJsonWorkMutex();
     if (mux && xSemaphoreTake(mux, pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -837,6 +958,7 @@ esp_err_t can_mode_handler(httpd_req_t *req)
     http_set_cors_headers(req);
 
     if (req->method == HTTP_GET) {
+        http_set_keepalive_hdr(req);   /* GET 轮询复用 TCP；POST 设置模式不复用 */
         can_feedback_result_t fb{};
         if (getLatestCanFeedback(0, &fb)) {
             char resp[64];
@@ -913,7 +1035,7 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
     constexpr int kMaxBody = 49152;
     constexpr int kMaxFrames = 128;
     constexpr uint32_t kPerFrameTimeoutMs = 80U;
-    constexpr uint32_t kSingleFrameTimeoutMs = 2000U;
+    constexpr uint32_t kSingleFrameTimeoutMs = 1200U;   /* 正常 <20ms；httpd 单线程，此值决定其它端点最坏阻塞 */
     constexpr uint32_t kInterFrameDelayMs = 5U;
 
     int content_len = req->content_len;
@@ -1239,6 +1361,55 @@ static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUs
 esp_err_t system_status_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
+
+    /* ?lite=1：轻量路径，只返回 motor.html 高频轮询需要的 4 个字段
+     * (wifi.ip/mode/connected + gd32_features)。不调 heap_caps_get_info /
+     * collectTaskStackMetrics / OtaCoordinator::getSnapshot / SystemBoot::appendStatusJson
+     * 等重活，避免在 httpd 单线程里阻塞几十~上百 ms 拖慢 motor/feedback 请求。
+     * 完整 status 由前端 5s 拉一次。 */
+    bool want_lite = false;
+    {
+        char query[32];
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            char val[4] = {};
+            if (httpd_query_key_value(query, "lite", val, sizeof(val)) == ESP_OK) {
+                want_lite = (val[0] == '1' || val[0] == 'y' || val[0] == 't');
+            }
+        }
+    }
+    if (want_lite) {
+        char ip_str[16] = "0.0.0.0";
+        const char *mode_str = "AP";
+        bool connected = false;
+        if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_STA && WifiOta::instance().getStaConnected()) {
+            esp_netif_ip_info_t ip_info;
+            esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+                snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+            }
+            mode_str = "STA";
+            connected = true;
+        } else if (WifiOta::instance().m_wifiMode == OTA_WIFI_MODE_AP) {
+            connected = true;
+        }
+        const bool feat_known = SpiMaster::instance().gd32FeatKnown();
+        const uint32_t fl = SpiMaster::instance().gd32FeatFlags();
+        char resp[256];
+        int n = snprintf(resp, sizeof(resp),
+            "{\"wifi\":{\"mode\":\"%s\",\"ip\":\"%s\",\"connected\":%s},"
+            "\"gd32_features\":{\"known\":%s,\"flags\":%lu,"
+            "\"can_ch0\":%s,\"can_ch1\":%s,\"can_ch2\":%s,\"can_ch_mask\":%u}}",
+            mode_str, ip_str, connected ? "true" : "false",
+            feat_known ? "true" : "false",
+            (unsigned long)fl,
+            (feat_known && (fl & V2_FEAT_CAN_CH0)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_CAN_CH1)) ? "true" : "false",
+            (feat_known && (fl & V2_FEAT_CAN_CH2)) ? "true" : "false",
+            feat_known ? (unsigned)((fl & V2_FEAT_CAN_CH_MASK) >> V2_FEAT_CAN_CH_SHIFT) : 7U);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, resp, n > 0 ? n : 0);
+    }
 
     /* layout=1：附带链接期静态布局（IRAM/.data/.bss/堆容量等），前端缓存后轮询不再要。
      * 默认只下发 memory 动态字段，减 status JSON 体积。 */
@@ -1618,6 +1789,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
 esp_err_t system_probe_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
 
     gd32_version_t ver = {};
     uint32_t uptime = 0;
@@ -1673,4 +1845,470 @@ esp_err_t system_heap_low_log_handler(httpd_req_t *req)
     return err;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * GET /motor/state — 多电机状态表（来自 GD32 0xC5 推送）
+ * ──────────────────────────────────────────────────────────── */
+esp_err_t motor_state_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
 
+    motor_state_table_t tbl = {};
+    const bool have = getLatestMotorState(&tbl);
+    const uint32_t age = motorStateAgeMs();
+
+    /* 二进制模式：?bin=1（前端默认走此路径，体积比 JSON 省 66%）。
+     * 协议（LE，Header 12B + 每节点 Entry 44B）:
+     *   Header:  magic  u16 = 0x4D53 ('MS')
+     *            ver    u8  = 1
+     *            flags  u8  = 0
+     *            age_ms u32  (0xFFFFFFFF = 无数据)
+     *            active u8  (在线电机数)
+     *            count  u8  (有效 entry 数)
+     *            rsvd   u16 = 0
+     *   Entry:   node u8, ch u8, online u8, dlc u8,
+     *            rx_count u32, seq u32, data[32]
+     * 9 节点最大 12 + 9*44 = 408B。
+     * 无 have_data 时仍发 header（count=0），让前端区分「无数据」与「空总线」。 */
+    bool want_bin = false;
+    {
+        char query[32];
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            char val[4] = {};
+            if (httpd_query_key_value(query, "bin", val, sizeof(val)) == ESP_OK) {
+                want_bin = (val[0] == '1' || val[0] == 'y' || val[0] == 't');
+            }
+        }
+    }
+    if (want_bin) {
+        httpd_resp_set_type(req, "application/octet-stream");
+        /* 静态栈缓冲：12 + 9*44 = 408B，远小于常见任务栈 */
+        uint8_t buf[12 + MOTOR_MAX_NODES * MOTOR_ENTRY_SIZE];
+        size_t off = 0;
+        /* magic 'MS' (LE: 0x53, 0x4D) */
+        buf[off++] = 0x53U; buf[off++] = 0x4DU;
+        buf[off++] = 1U;            /* version */
+        /* flags bit0 = boot_active（总线有电机在 BOOT，0x103 心跳） */
+        buf[off++] = (have && tbl.boot_active) ? 0x01U : 0x00U;
+        /* age_ms LE u32 */
+        const uint32_t age_send = (age == UINT32_MAX) ? 0xFFFFFFFFU : age;
+        buf[off++] = (uint8_t)(age_send & 0xFF);
+        buf[off++] = (uint8_t)((age_send >> 8) & 0xFF);
+        buf[off++] = (uint8_t)((age_send >> 16) & 0xFF);
+        buf[off++] = (uint8_t)((age_send >> 24) & 0xFF);
+        buf[off++] = have ? tbl.active_count : 0U;   /* active */
+        const size_t count_pos = off;                /* count，稍后回填 */
+        off += 3U;                                   /* count u8 + rsvd u16 */
+        /* off 现在应该是 12 */
+        assert(off == 12);
+
+        uint8_t count = 0;
+        if (have) {
+            for (uint8_t i = 0; i < MOTOR_MAX_NODES; ++i) {
+                const motor_slot_t &s = tbl.slots[i];
+                if (s.node_id == 0) continue;
+                buf[off++] = s.node_id;
+                buf[off++] = s.channel;
+                buf[off++] = s.online;
+                buf[off++] = s.dlc;
+                /* rx_count LE */
+                uint32_t r = s.rx_count;
+                buf[off++] = (uint8_t)(r & 0xFF);
+                buf[off++] = (uint8_t)((r >> 8) & 0xFF);
+                buf[off++] = (uint8_t)((r >> 16) & 0xFF);
+                buf[off++] = (uint8_t)((r >> 24) & 0xFF);
+                /* seq LE */
+                uint32_t sq = s.seq;
+                buf[off++] = (uint8_t)(sq & 0xFF);
+                buf[off++] = (uint8_t)((sq >> 8) & 0xFF);
+                buf[off++] = (uint8_t)((sq >> 16) & 0xFF);
+                buf[off++] = (uint8_t)((sq >> 24) & 0xFF);
+                memcpy(&buf[off], s.data, MOTOR_STATUS_DLC);
+                off += MOTOR_STATUS_DLC;
+                count++;
+            }
+        }
+        buf[count_pos] = count;
+
+        return httpd_resp_send(req, (const char *)buf, off);
+    }
+
+    /* JSON 兼容路径（保留旧消费者，?bin 缺省时走此分支） */
+    httpd_resp_set_type(req, "application/json");
+
+    if (!have) {
+        httpd_resp_sendstr(req, "{\"have_data\":false,\"active_count\":0,\"motors\":[]}");
+        return ESP_OK;
+    }
+
+    SemaphoreHandle_t mux = httpJsonWorkMutex();
+    if (mux && xSemaphoreTake(mux, pdMS_TO_TICKS(200)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "motor busy");
+        return ESP_FAIL;
+    }
+
+    char *w = s_http_json_work;
+    int off = snprintf(w, HTTP_JSON_WORK_CAP,
+        "{\"have_data\":true,\"active_count\":%u,\"boot_active\":%s,\"age_ms\":%lu,\"motors\":[",
+        (unsigned)tbl.active_count, tbl.boot_active ? "true" : "false", (unsigned long)age);
+
+    bool first = true;
+    for (uint8_t i = 0; i < MOTOR_MAX_NODES && off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 128; ++i) {
+        const motor_slot_t &s = tbl.slots[i];
+        if (s.node_id == 0) continue;
+
+        /* data hex */
+        char hex[MOTOR_STATUS_DLC * 2 + 1];
+        for (uint8_t b = 0; b < MOTOR_STATUS_DLC; ++b) {
+            snprintf(&hex[b * 2], 3, "%02X", s.data[b]);
+        }
+
+        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off,
+            "%s{\"node\":%u,\"ch\":%u,\"online\":%s,\"dlc\":%u,"
+            "\"rx_count\":%lu,\"seq\":%lu,\"data\":\"%s\"}",
+            first ? "" : ",",
+            (unsigned)s.node_id, (unsigned)s.channel,
+            s.online ? "true" : "false",
+            (unsigned)s.dlc,
+            (unsigned long)s.rx_count,
+            (unsigned long)s.seq,
+            hex);
+        first = false;
+    }
+
+    if (off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 2) {
+        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off, "]}");
+    }
+
+    esp_err_t ret = httpd_resp_send(req, w, off > 0 ? off : 0);
+    if (mux) {
+        xSemaphoreGive(mux);
+    }
+    return ret;
+}
+
+/**
+ * @brief /motor/version — 返回 GD32 缓存的电机版本（0xC6 事件推送）。
+ *
+ * 版本为按需查询的低频数据：前端发 0x00FF 请求触发电机应答，GD32 缓存后经
+ * 0xC6 推给 ESP32，本端点从缓存读取。前端按 seq 判断是否为本次查询的新应答。
+ *
+ * JSON: {"have_data":bool,"nodes":[{"node":N,"seq":N,"age_ms":N,"version":"HEX(24B)"}]}
+ */
+esp_err_t motor_version_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
+
+    motor_version_table_t tbl = {};
+    const bool have = getLatestMotorVersion(&tbl);
+
+    httpd_resp_set_type(req, "application/json");
+
+    if (!have) {
+        httpd_resp_sendstr(req, "{\"have_data\":false,\"nodes\":[]}");
+        return ESP_OK;
+    }
+
+    SemaphoreHandle_t mux = httpJsonWorkMutex();
+    if (mux && xSemaphoreTake(mux, pdMS_TO_TICKS(200)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "motor version busy");
+        return ESP_FAIL;
+    }
+
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    char *w = s_http_json_work;
+    int off = snprintf(w, HTTP_JSON_WORK_CAP, "{\"have_data\":true,\"nodes\":[");
+
+    bool first = true;
+    for (uint8_t i = 0; i < MOTORVER_MAX_NODES && off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 128; ++i) {
+        const motor_version_slot_t &s = tbl.slots[i];
+        if (!s.valid || s.node_id == 0) continue;
+
+        char hex[MOTORVER_DLC * 2 + 1];
+        for (uint8_t b = 0; b < MOTORVER_DLC; ++b) {
+            snprintf(&hex[b * 2], 3, "%02X", s.version[b]);
+        }
+        const long age = (s.recv_ms > 0 && now_ms >= s.recv_ms)
+                             ? static_cast<long>(now_ms - s.recv_ms) : 0L;
+
+        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off,
+            "%s{\"node\":%u,\"seq\":%lu,\"age_ms\":%ld,\"version\":\"%s\"}",
+            first ? "" : ",",
+            (unsigned)s.node_id,
+            (unsigned long)s.seq,
+            age,
+            hex);
+        first = false;
+    }
+
+    if (off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 2) {
+        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off, "]}");
+    }
+
+    esp_err_t ret = httpd_resp_send(req, w, off > 0 ? off : 0);
+    if (mux) {
+        xSemaphoreGive(mux);
+    }
+    return ret;
+}
+
+/* ═══════════════════ 电机 OTA relay ═══════════════════ */
+
+esp_err_t motor_ota_upload_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    char query[16] = {};
+    uint8_t channel = 0;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[4] = {};
+        if (httpd_query_key_value(query, "ch", val, sizeof(val)) == ESP_OK) {
+            channel = static_cast<uint8_t>(atoi(val));
+        }
+    }
+
+    const int content_len = req->content_len;
+    if (content_len <= 0 || content_len > (int)MOTOR_OTA_MAX_FW_SIZE) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"firmware too large or empty\"}");
+        return ESP_FAIL;
+    }
+
+    /* ── 协调：电机固件与 GD32E508 固件共用 gd32_ota 分区，先互斥 + 安全清理 ── */
+    OtaCoordinator &coord = OtaCoordinator::instance();
+    /* 有活跃 OTA（GD32 STORING/RELAYING、ESP32_* 等）时拒绝 */
+    if (!coord.isIdleState(coord.getSystemState())) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"system busy with another OTA\"}");
+        return ESP_FAIL;
+    }
+    if (motorOtaIsActive()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"motor OTA already in progress\"}");
+        return ESP_FAIL;
+    }
+    /* 即将覆写 gd32_ota 分区：先失效已暂存的 GD32 固件并复位协调器到 IDLE，
+       避免 /ota/relay 误把电机固件当成 GD32 固件中继刷进主控 */
+    coord.abortCurrent();
+    (void)coord.clearGd32Meta();
+
+    /* ── 流式收固件写 flash（无整固件堆缓冲；复用 OTA 静态收块）──
+     * ★ full_erase=true：强制擦除整个 gd32_ota 分区（252KB ~200ms），
+     * 杜绝上次固件残留 + 擦除位错误导致的单 bit 翻转（0xAC20 处 0x19→0x18 根因）。 */
+    Gd32FlashStore::instance().beginWriteSession(true);
+
+    int received = 0;
+    while (received < content_len) {
+        size_t to_read = (size_t)content_len - received;
+        if (to_read > OTA_BLOCK_SIZE) to_read = OTA_BLOCK_SIZE;
+
+        otaUploadPaceIfHeapTight();
+
+        int r = httpd_req_recv(req, reinterpret_cast<char *>(s_ota_upload_recv), to_read);
+        if (r <= 0) {
+            DEBUG_ERR("MOTOR_OTA", "upload interrupted: received=%d expected=%d", received, content_len);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+            return ESP_FAIL;
+        }
+
+        esp_err_t werr = Gd32FlashStore::instance().flashWriteChunk(
+            (uint32_t)received, s_ota_upload_recv, (size_t)r);
+        if (werr != ESP_OK) {
+            DEBUG_ERR("MOTOR_OTA", "flash write fail @%d: %s", received, esp_err_to_name(werr));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "flash write failed");
+            return ESP_FAIL;
+        }
+
+        received += r;
+        (void)esp_task_wdt_reset();
+    }
+
+    /* ── 收完固件写 meta（供 /motor/ota/relay 确认固件完整）──
+     * 不在此处触发 SPI START + 喂数据：拆分两段式，与 BLE 刷 GD32 的
+     * "prepare+收流 → /ota/relay" 对齐。收固件阶段纯写 flash，不碰 SPI，
+     * 避免与 GD32 按铃推送争抢单缓冲 MISO 产生的 "SPI start failed" 竞态。 */
+    ota_meta_t meta = {};
+    meta.total_size  = static_cast<uint32_t>(content_len);
+    meta.stored_size = static_cast<uint32_t>(received);
+    meta.last_seq   = 0;
+    esp_err_t merr = Gd32FlashStore::instance().metaSave(&meta);
+    if (merr != ESP_OK) {
+        DEBUG_ERR("MOTOR_OTA", "meta save fail after upload: %s", esp_err_to_name(merr));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"meta save failed\"}");
+        return ESP_FAIL;
+    }
+
+    /* ★ 上传收尾计算 flash SHA-256 并存入 meta.checksum。
+     * 电机 OTA 之前完全没有完整性校验：HTTP 流式写 flash → metaSave → relay 直接刷。
+     * 一旦 flash 写入错位/损坏，ESP32 会把"一致的垃圾"喂给 GD32（CAN CRC 全过但 APP 跑飞）。
+     * 这里在收流结束立即算 SHA-256，relay 触发时 metaVerifyChecksum 复核，从源头堵住坏数据。 */
+    esp_err_t sha_err = Gd32FlashStore::instance().metaFinalizeChecksum();
+    if (sha_err != ESP_OK) {
+        DEBUG_ERR("MOTOR_OTA", "SHA-256 finalize fail after upload: %s", esp_err_to_name(sha_err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"sha256 compute failed\"}");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    char resp_buf[160];
+    snprintf(resp_buf, sizeof(resp_buf),
+        "{\"status\":\"stored\",\"message\":\"call POST /motor/ota/relay?ch=%u to trigger\","
+        "\"channel\":%u,\"size\":%d}",
+        (unsigned)channel, (unsigned)channel, received);
+    httpd_resp_sendstr(req, resp_buf);
+    return ESP_OK;
+}
+
+esp_err_t motor_ota_relay_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
+    DEBUG_INFO("MOTOR_OTA", "=== HTTP: POST /motor/ota/relay ===");
+
+    char query[16] = {};
+    uint8_t channel = 0;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[4] = {};
+        if (httpd_query_key_value(query, "ch", val, sizeof(val)) == ESP_OK) {
+            channel = static_cast<uint8_t>(atoi(val));
+        }
+    }
+
+    /* 确认固件已完整存储 */
+    ota_meta_t meta = {};
+    if (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK ||
+        meta.total_size == 0 || meta.stored_size < meta.total_size) {
+        return http_send_json_error(req, "400 Bad Request",
+                                    "firmware_not_stored", "firmware not fully stored");
+    }
+
+    /* ★ 接收前端发送的固件 SHA-256（JSON body: {"sha256":"<hex64>"}）。
+     * 前端在 relay 触发前用 Web Crypto 算固件 bytes 的 SHA-256，
+     * ESP32 与自己算的 flash SHA 比对，从源头确认"前端发的 = ESP32 flash 存的"。
+     * 之前 motor OTA 没有这一层比对，flash 写入位错误无法被发现，
+     * 直到刷进电机 APP 跑飞才暴露。 */
+    uint8_t frontend_sha[32] = {0};
+    bool has_frontend_sha = false;
+    if (req->content_len > 0 && req->content_len < 512) {
+        char body_buf[512] = {0};
+        int rret = httpd_req_recv(req, body_buf, req->content_len);
+        if (rret > 0) {
+            body_buf[rret] = '\0';
+            cJSON *root = cJSON_Parse(body_buf);
+            if (root) {
+                cJSON *sha_item = cJSON_GetObjectItem(root, "sha256");
+                if (sha_item && cJSON_IsString(sha_item) &&
+                    strlen(cJSON_GetStringValue(sha_item)) == 64) {
+                    const char *hex = cJSON_GetStringValue(sha_item);
+                    for (int i = 0; i < 32; ++i) {
+                        char hb[3] = { hex[i*2], hex[i*2+1], 0 };
+                        frontend_sha[i] = (uint8_t)strtoul(hb, nullptr, 16);
+                    }
+                    has_frontend_sha = true;
+                }
+                cJSON_Delete(root);
+            }
+        }
+    }
+    if (!has_frontend_sha) {
+        return http_send_json_error(req, "400 Bad Request",
+            "missing_sha256", "missing sha256 in body (frontend SHA-256 required)");
+    }
+
+    /* 三方比对：前端 SHA vs flash 实际 SHA vs meta.checksum。
+     * verifyFrontendSha 内部重算 flash SHA，与 frontend_sha 比对，
+     * 同时也验证与 meta.checksum（上传收尾存的）一致。
+     * 任何一项不符都拒绝刷写，从源头堵住 flash 存储环节位错误。 */
+    uint8_t device_sha[32] = {0};
+    esp_err_t verify_err = Gd32FlashStore::instance().verifyFrontendSha(frontend_sha, device_sha);
+    if (verify_err != ESP_OK) {
+        char dev_hex[65] = {0}, front_hex[65] = {0};
+        for (int i = 0; i < 32; ++i) {
+            snprintf(&dev_hex[i*2], 3, "%02X", device_sha[i]);
+            snprintf(&front_hex[i*2], 3, "%02X", frontend_sha[i]);
+        }
+        DEBUG_ERR("MOTOR_OTA", "relay 前 SHA 比对失败: front=%s device=%s err=%s",
+                  front_hex, dev_hex, esp_err_to_name(verify_err));
+        (void)Gd32FlashStore::instance().metaClear();
+        char err_msg[224];  /* 固定文字 ~55 + 2×64 hex = 需 >183，给 224 余量 */
+        snprintf(err_msg, sizeof(err_msg),
+                 "frontend SHA != flash SHA (front=%s device=%s), re-upload required",
+                 front_hex, dev_hex);
+        return http_send_json_error(req, "400 Bad Request",
+                                    "firmware_checksum_mismatch", err_msg);
+    }
+    DEBUG_INFO("MOTOR_OTA", "relay 前三方 SHA 比对通过 (%lu B)", (unsigned long)meta.total_size);
+
+    if (motorOtaIsActive()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"motor OTA already in progress\"}");
+        return ESP_FAIL;
+    }
+
+    /* 触发 SPI START + 启动 feedTask（从 flash 分块读取喂 GD32）*/
+    const int result = motorOtaStart(meta.total_size, channel);
+
+    httpd_resp_set_type(req, "application/json");
+    if (result == 0) {
+        /* 成功触发后清 meta：固件已交给 feedTask，避免残留导致下次误判 */
+        (void)Gd32FlashStore::instance().metaClear();
+        httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"OTA started\"}");
+    } else if (result == -2) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_sendstr(req, "{\"error\":\"OTA already in progress\"}");
+    } else {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"SPI start failed\"}");
+    }
+    return ESP_OK;
+}
+
+esp_err_t motor_ota_status_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+    http_set_keepalive_hdr(req);
+
+    const motor_ota_status_t st = motorOtaGetStatus();
+
+    static const char *state_names[] = {
+        "idle", "handshake_req", "handshake_nonce", "handshake_confirm",
+        "erase", "transfer", "finish_ota", "finished", "error",
+        "pre_cancel"
+    };
+    const int si = (st.state <= MOTOR_OTA_PRE_CANCEL) ? (int)st.state : 0;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"state\":\"%s\",\"error\":%u,\"packets_acked\":%u,\"total_packets\":%u,"
+        "\"fw_size\":%lu,\"buf_used\":%u}",
+        state_names[si], st.error_code,
+        st.packets_acked, st.total_packets,
+        (unsigned long)st.fw_size, st.buf_used);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+esp_err_t motor_ota_cancel_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+    DEBUG_WARN("MOTOR_OTA", "cancel HTTP request received, calling motorOtaCancel()");
+    motorOtaCancel();
+    /* 两阶段都可取消：触发前未跑 feedTask 时 motorOtaCancel 是空操作，
+     * 但仍清 GD32 侧状态 + 清 flash meta，避免残留固件占分区/被误判为已存。
+     * 触发后取消也清 meta 无害（feedTask 已停）。 */
+    (void)Gd32FlashStore::instance().metaClear();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"cancelled\"}");
+    return ESP_OK;
+}

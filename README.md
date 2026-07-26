@@ -60,13 +60,11 @@ ESP32_COMM/
 ├── sdkconfig.defaults                # SDK 配置默认值 (WiFi RX/TX BA=6)
 ├── config/
 │   └── partitions.csv                # 4MB Flash 分区表
-├── cmake/
-│   └── gen_version_script.cmake      # 构建时自动生成 version.h
 ├── main/
 │   ├── CMakeLists.txt                # 注册 12 个源文件 + 依赖
 │   ├── include/
 │   │   ├── app_config.h              # 统一配置 (constexpr: WiFi/BLE/OTA/阈值/密钥)
-│   │   ├── version.h                 # 自动生成版本信息 (v0.3.12)
+│   │   ├── version.h                 # 手动维护的版本信息 (v0.3.56)
 │   │   └── ota_mutex.h               # BLE/WiFi OTA 全局互斥
 │   ├── core/main.cpp                 # app_main 入口，4 个 FreeRTOS 任务
 │   ├── relay/ota_relay.{h,cpp}       # GD32 OTA 中继事件驱动状态机
@@ -626,8 +624,7 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
 
 ## 固件版本管理
 
-位于 `cmake/gen_version_script.cmake`，在每次 `idf.py build` 时自动执行：
-- **版本号**: `0.3.12`（手动修改 CMake 文件中的 MAJOR/MINOR/PATCH）
-- **构建时间**: 自动写入 `%Y-%m-%d %H:%M:%S`
-- **Git Hash**: 自动从 `git rev-parse --short HEAD` 获取 (当前 `5b2c5f8`)
-- 输出到 `main/include/version.h`，仅在内容变化时写入以避免不必要的重编译
+版本信息位于 `main/include/version.h`，**手动维护**，不再由构建脚本自动生成：
+- **版本号**: `0.3.56`（发版时手动递增 `FW_VERSION_MAJOR/MINOR/PATCH` 及 `FW_VERSION_STRING`）
+- **构建时间**: `BUILD_TIME`，每次发版编译时手动填写
+- **Git Hash**: `GIT_HASH`，手动填写对应提交的 `git rev-parse --short HEAD` 结果
