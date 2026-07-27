@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>电机控制台 — Motor CAN FD Console</title>
-<link rel="stylesheet" href="css/motor.css?v=20260727a">
+<link rel="stylesheet" href="css/motor.css?v=20260727b">
 </head>
 <body>
 
@@ -199,8 +199,8 @@
       <!-- OTA TAB -->
       <div class="tab-page" id="tab-ota">
         <div class="ota-stages" id="otaStages" aria-label="OTA阶段">
-          <div class="ota-stage" data-stage="boot"><span class="st-dot">1</span>进入BOOT</div>
-          <div class="ota-stage" data-stage="upload"><span class="st-dot">2</span>上传固件</div>
+          <div class="ota-stage" data-stage="upload"><span class="st-dot">1</span>上传固件</div>
+          <div class="ota-stage" data-stage="boot"><span class="st-dot">2</span>进入BOOT</div>
           <div class="ota-stage" data-stage="handshake"><span class="st-dot">3</span>转发握手</div>
           <div class="ota-stage" data-stage="erase"><span class="st-dot">4</span>擦除Flash</div>
           <div class="ota-stage" data-stage="transfer"><span class="st-dot">5</span>数据传输</div>
@@ -226,8 +226,8 @@
           <button id="otaLogClearBtn" title="清空日志">清空</button>
         </div>
         <div class="ota-log" id="otaLog" aria-live="polite">
-          <div class="log-info">[就绪] 电机 Bootloader OTA · 先发 0x000N0000 进 BOOT → 上传固件到 ESP32 → 触发转发 → GD32 本地 relay（AES-128 + CAN stop-and-wait）</div>
-          <div>[信息] 选固件 → 发进BOOT命令 → 上传固件到 ESP32 → 触发 /motor/ota/relay → GD32 完成握手/加密/传输 · 每包 48 B · 48 KB 上限</div>
+          <div class="log-info">[就绪] 电机 Bootloader OTA · 先上传固件到 ESP32 → 发 0x000N0000 进 BOOT → 触发转发 → GD32 本地 relay（AES-128 + CAN stop-and-wait）</div>
+          <div>[信息] 选固件 → 上传并比对 flash SHA-256（失败重传≤2次）→ 发进BOOT命令 → 触发 /motor/ota/relay → GD32 完成握手/加密/传输 · 每包 48 B · 48 KB 上限</div>
         </div>
       </div>
     </div>
@@ -343,6 +343,6 @@
   </div>
 </div>
 
-<script type="module" src="js/motor/main.js?v=20260727a"></script>
+<script type="module" src="js/motor/main.js?v=20260727l"></script>
 </body>
 </html>

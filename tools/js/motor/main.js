@@ -363,18 +363,38 @@ function faultCountOf(d) {
  * PID_vel_loop_P     136|16@1-       → B17-18
  * PID_angle_loop_P   152|16@1-       → B19-20
  */
+/* ── CMD 数值输入提交制 ──
+ * 周期发送每 80~100ms 读一次输入框：若直接读 .value，键入 "200" 的中间态
+ * "2"/"20" 会被当目标值发给电机。改为：输入过程不生效，按回车或点击别处
+ * （blur 触发 change）才提交到 cmdCommitted，buildCmdBytes 只读已提交值。 */
+const CMD_VALUE_IDS = ["inVoltage", "inCurrent", "inVelocity", "inAngle", "pidCurP", "pidVelP", "pidAngP"];
+const cmdCommitted = {};
+function initCmdCommit() {
+  for (const id of CMD_VALUE_IDS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    cmdCommitted[id] = el.value;  /* 初始提交：含 loadUiState 回填值（本函数在其之后调用） */
+    el.addEventListener("change", () => { cmdCommitted[id] = el.value; });  /* blur/回车后值变化才触发 */
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter") el.blur(); });  /* 回车 = 失焦提交 */
+  }
+}
+/* 读已提交值（未 init 时回退读当前框值，保险） */
+function cmdVal(id) {
+  return cmdCommitted[id] !== undefined ? cmdCommitted[id] : $("#" + id).value;
+}
+
 function buildCmdBytes() {
   const buf = new ArrayBuffer(32);
   const dv = new DataView(buf);
   const mode = parseInt($("#modeSelect").value, 10) || 0;
   dv.setUint8(0, mode);
-  dv.setUint16(1, Math.round((parseFloat($("#inVoltage").value) || 0) * 1000) & 0xFFFF, true);
-  dv.setFloat32(3, parseFloat($("#inCurrent").value) || 0, true);
-  dv.setFloat32(7, parseFloat($("#inVelocity").value) || 0, true);
-  dv.setFloat32(11, parseFloat($("#inAngle").value) || 0, true);
-  dv.setInt16(15, parseInt($("#pidCurP").value, 10) || 0, true);
-  dv.setInt16(17, parseInt($("#pidVelP").value, 10) || 0, true);
-  dv.setInt16(19, parseInt($("#pidAngP").value, 10) || 0, true);
+  dv.setUint16(1, Math.round((parseFloat(cmdVal("inVoltage")) || 0) * 1000) & 0xFFFF, true);
+  dv.setFloat32(3, parseFloat(cmdVal("inCurrent")) || 0, true);
+  dv.setFloat32(7, parseFloat(cmdVal("inVelocity")) || 0, true);
+  dv.setFloat32(11, parseFloat(cmdVal("inAngle")) || 0, true);
+  dv.setInt16(15, parseInt(cmdVal("pidCurP"), 10) || 0, true);
+  dv.setInt16(17, parseInt(cmdVal("pidVelP"), 10) || 0, true);
+  dv.setInt16(19, parseInt(cmdVal("pidAngP"), 10) || 0, true);
   return new Uint8Array(buf);
 }
 function bytesToHexStr(bytes) {
@@ -1775,7 +1795,9 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
  * 两段式（与 BLE 刷 GD32 对齐）：
  *   步1 POST /motor/ota        收固件写 ESP32 flash（不碰 SPI，避免与 GD32 按铃竞态）
  *   步2 POST /motor/ota/relay   触发 SPI START + feedTask 喂 GD32 → GD32 本地 AES 握手 + CAN stop-and-wait
- * 前端负责：选文件 → 进BOOT → 上传 → 触发转发 → 轮询进度 → 显示结果。 */
+ * 前端负责：选文件 → 上传 → 进BOOT → 触发转发 → 轮询进度 → 显示结果。
+ * ★ 顺序（2026-07-27 调整）：先收完固件再让电机进 BOOT——上传期间电机仍在 APP
+ * 正常运行，上传失败/固件损坏时电机不会被白白踢进 BOOT 空等。 */
 const OTA_MAX_FW = 0xC000;    // 48 KB 上限
 const OTA_POLL_MS = 500;      // 进度轮询间隔
 const OTA_TOTAL_TIMEOUT_MS = 120000;  // OTA 整体超时（含进 BOOT + 上传 + 传输），超时自动取消
@@ -1975,17 +1997,17 @@ function resetOtaUi() {
   $("#otaPktNum").textContent = "0";
 }
 
-/* 状态名 → 阶段索引映射（6 阶段：进入BOOT → 上传固件 → 转发握手 → 擦除 → 传输 → 完成）
- * 后端 motor_ota_state_t 不含 boot/upload 阶段（纯前端驱动），后端状态从 handshake_req 起。
- * 两段式：上传固件(stage1)完成 → 触发转发 → GD32 握手(stage2)/擦除(stage3)/传输(stage4)/完成(stage5)。 */
+/* 状态名 → 阶段索引映射（6 阶段：上传固件 → 进入BOOT → 转发握手 → 擦除 → 传输 → 完成）
+ * 后端 motor_ota_state_t 不含 upload/boot 阶段（纯前端驱动），后端状态从 handshake_req 起。
+ * 顺序：上传固件(stage0) → 进BOOT(stage1) → 触发转发 → GD32 握手(stage2)/擦除(stage3)/传输(stage4)/完成(stage5)。 */
 const OTA_STATE_STAGE = {
   idle: -1, pre_cancel: 2, handshake_req: 2, handshake_nonce: 2, handshake_confirm: 2,
-  erase: 3, transfer: 4, finish_ota: 5, finished: 5, error: -1,
+  erase: 3, transfer: 4, finish_ota: 5, wait_app_run: 5, finished: 5, error: -1,
 };
 const OTA_STATE_ZH = {
   idle: "空闲", pre_cancel: "准备中…", handshake_req: "握手中…", handshake_nonce: "密钥协商…",
   handshake_confirm: "会话确认…", erase: "擦除 Flash…", transfer: "数据传输",
-  finish_ota: "等待跳转…", finished: "完成", error: "错误",
+  finish_ota: "等待跳转…", wait_app_run: "等新 APP 运行确认(0AAC)…", finished: "完成", error: "错误",
 };
 
 $("#otaFileBtn").addEventListener("click", async () => {
@@ -2087,20 +2109,21 @@ async function startOta() {
   }
 
   const ok = await showModal("开始电机 OTA",
-    `将先发送 CANFD_BOOT (0x000${nodeHex(node)}0000) 让节点 ${node} 进入 Bootloader，` +
-    `再上传固件 ${ota.file.name} (${ota.file.size.toLocaleString()} B) 到设备，` +
+    `将先上传固件 ${ota.file.name} (${ota.file.size.toLocaleString()} B) 到设备并校验 SHA-256，` +
+    `再发送 CANFD_BOOT (0x000${nodeHex(node)}0000) 让节点 ${node} 进入 Bootloader，` +
     `由 GD32 本地完成 AES 握手与 CAN 传输。OTA 期间请勿操作电机。`);
   if (!ok) return;
 
   stopRepeat(true);
   ota.running = true;
+  ota.node = node;  /* 记录目标节点：finished 后 verifyNewApp 查版本用 */
   ota.startTime = performance.now();
   $("#otaStartBtn").disabled = true;
   $("#otaCancelBtn").disabled = false;
   resetOtaUi();
-  setOtaStage(0);  /* 进入 BOOT 阶段 */
+  setOtaStage(0);  /* 上传固件阶段 */
 
-  /* 整体超时看门狗：进 BOOT + 上传 + 传输 + 跳转 总计不应超过 OTA_TOTAL_TIMEOUT_MS。
+  /* 整体超时看门狗：上传 + 进 BOOT + 传输 + 跳转 总计不应超过 OTA_TOTAL_TIMEOUT_MS。
    * 超时后自动取消，避免卡死时前端无限轮询 + ESP32 feedTask 残留。 */
   if (ota.watchdogTimer) clearTimeout(ota.watchdogTimer);
   ota.watchdogTimer = setTimeout(() => {
@@ -2110,67 +2133,93 @@ async function startOta() {
   }, OTA_TOTAL_TIMEOUT_MS);
 
   /* OTA 期间暂停 motor/feedback/status 三链路轮询：
-   * 电机已跳 BOOT，motor 状态无意义；三条链各占一个 HTTP socket + httpd 线程时间，
-   * 叠加 OTA poll（500ms）+ cancel 需要的新连接，6 个 max_open_sockets 会紧张，
-   * 导致 cancel "Failed to fetch"（连接建立失败/被 lru_purge 踢掉）。
+   * 三条链各占一个 HTTP socket + httpd 线程时间，叠加固件上传 + OTA poll（500ms）
+   * + cancel 需要的新连接，6 个 max_open_sockets 会紧张，
+   * 导致 cancel "Failed to fetch"（连接建立失败/被 lru_purge 踢掉）；
+   * 且电机随后将跳 BOOT，motor 状态轮询无意义。
    * OTA 完成后 otaDone→startPolling 恢复。 */
   stopDataPolling();
 
-  /* ── 步骤 1：发 0x000N0000 进 BOOT 帧（DLC=0，fire-and-forget）──
-   * APP 侧 handle_boot_message() 只看 ID 的 bits[19:16] == node_id 即跳 BOOT。
-   * 电机收到后立即 jumpToBOOT()（can_deinit + 复位），来不及回 CAN ACK，
-   * 因此「GD32 未确认发送 / 总线无应答」是预期现象，绝不能当作进 BOOT 失败——
-   * 之前正因把「未 ACK」当失败而中止，导致「电机其实已进 BOOT 却被判为失败」。
-   * 是否真进 BOOT 交给后续 GD32 relay 握手（REQ→00AC）判定，握手超时才算失败。 */
-  const bootId = canId(node, 0x0000);  /* 0x000N0000 */
-  otaLog(`<span class="log-info">[进BOOT]</span> 发送 CANFD_BOOT ${hexId(bootId)} → 节点 ${node} (CH${ch})`);
+  /* ── 步骤 1：前端先算本地固件 SHA-256（只算一次，重传不变）── */
+  const fwSha256 = await crypto.subtle.digest("SHA-256", ota.bytes);
+  const fwShaHex = Array.from(new Uint8Array(fwSha256))
+    .map(b => b.toString(16).padStart(2, "0")).join("");
+  otaLog(`<span class="log-info">[校验]</span> 本地固件 SHA-256: ${fwShaHex}`);
+
   try {
-    const r = await sendBatch([{ id: bootId, dlc: 0, data: "" }], { allowOffline: true });
-    if (r.ok) {
-      otaLog(`<span class="log-ok">[进BOOT]</span> 命令已发送并确认`);
-    } else {
-      otaLog(`<span class="log-ok">[进BOOT]</span> 命令已发出（无 CAN 应答属正常——电机跳 BOOT 来不及 ACK，交握手确认）`);
+    /* ── 步骤 2：上传 + SHA 比对，不通过重传（最多 3 次尝试 = 首发 + 重发 2 次）──
+     * POST /motor/ota 只收固件写 flash（不触发 SPI），ESP32 收尾从 flash 读回算 SHA 随响应返回；
+     * 前端比对不一致 = flash 写坏 → 重传（每次上传都全盘擦除重写）；
+     * 连续 3 次不过才中断——此时电机仍在 APP 正常运行，重试/中断都不影响电机。 */
+    const kUploadMaxAttempts = 3;
+    let uploadOk = false;
+    for (let attempt = 1; attempt <= kUploadMaxAttempts && ota.running; attempt++) {
+      otaLog(`<span class="log-info">[上传]</span> 上传固件到 ESP32 (CH${ch})，第 ${attempt}/${kUploadMaxAttempts} 次…`);
+      let upJson = {};
+      try {
+        const upResp = await fetch(getBaseUrl() + `/motor/ota?ch=${ch}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: ota.bytes,
+          signal: AbortSignal.timeout(15000),
+        });
+        upJson = await upResp.json().catch(() => ({}));
+        if (!upResp.ok) throw new Error(upJson.error || `HTTP ${upResp.status}`);
+      } catch (e) {
+        otaLog(`<span class="log-err">[上传]</span> 第 ${attempt} 次上传失败：${e.message || e}`);
+        if (attempt < kUploadMaxAttempts) await sleep(300);
+        continue;
+      }
+      otaLog(`<span class="log-ok">[上传]</span> 固件已存储 (${upJson.size || ota.bytes.length} B)`);
+
+      /* 比对：本地 SHA vs ESP32 从 flash 读回算的 SHA（upJson.sha256） */
+      if (!upJson.sha256 || upJson.sha256.length !== 64) {
+        /* 旧 ESP32 固件无 sha256 字段：无法本地比对，且旧固件 relay 还要求 body（新前端已不发），
+         * 需刷新 ESP32 固件；继续尝试，若 relay 被拒会报错中止。 */
+        otaLog(`<span class="log-err">[校验]</span> 设备未返回 flash SHA（旧 ESP32 固件，建议先刷新 ESP32），跳过比对继续`);
+        uploadOk = true;
+        break;
+      }
+      if (upJson.sha256.toLowerCase() === fwShaHex) {
+        otaLog(`<span class="log-ok">[校验]</span> flash SHA 比对一致，允许进 BOOT`);
+        uploadOk = true;
+        break;
+      }
+      otaLog(`<span class="log-err">[校验]</span> 第 ${attempt} 次 flash SHA 不一致（device=${upJson.sha256.slice(0, 16)}…）${attempt < kUploadMaxAttempts ? "，重传…" : ""}`);
+      if (attempt < kUploadMaxAttempts) await sleep(300);
     }
-  } catch (e) {
-    otaLog(`<span class="log-info">[进BOOT]</span> 发送异常：${e.message || e}（继续，由握手确认是否进 BOOT）`);
-  }
-  otaLog(`<span class="log-ok">[进BOOT]</span> 等待电机 jumpToBOOT() 重启进入 Bootloader…`);
+    if (!uploadOk) {
+      throw new Error(`上传/SHA 校验连续 ${kUploadMaxAttempts} 次失败，中断（电机未进 BOOT）`);
+    }
 
-  /* ── 等待电机跳转 + BOOT 初始化 ──
-   * jumpToBOOT() 含 can_deinit + 时钟重置 + MSP 跳转，实测 <100ms；
-   * 给 1000ms 余量覆盖 APP 保存配置 + flash 写 + 重启稳定 + CAN 恢复。
-   * 原 2000ms 过保守（GD32 kBootSettleMs 已降到 800ms，总链路无需 2s 等待）。 */
-  await sleep(1000);
-  otaLog(`<span class="log-info">[上传]</span> 开始上传固件到 ESP32 (CH${ch})…`);
-  setOtaStage(1);  /* 上传固件阶段 */
+    /* ── 步骤 3：发 0x000N0000 进 BOOT 帧（DLC=0，fire-and-forget）──
+     * 固件已收完且 flash SHA 比对通过，此刻才让电机离开 APP。
+     * APP 侧 handle_boot_message() 只看 ID 的 bits[19:16] == node_id 即跳 BOOT。
+     * 电机收到后立即 jumpToBOOT()（can_deinit + 复位），来不及回 CAN ACK，
+     * 因此「GD32 未确认发送 / 总线无应答」是预期现象，绝不能当作进 BOOT 失败——
+     * 之前正因把「未 ACK」当失败而中止，导致「电机其实已进 BOOT 却被判为失败」。
+     * 是否真进 BOOT 交给后续 GD32 relay 握手（REQ→00AC）判定，握手超时才算失败。 */
+    setOtaStage(1);  /* 进入 BOOT 阶段 */
+    const bootId = canId(node, 0x0000);  /* 0x000N0000 */
+    otaLog(`<span class="log-info">[进BOOT]</span> 发送 CANFD_BOOT ${hexId(bootId)} → 节点 ${node} (CH${ch})`);
+    try {
+      const r = await sendBatch([{ id: bootId, dlc: 0, data: "" }], { allowOffline: true });
+      if (r.ok) {
+        otaLog(`<span class="log-ok">[进BOOT]</span> 命令已发送并确认`);
+      } else {
+        otaLog(`<span class="log-ok">[进BOOT]</span> 命令已发出（无 CAN 应答属正常——电机跳 BOOT 来不及 ACK，交握手确认）`);
+      }
+    } catch (e) {
+      otaLog(`<span class="log-info">[进BOOT]</span> 发送异常：${e.message || e}（继续，由握手确认是否进 BOOT）`);
+    }
+    otaLog(`<span class="log-ok">[进BOOT]</span> 命令已发出，立即触发转发…`);
 
-  try {
-    /* ── 步骤 2：POST /motor/ota 只收固件写 flash（不触发 SPI，避免与 GD32 按铃竞态）── */
-    const upResp = await fetch(getBaseUrl() + `/motor/ota?ch=${ch}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: ota.bytes,
-      signal: AbortSignal.timeout(15000),
-    });
-    const upJson = await upResp.json().catch(() => ({}));
-    if (!upResp.ok) throw new Error(upJson.error || `HTTP ${upResp.status}`);
-    otaLog(`<span class="log-ok">[上传]</span> 固件已存储 (${upJson.size || ota.bytes.length} B)，触发 GD32 转发…`);
-
-    /* ── 步骤 3：前端算固件 SHA-256，发给 ESP32 与 flash 实际 SHA 比对 ──
-     * ★ 关键：之前 motor OTA 没有 SHA-256 比对，ESP32 flash 写入位错误无法被发现。
-     * 前端用 Web Crypto 算 ota.bytes 的 SHA-256，relay 触发时用 JSON body 发给 ESP32，
-     * ESP32 调 metaVerifyChecksum 复核 flash 实际 SHA，不匹配则拒绝刷写。
-     * 这样从源头确认"前端发的 = ESP32 flash 存的"，堵住 flash 存储环节位错误。 */
-    const fwSha256 = await crypto.subtle.digest("SHA-256", ota.bytes);
-    const fwShaHex = Array.from(new Uint8Array(fwSha256))
-      .map(b => b.toString(16).padStart(2, "0")).join("");
-    otaLog(`<span class="log-info">[校验]</span> 固件 SHA-256: ${fwShaHex}`);
-
-    /* ── 步骤 4：POST /motor/ota/relay 触发 SPI START + 喂数据 ── */
+    /* ── 步骤 4：POST /motor/ota/relay 触发 SPI START + 喂数据（纯启动扳机，无 body）──
+     * SHA 校验已在步骤 2 闭环（比对+重传），relay 不再传/比 SHA。
+     * 无前端 sleep：电机跳转由 GD32 kPreCancel 等 0x103 心跳窗口吸收（3s 超时报 0x02）。
+     * SPI 0xC0(进 BOOT) 与 0xD0(START) 经 SPI worker 串行，顺序有保证。 */
     const rResp = await fetch(getBaseUrl() + `/motor/ota/relay?ch=${ch}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sha256: fwShaHex }),
       signal: AbortSignal.timeout(8000),
     });
     const rJson = await rResp.json().catch(() => ({}));
@@ -2213,10 +2262,10 @@ function startOtaPoll() {
 	        clearInterval(ota.pollTimer);
 	        ota.pollTimer = null;
 	        if (st.state === "finished") {
-	          otaLog(`<span class="log-ok">[完成]</span> OTA 成功 · ${st.packets_acked} 包 · 电机 APP 已启动`);
-	          toast("电机 OTA 完成", "ok");
+	          otaLog(`<span class="log-ok">[完成]</span> 传输完成 · ${st.packets_acked} 包 · 电机新 APP 已发 0AAC 运行确认，核对版本…`);
 	        } else if (st.state === "error") {
-	          otaLog(`<span class="log-err">[错误]</span> 代码 0x${(st.error || 0).toString(16).toUpperCase()}`);
+	          const errHint = st.error === 0x25 ? "（刷写传完但新 APP 未发 0AAC 运行确认——APP 可能未启动）" : "";
+	          otaLog(`<span class="log-err">[错误]</span> 代码 0x${(st.error || 0).toString(16).toUpperCase()}${errHint}`);
 	          toast("电机 OTA 失败 (0x" + (st.error || 0).toString(16) + ")", "err");
 	        }
 	        /* ★ 正常完成(finished)不发 cancel：电机 APP 已跳转启动，此时发 cancel
@@ -2224,9 +2273,54 @@ function startOtaPoll() {
 	         * CANFD_BOOT_ID(base_id=0x0000) → enter_silent_mode 10s → APP 看似卡死。
 	         * 只有 error/idle/异常退出才发 cancel 兜底清理设备端残留状态。 */
 	        otaDone(st.state !== "finished");
+	        /* ★ finished = GD32 已收到电机新 APP 上电自主发的 [0A AC] 运行确认
+	         * （kWaitAppRun → kFinished，无确认 3s 超时报 0x25）——APP 已确认在跑。
+	         * verifyNewApp 只做最后一步：查版本号核对并回填 UI。 */
+	        if (st.state === "finished") verifyNewApp(ota.node);
 	      }
 	    } catch (e) { /* 轮询瞬时失败静默 */ }
 	  }, OTA_POLL_MS);
+	}
+	
+	/* ── OTA 终验：查版本号核对新 APP ──
+	 * 运行确认已由设备端闭环：电机新 APP 上电自主发 [0A AC]，GD32 kWaitAppRun
+	 * 收到才报 finished（无确认 3s → error 0x25）——走到这里 APP 必然在跑且 CAN 已就绪。
+	 * 本函数只补最后一步：发 GET_VERSION(0x000N00FF) 拿新版本号展示/核对，
+	 * 无应答仅提醒（不推翻设备端的运行确认结论）。 */
+	async function verifyNewApp(node) {
+	  if (node == null || node < 1) return;
+	  otaLog(`<span class="log-info">[验证]</span> 查询新 APP 版本号 (${hexId(ID_GET_VERSION_REQ(node))})…`);
+	  await sleep(200);  /* APP 已发过 0AAC，CAN 已就绪，留小间隔避开启动期杂帧 */
+	  const kVerifyAttempts = 2;
+	  for (let attempt = 1; attempt <= kVerifyAttempts; attempt++) {
+	    try {
+	      const before = await fetchMotorVersionNode(node);
+	      const prevSeq = before ? before.seq : null;
+	      const res = await sendOneFrameWhenFree(ID_GET_VERSION_REQ(node), 24, bytesToHexStr(new Uint8Array(24)));
+	      if (res.ok) {
+	        const v = await waitMotorVersion(node, prevSeq, 4000);
+	        if (v && v.version) {
+	          const parsed = parseVersionPayload(v.version);
+	          if (parsed && parsed.soft) {
+	            /* 同步版本卡片与缓存，用户无需再手动点查版本 */
+	            setVer("verSoft", parsed.soft || "--");
+	            setVer("verHard", parsed.hard || "--");
+	            setVer("verBoot", parsed.boot || "--");
+	            state.versions.set(node, { soft: parsed.soft || null, hard: parsed.hard || null, boot: parsed.boot || null });
+	            saveUiState();
+	            otaLog(`<span class="log-ok">[成功]</span> OTA 成功 · 新 APP v${parsed.soft} 运行中（0AAC 确认 + 版本应答）`);
+	            toast(`电机 OTA 成功 · APP v${parsed.soft}`, "ok");
+	            return;
+	          }
+	        }
+	      }
+	    } catch (e) { /* 单轮异常按未应答处理，进入重试 */ }
+	    if (attempt < kVerifyAttempts) {
+	      otaLog(`<span class="log-info">[验证]</span> 第 ${attempt} 次无应答，重试…`);
+	    }
+	  }
+	  otaLog(`<span class="log-err">[提醒]</span> APP 已发 0AAC 确认运行，但版本查询无应答，请手动点「查版本」核对`);
+	  toast("OTA 完成（版本查询无应答，请手动核对）", "warn");
 	}
 
 	function updateOtaUi(st, startTime) {
@@ -2234,7 +2328,10 @@ function startOtaPoll() {
 	  setOtaStage(stage);
 	  const acked = st.packets_acked || 0;
 	  const total = st.total_packets || 1;
-	  $("#otaPktNum").textContent = String(acked) + "/" + String(total);
+	  /* HTML 模板已是「包 <已确认> / <总数>」，这里各填各的；
+	   * 之前往 otaPktNum 塞整串 "acked/total" 会渲染成「包 696/912 / 912」。 */
+	  $("#otaPktNum").textContent = String(acked);
+	  $("#otaPktTotal").textContent = String(total);
 	  $("#otaProgressFill").style.width = (acked / total * 100).toFixed(1) + "%";
 	  const elapsed = (performance.now() - startTime) / 1000;
 	  if (elapsed > 0.5 && acked > 0) {
@@ -2614,6 +2711,7 @@ renderNodeList();
 renderStatusPanel();
 restoreVersionUi(state.selectedNode);  /* 回填上次缓存的版本号 */
 bindAutoSave();
+initCmdCommit();  /* CMD 输入提交制：必须在 loadUiState 回填之后初始化，否则初始提交值是 HTML 默认值 */
 otaRestorePersistedFirmware();  /* 异步恢复上次固件（无阻塞） */
 
 /* 暴露诊断对象到 window，供控制台排查 age 波动 / 锁相状态：

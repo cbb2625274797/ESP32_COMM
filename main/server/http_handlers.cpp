@@ -1566,7 +1566,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
         "\"ota\": {\"sys_state\": \"%s\", \"sys_state_code\": %d, \"channel\": %d, \"channel_name\": \"%s\", "
         "\"relay_state\": %d, \"relay_seq\": %lu, \"relay_total_packets\": %lu, \"gd32_app_alive\": %s, "
         "\"gd32_app\": \"v%d.%d.%d.%d\", \"gd32_boot\": \"v%d.%d.%d.%d\"}, ",
-        FW_VERSION, FW_BUILD_TIME, FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
+        FW_VERSION, fwBuildTime(), FW_GIT_HASH, HealthMonitor::instance().getCurrent(),
         (unsigned long)free_heap,
         (unsigned long)min_free_heap,
         (unsigned long)largest_free_block,
@@ -2157,12 +2157,23 @@ esp_err_t motor_ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    /* ★ 把设备端 flash SHA 直接回给前端：前端在发进 BOOT 帧之前就能比对，
+     * flash 写坏时电机还在 APP 正常运行即可中止，不用等到 relay 阶段
+     * （那时电机已被踢进 BOOT 白等）。relay 的三方比对仍保留作兜底。 */
+    ota_meta_t sha_meta = {};
+    char sha_hex[65] = {0};
+    if (Gd32FlashStore::instance().metaLoad(&sha_meta) == ESP_OK) {
+        for (int i = 0; i < 32; ++i) {
+            snprintf(&sha_hex[i * 2], 3, "%02x", sha_meta.checksum[i]);
+        }
+    }
+
     httpd_resp_set_type(req, "application/json");
-    char resp_buf[160];
+    char resp_buf[256];
     snprintf(resp_buf, sizeof(resp_buf),
         "{\"status\":\"stored\",\"message\":\"call POST /motor/ota/relay?ch=%u to trigger\","
-        "\"channel\":%u,\"size\":%d}",
-        (unsigned)channel, (unsigned)channel, received);
+        "\"channel\":%u,\"size\":%d,\"sha256\":\"%s\"}",
+        (unsigned)channel, (unsigned)channel, received, sha_hex);
     httpd_resp_sendstr(req, resp_buf);
     return ESP_OK;
 }
@@ -2182,70 +2193,29 @@ esp_err_t motor_ota_relay_handler(httpd_req_t *req)
         }
     }
 
-    /* 确认固件已完整存储 */
+    /* 读 meta 拿 fw_size（motorOtaStart 参数的唯一来源）。
+     * total_size==0 = 无固件可刷（未上传过，或上次 relay 成功后 metaClear 已消费）。
+     * 数量完整性由上传流程保证：上传开头 clearGd32Meta，收满 content_len 才 metaSave，
+     * 中断则 meta 保持空——因此这里无需再查 stored_size。 */
     ota_meta_t meta = {};
-    if (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK ||
-        meta.total_size == 0 || meta.stored_size < meta.total_size) {
+    if (Gd32FlashStore::instance().metaLoad(&meta) != ESP_OK || meta.total_size == 0) {
         return http_send_json_error(req, "400 Bad Request",
-                                    "firmware_not_stored", "firmware not fully stored");
+                                    "firmware_not_stored", "no firmware stored (upload first)");
     }
 
-    /* ★ 接收前端发送的固件 SHA-256（JSON body: {"sha256":"<hex64>"}）。
-     * 前端在 relay 触发前用 Web Crypto 算固件 bytes 的 SHA-256，
-     * ESP32 与自己算的 flash SHA 比对，从源头确认"前端发的 = ESP32 flash 存的"。
-     * 之前 motor OTA 没有这一层比对，flash 写入位错误无法被发现，
-     * 直到刷进电机 APP 跑飞才暴露。 */
-    uint8_t frontend_sha[32] = {0};
-    bool has_frontend_sha = false;
-    if (req->content_len > 0 && req->content_len < 512) {
-        char body_buf[512] = {0};
-        int rret = httpd_req_recv(req, body_buf, req->content_len);
-        if (rret > 0) {
-            body_buf[rret] = '\0';
-            cJSON *root = cJSON_Parse(body_buf);
-            if (root) {
-                cJSON *sha_item = cJSON_GetObjectItem(root, "sha256");
-                if (sha_item && cJSON_IsString(sha_item) &&
-                    strlen(cJSON_GetStringValue(sha_item)) == 64) {
-                    const char *hex = cJSON_GetStringValue(sha_item);
-                    for (int i = 0; i < 32; ++i) {
-                        char hb[3] = { hex[i*2], hex[i*2+1], 0 };
-                        frontend_sha[i] = (uint8_t)strtoul(hb, nullptr, 16);
-                    }
-                    has_frontend_sha = true;
-                }
-                cJSON_Delete(root);
-            }
+    /* relay 不做 SHA 校验（2026-07-27）：完整性校验已在上传阶段闭环
+     *（ESP32 从 flash 读回算 SHA 随响应返回，前端比对 + 失败重传）。
+     * relay 只是启动扳机；body 一律忽略，仅排空以维持 keep-alive 解析。 */
+    if (req->content_len > 0) {
+        char drain[128];
+        int remaining = req->content_len;
+        while (remaining > 0) {
+            const int chunk = remaining > (int)sizeof(drain) ? (int)sizeof(drain) : remaining;
+            const int r = httpd_req_recv(req, drain, (size_t)chunk);
+            if (r <= 0) break;
+            remaining -= r;
         }
     }
-    if (!has_frontend_sha) {
-        return http_send_json_error(req, "400 Bad Request",
-            "missing_sha256", "missing sha256 in body (frontend SHA-256 required)");
-    }
-
-    /* 三方比对：前端 SHA vs flash 实际 SHA vs meta.checksum。
-     * verifyFrontendSha 内部重算 flash SHA，与 frontend_sha 比对，
-     * 同时也验证与 meta.checksum（上传收尾存的）一致。
-     * 任何一项不符都拒绝刷写，从源头堵住 flash 存储环节位错误。 */
-    uint8_t device_sha[32] = {0};
-    esp_err_t verify_err = Gd32FlashStore::instance().verifyFrontendSha(frontend_sha, device_sha);
-    if (verify_err != ESP_OK) {
-        char dev_hex[65] = {0}, front_hex[65] = {0};
-        for (int i = 0; i < 32; ++i) {
-            snprintf(&dev_hex[i*2], 3, "%02X", device_sha[i]);
-            snprintf(&front_hex[i*2], 3, "%02X", frontend_sha[i]);
-        }
-        DEBUG_ERR("MOTOR_OTA", "relay 前 SHA 比对失败: front=%s device=%s err=%s",
-                  front_hex, dev_hex, esp_err_to_name(verify_err));
-        (void)Gd32FlashStore::instance().metaClear();
-        char err_msg[224];  /* 固定文字 ~55 + 2×64 hex = 需 >183，给 224 余量 */
-        snprintf(err_msg, sizeof(err_msg),
-                 "frontend SHA != flash SHA (front=%s device=%s), re-upload required",
-                 front_hex, dev_hex);
-        return http_send_json_error(req, "400 Bad Request",
-                                    "firmware_checksum_mismatch", err_msg);
-    }
-    DEBUG_INFO("MOTOR_OTA", "relay 前三方 SHA 比对通过 (%lu B)", (unsigned long)meta.total_size);
 
     if (motorOtaIsActive()) {
         httpd_resp_set_status(req, "409 Conflict");
@@ -2282,9 +2252,9 @@ esp_err_t motor_ota_status_handler(httpd_req_t *req)
     static const char *state_names[] = {
         "idle", "handshake_req", "handshake_nonce", "handshake_confirm",
         "erase", "transfer", "finish_ota", "finished", "error",
-        "pre_cancel"
+        "pre_cancel", "wait_app_run"
     };
-    const int si = (st.state <= MOTOR_OTA_PRE_CANCEL) ? (int)st.state : 0;
+    const int si = (st.state <= MOTOR_OTA_WAIT_APP_RUN) ? (int)st.state : 0;
 
     char buf[256];
     snprintf(buf, sizeof(buf),

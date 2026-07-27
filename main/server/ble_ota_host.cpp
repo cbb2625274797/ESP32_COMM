@@ -287,7 +287,7 @@ int ble_ota_version_access(uint16_t conn_handle, uint16_t attr_handle,
     const char *version = FW_VERSION;
     // 版本字符串: "vX.Y.Z YYYY-MM-DD HH:MM:SS"
     char ver_buf[64];
-    int ver_len = snprintf(ver_buf, sizeof(ver_buf), "%s %s", FW_VERSION, FW_BUILD_TIME);
+    int ver_len = snprintf(ver_buf, sizeof(ver_buf), "%s %s", FW_VERSION, fwBuildTime());
     if (ver_len < 0 || ver_len >= (int)sizeof(ver_buf)) {
         ver_len = strlen(version);
         int rc = os_mbuf_append(ctxt->om, version, ver_len);

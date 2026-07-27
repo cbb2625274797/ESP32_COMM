@@ -9,6 +9,7 @@
 #include <cstdint>
 #include "freertos/FreeRTOS.h"
 #include "version.h"
+#include "build_info.h"
 
 // ============================================================
 // 功能开关（ESP32 本机；GD32 侧开关随 HELLO/PING 身份块上报，无需镜像）
@@ -20,7 +21,8 @@ inline constexpr uint8_t CONFIG_WIFI_MODE = 1;
 // 固件版本（在 version.h 中手动维护，此处提供 C++ constexpr 访问）
 // ============================================================
 inline constexpr const char *FW_VERSION = FW_VERSION_STRING;     ///< 固件版本字符串（手动维护）
-inline constexpr const char *FW_BUILD_TIME = BUILD_TIME;         ///< 编译时间字符串（手动维护）
+/* FW_BUILD_TIME 已删：手写死值停在旧时间，刷新固件仍显示 20:25 被误判回退。
+ * 改用 fwBuildTime()（build_info.h，构建系统每次自动生成真实编译时间）。 */
 inline constexpr const char *FW_GIT_HASH = GIT_HASH;             ///< Git 提交哈希（手动维护）
 
 // ============================================================

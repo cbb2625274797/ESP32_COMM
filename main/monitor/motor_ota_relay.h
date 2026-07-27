@@ -36,7 +36,8 @@ typedef enum {
     MOTOR_OTA_FINISH_OTA,    /* 收到 0xF0F0F0F0，已发 FINISH_OTA，等跳转 ACK */
     MOTOR_OTA_FINISHED,
     MOTOR_OTA_ERROR,
-    MOTOR_OTA_PRE_CANCEL = 9 /* 握手前预取消：发 CANCEL 清理电机残留会话（GD32 侧过渡态） */
+    MOTOR_OTA_PRE_CANCEL = 9,    /* 握手前预取消：发 CANCEL 清理电机残留会话（GD32 侧过渡态） */
+    MOTOR_OTA_WAIT_APP_RUN = 10  /* 尾包 ACK 后等新 APP 自主发 [0A AC] 运行确认，收到才 FINISHED */
 } motor_ota_state_t;
 
 typedef struct {

@@ -3,6 +3,7 @@ idf_component_register(
     SRCS
         "core/main.cpp"                # 程序入口 (app_main)
         "core/system_boot.cpp"         # 启动模块位图与汇总
+        "core/build_info.cpp"          # 真实编译时间（每次构建自动刷新，见文末 gen_build_time）
         "ota/esp32_ota_core.cpp"       # ESP32 本机 OTA 核心（分区写入/SHA验证）
         "ota/ota_coordinator.cpp"      # OTA 多通道协调器（状态机/互斥）
         "relay/ota_relay.cpp"          # GD32 SPI OTA 中继状态机
@@ -48,4 +49,17 @@ idf_component_register(
         mbedtls                       # SHA-256 / AES 加密
         bt                            # NimBLE BLE 协议栈
 )
+
+# ── 真实编译时间：每次构建重新生成 build_time_gen.h ──
+# 背景：version.h 的 BUILD_TIME 是手写死值（停在 2026-07-26 20:25），刷新固件后仍显示旧时间，
+# 被误判为 OTA 回退；__DATE__/__TIME__ 方案在增量编译下同样会过期。
+# 机制：gen_build_time 无产物依赖 → 每次构建必跑 → 重写头文件 → 仅 core/build_info.cpp 重编+重链。
+set(BUILD_TIME_HDR "${CMAKE_CURRENT_BINARY_DIR}/gen/build_time_gen.h")
+add_custom_target(gen_build_time
+    COMMAND ${CMAKE_COMMAND} -D OUT=${BUILD_TIME_HDR} -P ${CMAKE_CURRENT_LIST_DIR}/gen_build_time.cmake
+    BYPRODUCTS ${BUILD_TIME_HDR}
+    COMMENT "Refreshing build_time_gen.h"
+)
+add_dependencies(${COMPONENT_LIB} gen_build_time)
+target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen")
 

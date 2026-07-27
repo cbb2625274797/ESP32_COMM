@@ -51,12 +51,12 @@ static void feedTask(void *arg)
      * 导致 motorOtaIsActive() 一直为 true、阻塞其他 OTA。 */
     const int64_t deadline_ms = nowMs() + 120000LL;
 
-    /* 启动宽限期：GD32 需要时间完成 kPreCancel(800ms 残帧窗口) + 握手(~1s)。
-     * 在这个窗口内不检查终态，避免上一次 OTA 残留的 ERROR 状态推送
-     * (0xD2 ring) 抢先覆写 s_status 导致 feedTask 误判退出。
-     * 原 3s 过保守：GD32 进握手后不再发 ERROR push，1500ms 足够覆盖
-     * kPreCancel + 开始握手（kBootSettleMs 已降到 800ms）。 */
-    const int64_t grace_end_ms = nowMs() + 1500LL;
+    /* 启动宽限期：只需覆盖“suppress 生效前在途的陈旧 0xD2 push”这一极小窗口——
+     * s_status 刚被 motorOtaStart 置为 HANDSHAKE_REQ，下方 suppress 后 ring 不再读，
+     * 残留 ERROR 只可能在这几十 ms 内覆写。原 1500ms 基于 kBootSettleMs=800ms 时代，
+     * GD32 v1.5.1 已移除残帧窗口（收 0x103 即进握手，握手后不再发 ERROR push），
+     * 100ms 足够（用户指定）。 */
+    const int64_t grace_end_ms = nowMs() + 100LL;
 
     /* 重新启用 suppressRingService：ring service 抢占 SPI 带宽导致吐量从 ~5 chunks/s 降到 ~1.5 chunks/s。
      * 进度显示由 feedTask 自己基于 s_fw_offset 更新(近似值)，不依赖 GD32 push。 */
@@ -77,9 +77,8 @@ static void feedTask(void *arg)
         }
 
         /* GD32 已进终态：停止喂，避免盲重试空转到 120s 超时。
-         * 启动宽限期(3s)内跳过终态检查：避免上一次 OTA 残留的 ERROR 状态推送
-         * (0xD2 ring 延迟到达) 覆写 s_status 导致 feedTask 误判退出发 CANCEL。
-         * GD32 需 kPreCancel(500ms 沉淀)+握手(~1s) 才能进入传输态。 */
+         * 启动宽限期(100ms)内跳过终态检查：避免上一次 OTA 残留的 ERROR 状态推送
+         * (0xD2 ring 延迟到达) 覆写 s_status 导致 feedTask 误判退出发 CANCEL。 */
         const motor_ota_status_t st = motorOtaGetStatus();
         if (nowMs() >= grace_end_ms) {
             if (st.state == MOTOR_OTA_IDLE || st.state == MOTOR_OTA_FINISHED ||
