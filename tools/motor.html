@@ -4,7 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>电机控制台 — Motor CAN FD Console</title>
-<link rel="stylesheet" href="css/motor.css?v=20260727b">
+<!-- 空 favicon：阻止浏览器自动请求 /favicon.ico（本地静态服务无此文件会 404） -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="css/motor.css?v=20260730a">
 </head>
 <body>
 
@@ -36,9 +38,9 @@
     </select>
   </div>
   <div class="toolbar-sep"></div>
-  <div class="conn-group" title="电机状态轮询间隔（ms）。GD32 0xC5 推送周期 250ms：设 ≤250 按 250ms 锁相；设更大则按 N×250ms 抽稀（例如 1000≈每 4 次推送拉一次）">
+  <div class="conn-group" title="电机状态刷新间隔（ms，50~5000）。同时驱动前端 HTTP 轮询与 GD32 0xC5 SPI 主动推送周期，端到端节拍一致">
     <label for="refreshRate" class="refresh-hint">刷新速度</label>
-    <input type="number" id="refreshRate" class="refresh-input" value="250" min="250" max="5000" step="50" aria-label="电机状态刷新间隔（毫秒）" />
+    <input type="number" id="refreshRate" class="refresh-input" value="250" min="50" max="5000" step="50" aria-label="电机状态刷新间隔（毫秒）" />
     <span class="refresh-hint">ms</span>
   </div>
   <div class="toolbar-right">
@@ -343,6 +345,6 @@
   </div>
 </div>
 
-<script type="module" src="js/motor/main.js?v=20260727l"></script>
+<script type="module" src="js/motor/main.js?v=20260730g"></script>
 </body>
 </html>

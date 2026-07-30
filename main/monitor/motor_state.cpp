@@ -63,19 +63,20 @@ bool onMotorStateEvent(const uint8_t *payload, size_t len)
         s_table.boot_active  = (active_cnt & 0x80U) ? 1U : 0U;
     }
 
-    /* 逐条解析 entry */
+    /* 逐条解析 entry：node×channel 双键槽位，同节点号多通道互不覆盖 */
     size_t offset = MOTOR_PAGE_HEADER;
     for (uint8_t i = 0; i < entry_count; ++i) {
         const uint8_t *e = &payload[offset];
         const uint8_t node = e[0];
-        if (node < 1 || node > MOTOR_MAX_NODES) {
+        const uint8_t ch   = e[1];
+        if (node < 1 || node > MOTOR_MAX_NODES || ch >= MOTOR_CHANNELS) {
             offset += MOTOR_ENTRY_SIZE;
             continue;
         }
 
-        motor_slot_t &slot = s_table.slots[node - 1];
+        motor_slot_t &slot = s_table.slots[(node - 1) * MOTOR_CHANNELS + ch];
         slot.node_id  = node;
-        slot.channel  = e[1];
+        slot.channel  = ch;
         slot.online   = e[2];
         slot.dlc      = e[3];
         slot.rx_count = rdU32Le(&e[4]);
@@ -87,7 +88,7 @@ bool onMotorStateEvent(const uint8_t *payload, size_t len)
 
     /* 统计有效槽位 */
     uint8_t valid = 0;
-    for (uint8_t i = 0; i < MOTOR_MAX_NODES; ++i) {
+    for (uint8_t i = 0; i < MOTOR_MAX_SLOTS; ++i) {
         if (s_table.slots[i].node_id != 0) valid++;
     }
     s_table.valid_slots = valid;

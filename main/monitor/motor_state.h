@@ -10,6 +10,9 @@
  *     [0] node_id, [1] channel, [2] online, [3] dlc,
  *     [4..7] rx_count (LE), [8..11] seq (LE),
  *     [12..43] data[32] (原始 STATUS payload)
+ *
+ * 同一节点号可能同时挂在多个 CAN 通道（两台电机同号异线），
+ * 缓存表与 GD32 端一致按 node×channel 双键存储（27 槽）。
  */
 #ifndef MOTOR_STATE_H
 #define MOTOR_STATE_H
@@ -23,10 +26,12 @@ extern "C" {
 #endif
 
 #define MOTOR_MAX_NODES      9
+#define MOTOR_CHANNELS       3
+#define MOTOR_MAX_SLOTS      (MOTOR_MAX_NODES * MOTOR_CHANNELS)
 #define MOTOR_STATUS_DLC     32
 #define MOTOR_ENTRY_SIZE     44
 #define MOTOR_PAGE_HEADER    4
-#define MOTOR_TOTAL_PAGES    2
+#define MOTOR_TOTAL_PAGES    6
 
 /** @brief 单电机状态快照。 */
 typedef struct {
@@ -41,7 +46,7 @@ typedef struct {
 
 /** @brief 全局电机状态表。 */
 typedef struct {
-    motor_slot_t slots[MOTOR_MAX_NODES]; ///< 按 node_id-1 索引
+    motor_slot_t slots[MOTOR_MAX_SLOTS]; ///< 按 (node_id-1)*MOTOR_CHANNELS+channel 索引
     uint8_t  active_count;               ///< 在线电机数
     uint8_t  boot_active;                ///< 1=总线上有电机在 BOOT（0x103 心跳，来自 0xC5 头 bit7）
     uint8_t  valid_slots;                ///< 有效槽位数（node_id!=0）

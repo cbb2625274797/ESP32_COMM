@@ -1868,7 +1868,7 @@ esp_err_t motor_state_handler(httpd_req_t *req)
      *            rsvd   u16 = 0
      *   Entry:   node u8, ch u8, online u8, dlc u8,
      *            rx_count u32, seq u32, data[32]
-     * 9 节点最大 12 + 9*44 = 408B。
+     * 27 槽（9 node × 3 ch，node×channel 双键）最大 12 + 27*44 = 1200B。
      * 无 have_data 时仍发 header（count=0），让前端区分「无数据」与「空总线」。 */
     bool want_bin = false;
     {
@@ -1882,8 +1882,9 @@ esp_err_t motor_state_handler(httpd_req_t *req)
     }
     if (want_bin) {
         httpd_resp_set_type(req, "application/octet-stream");
-        /* 静态栈缓冲：12 + 9*44 = 408B，远小于常见任务栈 */
-        uint8_t buf[12 + MOTOR_MAX_NODES * MOTOR_ENTRY_SIZE];
+        /* 静态缓冲：27 槽扩容后 1200B 不再上栈（httpd 栈 7KB 已紧）；
+         * httpd 单任务串行处理请求，静态缓冲无竞态。 */
+        static uint8_t buf[12 + MOTOR_MAX_SLOTS * MOTOR_ENTRY_SIZE];
         size_t off = 0;
         /* magic 'MS' (LE: 0x53, 0x4D) */
         buf[off++] = 0x53U; buf[off++] = 0x4DU;
@@ -1904,7 +1905,7 @@ esp_err_t motor_state_handler(httpd_req_t *req)
 
         uint8_t count = 0;
         if (have) {
-            for (uint8_t i = 0; i < MOTOR_MAX_NODES; ++i) {
+            for (uint8_t i = 0; i < MOTOR_MAX_SLOTS; ++i) {
                 const motor_slot_t &s = tbl.slots[i];
                 if (s.node_id == 0) continue;
                 buf[off++] = s.node_id;
@@ -1953,7 +1954,7 @@ esp_err_t motor_state_handler(httpd_req_t *req)
         (unsigned)tbl.active_count, tbl.boot_active ? "true" : "false", (unsigned long)age);
 
     bool first = true;
-    for (uint8_t i = 0; i < MOTOR_MAX_NODES && off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 128; ++i) {
+    for (uint8_t i = 0; i < MOTOR_MAX_SLOTS && off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 128; ++i) {
         const motor_slot_t &s = tbl.slots[i];
         if (s.node_id == 0) continue;
 

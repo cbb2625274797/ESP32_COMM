@@ -247,6 +247,8 @@ label { display: block; }
 }
 .nc-mode.mode-off { background: color-mix(in srgb, var(--fg) 8%, transparent); color: var(--fg-muted); }
 .nc-mode.mode-fault { background: var(--danger-dim); color: var(--danger); }
+/* 节点在其他通道在线：橙色通道标签，提示切换顶部通道查看 */
+.nc-mode.mode-other-ch { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .nc-status-text {
   margin-left: auto; font-size: 0.68rem; color: var(--fg-muted);
   font-family: var(--font-mono); max-width: 7.5em;

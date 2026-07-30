@@ -58,12 +58,12 @@ const state = {
   ip: DEFAULT_ESP_IP,
   ch: 0,
   chEnabled: [true, true, true], // 各通道启用状态（由 onFeedback 更新）
+  chOnline: [0, 0, 0],     // 各通道在线电机数（由 onMotorState 按 m.ch 统计，驱动下拉框信号标记）
   selectedNode: null,      // 当前选中节点号
   motors: [],              // 最近一次 /motor/state 的 motors 数组
   decoded: new Map(),      // node -> 解码后的 STATUS 对象
   versions: new Map(),     // node -> {soft,hard,boot} 查询到的版本号（持久化）
   /* 用户可调的电机状态轮询间隔（ms）。由工具栏 #refreshRate 输入框驱动。
-   * 锁相计算 computePhaseLockDelayMs() 失败时回退到此值，避免硬编码 250ms。
    * 注意：仅影响 motor 链路；feedback(CAN 1Hz)/status(1Hz lite+5s full) 保持独立。 */
   refreshIntervalMs: 250,
   lastSentMode: new Map(), // node -> 最近发送的 Control_Mode
@@ -82,24 +82,14 @@ const state = {
   offlineSince: 0,         // 进入离线时刻，短离线恢复不 toast
   tickN: 0,                // 轮询序号（每 5 轮附带 status）
   statusTickN: 0,           // status lite/full 交替计数（4 lite + 1 full 循环）
-  /* ── 锁相参数：把轮询沿对齐到 GD32 0xC5 推送后沿 ──
-   * GD32 由 CONFIG_TASK_PERIOD_MOTOR_STATE_TICKS 节拍驱动 250ms 推送（独立于 1Hz heartbeat），
-   * 与浏览器 setTimeout 不同源、不锁相，age_ms 会在 0~250 间拍频扫描。
-   * 这里用最近一次 age_ms + 本地 performance.now() 反推下一帧推送时刻，
-   * 把下一轮 poll 目标时刻钉在「GD32 刚推完 + 安全余量」处。 */
-  phase: {
-    motorPeriodMs: 250,    // GD32 推送周期（motor state = 2500 × 100µs）
-    servoMs: 60,           // 推送后沿安全余量（吸收 SPI/HTTP/mutex 抖动；周期短，余量相应减小）
-    haveSync: false,       // 是否已建立相位基准
-    lastAgeMs: null,       // 最近一次 /motor/state 返回的 age_ms
-    lastRecvPerfMs: 0,     // 对应响应到达时的 performance.now()
-  },
-  /* ── age 显示平滑：原始 age 对丢帧极敏感（丢 1 帧 → age 跳到 ~500ms），
-   * 用滚动窗口中位数显示，反映「稳态相位」而非瞬时抖动。原始值仍可在
-   * state.phaseDebug.history 查看 / 控制台诊断。 */
-  ageWindow: [],          // 最近 N 次原始 age_ms（按到达顺序）
-  ageLossCount: 0,        // 窗口内 age > motorPeriodMs*1.5 的次数（近似丢帧计数）
   phaseDebug: { lastSlowReq: null, slowStats: {} },  // 慢请求诊断（>200ms）
+};
+
+/* 控制台诊断入口：main.js 以 ES module 加载，state 等顶层变量不会挂到 window，
+ * 控制台直接敲 state 会报 "state is not defined"。这里显式暴露只读诊断快照。
+ * 用法：控制台敲 motorDbg.state 。 */
+window.motorDbg = {
+  state,                                                   // 完整 state 引用，方便深挖
 };
 /**
  * 连续「硬失败」多少次才判离线。
@@ -109,8 +99,7 @@ const FAIL_THRESHOLD = 5;
 const CONN_TOAST_GAP_MS = 6000;
 /** 离线不足此时长就恢复：不弹「连接已恢复」（过滤毛刺） */
 const RECOVER_TOAST_MIN_OFFLINE_MS = 8000;
-/* 前端固定节拍：与 GD32 0xC5 推送周期对齐（250ms）。
- * 锁相成功时由 computePhaseLockDelayMs() 覆盖；此值仅作未同步/异常回退。 */
+/* 前端固定节拍：与 GD32 0xC5 推送周期对齐（250ms）。 */
 const TICK_INTERVAL_MS = 250;
 const PROBE_INTERVAL_MS = 2000;
 
@@ -178,8 +167,8 @@ function loadUiState() {
      * 此时 polling 尚未启动，直接写 state 即可，无需重排定时器） */
     const rr = parseInt(o.refreshRate, 10);
     if (Number.isFinite(rr)) {
-      /* 与 #refreshRate min/max 一致：最快对齐 GD32 250ms，最慢 5s */
-      const clamped = clampNum(rr, 250, 5000);
+      /* 与 #refreshRate min/max 一致：最快 50ms(20Hz)，最慢 5s */
+      const clamped = clampNum(rr, 50, 5000);
       state.refreshIntervalMs = clamped;
       const el = document.getElementById("refreshRate");
       if (el) el.value = clamped;
@@ -591,21 +580,15 @@ function recordSlowReq(path, durMs, errMsg) {
   };
 }
 
-function noteHardSuccess() {
-  state.failCount = 0;
-}
+/* 连接判定：轮询/探测硬失败达阈值才离线（瞬时错误不计）。 */
+function noteHardSuccess() { state.failCount = 0; }
 
 function noteHardFailure(e, source) {
-  if (state.probing || state.connecting) return;
-  /* 瞬时错误：完全静默，连 failCount 都不动，避免 LED/toast 毛刺 */
-  if (isTransientError(e)) return;
-  state.failCount += 1;
-  const msg = (e && e.message) ? e.message : String(e || "请求失败");
-  if (state.connected && state.failCount < FAIL_THRESHOLD) {
-    /* 在线且未达阈值：UI 完全不动（不再把 LED 打成黄灯） */
-    return;
+  if (e && e.transient) return;   /* 500/503/超时等瞬时错误不计入 */
+  state.failCount++;
+  if (state.failCount >= FAIL_THRESHOLD && state.connected) {
+    enterDisconnected(e && e.message, source);
   }
-  enterDisconnected(msg, source);
 }
 
 function enterDisconnected(msg, source) {
@@ -677,7 +660,7 @@ async function probeOnce() {
  * 使用主页共享 IP 自动连接（本页无连接按钮）。
  * 失败不阻断页面，进入探测直到 /system/status 可用。
  */
-async function connectShared() {
+function connectShared() {
   state.ip = getSharedDeviceIp();
   state.connecting = true;
   state.probing = false;
@@ -687,28 +670,9 @@ async function connectShared() {
   updateConnUi();
   $("#netBanner").classList.add("show");
   $("#netBannerText").textContent =
-    "自动连接 " + state.ip + " … 本页与 OTA 主页共用 IP，请在主页配置并测试连接";
-  try {
-    const data = await fetchDeviceJson("/system/status", 4000);
-    state.connecting = false;
-    state.connected = true;
-    state.failCount = 0;
-    state.offlineSince = 0;
-    $("#netBanner").classList.remove("show");
-    applySystemStatus(data);
-    updateConnUi();
-    startPolling();
-    connToast("已连接 " + state.ip + " · /system/status 正常", "ok");
-  } catch (e) {
-    state.connecting = false;
-    state.connected = false;
-    updateConnUi();
-    $("#netBanner").classList.add("show");
-    $("#netBannerText").textContent =
-      "无法连接 " + state.ip + " — 自动重试中。请先到 OTA 主页配置 IP 并点「测试」";
-    connToast("自动连接失败：" + (e.message || "无法访问 " + state.ip) + " — 将持续探测", "warn");
-    startProbe();
-  }
+    "自动连接 " + state.ip + " … 本页与 OTA 主页共用 IP";
+  /* HTTP 探测驱动连接：/system/status 可用 → startPolling */
+  startProbe();
 }
 
 function applySystemStatus(data) {
@@ -762,36 +726,37 @@ function stopTimer(key) {
  * 双链路轮询：motor 和 feedback 各自独立定时器，互不阻塞。
  *
  * 历史问题：原来 motor → feedback 串行，任一挂起（ESP32 端 mutex 阻塞 /
- * WiFi 抖动）会拖累另一个，表现为"age 不动 + 数据卡顿"。
- * 现在：motor 走锁相定时器，feedback 走固定 250ms 定时器，
+ * WiFi 抖动）会拖累另一个，表现为数据卡顿。
+ * 现在：motor 和 feedback 各走独立固定节拍定时器，
  *   - motor 挂起 3s 超时期间，feedback 仍正常刷
- *   - feedback 挂起不影响 motor 锁相
+ *   - feedback 挂起不影响 motor
  * 两者共用 ESP32 端 httpJsonWorkMutex，ESP32 串行处理即可。
  */
 function stopDataPolling() {
-  state.pollGen += 1; /* 使在途 pollLoop 退出后不再续约 */
+  state.pollGen += 1;
   stopTimer("tick");
   stopTimer("feedback");
   stopTimer("status");
   state.tickInFlight = false;
   state.feedbackInFlight = false;
 }
+
+/**
+ * 启动数据链路：HTTP 三链（motor tick / feedback 1Hz / status 1Hz）立即开车。
+ */
 function startPolling() {
-  stopDataPolling();
+  stopDataPolling();           /* 递增 pollGen，清残留定时器/在途链 */
   state.failCount = 0;
   state.tickN = 0;
+  state.statusTickN = 0;
   const gen = state.pollGen;
   schedulePollLoop(gen, 0);
-  scheduleFeedbackPoll(gen, 100);
-  /* status 独立定时器：与 motor/feedback 解耦，避免 ESP32 端 httpJsonWorkMutex
-   * 被 system_status_handler 长时间占用时拖慢 motor/feedback 轮询。
-   * - lite（?lite=1）：轻量路径，~150B，只返回 wifi + gd32_features，
-   *   不调 heap_caps_get_info / 任务栈遍历。1s 一次（高频）。
-   * - full：完整路径，~3KB，含 OTA/heap/SPI 等。5s 一次（低频）。
-   * 两条路径交替：lite, lite, lite, lite, full, lite, lite, lite, lite, full, …
-   * 这样完整 status 阻塞 httpd 的频率从 2s/次 降到 5s/次，pending 显著减少。 */
+  scheduleFeedbackPoll(gen, 0);
   scheduleStatusPoll(gen, 1000);
+  /* 连上后把持久化的刷新速度同步给 GD32，使 0xC5 推送周期与本地轮询一致（无需用户重新拨动） */
+  sendMotorPeriod(state.refreshIntervalMs || 250);
 }
+
 function scheduleStatusPoll(gen, delayMs) {
   if (gen !== state.pollGen) return;
   stopTimer("status");
@@ -835,52 +800,11 @@ function scheduleFeedbackPoll(gen, delayMs) {
 function schedulePollLoop(gen, delayMs) {
   if (gen !== state.pollGen) return;
   stopTimer("tick");
-  /* 锁相模式：delayMs 省略时，根据最近一次 age_ms 反推下一帧推送时刻，
-   * 把 poll 沿钉到「GD32 推送后沿 + servoMs」处。任何异常都退回固定节拍。 */
-  let delay = delayMs;
-  if (delay == null) {
-    delay = computePhaseLockDelayMs();
-  }
+  const delay = delayMs != null ? delayMs : (state.refreshIntervalMs || TICK_INTERVAL_MS);
   state.poll.tick = setTimeout(function () {
     state.poll.tick = null;
     pollLoop(gen);
   }, delay);
-}
-
-/**
- * 根据最近一次 /motor/state 的 age_ms + 本地时钟，计算下一轮 motor 轮询延迟。
- *
- * 数据源 GD32 0xC5 固定 ~250ms 推送，浏览器无法拿到比源更新的数据：
- *  - 用户间隔 ≤ 推送周期：按 1×period 锁相（最快 250ms）
- *  - 用户间隔 > 推送周期：按 N×period 抽稀（N = round(user/period)）
- *    这样改「刷新速度」到 500/1000/2000 会真实变慢，而不是被锁相钉死在 250。
- * 上一帧推送本地时刻 = lastRecvPerfMs - lastAgeMs。
- * 无同步样本时退回 max(userMs, period)。
- */
-function computePhaseLockDelayMs() {
-  const ph = state.phase;
-  const period = ph.motorPeriodMs || TICK_INTERVAL_MS;
-  const userMs = state.refreshIntervalMs || TICK_INTERVAL_MS;
-  /* 不能比 GD32 推送更快；更慢则取整到 N 个推送周期 */
-  const n = Math.max(1, Math.round(userMs / period));
-  const targetPeriod = n * period;
-  if (!ph.haveSync || ph.lastAgeMs == null || ph.lastRecvPerfMs <= 0) {
-    return targetPeriod;
-  }
-  const now = performance.now();
-  const lastPushPerfMs = ph.lastRecvPerfMs - ph.lastAgeMs;
-  let nextPushPerfMs = lastPushPerfMs + targetPeriod;
-  while (nextPushPerfMs <= now) {
-    nextPushPerfMs += targetPeriod;
-  }
-  const target = nextPushPerfMs + ph.servoMs;
-  let delay = target - now;
-  /* clamp：太小会贴着推送沿被抖到沿前；太大说明相位估计已漂远，
-   * 退回固定节拍等下一轮重新对齐。 */
-  if (!Number.isFinite(delay) || delay < 30 || delay > targetPeriod + 200) {
-    return targetPeriod;
-  }
-  return delay;
 }
 
 /**
@@ -901,8 +825,6 @@ async function pollLoop(gen) {
   } finally {
     state.tickInFlight = false;
     if (gen === state.pollGen && state.connected && !state.probing) {
-      /* 不传 delayMs → schedulePollLoop 用锁相计算；
-       * 失败轮（noteHardFailure 已处理）或尚未同步时退回固定节拍。 */
       schedulePollLoop(gen);
     }
   }
@@ -1042,73 +964,44 @@ async function fetchFeedback(gen) {
 }
 
 /* ═══════════════════════ /motor/state 处理 ═══════════════════════ */
+/* 后端表已改 node×channel 双键（同节点号可同时在多通道在线），
+ * motors[] 可能含同 node 不同 ch 的多条记录，decoded 缓存键也必须带通道。 */
+function motorKey(m) { return m.ch + ":" + m.node; }
+
 function onMotorState(data) {
   const motors = (data && data.motors) ? data.motors : [];
   state.motors = motors;
 
-  /* 锁相采样：记录 age_ms 与本地高精度时钟，供 schedulePollLoop 反推
-   * GD32 下一次推送时刻。age 异常（null / UINT32_MAX 上界 / 负数）时
-   * 不更新基准，schedulePollLoop 会自动回退固定节拍。
-   * 上界 600 ≈ 2.4 × motorPeriodMs：覆盖 1 拍丢失后 age 跳到 ~500ms 的情形，
-   * 仍能维持锁相基准；超过 600 视为长时通信故障，退回固定节拍重学。 */
-  if (data && data.age_ms != null) {
-    const a = Number(data.age_ms);
-    if (Number.isFinite(a) && a >= 0 && a < 600) {
-      state.phase.lastAgeMs = a;
-      state.phase.lastRecvPerfMs = performance.now();
-      state.phase.haveSync = true;
-    }
-  }
-
-  /* age 显示平滑：滚动窗口采样 + 丢帧近似计数。
-   * age > motorPeriodMs*1.5 视为丢帧（GD32 ring 超时 / SPI 抢占 / ESP32 忙）。 */
-  if (data && data.age_ms != null) {
-    const a = Number(data.age_ms);
-    if (Number.isFinite(a) && a >= 0) {
-      const w = state.ageWindow;
-      w.push(a);
-      if (w.length > 12) w.shift();
-      if (a > state.phase.motorPeriodMs * 1.5) {
-        state.ageLossCount = (state.ageLossCount || 0) + 1;
-      }
-    }
-  }
-
-  /* 解码每个节点的 STATUS 帧 */
+  /* 解码每个 节点×通道 的 STATUS 帧 */
   const decoded = new Map();
   for (const m of motors) {
     const bytes = hexToBytes(m.data);
     const d = decodeStatus(bytes);
-    if (d) decoded.set(m.node, d);
+    if (d) decoded.set(motorKey(m), d);
   }
   state.decoded = decoded;
 
+  /* 按实际通道统计在线电机数：驱动通道下拉框信号标记 + 本页通道过滤视图 */
+  const chOnline = [0, 0, 0];
+  for (const m of motors) {
+    if (m.online && m.node >= 1 && m.node <= 9 && m.ch >= 0 && m.ch <= 2) chOnline[m.ch]++;
+  }
+  state.chOnline = chOnline;
+  updateChSelectOptions();
+
   /* 固定节点 1–9：始终可选（含离线），便于电机已进 BOOT / 无 STATUS 时仍能刷写。
-   * 自动选择：当前选中已是 1–9 则保持；否则优先第一个在线，否则默认 1。 */
+   * 自动选择：当前选中已是 1–9 则保持；否则优先当前通道的在线节点，其次任意在线，否则默认 1。 */
   let autoSelected = false;
   if (state.selectedNode == null || state.selectedNode < 1 || state.selectedNode > 9) {
-    const online = motors.find((m) => m.online && m.node >= 1 && m.node <= 9);
+    const online = motors.find((m) => m.online && m.ch === state.ch && m.node >= 1 && m.node <= 9)
+                || motors.find((m) => m.online && m.node >= 1 && m.node <= 9);
     state.selectedNode = online ? online.node : 1;
     autoSelected = true;
   }
 
-  renderNodeList();
-  renderStatusPanel();
+  refreshChannelViews();
   updateNodeLabels();
   if (autoSelected) restoreVersionUi(state.selectedNode);  /* 自动切节点时回填缓存版本 */
-
-  /* age 显示：用滚动窗口中位数过滤丢帧瞬时跳变。
-   * 原始 age 在 GD32 丢一帧时会跳到 ~500ms，但稳态相位没变；
-   * 中位数反映「最近典型 age」，对单点跳变免疫。
-   * 丢帧计数单独显示，让用户能区分「相位漂移」和「丢帧」。 */
-  const onlineCount = motors.filter((m) => m.online && m.node >= 1 && m.node <= 9).length;
-  const w = state.ageWindow;
-  const medAge = w.length ? median(w) : null;
-  const lossN = state.ageLossCount || 0;
-  const ageText = medAge != null
-    ? `age≈${Math.round(medAge)}ms` + (lossN ? ` · 丢帧${lossN}` : "")
-    : (data && data.age_ms != null ? `age ${data.age_ms}ms` : "age --");
-  $("#nodeSummary").textContent = `${onlineCount}/9 在线 · ${ageText}`;
 
   /* BOOT 徽章：总线上有电机在 Bootloader（0x103 心跳）时显示，独立于 N1-N9。
    * 0x103 固定 ID 不带节点号，故不归属任何 Nx，只作总线级 BOOT 提示。
@@ -1124,31 +1017,39 @@ function onMotorState(data) {
   }
 }
 
-/* 滚动窗口中位数：复制后排序取中，避免污染原数组顺序。 */
-function median(arr) {
-  if (!arr || !arr.length) return null;
-  const s = arr.slice().sort((a, b) => a - b);
-  const n = s.length;
-  return (n % 2) ? s[(n - 1) >> 1] : (s[n / 2 - 1] + s[n / 2]) / 2;
-}
-
 /* ─── 节点列表渲染 ───
  * ★ 固定显示 N1–N9：即使离线/无 0xC5 推送也可见可选，方便电机在 BOOT 时刷写。
  * 性能：首次全量重建 DOM；之后只增量更新文本/class。 */
 const FIXED_MOTOR_NODES = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const _nodeCards = new Map();   // node -> { card, led, modeEl, stTxt, angleVal, velVal, curVal, faultsEl }
 
-/** 把后端 motors[] 叠到固定 1–9 槽位；无数据的槽位记为 offline。 */
+/** 把后端 motors[] 叠到固定 1–9 槽位；无数据的槽位记为 offline。
+ * ★ node×channel 双键：同节点号可能在多个通道各有一条记录。
+ *   优先级：当前通道在线 > 其他通道在线（otherCh 标注，如 "0/2"）>
+ *   当前通道离线记录 > 空槽位。 */
 function getDisplayMotors() {
-  const byNode = new Map();
-  for (const m of state.motors || []) {
-    if (m && m.node >= 1 && m.node <= 9) byNode.set(m.node, m);
-  }
+  const motors = state.motors || [];
   return FIXED_MOTOR_NODES.map((node) => {
-    const m = byNode.get(node);
-    if (m) return m;
+    const entries = motors.filter((m) => m && m.node === node);
+    const cur = entries.find((m) => m.ch === state.ch);
+    if (cur && cur.online) return cur;
+    const others = entries.filter((m) => m.online && m.ch !== state.ch);
+    if (others.length) {
+      const chs = others.map((o) => o.ch).sort().join("/");
+      return { node, ch: others[0].ch, online: false, otherCh: chs, dlc: 0, rx_count: 0, seq: 0, data: "" };
+    }
+    if (cur) return cur;
     return { node, ch: state.ch || 0, online: false, dlc: 0, rx_count: 0, seq: 0, data: "" };
   });
+}
+
+/** 通道切换或电机数据更新后，按当前通道刷新节点列表 / STATUS 面板 / 在线汇总 */
+function refreshChannelViews() {
+  renderNodeList();
+  renderStatusPanel();
+  const onlineCount = (state.motors || [])
+    .filter((m) => m.online && m.ch === state.ch && m.node >= 1 && m.node <= 9).length;
+  $("#nodeSummary").textContent = `${onlineCount}/9 在线 · CH${state.ch}`;
 }
 
 function renderNodeList() {
@@ -1185,7 +1086,8 @@ function renderNodeList() {
   for (const m of motors) {
     const ref = _nodeCards.get(m.node);
     if (!ref) continue;
-    const d = state.decoded.get(m.node);
+    /* otherCh 卡片不取解码数据：其 STATUS 属于其他通道，本通道视图不展示/不标故障 */
+    const d = m.otherCh != null ? null : state.decoded.get(motorKey(m));
     const faultCount = faultCountOf(d);
     const faultLabel = faultShortLabel(d);
     const isSel = m.node === state.selectedNode;
@@ -1199,19 +1101,22 @@ function renderNodeList() {
     if (ref.card.className !== cls) ref.card.className = cls;
     ref.card.setAttribute("aria-selected", String(isSel));
     if (faultLabel) ref.card.title = "故障: " + faultLabel;
+    else if (m.otherCh != null) ref.card.title = `节点在 CH${m.otherCh} 在线，切换顶部通道查看`;
     else if (!m.online) ref.card.title = "离线也可选中刷写";
     else ref.card.title = "在线";
 
-    const ledCls = m.online ? (faultCount > 0 ? "led-err" : "led-on") : "";
+    const ledCls = m.otherCh != null ? "led-warn" : (m.online ? (faultCount > 0 ? "led-err" : "led-on") : "");
     const ledFull = "led " + ledCls;
     if (ref.led.className !== ledFull) ref.led.className = ledFull;
 
     const sentMode = state.lastSentMode.get(m.node);
     const mode = (sentMode != null && MODES[sentMode]) ? MODES[sentMode] : null;
-    /* motStatus 是报错位(1=故障)，不是运行标志；无最近 CMD 时用 待机 */
-    const modeLabel = !m.online ? "离线" : (mode ? mode.zh : "待机");
+    /* motStatus 是报错位(1=故障)，不是运行标志；无最近 CMD 时用 待机。
+     * otherCh：节点在其他通道在线，标注实际通道供用户切换。 */
+    const modeLabel = m.otherCh != null ? ("CH" + m.otherCh) : (!m.online ? "离线" : (mode ? mode.zh : "待机"));
     if (ref.modeEl.textContent !== modeLabel) ref.modeEl.textContent = modeLabel;
-    const modeCls = !m.online ? "nc-mode mode-off" : (faultCount > 0 ? "nc-mode mode-fault" : "nc-mode");
+    const modeCls = m.otherCh != null ? "nc-mode mode-other-ch"
+      : (!m.online ? "nc-mode mode-off" : (faultCount > 0 ? "nc-mode mode-fault" : "nc-mode"));
     if (ref.modeEl.className !== modeCls) ref.modeEl.className = modeCls;
 
     const stTxt = !m.online ? "--" : (faultLabel || "OK");
@@ -1236,7 +1141,8 @@ function renderNodeList() {
 
 /* 构建单节点卡片的 HTML（仅集合变化时调用） */
 function buildNodeCardHtml(m) {
-  const d = state.decoded.get(m.node);
+  /* otherCh 卡片不取解码数据（同 renderNodeList 增量路径） */
+  const d = m.otherCh != null ? null : state.decoded.get(motorKey(m));
   const faultCount = faultCountOf(d);
   const faultLabel = faultShortLabel(d);
   const isSel = m.node === state.selectedNode;
@@ -1248,17 +1154,19 @@ function buildNodeCardHtml(m) {
   ].join(" ").trim();
   const sentMode = state.lastSentMode.get(m.node);
   const mode = (sentMode != null && MODES[sentMode]) ? MODES[sentMode] : null;
-  const modeLabel = !m.online ? "离线" : (mode ? mode.zh : "待机");
-  const modeCls = !m.online ? "mode-off" : (faultCount > 0 ? "mode-fault" : "");
+  const modeLabel = m.otherCh != null ? ("CH" + m.otherCh) : (!m.online ? "离线" : (mode ? mode.zh : "待机"));
+  const modeCls = m.otherCh != null ? "mode-other-ch" : (!m.online ? "mode-off" : (faultCount > 0 ? "mode-fault" : ""));
   const stTxt = !m.online ? "--" : (faultLabel || "OK");
-  const cardTitle = faultLabel ? ("故障: " + faultLabel) : (m.online ? "在线" : "离线也可选中刷写");
+  const cardTitle = faultLabel ? ("故障: " + faultLabel)
+    : m.otherCh != null ? `节点在 CH${m.otherCh} 在线，切换顶部通道查看`
+    : (m.online ? "在线" : "离线也可选中刷写");
   const angle = d && m.online ? d.rtAngle.toFixed(1) + "°" : "--";
   const vel = d && m.online ? d.rtVelocity.toFixed(0) : "--";
   const cur = d && m.online ? d.rtCurrent.toFixed(0) : "--";
   return `<div class="${cls}" role="option" tabindex="0" data-node="${m.node}" aria-selected="${isSel}" title="${cardTitle}">
     ${faultCount > 0 ? `<div class="nc-faults">${"<span class='fault-dot'></span>".repeat(faultCount)}</div>` : ""}
     <div class="nc-top">
-      <span class="led ${m.online ? (faultCount > 0 ? "led-err" : "led-on") : ""}"></span>
+      <span class="led ${m.otherCh != null ? "led-warn" : (m.online ? (faultCount > 0 ? "led-err" : "led-on") : "")}"></span>
       <span class="nc-id">N${m.node}</span>
       <span class="nc-mode ${modeCls}">${modeLabel}</span>
       <span class="nc-status-text" title="${faultLabel ? ("故障: " + faultLabel) : ""}">${stTxt}</span>
@@ -1310,8 +1218,13 @@ function flashEl(el) {
 
 function renderStatusPanel() {
   const n = state.selectedNode;
-  const motor = n != null ? state.motors.find((m) => m.node === n) : null;
-  const d = n != null ? state.decoded.get(n) : null;
+  /* ★ node×channel 双键：只展示当前通道的记录；节点在其他通道在线时给出切换提示 */
+  const entries = n != null ? state.motors.filter((m) => m.node === n) : [];
+  const cur = entries.find((m) => m.ch === state.ch);
+  const others = entries.filter((m) => m.online && m.ch !== state.ch);
+  const onOtherCh = !(cur && cur.online) && others.length > 0;
+  const motor = onOtherCh ? null : cur;
+  const d = (motor && motor.online) ? state.decoded.get(motorKey(motor)) : null;
   const offline = !motor || !motor.online || !d;
 
   $("#offlineOverlay").classList.toggle("show", offline);
@@ -1320,6 +1233,10 @@ function renderStatusPanel() {
     if (!state.connected) {
       $("#offlineTitle").textContent = "设备未连接";
       $("#offlineSub").textContent = "本页共用 OTA 主页 IP，请到主页配置并测试连接";
+    } else if (onOtherCh) {
+      const chs = others.map((o) => "CH" + o.ch).sort().join(" / ");
+      $("#offlineTitle").textContent = `节点 ${n} 在 ${chs} 有信号`;
+      $("#offlineSub").textContent = `当前通道 CH${state.ch} 无此节点，请切换顶部通道查看`;
     } else if (!motor || !motor.online) {
       $("#offlineTitle").textContent = n != null ? `节点 ${n} 离线（仍可刷写）` : "节点离线（仍可刷写）";
       $("#offlineSub").textContent = "无 STATUS 属正常（电机在 BOOT / 未上电）。左侧 N1–N9 可直接选中刷写";
@@ -1382,17 +1299,25 @@ function busStateText(bs) {
   return parts.length ? parts.join("|") : ("0x" + bs.toString(16));
 }
 
-/** 根据通道启用状态更新下拉框选项样式，禁用通道贴 "(禁用)" 标签并置灰 */
+/** 根据通道启用/信号状态更新下拉框选项：
+ *  - 禁用通道贴 "(禁用)" 标签并置灰
+ *  - 有信号通道（存在在线电机）贴 "●N" 标记并着色 */
 function updateChSelectOptions() {
   const sel = $("#chSelect");
   if (!sel) return;
   for (let i = 0; i < sel.options.length; i++) {
     const opt = sel.options[i];
     const en = state.chEnabled[i];
+    const cnt = state.chOnline[i] || 0;
     const base = "CH" + i;
-    opt.textContent = en ? base : base + " (禁用)";
-    opt.style.color = en ? "" : "var(--fg-dim,#666)";
+    opt.textContent = !en ? base + " (禁用)" : (cnt > 0 ? `${base} ●${cnt}` : base);
+    opt.style.color = !en ? "var(--fg-dim,#666)" : (cnt > 0 ? "var(--ok,#3ddc97)" : "");
   }
+  /* 收起态的选框文本用的是 select 自身颜色（option 内联色仅展开时生效），
+   * 同步按当前选中通道的状态着色，避免选中有信号通道后绿色变回默认白 */
+  const curEn = state.chEnabled[state.ch];
+  const curCnt = state.chOnline[state.ch] || 0;
+  sel.style.color = !curEn ? "var(--fg-dim,#666)" : (curCnt > 0 ? "var(--ok,#3ddc97)" : "");
 }
 
 function onFeedback(data) {
@@ -2398,40 +2323,56 @@ function otaDone(sendCancel = true) {
 $("#chSelect").addEventListener("change", () => {
   state.ch = parseInt($("#chSelect").value, 10) || 0;
   updateConnUi();
+  updateChSelectOptions();   /* 同步选框字色：切到有信号通道则绿色，否则默认 */
+  /* 按新通道重刷节点列表 / STATUS 面板 / 在线汇总（通道视图过滤立即生效） */
+  refreshChannelViews();
   /* 通道切换不额外拉 feedback：等下一轮 pollLoop，避免与单飞链并发 */
 });
 
 /* ═══════════════════════ 刷新速度（motor 轮询间隔） ═══════════════════════ */
 /* 用户改 #refreshRate 后：clamp、回填、写 state，并按「N×GD32周期」立即重排。
- * 仅影响 motor 链路；feedback/status 保持 1Hz 独立节拍。
- * 注意：旧实现只把 userMs 当锁相失败 fallback，成功锁相后永远 ~250ms，
- * 导致改刷新速度“看起来没反应”。现在 delay 真正跟随 N×period。 */
+ * 仅影响 motor 链路；feedback/status 保持 1Hz 独立节拍。 */
 const refreshRateInput = $("#refreshRate");
+
+/* 下发 GD32 0xC5 主动推送周期：复用通用 SPI 透传口 /spi/send（不新增 HTTP 路由）。
+ * 命令码 0xC5 + 子操作码 0xFE，data 十六进制 = FE <ms_lo> <ms_hi>（毫秒 LE）。
+ * GD32 端钳制 [50,5000]ms 并回 ACK。失败静默（不影响本地轮询）。 */
+async function sendMotorPeriod(ms) {
+  const lo = ms & 0xFF, hi = (ms >> 8) & 0xFF;
+  const toHex = (b) => b.toString(16).padStart(2, "0").toUpperCase();
+  try {
+    await fetch(getBaseUrl() + "/spi/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "C5", data: "FE" + toHex(lo) + toHex(hi), timeout_ms: 2000 }),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch (e) { /* 周期下发失败静默：GD32 保持旧周期，本地轮询不受影响 */ }
+}
 function applyRefreshRate() {
-  const period = (state.phase && state.phase.motorPeriodMs) || TICK_INTERVAL_MS;
-  const v = clampNum(parseInt(refreshRateInput.value, 10) || period, period, 5000);
+  const v = clampNum(parseInt(refreshRateInput.value, 10) || 250, 50, 5000);
   refreshRateInput.value = v;
   state.refreshIntervalMs = v;
-  const n = Math.max(1, Math.round(v / period));
-  const effective = n * period;
-  /* 取消在途 tick，按新间隔重排；本轮 in-flight 完成后 finally 也会走新 computePhaseLock。 */
   if (state.poll.tick) {
     clearTimeout(state.poll.tick);
     state.poll.tick = null;
   }
-  if (state.connected && !state.probing && !state.tickInFlight) {
-    schedulePollLoop(state.pollGen, effective);
+  /* HTTP 轮询驱动：清掉旧节拍后必须立即按新间隔重排 motor 链，
+   * 否则轮询链断死、STATUS 面板停更。
+   * tickInFlight 时在途 pollLoop 的 finally 也会重排，schedulePollLoop 内部
+   * stopTimer 保证不会双链并发。 */
+  if (state.connected && !state.probing) {
+    schedulePollLoop(state.pollGen, 0);
+    sendMotorPeriod(v);   /* 同步 GD32 0xC5 推送周期（复用 /spi/send，命令码 0xC5 + 子命令 0xFE） */
   }
-  const hz = 1000 / effective;
-  const note = (effective !== v) ? ` → 实际 ${effective}ms` : "";
-  toast(`刷新速度 ${v} ms（≈${hz >= 10 ? hz.toFixed(0) : hz.toFixed(1)} Hz，${n}×${period}ms）${note}`, "ok");
+  const hz = 1000 / v;
+  toast(`刷新速度 ${v} ms（≈${hz >= 10 ? hz.toFixed(0) : hz.toFixed(1)} Hz）`, "ok");
 }
 refreshRateInput.addEventListener("change", applyRefreshRate);
 refreshRateInput.addEventListener("input", () => {
-  /* 输入过程中只 clamp 显示，松手/change 再应用节拍，避免每个键都 toast */
-  const period = (state.phase && state.phase.motorPeriodMs) || TICK_INTERVAL_MS;
+  /* 输入过程中只 clamp 下限显示，松手/change 再应用节拍，避免每个键都 toast */
   const raw = parseInt(refreshRateInput.value, 10);
-  if (Number.isFinite(raw) && raw < period) refreshRateInput.value = period;
+  if (Number.isFinite(raw) && raw < 50) refreshRateInput.value = 50;
 });
 
 /* ═══════════════════════ 示波器系统 ═══════════════════════ */
@@ -2648,11 +2589,12 @@ const scopeSys = (() => {
     card.addEventListener("click", () => card.classList.toggle("open"));
   });
 
-  /* 采样：用真实解码的 STATUS 数据填充历史缓冲（1Hz 数据 → 平滑插值） */
+  /* 采样：用真实解码的 STATUS 数据填充历史缓冲（1Hz 数据 → 平滑插值）。
+   * node×channel 双键：只采当前通道的记录，避免波形混入其他通道同号电机数据。 */
   function sample() {
     const n = state.selectedNode;
-    const d = n != null ? state.decoded.get(n) : null;
-    const motor = n != null ? state.motors.find((m) => m.node === n) : null;
+    const motor = n != null ? state.motors.find((m) => m.node === n && m.ch === state.ch) : null;
+    const d = motor ? state.decoded.get(motorKey(motor)) : null;
     const online = d && motor && motor.online;
     if (!online) {
       hist.u[head] = hist.v[head] = hist.w[head] = 0;
@@ -2714,33 +2656,19 @@ bindAutoSave();
 initCmdCommit();  /* CMD 输入提交制：必须在 loadUiState 回填之后初始化，否则初始提交值是 HTML 默认值 */
 otaRestorePersistedFirmware();  /* 异步恢复上次固件（无阻塞） */
 
-/* 暴露诊断对象到 window，供控制台排查 age 波动 / 锁相状态：
- *   window.phaseDebug.history        // 最近 12 次 raw age_ms
- *   window.phaseDebug.lossCount      // 累计丢帧次数
- *   window.phaseDebug.lastSyncAge    // 锁相基准用的 age
- *   window.phaseDebug.haveSync       // 是否已建立锁相
- *   window.phaseDebug.lastSlowReq    // 上次慢请求（>200ms）path+耗时，定位"age 不动"卡顿
- *   window.phaseDebug.reset()        // 强制重新学习锁相 */
+/* 暴露诊断对象到 window，供控制台排查慢请求：
+ *   window.phaseDebug.lastSlowReq    // 上次慢请求（>200ms）path+耗时
+ *   window.phaseDebug.slowStats      // 累计慢请求统计
+ *   window.phaseDebug.reset()        // 清空慢请求统计 */
 window.phaseDebug = {
-  get history() { return state.ageWindow.slice(); },
-  get lossCount() { return state.ageLossCount || 0; },
-  get lastSyncAge() { return state.phase.lastAgeMs; },
-  get haveSync() { return state.phase.haveSync; },
-  get motorPeriodMs() { return state.phase.motorPeriodMs; },
-  get servoMs() { return state.phase.servoMs; },
   get lastSlowReq() { return state.phaseDebug && state.phaseDebug.lastSlowReq; },
   get slowStats() { return state.phaseDebug && state.phaseDebug.slowStats; },
   reset() {
-    state.phase.haveSync = false;
-    state.phase.lastAgeMs = null;
-    state.phase.lastRecvPerfMs = 0;
-    state.ageWindow.length = 0;
-    state.ageLossCount = 0;
     if (state.phaseDebug) {
       state.phaseDebug.lastSlowReq = null;
       state.phaseDebug.slowStats = {};
     }
-    console.log("[phaseDebug] 锁相基准 + 慢请求统计已清空");
+    console.log("[phaseDebug] 慢请求统计已清空");
   },
 };
 
