@@ -67,7 +67,13 @@ static void feedTask(void *arg)
      * 连续 SPI 失败计数：超过阈值时主动 QUERY GD32 真实状态，避免盲重试空转到 120s。 */
     uint32_t consec_fail = 0U;
     constexpr uint32_t kQueryAfterFails = 8U;  /* 连续 8 次失败(~2s)后 QUERY 一次 */
+    uint32_t consec_wait = 0U;
+    constexpr uint32_t kQueryAfterWaits = 150U; /* 连续 150 次 WAIT(~300ms)后 QUERY：
+                                                  * 正常 buffer-full WAIT <100 次即恢复；
+                                                  * 超限说明 GD32 可能因 auto-retry 重置了
+                                                  * s_fw_fed=0，当前 offset 被 gap 拒收。 */
     uint32_t ack_n = 0U;  /* 成功 ACK 计数，用于降频写 s_status */
+    bool handshake_confirmed = false;  /* GD32 已进 kTransfer/kErase，可标 TRANSFER */
 
     while (s_feed_running && s_fw_offset < s_fw_size) {
         if (nowMs() >= deadline_ms) {
@@ -88,10 +94,10 @@ static void feedTask(void *arg)
                 break;
             }
         }
-        /* 注：旧版有 "GD32 回到握手阶段→重置 offset" 的逻辑，
-         * 但 v1.4.38+ 已移除握手重试(0x05 直接中止不重握手)，
-         * 且 v1.4.58 feedData 在握手期间就接受数据(预填充缓冲)。
-         * 若在此重置 offset，会导致缓冲中数据重复。已移除。 */
+        /* GD32 auto-retry 检测（v1.5.5+）：GD32 SPI 断流/电机超时后自动重新握手，
+         * 重置 s_fw_fed=0。ESP32 侧通过连续 WAIT→QUERY 检测到 state!=kTransfer 后
+         * 重置 s_fw_offset=0 从头喂（见下方 kRspWait 分支）。
+         * 注：v1.4.38~v1.5.4 曾移除此逻辑（当时无 auto-retry，握手失败即中止）。 */
 
 const uint32_t remaining = s_fw_size - s_fw_offset;
 	        const uint32_t data_len = (remaining < MOTOR_OTA_CHUNK_DATA)
@@ -154,33 +160,98 @@ const uint32_t remaining = s_fw_size - s_fw_offset;
 	            continue;  /* 不推进 offset，同 offset 重发 */
 	        }
 	        consec_fail = 0U;
+	        consec_wait = 0U;
 
-	        if (resp_type == kRspAck) {
-	            s_fw_offset += data_len;
-	            /* 进度：每 8 chunk 写 s_status；state 在 suppress 下不会收 0xD2，
-	             * 喂数一开始就标 TRANSFER，避免网页卡在「开始握手」。 */
-	            const bool touch_status = ((++ack_n & 7U) == 0U) || (s_fw_offset >= s_fw_size);
-	            if (touch_status || ack_n == 1U) {
-	                const uint16_t fed_pkts = static_cast<uint16_t>((s_fw_offset + 47U) / 48U);
-	                if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-	                    if (s_status.state < MOTOR_OTA_TRANSFER ||
-	                        s_status.state == MOTOR_OTA_PRE_CANCEL ||
-	                        s_status.state == MOTOR_OTA_HANDSHAKE_REQ ||
-	                        s_status.state == MOTOR_OTA_HANDSHAKE_NONCE ||
-	                        s_status.state == MOTOR_OTA_HANDSHAKE_CONFIRM ||
-	                        s_status.state == MOTOR_OTA_ERASE) {
-	                        s_status.state = MOTOR_OTA_TRANSFER;
+        if (resp_type == kRspAck) {
+            s_fw_offset += data_len;
+            /* 进度：每 8 chunk 写 s_status。
+             * ★ 不再喂数据一成功就强标 TRANSFER：GD32 feedData() 在握手阶段
+             *   (kPreCancel/kHandshakeReq 等) 也接收预填充数据，若此刻强标
+             *   TRANSFER，无电机的空通道会让网页误显示"数据传输 N/912"而非
+             *   "握手中…→超时"。改为：只在 GD32 真正进 kErase/kTransfer 后
+             *   才标 TRANSFER；握手未完成时保持握手态显示。
+             *   握手未确认时每 8 个 ACK 重新 QUERY 一次（GD32 握手+擦除
+             *   通常 1~3s，8 个 ACK ~16 个 chunk ≈ 3700B <1s，需多轮确认）。 */
+            ++ack_n;
+            const bool touch_status = ((ack_n & 7U) == 0U) || (s_fw_offset >= s_fw_size);
+
+            /* 握手未确认时定期 QUERY：确认 GD32 已过握手阶段才标 TRANSFER */
+            if (!handshake_confirmed && (ack_n & 7U) == 0U) {
+                uint8_t qcmd[1] = {2U};
+                uint8_t qt = 0, qp[16] = {0};
+                size_t ql = 0;
+                if (SpiMaster::instance().transact(
+                        kSpiMotorOtaCmd, qcmd, 1, &qt, qp, sizeof(qp), &ql, 300U) == ESP_OK
+                    && qt == kRspAck && ql >= 1U) {
+                    motor_ota_state_t qst = static_cast<motor_ota_state_t>(qp[0]);
+                    if (qst == MOTOR_OTA_ERASE || qst == MOTOR_OTA_TRANSFER ||
+                        qst == MOTOR_OTA_FINISH_OTA || qst == MOTOR_OTA_WAIT_APP_RUN) {
+                        handshake_confirmed = true;
+                        if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+                            s_status.state = MOTOR_OTA_TRANSFER;
+                            s_status.last_update_ms = nowMs();
+                            xSemaphoreGive(s_mutex);
+                        }
+                    }
+                    /* 终态（ERROR/IDLE/FINISHED）交给下方终态检测处理 */
+                }
+            }
+            if (touch_status) {
+                const uint16_t fed_pkts = static_cast<uint16_t>((s_fw_offset + 47U) / 48U);
+                if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+                    /* 握手未确认时不标 TRANSFER、不更新 packets_acked：
+                     * 此刻 fed_pkts 是喂给 GD32 环缓冲的字节数（预填充），
+                     * 不是电机真实 ACK，握手未成时显示会让用户误以为在传输。 */
+                    if (handshake_confirmed) {
+                        s_status.state = MOTOR_OTA_TRANSFER;
+                        s_status.packets_acked = fed_pkts;
+                    }
+                    s_status.last_update_ms = nowMs();
+                    xSemaphoreGive(s_mutex);
+                }
+            }
+	        } else if (resp_type == kRspWait) {
+	            /* 缓冲满 / gap 拒收：不推进 offset，稍候重试。
+	             * WAIT 路径 SPI 层已推进 seq，避免同 seq 重发被 GD32 当重复请求死锁。 */
+	            vTaskDelay(pdMS_TO_TICKS(2));
+	            /* 连续 WAIT 超限：可能 GD32 auto-retry 重置了 s_fw_fed=0，
+	             * 当前 offset 被 gap 拒收（永远不会变 ACK）。QUERY 确认真实状态。 */
+	            if (++consec_wait >= kQueryAfterWaits) {
+	                consec_wait = 0U;
+	                uint8_t qcmd[1] = {2U};  /* cmd=QUERY */
+	                uint8_t qt = 0, qp[16] = {0};
+	                size_t ql = 0;
+	                if (SpiMaster::instance().transact(
+	                        kSpiMotorOtaCmd, qcmd, 1, &qt, qp, sizeof(qp), &ql, 300U) == ESP_OK
+	                    && qt == kRspAck && ql >= 2U) {
+	                    const motor_ota_state_t qst = static_cast<motor_ota_state_t>(qp[0]);
+	                    const uint8_t qerr = qp[1];
+                    if (qst != MOTOR_OTA_TRANSFER) {
+                        /* GD32 不在传输态（auto-retry 回了 kPreCancel/握手）：
+                         * 重置 offset 从头喂，配合 GD32 重新擦除+握手。 */
+                        ESP_LOGW(TAG, "GD32 retry detected: state=%u err=0x%02X, reset offset %u->0",
+                                 (unsigned)qst, (unsigned)qerr, (unsigned)s_fw_offset);
+                        s_fw_offset = 0U;
+                        ack_n = 0U;
+                        handshake_confirmed = false;  /* 重新握手，需重新确认 */
+                    } else {
+                        handshake_confirmed = true;  /* GD32 在 transfer，确认握手完成 */
+                    }
+	                    /* 终态仍 break */
+	                    if (qst == MOTOR_OTA_IDLE || qst == MOTOR_OTA_FINISHED ||
+	                        qst == MOTOR_OTA_ERROR) {
+	                        ESP_LOGW(TAG, "QUERY(WAIT) 终态 0x%02X err=0x%02X，停止",
+	                                 (unsigned)qst, (unsigned)qerr);
+	                        if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+	                            s_status.state = qst;
+	                            s_status.error_code = qerr;
+	                            s_status.last_update_ms = nowMs();
+	                            xSemaphoreGive(s_mutex);
+	                        }
+	                        break;
 	                    }
-	                    s_status.packets_acked = fed_pkts;
-	                    s_status.last_update_ms = nowMs();
-	                    xSemaphoreGive(s_mutex);
 	                }
 	            }
-	        } else if (resp_type == kRspWait) {
-	            /* 缓冲满：不推进 offset，稍候用新 TX_SEQ 再发同一 offset。
-	             * WAIT 路径 SPI 层已推进 seq（见 otaPollResponseUnlocked），
-	             * 避免同 seq 重发被 GD32 当重复请求死锁。 */
-	            vTaskDelay(pdMS_TO_TICKS(2));
 	        } else {
 	            /* 非 ACK/WAIT（含 ERROR/陈旧 type）：不 break 整次 OTA。
 	             * 曾因 poll 读到 EVENT/错 type 直接 break → fed 卡首 chunk。 */

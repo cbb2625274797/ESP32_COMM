@@ -12,14 +12,20 @@ const TOAST_AUTOHIDE_MS = 3000;
 var _toastHideTimer = null;
 var _toastLastKey = '';
 var _toastLastAt = 0;
-export function showToast(message, type) {
+/**
+ * @param {string} message
+ * @param {string} [type] success/error/warning
+ * @param {{ force?: boolean }} [opts] force=true 时跳过 5s 去重，
+ *   用于用户主动操作（如批量发送完成）的反馈，避免 alert 阻塞后时间漂移导致被去重吞掉。
+ */
+export function showToast(message, type, opts) {
   type = type || 'success';
   var toast = document.getElementById('toast');
   if (!toast) return;
   // 相同文案 5s 内不重复弹，避免轮询把 ✓ 刷成「疯狂跳」
   var key = type + '|' + message;
   var now = Date.now();
-  if (key === _toastLastKey && (now - _toastLastAt) < TOAST_DEDUPE_MS) {
+  if (!(opts && opts.force) && key === _toastLastKey && (now - _toastLastAt) < TOAST_DEDUPE_MS) {
     return;
   }
   _toastLastKey = key;

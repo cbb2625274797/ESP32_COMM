@@ -12,8 +12,10 @@ CONFIG_DCU_OTA_FINISH_TIMEOUT_MS=10000
 # 不要再开 QIO，除非确认 flash 型号与硬件连接均兼容。
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 
-# DCU SPI clock -- 4 MHz（GD32 SPI0 RX DMA 武装后可安全提速；8/12MHz 须零错误验证后再开）
-CONFIG_DCU_SPI_CLOCK_HZ=4000000
+# DCU SPI clock -- 8 MHz（2026-07-31 提速：事件驱动握手后时钟占周期 ~78%，
+#   8MHz 实测测速页/relay/PING 零错误后启用；半周期 62.5ns，GD32 从机 MISO
+#   输出延迟 + ESP32 GPIO 矩阵输入延迟 ~45ns 仍有余量；≥16MHz 全双工不可行）
+CONFIG_DCU_SPI_CLOCK_HZ=8000000
 
 # GD32 OTA 包间节奏：不用固定 PACKET_INTERVAL；依赖 SpiMaster CREDIT 背压
 # （flash 槽满时 CREDIT=0，等 CREDIT_UPDATE / 帧头 credit 恢复后再发）

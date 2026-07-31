@@ -1163,10 +1163,14 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
     size_t resp_len = 0;
     const uint32_t expected_ack = (seq == m_transferTotalPackets - 1) ? kLastPacketAckSeq : (seq + 1U);
     /*
-     * 协议要点：
-     * - GD32 ISR 收 DATA 后立刻回 WAIT，主循环 AES/Flash 后再 ACK。
-     * - 一旦见过 WAIT，说明包已进从机；再发 DATA = DUP-SEQ，只会反复 WAIT。
-     * - 因此：见 WAIT 后只 poll；仅「完全无响应」才允许重发 DATA。
+     * 协议要点（v2，GD32 侧缓存修复后）：
+     * - GD32 ISR 收 DATA 后立刻回 WAIT，主循环 AES/Flash 后再回 ACK。
+     * - 一旦见过 WAIT，包已进从机；但那帧 ACK 可能因时序（尤其 8MHz）丢失。
+     * - GD32 主循环发 ACK 时已同步更新重发缓存（见 SpiOta::sender），
+     *   且主循环对已写入包号去重（receive_packet_num < next_expected_packet 只回 ACK，
+     *   不二次写 flash）——故重发 DATA 安全。
+     * - 因此：见 WAIT 后若 poll 超时，允许有限次重发 DATA 触发 DUP-SEQ 回放最终 ACK，
+     *   实现“重发快且不漏”（旧逻辑见 WAIT 后只能干 poll 到 stall，ACK 丢了就永丢）。
      * - 等 ACK 期间可预组下一包（与从机处理重叠）。
      */
     constexpr uint32_t kMaxDataSends = 3U;
@@ -1195,10 +1199,9 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
     };
 
     for (uint32_t send_i = 0; send_i < kMaxDataSends; ++send_i) {
-        /* 已见 WAIT：禁止再发 DATA，只延长 poll */
-        if (saw_wait && send_i > 0U) {
-            DEBUG_DBG("OTA", "包 %" PRIu32 " 已见 WAIT，继续 poll 不重发", seq);
-        } else {
+        /* saw_wait 后仍允许重发 DATA：触发 GD32 DUP-SEQ 回放最终 ACK（缓存已修复）。
+         * 重发的 DATA 进 GD32 主循环会因包号去重只回 ACK，不二次写 flash。 */
+        {
             resp_len = 0;
             resp_type = 0;
             esp_err_t err = SpiMaster::instance().transact(
@@ -1264,16 +1267,12 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
             }
         }
 
-        /* 超时：仅当从未见 WAIT 时才重发 DATA；见过 WAIT 则再 poll 一轮 */
-        if (saw_wait) {
-            if (send_i + 1U >= kMaxDataSends) {
-                break;
-            }
-            continue;
-        }
+        /* 超时：无论是否见过 WAIT 都允许重发 DATA。
+         * 见过 WAIT 时重发靠 GD32 DUP-SEQ 回放缓存的最终 ACK 来捞回丢失的 ACK；
+         * 未见 WAIT 时重发则是重新送注。两者均安全（GD32 对已写包号去重）。 */
         if (send_i + 1U < kMaxDataSends) {
-            DEBUG_WARN("OTA", "包 %" PRIu32 " 无 WAIT/ACK，重发 DATA (%" PRIu32 "/%" PRIu32 ")",
-                       seq, send_i + 1U, kMaxDataSends);
+            DEBUG_WARN("OTA", "包 %" PRIu32 " 超时重发 DATA (%" PRIu32 "/%" PRIu32 ") saw_wait=%d",
+                       seq, send_i + 1U, kMaxDataSends, (int)saw_wait);
             vTaskDelay(pdMS_TO_TICKS(2));
         }
     }

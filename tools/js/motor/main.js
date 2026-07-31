@@ -2172,8 +2172,14 @@ function startOtaPoll() {
 	      /* 状态变化写日志，避免 UI 只停在「开始握手」一行 */
 	      if (st.state && st.state !== lastState) {
 	        const zh = OTA_STATE_ZH[st.state] || st.state;
+	        /* 握手阶段(pre_cancel / handshake_req / handshake_nonce / handshake_confirm / erase)
+	         * 不显示 x/y 进度——
+	         * 握手未成时 packets_acked 是 ESP32 预填充字节数，不是电机真实 ACK，
+	         * 显示 "0/912" 无意义且让用户误以为在传输。transfer 起才显示进度。 */
+	        const showPkt = (st.state === "transfer" || st.state === "wait_app_run" ||
+	                        st.state === "finish_ota" || st.state === "finished");
 	        otaLog(`<span class="log-info">[状态]</span> ${zh}` +
-	          (st.total_packets ? ` · ${st.packets_acked || 0}/${st.total_packets}` : ""));
+	          (showPkt && st.total_packets ? ` · ${st.packets_acked || 0}/${st.total_packets}` : ""));
 	        lastState = st.state;
 	      } else if (st.state === "transfer" && st.total_packets > 0) {
 	        const acked = st.packets_acked || 0;
@@ -2253,13 +2259,23 @@ function startOtaPoll() {
 	  setOtaStage(stage);
 	  const acked = st.packets_acked || 0;
 	  const total = st.total_packets || 1;
-	  /* HTML 模板已是「包 <已确认> / <总数>」，这里各填各的；
-	   * 之前往 otaPktNum 塞整串 "acked/total" 会渲染成「包 696/912 / 912」。 */
-	  $("#otaPktNum").textContent = String(acked);
-	  $("#otaPktTotal").textContent = String(total);
-	  $("#otaProgressFill").style.width = (acked / total * 100).toFixed(1) + "%";
+	  /* 握手阶段(pre_cancel / handshake_req / handshake_nonce / handshake_confirm / erase)
+	   * 不更新进度条和包数——
+	   * 此时 packets_acked 是 ESP32 预填充字节数不是电机真实 ACK，
+	   * 显示 0/912 会让人误以为在传输。transfer 起才显示进度。 */
+	  const inTransfer = (st.state === "transfer" || st.state === "wait_app_run" ||
+	                      st.state === "finish_ota" || st.state === "finished");
+	  if (inTransfer) {
+	    $("#otaPktNum").textContent = String(acked);
+	    $("#otaPktTotal").textContent = String(total);
+	    $("#otaProgressFill").style.width = (acked / total * 100).toFixed(1) + "%";
+	  } else {
+	    /* 握手阶段进度条归零，避免残留上次进度 */
+	    $("#otaPktNum").textContent = "0";
+	    $("#otaProgressFill").style.width = "0%";
+	  }
 	  const elapsed = (performance.now() - startTime) / 1000;
-	  if (elapsed > 0.5 && acked > 0) {
+	  if (elapsed > 0.5 && acked > 0 && inTransfer) {
 	    $("#otaSpeed").textContent = (acked * 48 / elapsed / 1024).toFixed(1) + " KB/s";
 	  }
 	  $("#otaCrc").textContent = OTA_STATE_ZH[st.state] || st.state;

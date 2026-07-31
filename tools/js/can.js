@@ -44,7 +44,7 @@ import {
   sendManualFrame,
   resetManualFields,
   loadPreviewToManual
-} from './can/send.js';
+} from './can/send.js?v=20260801f';
 import {
   scheduleCanPersist,
   loadCanSession,

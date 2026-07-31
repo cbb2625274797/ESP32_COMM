@@ -1036,7 +1036,7 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
     constexpr int kMaxFrames = 128;
     constexpr uint32_t kPerFrameTimeoutMs = 80U;
     constexpr uint32_t kSingleFrameTimeoutMs = 1200U;   /* 正常 <20ms；httpd 单线程，此值决定其它端点最坏阻塞 */
-    constexpr uint32_t kInterFrameDelayMs = 5U;
+    constexpr uint32_t kInterFrameDelayMs = 1U;
 
     int content_len = req->content_len;
     if (content_len <= 0 || content_len > kMaxBody) {

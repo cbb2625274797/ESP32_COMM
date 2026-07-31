@@ -22,6 +22,7 @@ idf_component_register(
         "monitor/motor_ota_relay.cpp"  # 电机 OTA relay（0xD0~0xD2）
         "monitor/debug_log.cpp"        # 三路调试日志（UART/UDP/环形缓冲）
         "monitor/task_stack.cpp"       # 任务栈水位收集 + 溢出钩子
+        "monitor/spi_speed_test.cpp"   # [SPI-SPEEDTEST] 临时：SPI 测速端点（可整行删除）
     INCLUDE_DIRS
         "."
         "core"

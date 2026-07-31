@@ -14,7 +14,7 @@
  */
 import { state, el, getBaseUrl, padHex, bytesToHex, parseNumericId } from './dbc.js';
 import { escapeHtml } from '../common/utils.js';
-import { showToast } from '../common/toast.js';
+import { showToast } from '../common/toast.js?v=20260801f';
 import { updateBatchUi } from './messages.js';
 import { ensureMessageDefaults, getSignalValueMap, getSelectedMessage, updateEncodedPreview, encodeMessageData } from './signals.js';
 import { scheduleCanPersist } from './persist.js';
@@ -124,12 +124,23 @@ async function sendCanBatchRequest(channel, frames) {
   var n = frames && frames.length ? frames.length : 0;
   /* 单帧设备侧 timeout 2s；多帧按帧数留余量 */
   var timeoutMs = (n <= 1) ? 8000 : Math.max(15000, n * 500);
-  var resp = await fetch(getBaseUrl() + '/can/send_batch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ch: channel, frames: frames }),
-    signal: AbortSignal.timeout(timeoutMs)
-  });
+  /* AbortSignal.timeout 在连接被 reset 的边缘情况下偶发不触发，
+   * 叠加一条手动竞速超时，避免 await 永久挂起导致整批不渲染。 */
+  var ac = new AbortController();
+  var timer = setTimeout(function () { ac.abort(); }, timeoutMs);
+  var resp;
+  try {
+    resp = await fetch(getBaseUrl() + '/can/send_batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ch: channel, frames: frames }),
+      signal: ac.signal
+    });
+  } catch (err) {
+    throw new Error('请求失败: ' + (err && err.message ? err.message : err));
+  } finally {
+    clearTimeout(timer);
+  }
   var text = await resp.text();
   var json = {};
   try {
@@ -231,12 +242,12 @@ export function renderHistory() {
 
 // ==================== 批量发送 ====================
 /**
- * 单批最多帧数。实测一次发送 >9 帧失败率明显上升，故按 9 帧分批；
- * 批次之间留 BATCH_INTER_CHUNK_DELAY_MS 间隔，给 CAN/SPI 总线喘息时间。
+ * 单批最多帧数。按 64 帧分批（一次请求发 64 帧）；批次之间留
+ * BATCH_INTER_CHUNK_DELAY_MS 间隔，给 CAN/SPI 总线喘息时间。
  */
-var BATCH_CHUNK = 32;
+var BATCH_CHUNK = 64;
 /** 批次间延时（ms），仅在还有后续批次时等待 */
-var BATCH_INTER_CHUNK_DELAY_MS = 200;
+var BATCH_INTER_CHUNK_DELAY_MS = 100;
 
 /**
  * @description 批量发送所有勾选的报文（仅 /can/send_batch）。
@@ -330,10 +341,13 @@ export async function sendCheckedMessages() {
     renderHistory();
     scheduleCanPersist();
     var tone = fail === 0 ? 'success' : (ok === 0 ? 'error' : 'warning');
-    showToast('批量发送完成：成功 ' + ok + '，失败 ' + fail, tone);
+    showToast('批量发送完成：成功 ' + ok + '，失败 ' + fail, tone, { force: true });
   } finally {
     state.batchInFlight = false;
     updateBatchUi();
+    /* 兜底渲染：无论 try 内是否抛异常，都保证已写入的 silent 历史条目可见，
+     * 避免「批量发了但结果不显示」的偶发现象（renderHistory 幂等，多调一次无害）。 */
+    renderHistory();
   }
 }
 

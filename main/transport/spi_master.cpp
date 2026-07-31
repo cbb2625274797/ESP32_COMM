@@ -97,6 +97,11 @@ static int IRAM_ATTR readReadyLevelRaw(void)
  * 但 serviceRingOnce / otaPollResponseUnlocked 等更早出现的方法需要它。 */
 static esp_err_t waitSpiDataReady(uint32_t timeout_ms);
 
+/** @brief DATA_READY 下降沿事件信号量（ISR give / waitSpiDataReady take）。
+ *  二值信号量：多余边沿饱和为 1，消费方醒来后必须重查电平，
+ *  陈旧 give 只多一次电平检查，无副作用。 */
+static SemaphoreHandle_t s_readyEdgeSem = nullptr;
+
 // ============================================================
 // 单例
 // ============================================================
@@ -220,12 +225,14 @@ esp_err_t SpiMaster::serviceRingOnce()
         return ESP_ERR_NOT_FOUND;
     }
 
-    /* 仅 worker 调用。有 pending 或 DATA_READY 低时读一帧 EVENT。 */
-    if (!m_gd32RequestPending) {
-        /* 无 ISR 标志时，若线已低仍尝试读（丢边沿兜底） */
-        if (readReadyLevelRaw() != 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
+    /* 仅 worker 调用。有 pending 或 DATA_READY 低时读一帧 EVENT。
+     * ★ pending 也必须验电平：业务响应（PING/OTA ACK）拉低 PB6 时链路忙，
+     * ISR 误记 pending；响应被 poll 读走后 PB6 已回高，若不验电平会白等
+     * waitSpiDataReady(3ms) 超时，把每笔业务周期拖慢 ~3ms（测速直方图
+     * 79% 帧堆在 3-4ms 的根因）。真按铃时 PB6 在被读走前保持低，不误伤。 */
+    if (readReadyLevelRaw() != 0) {
+        m_gd32RequestPending = false;
+        return ESP_ERR_NOT_FOUND;
     }
     m_gd32RequestPending = false;
     m_linkState.enterBusy(HandshakeState::SERVING_GD32_RING);
@@ -557,8 +564,11 @@ void SpiMaster::workerLoop()
  * @brief GPIO 边沿中断回调（DATA_READY / PB6）。
  *
  * 仅处理下降沿：GD32 有待读数据（按铃）。上升沿不再使用（旧的"等上升沿
- * ready"逻辑已删除，现由 waitSpiDataReady 做电平轮询）。
- * ISR 内仅做标志翻转 + 任务通知，不做 SPI 传输。
+ * ready"逻辑已删除）。
+ * ISR 内仅做标志翻转 + 信号量/任务通知，不做 SPI 传输。
+ *
+ * 所有下降沿先 give s_readyEdgeSem：唤醒阻塞在 waitSpiDataReady 的任务
+ * （OTA 响应等待），把原来 1ms tick 轮询变成 µs 级事件驱动。
  *
  * 本端忙时（acceptRing()==false）：记下 pending 但不 notify，避免抢断
  * 当前 SPI 事务；事务结束 worker 下一轮会立即消费此标志，省去最多 25ms
@@ -571,6 +581,13 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
     /* 只关心低电平（下降沿后采样）：有数据待读 */
     if (readReadyLevelRaw() != 0) {
         return;
+    }
+    /* 无条件先 give 边沿事件：精确唤醒 waitSpiDataReady（响应已装载）。
+     * 无人等待时二值信号量饱和为 1，由消费方电平重查兜底。 */
+    if (s_readyEdgeSem != nullptr) {
+        BaseType_t sem_hp = pdFALSE;
+        xSemaphoreGiveFromISR(s_readyEdgeSem, &sem_hp);
+        portYIELD_FROM_ISR(sem_hp);
     }
     if (self->m_suppressRingService) {
         /* OTA 中继：PB6 低是 WAIT/ACK 就绪，留给业务 poll，不按 EVENT 处理 */
@@ -594,6 +611,8 @@ void IRAM_ATTR SpiMaster::onReadyEdgeISR(void *arg)
 /**
  * @brief 等 GD32 拉低 PB6（有待读响应）。
  * v2 DATA_READY：低 = 有数据；高 = 队列空。TX 前不等 HIGH（CS 即互斥）。
+ * 事件驱动：阻塞在 s_readyEdgeSem 上，由下降沿 ISR 精确唤醒（µs 级），
+ * 每次醒来重查电平以过滤陈旧 give；信号量不可用时退回 1ms tick 轮询。
  * @return ESP_OK 已低；ESP_ERR_TIMEOUT 超时仍为高（调用方可再决定是否盲 poll）。
  */
 static esp_err_t waitSpiDataReady(uint32_t timeout_ms)
@@ -602,11 +621,16 @@ static esp_err_t waitSpiDataReady(uint32_t timeout_ms)
     if (timeout_ms == 0U) { return ESP_ERR_TIMEOUT; }
 
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    while (xTaskGetTickCount() < deadline) {
+    for (;;) {
         if (readReadyLevelRaw() == 0) { return ESP_OK; }
-        vTaskDelay(pdMS_TO_TICKS(1) > 0 ? pdMS_TO_TICKS(1) : 1);
+        const TickType_t now = xTaskGetTickCount();
+        if (now >= deadline) { return ESP_ERR_TIMEOUT; }
+        if (s_readyEdgeSem != nullptr) {
+            (void)xSemaphoreTake(s_readyEdgeSem, deadline - now);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1) > 0 ? pdMS_TO_TICKS(1) : 1);
+        }
     }
-    return ESP_ERR_TIMEOUT;
 }
 
 // ============================================================
@@ -966,6 +990,14 @@ esp_err_t SpiMaster::init()
         DEBUG_WARN("SPI", "SPI Ready 握手引脚 GPIO%d 配置失败: %s", SPI_READY_GPIO, esp_err_to_name(gpio_ret));
     } else {
         DEBUG_INFO("SPI", "DATA_READY 输入已配置: GPIO%d (← GD32 PB6，低=有数据)", SPI_READY_GPIO);
+    }
+
+    /* 边沿事件信号量必须先于 ISR 注册创建，避免 ISR 触发时句柄为空 */
+    if (s_readyEdgeSem == nullptr) {
+        s_readyEdgeSem = xSemaphoreCreateBinary();
+        if (s_readyEdgeSem == nullptr) {
+            DEBUG_WARN("SPI", "ready edge sem create failed, 退回轮询等待");
+        }
     }
 
     /* 安装 GPIO ISR 服务（全局仅安装一次）并注册边沿回调 */
@@ -1487,12 +1519,16 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         return send_ret;
     }
 
-    /* CS 释放后短延时，再 poll 应答。
-     * GD32 主控 OTA / HELLO 等：5ms（BOOT AES 路径需要）。
-     * 电机 OTA 数据 0xD1：1ms。每 chunk 固定 5ms 会把 SPI 喂速压到 ~47KB/s 边缘，
-     * CAN 5ms/包消费时环缓经常被掏空（日志「缓冲空,等ESP32喂」+ ACK 超时重发）。 */
-    const uint32_t post_cs_ms = (type == 0xD1U) ? 1U : 5U;
-    vTaskDelay(pdMS_TO_TICKS(post_cs_ms));
+    /* CS 释放后的静默期分型处理：
+     * - 0xD1（电机 OTA 数据）/ 0xA1（APP PING）：GD32 APP 在 onCsRelease ISR
+     *   内 µs 级装好响应并拉低 PB6 → 零盲等，waitSpiDataReady 由下降沿 ISR
+     *   精确唤醒，旧 1ms 固定延时压制喂速～47KB/s，现由事件驱动提速。
+     * - 其他类型（GD32 relay/BOOT AES/HELLO 等）：保留 5ms——BOOT 在主循环
+     *   处理 CHALLENGE/flash，poll 前 2 轮盲读 CS 过早打进去会打断其
+     *   EXTI/DMA 时序（实测去掉后 CHALLENGE 超时）。 */
+    if (type != 0xD1U && type != 0xA1U) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 
     /* 步骤 2: 轮询读取真实响应（变长读，不重发命令） */
     return otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len, poll_timeout,

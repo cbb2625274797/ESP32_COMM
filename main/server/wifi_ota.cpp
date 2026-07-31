@@ -31,6 +31,7 @@
 #include "spi_master.h"
 #include "ble_ota.h"
 #include "http_handlers.h"
+#include "monitor/spi_speed_test.h"  /* [SPI-SPEEDTEST] 临时：可整行删除 */
 
 
 // ----------------------------------------
@@ -483,6 +484,7 @@ esp_err_t WifiOta::httpServerStart()
         {"/motor/ota/relay", HTTP_POST, motor_ota_relay_handler},
         {"/motor/ota/status", HTTP_GET,  motor_ota_status_handler},
         {"/motor/ota/cancel", HTTP_POST, motor_ota_cancel_handler},
+        {"/spi/speedtest",  HTTP_GET,  spi_speedtest_handler},  /* [SPI-SPEEDTEST] 临时：可整行删除 */
     };
 
     /* 同一 path 可有多 method（如 GET+POST）；OPTIONS 每个 path 只注册一次，
