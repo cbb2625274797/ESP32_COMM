@@ -113,15 +113,15 @@
   function addHistory(frames, payload, text) {
     /* 从设备中文文本里提取关键数字做历史行 */
     var fail = (text.match(/失败:\s*(\d+)/) || [])[1] || "?";
-    var avg  = (text.match(/平均\s*([\d.]+)\s*ms/) || [])[1] || "?";
-    var min  = (text.match(/最快\s*([\d.]+)\s*ms/) || [])[1] || "?";
+    var avg  = (text.match(/平均\s*([\d.]+)\s*µs/) || [])[1] || "?";
+    var min  = (text.match(/最快\s*([\d.]+)\s*µs/) || [])[1] || "?";
     var tput = (text.match(/等效吞吐:\s*([\d.]+)\s*KB\/s/) || [])[1] || "-";
     var d = new Date();
     var tr = document.createElement("tr");
     var cells = [
       pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds()),
       String(frames), String(payload) + "B", fail,
-      avg + "ms", min + "ms", tput === "-" ? "-" : tput + "KB/s"
+      avg + "µs", min + "µs", tput === "-" ? "-" : tput + "KB/s"
     ];
     for (var i = 0; i < cells.length; i++) {
       var td = document.createElement("td");

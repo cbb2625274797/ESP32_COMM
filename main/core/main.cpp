@@ -132,7 +132,9 @@ extern "C" void app_main(void)
         SystemBoot::mark(BOOT_OTA_VALID);
     }
 
-    DEBUG_INFO("MAIN", "ESP32-C3 OTA Relay %s, heap=%lu, wifi_early=%s",
+    /* ★ banner 文案必须包含「启动」，前端 polling.js 靠
+     *   /OTA Relay .*启动/ 匹配本行判定 ESP32 重启完成（阶段 6）。 */
+    DEBUG_INFO("MAIN", "ESP32-C3 OTA Relay %s 启动, heap=%lu, wifi_early=%s",
                FW_VERSION,
                (unsigned long)esp_get_free_heap_size(),
                wifi_early_started_sta ? "STA" : "AP/other");

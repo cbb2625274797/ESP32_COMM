@@ -61,11 +61,13 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
     uint8_t resp_type = 0U;
     size_t resp_len = 0U;
     esp_err_t ret = ESP_OK;
-    /* CAN 发送只会收到 ACK(0x80) 或 ERROR(0x82)。若读到 WAIT(0x81)，必是上一轮电机 OTA
+    /* 0xC0 发送只会收到 ACK(0x80) 或 ERROR(0x82)。若读到 WAIT(0x81)，必是上一轮电机 OTA
      * 喂数(0xD1→WAIT)残留在 SPI 响应管道里的陈旧帧（0xC0 命令本身永不产生 WAIT）。
      * 陈旧 WAIT 会被下方误判为 ERROR → resp_len=0 → gd32_err=0xFF → 无声拒绝发送（
-     * 表现为“失败一次就再也发不出去”）。此处最多重试几次排空陈旧帧，
-     * 直到读到本命令真正的 ACK/ERROR。 */
+     * 表现为“失败一次就再也发不出去”）。此处最多重试 4 次排空陈旧帧，
+     * 直到读到本命令真正的 ACK/ERROR。
+     * SPI 传输失败/无响应的重发已由 SpiMaster::otaSendAndPoll 统一处理
+     * （同 TX_SEQ，最多 3 次尝试），此处不再各自重试；GD32 拒绝(ERROR)同样不重试。 */
     for (uint8_t attempt = 0U; attempt < 4U; ++attempt) {
         resp_type = 0U;
         resp_len = 0U;
@@ -73,8 +75,8 @@ static int sendCanFrameOverSpi(can_channel_t channel, uint32_t ext_id,
             kSpiCanFrameType,
             tx_buf, tx_len,
             &resp_type, spi_rx, spi_rx_max, &resp_len, timeout_ms);
-        if (ret != ESP_OK || resp_type != SPI_OTA_RSP_WAIT) {
-            break;  /* SPI 失败或已拿到真正响应(ACK/ERROR) */
+        if (resp_type != SPI_OTA_RSP_WAIT) {
+            break;  /* 已拿到真正响应(ACK/ERROR)；SPI 失败(ret!=OK)也退出交上层处理 */
         }
         vTaskDelay(pdMS_TO_TICKS(3));  /* 让 GD32 更新响应，再读一次排空陈旧 WAIT */
     }
@@ -241,8 +243,10 @@ int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
 
         const uint8_t dataLen = (e.dlc < CANFD_ID_SNAPSHOT_DATA_MAX)
                                 ? e.dlc : static_cast<uint8_t>(CANFD_ID_SNAPSHOT_DATA_MAX);
-        const uint16_t entrySize = static_cast<uint16_t>(8U + dataLen);
-        if (offset + entrySize > len) {
+        // 线协议条目实际大小按原始 dlc 计算（CANFD 帧可能 64B），offset 必须按
+        // 实际条目推进，否则后续条目错位。data 拷贝按 dataLen 截断。
+        const uint16_t wireEntrySize = static_cast<uint16_t>(8U + e.dlc);
+        if (offset + wireEntrySize > len) {
             break;
         }
 
@@ -251,7 +255,7 @@ int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
             e.data[d] = 0U;
         }
 
-        offset += entrySize;
+        offset += wireEntrySize;
         (*entryIdx)++;
     }
 
@@ -261,6 +265,55 @@ int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
     }
 
     out->valid = 1;
+    return 0;
+}
+
+/* ── 0xC1 请求/响应查询（2026-08 架构改造：替代被动推送缓存）── */
+
+int canFdQueryFeedback(uint8_t channel, uint8_t page,
+                        can_feedback_result_t *out, uint8_t *entryIdx)
+{
+    if (out == nullptr || entryIdx == nullptr) {
+        return -1;
+    }
+    if (channel >= CAN_CHANNEL_MAX || page > 1U) {
+        return -1;
+    }
+
+    uint8_t req[2] = { channel, page };
+    uint8_t resp_type = 0;
+    /* SPI v2 payload 上限 236B（256 帧 - 20 开销），与 GD32 kFeedbackPayloadLen 一致 */
+    uint8_t resp_buf[SPI_OTA_FRAME_MAX];
+    size_t resp_len = 0;
+
+    esp_err_t ret = SpiMaster::instance().transact(
+        0xC1, req, sizeof(req),
+        &resp_type, resp_buf, sizeof(resp_buf), &resp_len, 200U);
+
+    if (ret != ESP_OK) {
+        DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u SPI失败: %s",
+                   (unsigned)channel, (unsigned)page, esp_err_to_name(ret));
+        return -1;
+    }
+    if (resp_type == SPI_OTA_RSP_ERROR) {
+        uint8_t gd32_err = (resp_len > 0) ? resp_buf[0] : 0;
+        DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u GD32拒绝 err=0x%02X",
+                   (unsigned)channel, (unsigned)page, (unsigned)gd32_err);
+        return -2;
+    }
+    if (resp_type != SPI_OTA_RSP_ACK || resp_len < 1U) {
+        DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u 非ACK type=0x%02X len=%zu",
+                   (unsigned)channel, (unsigned)page, (unsigned)resp_type, resp_len);
+        return -1;
+    }
+
+    /* 解析复用现有 canFdParseFeedbackPage（payload 格式与推送一致） */
+    int parse_rc = canFdParseFeedbackPage(resp_buf, resp_len, out, entryIdx);
+    if (parse_rc != 0) {
+        DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u 解析失败 rc=%d len=%zu",
+                   (unsigned)channel, (unsigned)page, parse_rc, resp_len);
+        return -1;
+    }
     return 0;
 }
 

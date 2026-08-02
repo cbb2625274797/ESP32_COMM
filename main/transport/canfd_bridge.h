@@ -57,7 +57,7 @@ int canFdSend(can_channel_t channel, uint32_t ext_id,
 // 不重复 ID 快照表（SPI 0xC3 协议配套）
 // ============================================================
 #define CANFD_ID_SNAPSHOT_MAX      16    ///< 每通道最大不重复 ID 条目数
-#define CANFD_ID_SNAPSHOT_DATA_MAX 64    ///< 快照条目最大数据字节数
+#define CANFD_ID_SNAPSHOT_DATA_MAX 64    ///< 快照条目最大数据字节数（CANFD 最大 64B，保持完整不截断）
 
 /**
  * @brief 单个不重复 ID 的最新帧快照条目。
@@ -130,6 +130,22 @@ typedef struct {
  */
 int canFdParseFeedbackPage(const uint8_t *payload, size_t len,
                            can_feedback_result_t *out, uint8_t *entryIdx);
+
+/**
+ * @brief 主动向 GD32 查询一页 CAN 反馈（SPI 0xC1 请求/响应）。
+ *
+ * 2026-08 架构改造：ESP32 不再被动缓存 GD32 推送，改为前端请求时按需查询。
+ * GD32 handleFeedback 接收 [channel, page] 返回 ACK + 页数据（与推送 payload 格式一致）。
+ * 查询成功后调 canFdParseFeedbackPage 解析，复用现有累积逻辑。
+ *
+ * @param channel  目标通道 0/1/2。
+ * @param page     页号 0 或 1（page 0 重置累积 + 填统计，page 1 追加 entries）。
+ * @param out      累积结果（跨 page 0/1 累积，调用方按通道维护）。
+ * @param entryIdx 当前已填充条目数（page 0 时被重置为 0）。
+ * @return 0 成功；-1 参数/SPI 失败；-2 GD32 返回 ERROR。
+ */
+int canFdQueryFeedback(uint8_t channel, uint8_t page,
+                        can_feedback_result_t *out, uint8_t *entryIdx);
 
 /**
  * @brief 切换 GD32 三路 CAN 的接收过滤模式（SPI 0xC2）。

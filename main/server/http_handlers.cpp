@@ -19,10 +19,11 @@
 #include "esp_heap_caps.h"
 #include "esp_rom_sys.h"
 #include "soc/soc.h"
-#include "cJSON.h"
 
 #include "app_config.h"
 #include "http_handlers.h"
+#include "http_util.h"
+#include "json_parse.h"
 #include "wifi_ota.h"
 #include "esp32_ota_core.h"
 #include "ota_coordinator.h"
@@ -41,25 +42,6 @@
 #include "monitor/task_stack.h"
 #include "ble_ota.h"
 #include "system_boot.h"
-
-static size_t parseHexToBytes(const char *hex, uint8_t *out, size_t max_out)
-{
-    size_t hex_len = strlen(hex);
-    size_t n = 0;
-    for (size_t i = 0; i + 1 < hex_len && n < max_out; i += 2) {
-        char byte_str[3] = { hex[i], hex[i + 1], 0 };
-        out[n++] = (uint8_t)strtol(byte_str, NULL, 16);
-    }
-    return n;
-}
-
-static void bytesToHexUpper(const uint8_t *in, size_t n, char *out)
-{
-    for (size_t i = 0; i < n; ++i) {
-        snprintf(out + i * 2, 3, "%02X", in[i]);
-    }
-    out[n * 2] = '\0';
-}
 
 /**
  * @brief 统一 JSON 错误响应（避免前端 resp.json() 被 httpd 明文坑）。
@@ -138,23 +120,18 @@ esp_err_t esp32_ota_update_handler(httpd_req_t *req)
         int ret = httpd_req_recv(req, buf, req->content_len);
         if (ret > 0) {
             buf[ret] = '\0';
-            cJSON *root = cJSON_Parse(buf);
-            if (root) {
-                cJSON *sha_item = cJSON_GetObjectItem(root, "sha256");
-                if (sha_item && cJSON_IsString(sha_item)) {
-                    const char *sha_str = cJSON_GetStringValue(sha_item);
-                    if (sha_str && strlen(sha_str) == 64) {
-                        strncpy(frontend_sha_hex, sha_str, 64);
-                        frontend_sha_hex[64] = '\0';
-                        has_frontend_sha = true;
-                        DEBUG_INFO("OTA", "Frontend SHA-256: %s", frontend_sha_hex);
-                    }
+            JsonView root = jsonParse(buf);
+            if (root.valid) {
+                JsonView sha_item = jsonGet(&root, "sha256");
+                if (jsonIsString(&sha_item) && sha_item.str_len == 64) {
+                    jsonGetStringCopy(&sha_item, frontend_sha_hex, 65);
+                    has_frontend_sha = true;
+                    DEBUG_INFO("OTA", "Frontend SHA-256: %s", frontend_sha_hex);
                 }
-                cJSON *verify_item = cJSON_GetObjectItem(root, "verify_only");
-                if (verify_item && cJSON_IsBool(verify_item)) {
-                    verify_only = cJSON_IsTrue(verify_item);
+                JsonView verify_item = jsonGet(&root, "verify_only");
+                if (jsonIsBool(&verify_item)) {
+                    verify_only = jsonIsTrue(&verify_item);
                 }
-                cJSON_Delete(root);
             }
         }
     }
@@ -292,18 +269,16 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
             if (pre_read_len > 256) pre_read_len = 256;
             memcpy(pre_read_buf, json_buf, pre_read_len);
 
-            cJSON *root = cJSON_Parse(json_buf);
-            if (root) {
-                cJSON *type_item = cJSON_GetObjectItem(root, "type");
-                if (type_item && cJSON_IsString(type_item) &&
-                    strcmp(cJSON_GetStringValue(type_item), "esp32") == 0) {
+            JsonView root = jsonParse(json_buf);
+            if (root.valid) {
+                JsonView type_item = jsonGet(&root, "type");
+                if (jsonStringEquals(&type_item, "esp32")) {
                     is_esp32_ota = true;
                 }
-                cJSON *size_item = cJSON_GetObjectItem(root, "total_size");
-                if (size_item) {
-                    total_size = (uint32_t)cJSON_GetNumberValue(size_item);
+                JsonView size_item = jsonGet(&root, "total_size");
+                if (size_item.valid) {
+                    total_size = (uint32_t)jsonGetNumberValue(&size_item);
                 }
-                cJSON_Delete(root);
             }
         }
     }
@@ -564,15 +539,12 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
         int ret = httpd_req_recv(req, buf, req->content_len);
         if (ret > 0) {
             buf[ret] = '\0';
-            cJSON *root = cJSON_Parse(buf);
-            if (root) {
-                cJSON *sha_item = cJSON_GetObjectItem(root, "sha256");
-                if (sha_item && cJSON_IsString(sha_item) &&
-                    strlen(cJSON_GetStringValue(sha_item)) == 64) {
-                    strncpy(frontend_sha_hex, cJSON_GetStringValue(sha_item), 64);
-                    frontend_sha_hex[64] = '\0';
+            JsonView root = jsonParse(buf);
+            if (root.valid) {
+                JsonView sha_item = jsonGet(&root, "sha256");
+                if (jsonIsString(&sha_item) && sha_item.str_len == 64) {
+                    jsonGetStringCopy(&sha_item, frontend_sha_hex, 65);
                 }
-                cJSON_Delete(root);
             }
         }
     }
@@ -582,17 +554,12 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
     }
 
     uint8_t frontend_sha[32] = {0};
-    for (int i = 0; i < 32; ++i) {
-        char hex[3] = { frontend_sha_hex[i*2], frontend_sha_hex[i*2+1], 0 };
-        frontend_sha[i] = (uint8_t)strtoul(hex, nullptr, 16);
-    }
+    http_hex_to_bytes(frontend_sha_hex, frontend_sha, 32);
 
     uint8_t device_sha[32] = {0};
     char device_sha_hex[65] = {0};
     esp_err_t verify_err = OtaCoordinator::instance().verifyGd32Firmware(frontend_sha, device_sha);
-    for (int i = 0; i < 32; ++i) {
-        snprintf(&device_sha_hex[i*2], 3, "%02X", device_sha[i]);
-    }
+    http_bytes_to_hex_upper(device_sha, 32, device_sha_hex);
 
     if (verify_err == ESP_ERR_INVALID_CRC) {
         DEBUG_ERR("OTA", "GD32 SHA-256 不匹配");
@@ -694,21 +661,16 @@ static SemaphoreHandle_t httpJsonWorkMutex(void)
  */
 static constexpr uint8_t FEEDBACK_DATA_HEX_MAX = 64;
 
+/* can_feedback 分块追加：溢出时返回 -1 让调用方 break 截断 entries。
+ * 与 http_json_append 的区别仅在此处需要"溢出=break"而非"溢出=截断填满"。 */
 static int feedback_append(char *buf, size_t cap, int off, const char *fmt, ...)
 {
-    if (!buf || cap == 0 || off < 0 || (size_t)off >= cap) {
-        return -1;
-    }
+    if (!buf || cap == 0 || off < 0 || (size_t)off >= cap) return -1;
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf + off, cap - (size_t)off, fmt, ap);
     va_end(ap);
-    if (n < 0) {
-        return -1;
-    }
-    if (off + n >= (int)cap) {
-        return -1; /* 分块装不下：调用方截断 entries */
-    }
+    if (n < 0 || off + n >= (int)cap) return -1;
     return off + n;
 }
 
@@ -721,23 +683,15 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
      * motor.html 的 onFeedback 只用 ch/enabled/valid/rx/tx/err/tec/rec/bus_state，
      * 不需要 entries（CAN 帧快照，index.html/can.html 才用）。
      * 跳过 entries 省掉 N×snprintf+hex 编码 + chunked 发送，handler 从 ~10ms 降到 <1ms。 */
-    bool want_lite = false;
-    {
-        char query[32];
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-            char val[4] = {};
-            if (httpd_query_key_value(query, "lite", val, sizeof(val)) == ESP_OK) {
-                want_lite = (val[0] == '1' || val[0] == 'y' || val[0] == 't');
-            }
-        }
-    }
+    bool want_lite = http_query_bool(req, "lite");
 
-    can_feedback_result_t results[CAN_CHANNEL_MAX] = {};
-    bool valid[CAN_CHANNEL_MAX] = {};
-    for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
-        valid[i] = getLatestCanFeedback(i, &results[i]);
-    }
+    /* OTA / send_batch 期间 SPI 被独占：跳过 0xC1 查询，全部通道返回 valid=false。
+     * 响应结构不变，前端轮询自然显示 "--"，恢复后自动回来。 */
+    const bool spi_paused = canFeedbackPaused();
 
+    /* 2026-08 架构改造：不再读被动缓存 s_latest，改为按需向 GD32 查询 0xC1。
+     * lite 路径只需 page 0（统计在 page0 header）；full 路径需 page 0+1（entries）。
+     * 单通道 result 在栈上用完即释放，不再常驻 s_latest[3]/s_work[3]（省 ~7.8KB BSS）。 */
     const bool feat_known = SpiMaster::instance().gd32FeatKnown();
     const uint32_t feat = SpiMaster::instance().gd32FeatFlags();
     const bool ch_en[CAN_CHANNEL_MAX] = {
@@ -750,7 +704,8 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         : 0x7U;
 
     /* lite 路径：一次性小响应，不走 chunked，不需要 httpJsonWorkMutex（用栈缓冲即可）。
-     * 体积上限：3 通道 × ~80B + header ~60B ≈ 300B，远小于 1024 栈预算。 */
+     * 体积上限：3 通道 × ~80B + header ~60B ≈ 300B，远小于 1024 栈预算。
+     * 每通道 1 次 SPI 查询（page 0），3 通道 ~6-12ms。 */
     if (want_lite) {
         char resp[512];
         int off = snprintf(resp, sizeof(resp),
@@ -763,9 +718,15 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
-            const can_feedback_result_t &r = results[i];
+            can_feedback_result_t result = {};
+            bool valid = false;
+            if (ch_en[i] && !spi_paused) {
+                uint8_t entryIdx = 0;
+                valid = (canFdQueryFeedback(i, 0, &result, &entryIdx) == 0);
+            }
+            const can_feedback_result_t &r = result;
             const char *stats_fmt;
-            if (valid[i] && ch_en[i]) {
+            if (valid) {
                 stats_fmt = ",\"mode\":%u,\"seq\":%lu,\"rx\":%lu,\"tx\":%lu,"
                             "\"drop\":%lu,\"err\":%lu,\"tec\":%u,\"rec\":%u,"
                             "\"bus_state\":%u,\"count\":%u";
@@ -778,13 +739,13 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
                 i == 0 ? "" : ",",
                 (unsigned)i,
                 ch_en[i] ? "true" : "false",
-                valid[i] ? "true" : "false");
+                valid ? "true" : "false");
             if (n < 0 || off + n >= (int)sizeof(resp)) {
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fb lite ch");
                 return ESP_FAIL;
             }
             off += n;
-            if (valid[i] && ch_en[i]) {
+            if (valid) {
                 n = snprintf(resp + off, sizeof(resp) - (size_t)off,
                     stats_fmt,
                     (unsigned)r.stats.mode,
@@ -821,7 +782,8 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         return httpd_resp_send(req, resp, off);
     }
 
-    /* 完整路径（含 entries）：保留给 index.html / can.html 的 CAN 监控页 */
+    /* 完整路径（含 entries）：保留给 index.html / can.html 的 CAN 监控页
+     * 每通道 2 次 SPI 查询（page 0+1），3 通道 6 次 ~12-24ms。 */
 
     SemaphoreHandle_t mux = httpJsonWorkMutex();
     if (mux && xSemaphoreTake(mux, pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -853,19 +815,31 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
     }
 
     for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
-        const can_feedback_result_t &r = results[i];
+        /* 按需查询：page 0 重置 + 统计，page 1 追加 entries（OTA 暂停期间跳过） */
+        can_feedback_result_t result = {};
+        bool valid = false;
+        if (ch_en[i] && !spi_paused) {
+            uint8_t entryIdx = 0;
+            int rc0 = canFdQueryFeedback(i, 0, &result, &entryIdx);
+            if (rc0 == 0) {
+                valid = true;
+                /* page 1 追加剩余 entries（失败则仅用 page 0 的条目） */
+                (void)canFdQueryFeedback(i, 1, &result, &entryIdx);
+            }
+        }
+        const can_feedback_result_t &r = result;
         int off = 0;
         off = feedback_append(work, HTTP_JSON_WORK_CAP, off,
             "%s{\"ch\":%u,\"enabled\":%s,\"valid\":%s",
             i == 0 ? "" : ",",
             (unsigned)i,
             ch_en[i] ? "true" : "false",
-            valid[i] ? "true" : "false");
+            valid ? "true" : "false");
         if (off < 0) {
             break;
         }
 
-        if (valid[i] && ch_en[i]) {
+        if (valid) {
             off = feedback_append(work, HTTP_JSON_WORK_CAP, off,
                 ",\"mode\":%u,\"seq\":%lu,\"rx\":%lu,\"tx\":%lu,"
                 "\"drop\":%lu,\"err\":%lu,\"tec\":%u,\"rec\":%u,"
@@ -959,14 +933,29 @@ esp_err_t can_mode_handler(httpd_req_t *req)
 
     if (req->method == HTTP_GET) {
         http_set_keepalive_hdr(req);   /* GET 轮询复用 TCP；POST 设置模式不复用 */
+
+        /* OTA / send_batch 期间不占 SPI：跳过 0xC1 查询与 0xC2 fallback */
+        if (canFeedbackPaused()) {
+            char resp[64];
+            int len = snprintf(resp, sizeof(resp),
+                "{\"mode\":0,\"source\":\"paused\",\"ok\":false}");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, resp, len);
+            return ESP_OK;
+        }
+
+        /* 2026-08 架构改造：按需向 GD32 查询 0xC1 page0 取 mode（不再读缓存 s_latest）。
+         * page0 header 含 mode 字段，1 次 SPI 查询 ~2-4ms。 */
         can_feedback_result_t fb{};
-        if (getLatestCanFeedback(0, &fb)) {
+        uint8_t entryIdx = 0;
+        if (canFdQueryFeedback(0, 0, &fb, &entryIdx) == 0) {
             char resp[64];
             int len = snprintf(resp, sizeof(resp),
                 "{\"mode\":%u}", (unsigned)fb.stats.mode);
             httpd_resp_set_type(req, "application/json");
             httpd_resp_send(req, resp, len);
         } else {
+            /* 查询失败：回退实时 SPI 0xC2 查询实际模式 */
             can_rx_mode_t actual = CAN_RX_MODE_ALL_PASS;
             int rc = canFdSetRxMode(CAN_RX_MODE_ALL_PASS, &actual, 2000);
             char resp[64];
@@ -987,21 +976,19 @@ esp_err_t can_mode_handler(httpd_req_t *req)
     }
     buf[ret] = '\0';
 
-    cJSON *root = cJSON_Parse(buf);
-    if (!root) {
+    JsonView root = jsonParse(buf);
+    if (!root.valid) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON 解析失败");
         return ESP_FAIL;
     }
 
-    cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
-    if (!mode_item || !cJSON_IsNumber(mode_item)) {
-        cJSON_Delete(root);
+    JsonView mode_item = jsonGet(&root, "mode");
+    if (!jsonIsNumber(&mode_item)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 mode 字段");
         return ESP_FAIL;
     }
 
-    int requested = (int)cJSON_GetNumberValue(mode_item);
-    cJSON_Delete(root);
+    int requested = (int)jsonGetNumberValue(&mode_item);
 
     can_rx_mode_t target = CAN_RX_MODE_ALL_PASS;
     if (requested == 1) {
@@ -1021,22 +1008,83 @@ esp_err_t can_mode_handler(httpd_req_t *req)
     return ESP_OK;
 }
 /**
+ * @brief POST /can/send_batch 流式 body 读取器。
+ *
+ * 用 512B 滚动缓冲逐字符读 HTTP body，避免一次性 malloc(≤49KB)。
+ * 仅在 can_send_batch_handler 内使用，针对该端点的固定 JSON schema。
+ */
+class BatchBodyReader {
+public:
+    static constexpr size_t kBuf = 512;
+
+    BatchBodyReader(httpd_req_t *req, int content_len)
+        : m_req(req), m_remaining(content_len > 0 ? content_len : 0) {}
+
+    /** 读下一字节，EOF 返回 -1 */
+    int nextChar() {
+        if (m_pos >= m_len && !refill()) return -1;
+        return (unsigned char)m_buf[m_pos++];
+    }
+    /** 偷看下一字节（不推进），EOF 返回 -1 */
+    int peekChar() {
+        if (m_pos >= m_len && !refill()) return -1;
+        return (unsigned char)m_buf[m_pos];
+    }
+
+private:
+    httpd_req_t *m_req;
+    int    m_remaining;
+    char   m_buf[kBuf];
+    size_t m_len = 0;
+    size_t m_pos = 0;
+    bool   m_eof = false;
+
+    bool refill() {
+        if (m_eof) return false;
+        if (m_pos > 0) {
+            if (m_pos < m_len) {
+                memmove(m_buf, m_buf + m_pos, m_len - m_pos);
+                m_len -= m_pos;
+            } else {
+                m_len = 0;
+            }
+            m_pos = 0;
+        }
+        int to_read = (int)kBuf - (int)m_len;
+        if (to_read > m_remaining) to_read = m_remaining;
+        if (to_read <= 0) { m_eof = true; return false; }
+        int ret = httpd_req_recv(m_req, m_buf + m_len, (size_t)to_read);
+        if (ret <= 0) { m_eof = true; return false; }
+        m_len += (size_t)ret;
+        m_remaining -= ret;
+        return m_pos < m_len;
+    }
+};
+
+/**
  * @brief POST /can/send_batch — CAN 发送唯一入口（单帧 = frames 长度 1）。
  *
  * JSON: { "ch": 0, "frames": [ { "id": n, "dlc": n, "data": "HEX" }, ... ] }
- * 返回: { "status":"ok", "results":[ ... ], 可选 skipped/abort_* }
- * 单帧 canFdSend 超时 2000ms（等应答）；多帧 80ms/帧 + 帧间隔。
+ * 返回: { "status":"ok","results":[ ... ], 可选 skipped/abort_* }
+ *
+ * 流式改造（2026-08）：原一次性 malloc(≤49KB) + JSON parse 双份堆占 +
+ *   输出，峰值 ~100KB 会挤压 lwip pbuf 导致网络断连。
+ *   现用 512B 滚动缓冲逐字符读 body，单帧 jsonParse(零堆分配) 即用即弃，
+ *   响应走 httpd_resp_send_chunk 小栈缓冲，峰值堆 <2KB。
+ *
+ * 单帧 canFdSend 超时 1200ms（等应答）；多帧 80ms/帧 + 帧间隔。
  * 发送期间暂停 CAN 反馈任务。
  */
 esp_err_t can_send_batch_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
 
-    constexpr int kMaxBody = 49152;
     constexpr int kMaxFrames = 128;
     constexpr uint32_t kPerFrameTimeoutMs = 80U;
     constexpr uint32_t kSingleFrameTimeoutMs = 1200U;   /* 正常 <20ms；httpd 单线程，此值决定其它端点最坏阻塞 */
     constexpr uint32_t kInterFrameDelayMs = 1U;
+    /* 上限保留 49152 以维持 API 兼容；流式读取不再一次性 malloc */
+    constexpr int kMaxBody = 49152;
 
     int content_len = req->content_len;
     if (content_len <= 0 || content_len > kMaxBody) {
@@ -1044,167 +1092,241 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
                                     "body 长度无效或过大");
     }
 
-    char *buf = static_cast<char *>(malloc(static_cast<size_t>(content_len) + 1U));
-    if (!buf) {
-        return http_send_json_error(req, "500 Internal Server Error", "oom", "内存不足");
-    }
+    BatchBodyReader reader(req, content_len);
 
-    int received = 0;
-    while (received < content_len) {
-        int ret = httpd_req_recv(req, buf + received, content_len - received);
-        if (ret <= 0) {
-            free(buf);
-            return http_send_json_error(req, "400 Bad Request", "recv_fail", "接收数据失败");
-        }
-        received += ret;
-    }
-    buf[received] = '\0';
-
-    cJSON *root = cJSON_Parse(buf);
-    free(buf);
-    buf = nullptr;
-    if (!root) {
-        return http_send_json_error(req, "400 Bad Request", "json_parse", "JSON 解析失败");
-    }
-
-    cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
-    cJSON *frames = cJSON_GetObjectItem(root, "frames");
-    if (!ch_item || !cJSON_IsArray(frames)) {
-        cJSON_Delete(root);
-        return http_send_json_error(req, "400 Bad Request", "bad_args", "需要 ch 与 frames 数组");
-    }
-
-    can_channel_t ch = static_cast<can_channel_t>(cJSON_GetNumberValue(ch_item));
-    const int frame_count = cJSON_GetArraySize(frames);
-    if (frame_count <= 0 || frame_count > kMaxFrames) {
-        cJSON_Delete(root);
-        return http_send_json_error(req, "400 Bad Request", "bad_frames",
-                                    "frames 数量无效（1~128）");
-    }
-    const uint32_t frame_timeout_ms =
-        (frame_count == 1) ? kSingleFrameTimeoutMs : kPerFrameTimeoutMs;
-
-    cJSON *out_root = cJSON_CreateObject();
-    cJSON *results = cJSON_CreateArray();
-    if (out_root == nullptr || results == nullptr) {
-        cJSON_Delete(out_root);
-        cJSON_Delete(results);
-        cJSON_Delete(root);
-        return http_send_json_error(req, "500 Internal Server Error", "oom", "JSON 分配失败");
-    }
-    cJSON_AddStringToObject(out_root, "status", "ok");
-    cJSON_AddItemToObject(out_root, "results", results);
-
-    /* 发送期间暂停 CAN 反馈，独占 SPI 业务路径 */
-    pauseCanFeedbackTask(true);
-
-    auto fill_err = [](cJSON *item, int code, uint8_t gd32_err) {
-        if (!item) {
-            return;
-        }
-        cJSON_AddStringToObject(item, "status", "error");
-        cJSON_AddNumberToObject(item, "code", code);
-        cJSON_AddNumberToObject(item, "gd32_err", gd32_err);
-    };
-
-    for (int i = 0; i < frame_count; i++) {
-        (void)esp_task_wdt_reset();
-
-        cJSON *item = cJSON_CreateObject();
-        if (item == nullptr) {
-            break;
-        }
-        cJSON_AddItemToArray(results, item);
-
-        cJSON *fr = cJSON_GetArrayItem(frames, i);
-        if (!cJSON_IsObject(fr)) {
-            fill_err(item, -1, 0);
-            continue;
-        }
-
-        cJSON *id_item = cJSON_GetObjectItem(fr, "id");
-        cJSON *data_item = cJSON_GetObjectItem(fr, "data");
-        cJSON *dlc_item = cJSON_GetObjectItem(fr, "dlc");
-        if (!id_item) {
-            fill_err(item, -1, 0);
-            continue;
-        }
-
-        uint32_t ext_id = static_cast<uint32_t>(cJSON_GetNumberValue(id_item));
-        uint8_t dlc = dlc_item ? static_cast<uint8_t>(cJSON_GetNumberValue(dlc_item)) : 0U;
-        if (dlc > CAN_MAX_DLC) {
-            dlc = CAN_MAX_DLC;
-        }
-        uint8_t tx_data[CAN_MAX_DLC];
-        memset(tx_data, 0, sizeof(tx_data));
-        uint8_t tx_dlc = 0U;
-        if (data_item && cJSON_IsString(data_item)) {
-            const char *hex = cJSON_GetStringValue(data_item);
-            if (hex) {
-                tx_dlc = static_cast<uint8_t>(parseHexToBytes(hex, tx_data, CAN_MAX_DLC));
+    /* ── prefix 解析：定位 "ch" → ':' → 数字；再定位 "frames" → '[' ── */
+    auto findKey = [&](const char *key) -> bool {
+        const size_t kl = strlen(key);
+        size_t match = 0;
+        int c;
+        while ((c = reader.nextChar()) != -1) {
+            if (c == key[match]) {
+                if (++match == kl) return true;
+            } else {
+                match = (c == key[0]) ? 1 : 0;
             }
         }
-        if (tx_dlc == 0U && dlc > 0U) {
-            tx_dlc = dlc;
+        return false;
+    };
+    auto skipWs = [&]() {
+        int c;
+        while ((c = reader.peekChar()) != -1) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                reader.nextChar();
+            } else {
+                break;
+            }
+        }
+    };
+    auto findChar = [&](char target) -> bool {
+        int c;
+        while ((c = reader.nextChar()) != -1) {
+            if (c == target) return true;
+        }
+        return false;
+    };
+    auto readInt = [&]() -> long {
+        skipWs();
+        long sign = 1;
+        int c = reader.peekChar();
+        if (c == '-') { reader.nextChar(); sign = -1; }
+        long v = 0;
+        while ((c = reader.peekChar()) != -1 && c >= '0' && c <= '9') {
+            v = v * 10 + (c - '0');
+            reader.nextChar();
+        }
+        return v * sign;
+    };
+
+    if (!findKey("\"ch\"")) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "缺少 ch 字段");
+    }
+    if (!findChar(':')) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "ch 字段格式错误");
+    }
+    long ch_val = readInt();
+    if (!findKey("\"frames\"")) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "缺少 frames 字段");
+    }
+    if (!findChar('[')) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "frames 非数组");
+    }
+    can_channel_t ch = static_cast<can_channel_t>(ch_val);
+
+    /* ── 读取单个帧对象到大括号匹配，返回含外层 {} 的 JSON 子串 ── */
+    char frameJson[320];
+    auto readFrameObj = [&]() -> int {
+        skipWs();
+        int c = reader.peekChar();
+        if (c != '{') return -1;
+        reader.nextChar();            /* 消费 '{' */
+        frameJson[0] = '{';
+        size_t n = 1;
+        int depth = 1;
+        while ((c = reader.nextChar()) != -1) {
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    if (n + 1 >= sizeof(frameJson)) return -1;
+                    frameJson[n++] = '}';
+                    frameJson[n] = '\0';
+                    return (int)n;
+                }
+            }
+            if (n + 1 >= sizeof(frameJson)) return -1;
+            frameJson[n++] = (char)c;
+        }
+        return -1;
+    };
+
+    /* abort 信息（processFrame 命中致命错误时填写） */
+    int  abort_code = 0;
+    int  abort_gd32_err = 0;
+    int  emitted = 0;
+    char chunk[192];
+    /* 单帧/多帧超时在读完首帧后确定；lambda 按引用捕获，后续赋值生效 */
+    uint32_t frame_timeout_ms = kPerFrameTimeoutMs;
+
+    /* ── 处理一帧：解析 JSON → canFdSend → 发 chunk ──
+     * 返回 true 表示致命错误需中止后续帧。 */
+    auto processFrame = [&]() -> bool {
+        JsonView fr = jsonParse(frameJson);
+        if (!fr.valid) {
+            int n = snprintf(chunk, sizeof(chunk),
+                             "%s{\"status\":\"error\",\"code\":-1,\"gd32_err\":0}",
+                             (emitted == 0) ? "" : ",");
+            httpd_resp_send_chunk(req, chunk, n);
+            emitted++;
+            return false;
+        }
+        JsonView id_item = jsonGet(&fr, "id");
+        JsonView data_item = jsonGet(&fr, "data");
+        JsonView dlc_item = jsonGet(&fr, "dlc");
+        if (!id_item.valid) {
+            int n = snprintf(chunk, sizeof(chunk),
+                             "%s{\"status\":\"error\",\"code\":-1,\"gd32_err\":0}",
+                             (emitted == 0) ? "" : ",");
+            httpd_resp_send_chunk(req, chunk, n);
+            emitted++;
+            return false;
         }
 
-        uint8_t resp_data[CAN_MAX_DLC];
-        memset(resp_data, 0, sizeof(resp_data));
+        uint32_t ext_id = static_cast<uint32_t>(jsonGetNumberValue(&id_item));
+        uint8_t dlc = dlc_item.valid ? static_cast<uint8_t>(jsonGetNumberValue(&dlc_item)) : 0U;
+        if (dlc > CAN_MAX_DLC) dlc = CAN_MAX_DLC;
+        uint8_t tx_data[CAN_MAX_DLC] = {0};
+        uint8_t tx_dlc = 0U;
+        if (jsonIsString(&data_item)) {
+            size_t hex_len = 0;
+            const char *hex = jsonGetStringValue(&data_item, &hex_len);
+            if (hex) {
+                tx_dlc = static_cast<uint8_t>(http_hex_to_bytes_n(hex, hex_len, tx_data, CAN_MAX_DLC));
+            }
+        }
+        if (tx_dlc == 0U && dlc > 0U) tx_dlc = dlc;
+
+        uint8_t resp_data[CAN_MAX_DLC] = {0};
         uint8_t gd32_err = 0U;
         int resp_len = canFdSend(ch, ext_id, tx_data, tx_dlc,
                                  resp_data, sizeof(resp_data), frame_timeout_ms, &gd32_err);
 
         if (resp_len >= 0) {
-            char resp_hex[CAN_MAX_DLC * 2 + 1];
-            memset(resp_hex, 0, sizeof(resp_hex));
+            char resp_hex[CAN_MAX_DLC * 2 + 1] = {0};
             const size_t copy_n = (static_cast<size_t>(resp_len) < sizeof(resp_data))
                                       ? static_cast<size_t>(resp_len) : sizeof(resp_data);
-            bytesToHexUpper(resp_data, copy_n, resp_hex);
-            cJSON_AddStringToObject(item, "status", "ok");
-            cJSON_AddNumberToObject(item, "sent", tx_dlc);
-            cJSON_AddNumberToObject(item, "recv_len", static_cast<double>(copy_n));
-            cJSON_AddStringToObject(item, "recv", resp_hex);
-        } else {
-            fill_err(item, resp_len, gd32_err);
-            /* SPI 失败 / BUS_OFF / TEC 过高：中止剩余帧，由 skipped 字段告知前端 */
-            const bool fatal_spi = (resp_len == -2);
-            const bool fatal_bus = (resp_len == -3) &&
-                                   (gd32_err == 0xE2U || gd32_err == 0xE3U);
-            if (fatal_spi || fatal_bus) {
-                const int skipped = frame_count - i - 1;
-                if (skipped > 0) {
-                    cJSON_AddNumberToObject(out_root, "skipped", skipped);
-                    cJSON_AddNumberToObject(out_root, "abort_code", resp_len);
-                    cJSON_AddNumberToObject(out_root, "abort_gd32_err", gd32_err);
-                }
-                break;
-            }
+            http_bytes_to_hex_upper(resp_data, copy_n, resp_hex);
+            int n = snprintf(chunk, sizeof(chunk),
+                             "%s{\"status\":\"ok\",\"sent\":%u,\"recv_len\":%u,\"recv\":\"%s\"}",
+                             (emitted == 0) ? "" : ",",
+                             (unsigned)tx_dlc, (unsigned)copy_n, resp_hex);
+            httpd_resp_send_chunk(req, chunk, n);
+            emitted++;
+            return false;
         }
+        /* 错误项 */
+        int n = snprintf(chunk, sizeof(chunk),
+                         "%s{\"status\":\"error\",\"code\":%d,\"gd32_err\":%u}",
+                         (emitted == 0) ? "" : ",", resp_len, (unsigned)gd32_err);
+        httpd_resp_send_chunk(req, chunk, n);
+        emitted++;
+        /* SPI 失败 / BUS_OFF / TEC 过高：中止剩余帧，由 skipped 字段告知前端 */
+        const bool fatal_spi = (resp_len == -2);
+        const bool fatal_bus = (resp_len == -3) && (gd32_err == 0xE2U || gd32_err == 0xE3U);
+        if (fatal_spi || fatal_bus) {
+            abort_code = resp_len;
+            abort_gd32_err = (int)gd32_err;
+            return true;
+        }
+        return false;
+    };
 
-        if (i + 1 < frame_count) {
+    /* ── 先读第一帧，判断单帧/多帧以决定超时 ── */
+    int flen = readFrameObj();
+    if (flen <= 0) {
+        /* 空数组或首帧非法：直接返回空 results */
+        httpd_resp_set_type(req, "application/json");
+        static const char kEmptyResults[] = "{\"status\":\"ok\",\"results\":[]}";
+        httpd_resp_send_chunk(req, kEmptyResults, sizeof(kEmptyResults) - 1);
+        httpd_resp_send_chunk(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    /* 偷看第一帧之后是否为 ']'：是→单帧，否→多帧 */
+    skipWs();
+    const bool single_frame = (reader.peekChar() == ']');
+    frame_timeout_ms = single_frame ? kSingleFrameTimeoutMs : kPerFrameTimeoutMs;
+
+    /* ── 开始 chunked 响应（prefix 已校验完毕，不会再回退为 error） ── */
+    httpd_resp_set_type(req, "application/json");
+    static const char kResultsPrefix[] = "{\"status\":\"ok\",\"results\":[";
+    httpd_resp_send_chunk(req, kResultsPrefix, sizeof(kResultsPrefix) - 1);
+
+    pauseCanFeedbackTask(true);
+
+    bool aborted = processFrame();
+    int processed = 1;
+
+    if (!aborted && !single_frame) {
+        while (processed < kMaxFrames) {
+            (void)esp_task_wdt_reset();
+            skipWs();
+            int c = reader.peekChar();
+            if (c == -1 || c == ']') break;
+            if (c == ',') { reader.nextChar(); continue; }
+            if (c != '{') { reader.nextChar(); continue; }   /* 跳过意外字符 */
+            flen = readFrameObj();
+            if (flen <= 0) break;
+            if (processFrame()) { aborted = true; break; }
+            processed++;
             vTaskDelay(pdMS_TO_TICKS(kInterFrameDelayMs));
         }
     }
 
     pauseCanFeedbackTask(false);
-    cJSON_Delete(root);
-    root = nullptr;
 
-    char *printed = cJSON_PrintUnformatted(out_root);
-    cJSON_Delete(out_root);
-    out_root = nullptr;
-    if (!printed) {
-        static const char kOom[] =
-            "{\"status\":\"error\",\"code\":\"json_print\",\"message\":\"JSON输出失败\"}";
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, kOom, HTTPD_RESP_USE_STRLEN);
-        return ESP_FAIL;
+    /* 统计中止后未发送的剩余帧数（按 '{' 计数到 ']'） */
+    int skipped = 0;
+    if (aborted) {
+        int c;
+        while ((c = reader.nextChar()) != -1) {
+            if (c == ']') break;
+            if (c == '{') skipped++;
+        }
     }
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, printed, HTTPD_RESP_USE_STRLEN);
-    free(printed);
+    char tail[96];
+    int tn;
+    if (aborted && skipped > 0) {
+        tn = snprintf(tail, sizeof(tail),
+                      "],\"skipped\":%d,\"abort_code\":%d,\"abort_gd32_err\":%u}",
+                      skipped, abort_code, (unsigned)abort_gd32_err);
+    } else {
+        tn = snprintf(tail, sizeof(tail), "]}");
+    }
+    httpd_resp_send_chunk(req, tail, tn);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -1219,35 +1341,37 @@ esp_err_t spi_send_handler(httpd_req_t *req)
     }
     buf[ret] = '\0';
 
-    cJSON *root = cJSON_Parse(buf);
-    if (!root) {
+    JsonView root = jsonParse(buf);
+    if (!root.valid) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "JSON 解析失败");
         return ESP_FAIL;
     }
 
-    cJSON *type_item = cJSON_GetObjectItem(root, "type");
-    cJSON *data_item = cJSON_GetObjectItem(root, "data");
-    cJSON *timeout_item = cJSON_GetObjectItem(root, "timeout_ms");
+    JsonView type_item = jsonGet(&root, "type");
+    JsonView data_item = jsonGet(&root, "data");
+    JsonView timeout_item = jsonGet(&root, "timeout_ms");
 
-    if (!type_item || !cJSON_IsString(type_item)) {
-        cJSON_Delete(root);
+    if (!jsonIsString(&type_item)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 type 字段");
         return ESP_FAIL;
     }
-    const char *type_hex = cJSON_GetStringValue(type_item);
-    uint8_t frame_type = (uint8_t)strtol(type_hex, NULL, 16);
+    /* type_hex 是 hex 字符串如 "A1"，拷贝到小缓冲供 strtol 使用 */
+    char type_hex_buf[8] = {};
+    jsonGetStringCopy(&type_item, type_hex_buf, sizeof(type_hex_buf));
+    uint8_t frame_type = (uint8_t)strtol(type_hex_buf, NULL, 16);
 
-    uint32_t timeout_ms = timeout_item ? (uint32_t)cJSON_GetNumberValue(timeout_item) : 1000;
+    uint32_t timeout_ms = timeout_item.valid ? (uint32_t)jsonGetNumberValue(&timeout_item) : 1000;
 
     uint8_t payload_data[SPI_OTA_FRAME_MAX] = {0};
     size_t payload_len = 0;
-    if (data_item && cJSON_IsString(data_item)) {
-        payload_len = parseHexToBytes(cJSON_GetStringValue(data_item), payload_data, SPI_OTA_FRAME_MAX);
+    if (jsonIsString(&data_item)) {
+        size_t hex_len = 0;
+        const char *hex = jsonGetStringValue(&data_item, &hex_len);
+        payload_len = http_hex_to_bytes_n(hex, hex_len, payload_data, SPI_OTA_FRAME_MAX);
     }
 
     DEBUG_INFO("SPI", "WEB SPI: type=0x%02X, payload=%zu 字节",
                frame_type, payload_len);
-    cJSON_Delete(root);
 
     char resp[1024];
     uint8_t resp_type = 0;
@@ -1259,7 +1383,7 @@ esp_err_t spi_send_handler(httpd_req_t *req)
 
     if (spi_err == ESP_OK) {
         char resp_hex[SPI_OTA_FRAME_MAX * 2 + 1] = {0};
-        bytesToHexUpper(resp_payload, resp_len, resp_hex);
+        http_bytes_to_hex_upper(resp_payload, resp_len, resp_hex);
         snprintf(resp, sizeof(resp),
             "{\"status\": \"ok\", \"type\": \"%02X\", \"payload_len\": %zu, \"resp_type\": \"%02X\", \"resp_len\": %zu, \"recv\": \"%s\"}",
             frame_type, payload_len, resp_type, resp_len, resp_hex);
@@ -1313,27 +1437,11 @@ static size_t get_task_stack_peak_used_bytes(TaskHandle_t handle, size_t stack_s
     return (stack_size_bytes >= high_watermark) ? (stack_size_bytes - high_watermark) : 0;
 }
 
-static int append_jsonf(char* buf, size_t cap, int offset, const char* fmt, ...)
-{
-    if (!buf || cap == 0 || offset < 0 || (size_t)offset >= cap) return offset;
-    va_list args;
-    va_start(args, fmt);
-    int n = vsnprintf(buf + offset, cap - (size_t)offset, fmt, args);
-    va_end(args);
-    if (n < 0) return offset;
-    size_t written = (size_t)n;
-    if (offset + (int)written >= (int)cap) {
-        buf[cap - 1] = '\0';
-        return (int)(cap - 1);
-    }
-    return offset + (int)written;
-}
-
 /** 将 CpuStats 1Hz 快照写入 JSON（不在 HTTP 线程采样）。最多 16 条任务以免撑爆 3KB 分块。 */
 static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUsageSnapshot& cpu)
 {
     static constexpr size_t kCpuTaskJsonMax = 16;
-    offset = append_jsonf(buf, cap, offset,
+    offset = http_json_append(buf, cap, offset,
         "\"cpu\":{\"available\":%s,\"valid\":%s,\"usage_pct\":%.2f,\"idle_pct\":%.2f,\"sample_ms\":%lu,\"tasks\":[",
         cpu.available ? "true" : "false",
         cpu.valid ? "true" : "false",
@@ -1345,7 +1453,7 @@ static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUs
         (cpu.task_count > kCpuTaskJsonMax) ? kCpuTaskJsonMax : cpu.task_count;
     for (size_t i = 0; i < ntask; ++i) {
         const CpuTaskMetric& task = cpu.tasks[i];
-        offset = append_jsonf(buf, cap, offset,
+        offset = http_json_append(buf, cap, offset,
             "%s{\"name\":\"%s\",\"task_number\":%lu,\"runtime_delta\":%" PRIu64 ",\"usage_pct\":%.2f}",
             i == 0 ? "" : ",",
             task.name,
@@ -1355,7 +1463,7 @@ static int append_cpu_status_json(char* buf, size_t cap, int offset, const CpuUs
     }
 
     // 不带尾随逗号；由后续拼接块自行添加前导逗号，避免双重逗号
-    return append_jsonf(buf, cap, offset, "]}");
+    return http_json_append(buf, cap, offset, "]}");
 }
 
 esp_err_t system_status_handler(httpd_req_t *req)
@@ -1368,16 +1476,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
      * collectTaskStackMetrics / OtaCoordinator::getSnapshot / SystemBoot::appendStatusJson
      * 等重活，避免在 httpd 单线程里阻塞几十~上百 ms 拖慢 motor/feedback 请求。
      * 完整 status 由前端 5s 拉一次。 */
-    bool want_lite = false;
-    {
-        char query[32];
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-            char val[4] = {};
-            if (httpd_query_key_value(query, "lite", val, sizeof(val)) == ESP_OK) {
-                want_lite = (val[0] == '1' || val[0] == 'y' || val[0] == 't');
-            }
-        }
-    }
+    bool want_lite = http_query_bool(req, "lite");
     if (want_lite) {
         char ip_str[16] = "0.0.0.0";
         const char *mode_str = "AP";
@@ -1413,17 +1512,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
 
     /* layout=1：附带链接期静态布局（IRAM/.data/.bss/堆容量等），前端缓存后轮询不再要。
      * 默认只下发 memory 动态字段，减 status JSON 体积。 */
-    bool want_mem_layout = false;
-    {
-        char query[48];
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-            char val[8] = {};
-            if (httpd_query_key_value(query, "layout", val, sizeof(val)) == ESP_OK) {
-                want_mem_layout = (val[0] == '1' || val[0] == 'y' || val[0] == 'Y' ||
-                                   val[0] == 't' || val[0] == 'T');
-            }
-        }
-    }
+    bool want_mem_layout = http_query_bool(req, "layout");
 
     /* 堆极紧时仍返回精简 JSON，禁止 500（前端轮询会刷红）。 */
     const size_t largest_now = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
@@ -1625,7 +1714,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
             case 2: role_str = "boot"; break;
             default: break;
         }
-        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, 0,
+        len = http_json_append(resp, HTTP_JSON_WORK_CAP, 0,
             ",\"spi_link\":{\"version\":%u,\"gd32_role\":\"%s\",\"session_id\":\"0x%08lX\","
             "\"v2_active\":%s,\"local_credit\":%u,\"remote_credit\":%u,"
             "\"crc_errors\":%lu,\"duplicate_requests\":%lu,\"seq_errors\":%lu,"
@@ -1657,7 +1746,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
         const char *en = feat_known ? (feat_adc ? "true" : "false")
                                     : (have ? "true" : "null");
         if (have) {
-            len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+            len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
                 ",\"gd32_adc\":{\"enabled\":%s,\"feat_known\":%s,\"fresh\":%s,\"valid\":%s,"
                 "\"temperature\":%.2f,\"vdda\":%.3f,\"vin_adc\":%.3f,\"vcc\":%.3f,"
                 "\"temp_raw\":%u,\"vref_raw\":%u,\"seq\":%lu,"
@@ -1670,12 +1759,12 @@ esp_err_t system_status_handler(httpd_req_t *req)
                 (unsigned long)ga.seq, (unsigned long)ga.uptime_sec,
                 (unsigned long)(age == UINT32_MAX ? 0UL : (unsigned long)age));
         } else {
-            len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+            len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
                 ",\"gd32_adc\":{\"enabled\":%s,\"feat_known\":%s,\"fresh\":false,\"valid\":false}",
                 en, feat_known ? "true" : "false");
         }
         const uint32_t fl = SpiMaster::instance().gd32FeatFlags();
-        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+        len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
             ",\"gd32_features\":{\"known\":%s,\"flags\":%lu,"
             "\"adc_feedback\":%s,\"uart_temp_print\":%s,"
             "\"spi_app_log\":%s,\"can_brs\":%s,"
@@ -1696,7 +1785,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
 
     /* memory 动态字段：每次轮询；layout 仅 ?layout=1 时附带（链接期常量）。 */
     if (want_mem_layout) {
-        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+        len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
             ",\"memory\":{\"layout\":{\"chip\":\"esp32c3\",\"sram_total\":%lu,\"sram_soc\":%lu,"
             "\"static_reserved\":%lu,\"reserved_tail\":%lu,"
             "\"iram\":%lu,\"data\":%lu,\"bss\":%lu,"
@@ -1728,7 +1817,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)rtc_free,
             (unsigned long)free_heap);
     } else {
-        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+        len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
             ",\"memory\":{\"heap_used\":%lu,\"heap_free\":%lu,"
             "\"heap_min_free\":%lu,\"heap_largest_free\":%lu,"
             "\"alloc_blocks\":%lu,\"free_blocks\":%lu,"
@@ -1752,9 +1841,9 @@ esp_err_t system_status_handler(httpd_req_t *req)
     }
 
     /* ── 分块 4：task_stack + 闭合 ── */
-    len = append_jsonf(resp, HTTP_JSON_WORK_CAP, 0, ",\"task_stack\": {");
+    len = http_json_append(resp, HTTP_JSON_WORK_CAP, 0, ",\"task_stack\": {");
     for (size_t i = 0; i < task_metrics_count; ++i) {
-        len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len,
+        len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
             "%s\"%s\":{\"stack_size_bytes\":%lu,\"high_watermark_bytes\":%lu,\"peak_used_bytes\":%lu}",
             i == 0 ? "" : ",",
             task_metrics[i].name,
@@ -1762,7 +1851,7 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)get_task_stack_high_watermark_bytes(task_metrics[i].handle),
             (unsigned long)get_task_stack_peak_used_bytes(task_metrics[i].handle, task_metrics[i].stack_size_bytes));
     }
-    len = append_jsonf(resp, HTTP_JSON_WORK_CAP, len, "}}");
+    len = http_json_append(resp, HTTP_JSON_WORK_CAP, len, "}}");
 
     if (!status_flush_chunk(req, resp, HTTP_JSON_WORK_CAP, &len)) {
         if (mux) {
@@ -1870,16 +1959,7 @@ esp_err_t motor_state_handler(httpd_req_t *req)
      *            rx_count u32, seq u32, data[32]
      * 27 槽（9 node × 3 ch，node×channel 双键）最大 12 + 27*44 = 1200B。
      * 无 have_data 时仍发 header（count=0），让前端区分「无数据」与「空总线」。 */
-    bool want_bin = false;
-    {
-        char query[32];
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-            char val[4] = {};
-            if (httpd_query_key_value(query, "bin", val, sizeof(val)) == ESP_OK) {
-                want_bin = (val[0] == '1' || val[0] == 'y' || val[0] == 't');
-            }
-        }
-    }
+    bool want_bin = http_query_bool(req, "bin");
     if (want_bin) {
         httpd_resp_set_type(req, "application/octet-stream");
         /* 静态缓冲：27 槽扩容后 1200B 不再上栈（httpd 栈 7KB 已紧）；
@@ -1960,9 +2040,7 @@ esp_err_t motor_state_handler(httpd_req_t *req)
 
         /* data hex */
         char hex[MOTOR_STATUS_DLC * 2 + 1];
-        for (uint8_t b = 0; b < MOTOR_STATUS_DLC; ++b) {
-            snprintf(&hex[b * 2], 3, "%02X", s.data[b]);
-        }
+        http_bytes_to_hex_upper(s.data, MOTOR_STATUS_DLC, hex);
 
         off += snprintf(w + off, HTTP_JSON_WORK_CAP - off,
             "%s{\"node\":%u,\"ch\":%u,\"online\":%s,\"dlc\":%u,"
@@ -2027,9 +2105,7 @@ esp_err_t motor_version_handler(httpd_req_t *req)
         if (!s.valid || s.node_id == 0) continue;
 
         char hex[MOTORVER_DLC * 2 + 1];
-        for (uint8_t b = 0; b < MOTORVER_DLC; ++b) {
-            snprintf(&hex[b * 2], 3, "%02X", s.version[b]);
-        }
+        http_bytes_to_hex_upper(s.version, MOTORVER_DLC, hex);
         const long age = (s.recv_ms > 0 && now_ms >= s.recv_ms)
                              ? static_cast<long>(now_ms - s.recv_ms) : 0L;
 
@@ -2060,14 +2136,7 @@ esp_err_t motor_ota_upload_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
 
-    char query[16] = {};
-    uint8_t channel = 0;
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char val[4] = {};
-        if (httpd_query_key_value(query, "ch", val, sizeof(val)) == ESP_OK) {
-            channel = static_cast<uint8_t>(atoi(val));
-        }
-    }
+    uint8_t channel = static_cast<uint8_t>(http_query_u32(req, "ch", 0));
 
     const int content_len = req->content_len;
     if (content_len <= 0 || content_len > (int)MOTOR_OTA_MAX_FW_SIZE) {
@@ -2164,9 +2233,7 @@ esp_err_t motor_ota_upload_handler(httpd_req_t *req)
     ota_meta_t sha_meta = {};
     char sha_hex[65] = {0};
     if (Gd32FlashStore::instance().metaLoad(&sha_meta) == ESP_OK) {
-        for (int i = 0; i < 32; ++i) {
-            snprintf(&sha_hex[i * 2], 3, "%02x", sha_meta.checksum[i]);
-        }
+        http_bytes_to_hex_lower(sha_meta.checksum, 32, sha_hex);
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -2185,14 +2252,7 @@ esp_err_t motor_ota_relay_handler(httpd_req_t *req)
     http_set_keepalive_hdr(req);
     DEBUG_INFO("MOTOR_OTA", "=== HTTP: POST /motor/ota/relay ===");
 
-    char query[16] = {};
-    uint8_t channel = 0;
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char val[4] = {};
-        if (httpd_query_key_value(query, "ch", val, sizeof(val)) == ESP_OK) {
-            channel = static_cast<uint8_t>(atoi(val));
-        }
-    }
+    uint8_t channel = static_cast<uint8_t>(http_query_u32(req, "ch", 0));
 
     /* 读 meta 拿 fw_size（motorOtaStart 参数的唯一来源）。
      * total_size==0 = 无固件可刷（未上传过，或上次 relay 成功后 metaClear 已消费）。

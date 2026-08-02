@@ -29,6 +29,7 @@
 #include "spi_master.h"
 #include "esp_event.h"
 #include "esp_netif_types.h"
+#include "server/http_util.h"
 
 // ============================================================
 // heap hook：捕获"破新低时的最后一次 alloc"（最后一击，未必是主因）
@@ -399,8 +400,13 @@ void HealthMonitor::taskEntry(void *pvParameters)
          * 必须在 maybeRecord 之前，否则 est 长期偏低会误触发 hook 快照。 */
         hookResyncEstFree(free_heap);
 
+        // 任务栈指标：本周期只采集一次，堆低水位快照和栈水位巡检共用。
+        TaskStackMetric metrics[STACK_TASK_MAX];
+        size_t count = collectTaskStackMetrics(metrics, STACK_TASK_MAX);
+
         // 堆低水位快照：仅在"最低空闲"创新低时记录一条上下文（5s 检测足够）
-        self.maybeRecordHeapLowWater();
+        //   传入已采集的 metrics，避免 maybeRecordHeapLowWater 内部二次遍历任务表。
+        self.maybeRecordHeapLowWater(metrics, count);
 
         if (free_heap < HEAP_WARNING_MIN) {
             /* 堆告警节流：OTA 期间阈值更低、间隔更长 */
@@ -426,10 +432,8 @@ void HealthMonitor::taskEntry(void *pvParameters)
             DEBUG_ERR("MON", "健康状态危险: %d", cur);
         }
 
-        // 栈水位主动巡检：复用 /system/status 的任务表，低水位时 DEBUG_ERR 主动告警。
+        // 栈水位主动巡检：复用已采集的任务表，低水位时 DEBUG_ERR 主动告警。
         //   health_mon 任务不被 OTA 暂停，告警经 UDP/UART 直发，穿透 OTA 门控。
-        TaskStackMetric metrics[STACK_TASK_MAX];
-        size_t count = collectTaskStackMetrics(metrics, STACK_TASK_MAX);
         for (size_t i = 0; i < count && i < STACK_TASK_MAX; ++i) {
             if (metrics[i].handle == NULL || metrics[i].stack_size_bytes == 0) {
                 continue;
@@ -604,23 +608,6 @@ health_status_t HealthMonitor::updateFromWifiRssi(int8_t rssi)
 // ============================================================
 // 堆低水位快照（"最低空闲"创新低时记录上下文）
 // ============================================================
-namespace {
-/** @brief snprintf 追加到 buf 的安全封装：截断但不越界，返回新 offset。 */
-int appendJsonfSafe(char *buf, size_t cap, int offset, const char *fmt, ...)
-{
-    if (offset < 0 || (size_t)offset >= cap) return offset;
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf + offset, cap - (size_t)offset, fmt, ap);
-    va_end(ap);
-    if (n < 0) return offset;
-    if ((size_t)n >= cap - (size_t)offset) {
-        // 被截断：vsnprintf 返回的是"本应写入"的长度，按截断后修正 offset
-        return (int)cap - 1;
-    }
-    return offset + n;
-}
-} // namespace
 
 /**
  * @brief 检测"内部堆最低空闲"是否创新低，是则覆盖写入唯一快照槽。
@@ -630,7 +617,7 @@ int appendJsonfSafe(char *buf, size_t cap, int offset, const char *fmt, ...)
  * 所有外部读取（OtaCoordinator::getSnapshot / collectTaskStackMetrics / rssi / temp）
  * 都先在锁外取，避免持锁期间嵌套调用其它模块的锁；持锁后只做字段拷贝。
  */
-void HealthMonitor::maybeRecordHeapLowWater()
+void HealthMonitor::maybeRecordHeapLowWater(const TaskStackMetric *pre_metrics, size_t pre_count)
 {
     // 与 http_handlers.cpp 同口径：内部 DRAM 数据堆
     static constexpr uint32_t CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
@@ -691,8 +678,17 @@ void HealthMonitor::maybeRecordHeapLowWater()
     HeapLowTaskStack stacks[8];
     uint8_t stack_count = 0;
     {
-        TaskStackMetric metrics[STACK_TASK_MAX];
-        size_t count = collectTaskStackMetrics(metrics, STACK_TASK_MAX);
+        // 优先复用巡检循环已采集的指标，避免二次遍历
+        TaskStackMetric local_metrics[STACK_TASK_MAX];
+        const TaskStackMetric *metrics;
+        size_t count;
+        if (pre_metrics && pre_count > 0) {
+            metrics = pre_metrics;
+            count = pre_count;
+        } else {
+            count = collectTaskStackMetrics(local_metrics, STACK_TASK_MAX);
+            metrics = local_metrics;
+        }
         // 先全部采集
         struct Item { char name[16]; uint32_t rem; };
         Item items[STACK_TASK_MAX];
@@ -816,7 +812,7 @@ int HealthMonitor::dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const
     LockGuard lock(m_mutex);
 
     if (!m_heapLowWaterValid) {
-        return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+        return http_json_append(buf, cap, offset, "{\"count\":0,\"records\":[]}");
     }
 
     const HeapLowWaterRecord &r = m_heapLowWater;
@@ -824,7 +820,7 @@ int HealthMonitor::dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const
      * hook_confidence 告知前端置信度：hook 命中=est_low_watermark，未命中=none。
      * 前端应据此区分 estimated 与 measured（free_heap/min_free_heap 为实测）。 */
     const char *hook_confidence = r.hook_fired ? "est_low_watermark" : "none";
-    int pos = appendJsonfSafe(buf, cap, offset,
+    int pos = http_json_append(buf, cap, offset,
         "{\"count\":1,\"records\":[{"
         "\"ts_ms\":%llu,\"free_heap\":%lu,\"min_free_heap\":%lu,"
         "\"largest_free_block\":%lu,\"sys_state\":%u,\"ota_channel\":%u,"
@@ -863,24 +859,24 @@ int HealthMonitor::dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const
         (unsigned long)r.hook_fired,
         (unsigned long)r.ip_event_count);
     if (pos == offset) {
-        return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+        return http_json_append(buf, cap, offset, "{\"count\":0,\"records\":[]}");
     }
 
     for (uint8_t k = 0; k < r.task_stack_count && k < 8; ++k) {
-        int after = appendJsonfSafe(buf, cap, pos,
+        int after = http_json_append(buf, cap, pos,
             "%s{\"name\":\"%s\",\"remaining\":%lu}",
             k == 0 ? "" : ",",
             r.task_stacks[k].name,
             (unsigned long)r.task_stacks[k].remaining);
         if (after == pos) {
-            return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+            return http_json_append(buf, cap, offset, "{\"count\":0,\"records\":[]}");
         }
         pos = after;
     }
 
-    int closed = appendJsonfSafe(buf, cap, pos, "]}]}");
+    int closed = http_json_append(buf, cap, pos, "]}]}");
     if (closed == pos) {
-        return appendJsonfSafe(buf, cap, offset, "{\"count\":0,\"records\":[]}");
+        return http_json_append(buf, cap, offset, "{\"count\":0,\"records\":[]}");
     }
     return closed;
 }

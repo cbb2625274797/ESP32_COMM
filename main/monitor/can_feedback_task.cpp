@@ -1,14 +1,11 @@
 /*
- * can_feedback_task.cpp - 被动监听 GD32 主动推送的 CAN 反馈快照
+ * can_feedback_task.cpp - 被动监听 GD32 主动推送的事件
  *
- * 架构（GD32 主动推送，ESP32 被动接收）：
- *   GD32 APP 在主循环中调用 canFeedbackPushStep()，循环遍历 3 通道 × 2 页，
- *   通过 requestEsp32Read(0xC1) 下拉 DATA_READY 主动按铃，将每页反馈 payload
- *   推送给 ESP32。ESP32 本任务 SpiMaster::takeEvent() 阻塞等待按铃/事件，
- *   读到一帧后用 canFdParseFeedbackPage() 解析并累积到 s_work[channel]，再
- *   publish() 到 s_latest[channel] 供 Web 读取。
- *
- *   替代了原先 ESP32 1Hz 主动发 0xC1 轮询的逻辑，避免占用主线 SPI 带宽。
+ * 架构（2026-08 改造后）：
+ *   0xC1 CAN 反馈已改为请求驱动（前端请求时 ESP32 主动向 GD32 查询），
+ *   不再被动缓存。本任务仅保留 0xC4/0xC5/0xC6/0xD2 事件分发：
+ *     0xC4 ADC 调试反馈、0xC5 多电机状态、0xC6 多电机版本、0xD2 电机 OTA 进度
+ *   这些仍由 GD32 主动推送，ESP32 被动接收。
  *
  *   OTA 期间通过 pauseCanFeedbackTask(true) 暂停本任务，避免与 OTA 抢占 SPI。
  */
@@ -17,7 +14,6 @@
 #include "freertos/semphr.h"
 
 #include "app_config.h"
-#include "transport/canfd_bridge.h"
 #include "transport/spi_master.h"
 #include "monitor/debug_log.h"
 #include "monitor/can_feedback_task.h"
@@ -25,7 +21,6 @@
 #include "monitor/motor_state.h"
 #include "monitor/motor_version.h"
 #include "monitor/motor_ota_relay.h"
-#include "app_config.h"
 #include "esp_system.h"
 
 #include <string.h>
@@ -34,7 +29,6 @@ namespace {
 
 constexpr uint32_t kWaitRingMs      = 500U;    ///< 单次等待 GD32 按铃超时
 constexpr uint32_t kPauseDelayMs    = 100U;    ///< 暂停时的轮询间隔
-constexpr uint8_t  kSpiCanFeedbackType = 0xC1U;
 constexpr uint8_t  kSpiAdcFeedbackType = 0xC4U;  ///< GD32 ADC 调试反馈
 constexpr uint8_t  kSpiMotorStateType  = 0xC5U;  ///< GD32 多电机状态推送
 constexpr uint8_t  kSpiMotorVersionType = 0xC6U; ///< GD32 多电机版本推送（事件驱动）
@@ -42,44 +36,22 @@ constexpr uint8_t  kSpiMotorOtaStatusType = 0xD2U; ///< GD32 电机 OTA relay �
 constexpr size_t   kRingPayloadMax  = SPI_OTA_FRAME_MAX;  ///< 与变长读一致，避免截断
 constexpr const char *kTag           = "CAN_FB";
 
-static can_feedback_result_t s_latest[CAN_CHANNEL_MAX];
-static bool                   s_valid [CAN_CHANNEL_MAX];
-static SemaphoreHandle_t      s_mutex = nullptr;
-static volatile bool          s_paused = false;
-
-/* 累积工作缓冲：跨 page 0/1 累积每通道的完整反馈 */
-static can_feedback_result_t s_work  [CAN_CHANNEL_MAX];
-static uint8_t               s_workIdx[CAN_CHANNEL_MAX];
-static uint32_t              s_lastLoggedError[CAN_CHANNEL_MAX];
+static volatile bool s_paused = false;
 
 /**
- * @brief 将某通道完整反馈发布到 s_latest（线程安全）。
- * @param ch  通道 0..2
- * @param fb  解析后的快照
- */
-static void publish(uint8_t ch, const can_feedback_result_t &fb)
-{
-    if (s_mutex == nullptr) return;
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        s_latest[ch] = fb;
-        s_valid[ch]  = true;
-        xSemaphoreGive(s_mutex);
-    }
-}
-
-/**
- * @brief can_fb 任务主循环：takeEvent 分发 0xC1 CAN / 0xC4 ADC。
+ * @brief can_fb 任务主循环：takeEvent 分发 0xC4/0xC5/0xC6/0xD2 推送事件。
+ *   0xC1 CAN 反馈已改为请求驱动（canFdQueryFeedback），不再在此处理。
  */
 static void taskLoop(void *)
 {
-    DEBUG_INFO(kTag, "CAN 反馈被动监听任务启动 (GD32 主动推送, 0xC1)");
+    DEBUG_INFO(kTag, "事件监听任务启动 (0xC4 ADC / 0xC5 motor / 0xC6 ver / 0xD2 ota)");
 
     /* 冷启动延后开始监听，错开上电初始化窗口 */
     {
         esp_reset_reason_t rr = esp_reset_reason();
         if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
             constexpr uint32_t kCanFbDeferMs = 1500U;
-            DEBUG_INFO(kTag, "冷启动: %lu ms 后开始 CAN 反馈监听",
+            DEBUG_INFO(kTag, "冷启动: %lu ms 后开始事件监听",
                        (unsigned long)kCanFbDeferMs);
             vTaskDelay(pdMS_TO_TICKS(kCanFbDeferMs));
         }
@@ -126,58 +98,20 @@ static void taskLoop(void *)
             continue;
         }
 
-        if (ring_type != kSpiCanFeedbackType || ring_len < 28U) {
-            continue;
-        }
-
-        const uint8_t ch = ring_payload[0];
-        if (ch >= CAN_CHANNEL_MAX) {
-            continue;
-        }
-
-        /* 解析本页并累积到工作缓冲，page=0 会自动重置 */
-        if (canFdParseFeedbackPage(ring_payload, ring_len,
-                                   &s_work[ch], &s_workIdx[ch]) == 0) {
-            publish(ch, s_work[ch]);
-
-            /* 累计错误发生变化时才告警一次；P0/P1 携带相同统计，不能重复打印。 */
-            if (s_work[ch].stats.error_count != 0U
-                && s_work[ch].stats.error_count != s_lastLoggedError[ch]) {
-                DEBUG_WARN(kTag,
-                    "CH%u err=%lu TEC=%u REC=%u",
-                    static_cast<unsigned>(ch),
-                    static_cast<unsigned long>(s_work[ch].stats.error_count),
-                    static_cast<unsigned>(s_work[ch].stats.tec),
-                    static_cast<unsigned>(s_work[ch].stats.rec));
-                s_lastLoggedError[ch] = s_work[ch].stats.error_count;
-            }
-        }
+        /* 0xC1 已改为请求驱动，不再在此处理；未知类型静默跳过 */
     }
 }
 
 } // namespace
 
 /**
- * @brief 启动 CAN 反馈被动监听任务（幂等）。
+ * @brief 启动事件监听任务（幂等）。
  * @return true 表示任务已存在或创建成功。
  */
 bool startCanFeedbackTask()
 {
     static bool s_started = false;
     if (s_started) return true;
-
-    if (s_mutex == nullptr) {
-        s_mutex = xSemaphoreCreateMutex();
-        if (s_mutex == nullptr) {
-            DEBUG_ERR(kTag, "互斥量创建失败");
-            return false;
-        }
-    }
-    memset(s_latest, 0, sizeof(s_latest));
-    memset(s_lastLoggedError, 0, sizeof(s_lastLoggedError));
-    memset(s_valid,  0, sizeof(s_valid));
-    memset(s_work,   0, sizeof(s_work));
-    memset(s_workIdx, 0, sizeof(s_workIdx));
 
     BaseType_t xRet = xTaskCreatePinnedToCore(
         taskLoop,
@@ -196,7 +130,7 @@ bool startCanFeedbackTask()
 }
 
 /**
- * @brief 暂停/恢复 CAN（及同任务分发的 ADC）事件监听。
+ * @brief 暂停/恢复事件监听。
  * @param pause true=OTA 期间暂停；false=恢复
  */
 void pauseCanFeedbackTask(bool pause)
@@ -204,28 +138,17 @@ void pauseCanFeedbackTask(bool pause)
     if (s_paused == pause) return;  // 幂等：状态未变时不重复日志
     s_paused = pause;
     if (pause) {
-        DEBUG_DBG(kTag, "CAN 监听已暂停（OTA 进行中）");
+        DEBUG_DBG(kTag, "事件监听已暂停（OTA 进行中）");
     } else {
-        DEBUG_DBG(kTag, "CAN 监听已恢复");
+        DEBUG_DBG(kTag, "事件监听已恢复");
     }
 }
 
 /**
- * @brief 拷贝某通道的最新快照（线程安全）。
- * @return true 表示拿到一份有效数据。
+ * @brief 查询是否处于暂停（OTA / send_batch 期间为 true）。
+ *   暂停期间 HTTP handler 应跳过 0xC1 查询，避免与 OTA 抢占 SPI。
  */
-bool getLatestCanFeedback(uint8_t channel, can_feedback_result_t *out)
+bool canFeedbackPaused()
 {
-    if (channel >= CAN_CHANNEL_MAX || out == nullptr || s_mutex == nullptr) {
-        return false;
-    }
-    bool ok = false;
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (s_valid[channel]) {
-            *out = s_latest[channel];
-            ok = true;
-        }
-        xSemaphoreGive(s_mutex);
-    }
-    return ok;
+    return s_paused;
 }

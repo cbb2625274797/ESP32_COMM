@@ -145,6 +145,12 @@ public:
      */
     const esp_partition_t* getPartition();
 
+    // ── OTA 期对齐缓冲生命周期 ──
+    /** @brief GD32 OTA begin 时调用：预分配对齐缓冲（消除 flashWriteChunk 逐块 malloc）。 */
+    static void acquireAlignBufForOta();
+    /** @brief GD32 OTA end/abort 时调用：释放对齐缓冲（非 OTA 期零占用）。 */
+    static void releaseAlignBufForOta();
+
 private:
     Gd32FlashStore();
     ~Gd32FlashStore() = default;

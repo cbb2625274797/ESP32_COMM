@@ -14,8 +14,8 @@
 // 固件版本
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 74
-#define FW_VERSION_STRING "0.3.74"   // can batch: 帧间隔 5→1ms；前端 BATCH_CHUNK=64 + fetch 超时加固 + finally 兜底 renderHistory
+#define FW_VERSION_PATCH 76
+#define FW_VERSION_STRING "0.3.76"   // 重启恢复提速2：httpd就绪后再打 MAIN「启动」banner（防环缩容裁掉）；前端用 uptime<120s 判重启完成，不再干等10s
 
 // Git 信息（手动填写）
 #define GIT_HASH "770ae14"

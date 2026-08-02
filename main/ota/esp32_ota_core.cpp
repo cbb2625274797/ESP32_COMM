@@ -19,6 +19,7 @@
 #include "esp32_ota_core.h"
 #include "app_config.h"
 #include "monitor/debug_log.h"
+#include "spi_master.h"   /* setSpiPaused：OTA 期间暂停 SPI，避免 flash 写与 SPI 读并发 */
 
 #define TAG "OTA_CORE"
 
@@ -110,6 +111,7 @@ esp_err_t Esp32OtaCore::finalizeCleanupAndReturn(esp_err_t code)
     }
     m_ended = false;
     releaseMutex();
+    SpiMaster::instance().setSpiPaused(false);  /* OTA 结束（失败也恢复 SPI） */
     resetState();
     return code;
 }
@@ -200,6 +202,12 @@ esp_err_t Esp32OtaCore::begin(size_t total_size)
     m_shaComputed = false;
     m_ended = false;
     memset(m_sha256, 0, sizeof(m_sha256));
+
+    /* ESP32 自我 OTA 期间暂停 SPI（GD32 按铃读 + 业务 transact 全部停摆）：
+     * esp_ota_write 写 flash 时 cache 反复失效，SPI worker 的 flash 驻留代码
+     * 访问会被拖慢甚至触发 Cache error，且此时 GD32 数据无意义。
+     * finalize()/abort() 恢复。 */
+    SpiMaster::instance().setSpiPaused(true);
 
     DEBUG_DBG(TAG, "ESP32 OTA begin part=%s size=%u (erase-on-write)",
                m_partition->label, (unsigned)total_size);
@@ -382,11 +390,13 @@ esp_err_t Esp32OtaCore::finalize(const char *frontend_sha_hex, bool reboot,
     if (err != ESP_OK) {
         DEBUG_ERR(TAG, "esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
         releaseMutex();
+        SpiMaster::instance().setSpiPaused(false);  /* OTA 失败也恢复 SPI */
         resetState();
         return err;
     }
 
     releaseMutex();
+    SpiMaster::instance().setSpiPaused(false);  /* OTA 收尾完成，恢复 SPI 业务 */
     DEBUG_INFO(TAG, "ESP32 OTA 收尾完成，共 %u 字节", (unsigned)m_received);
 
     // 保持 m_active 直到重启或下次 begin；resetState 由 begin/abort 处理
@@ -413,6 +423,7 @@ void Esp32OtaCore::abort()
         esp_ota_abort(m_handle);
     }
     releaseMutex();
+    SpiMaster::instance().setSpiPaused(false);  /* OTA 中止，恢复 SPI 业务 */
     resetState();
     DEBUG_INFO(TAG, "ESP32 OTA 已中止并清理");
 }

@@ -420,12 +420,6 @@ public:
     bool isIdle() const;
 
     // ── GD32 状态（供 status API 使用，委托给 OtaRelay 查询）──
-    /**
-     * @brief 获取 GD32 APP 存活状态。
-     * @return true 表示 GD32 APP 存活。
-     */
-    bool getGd32AppAlive() const;
-
     // ── 完全复位 ──
     /**
      * @brief 完全复位协调器和所有子系统状态。
@@ -478,6 +472,13 @@ private:
 
     // 已持锁中止：清理子系统并将状态复位为 IDLE
     void doAbortLocked();
+
+    /** @brief 统一 "lock + watchdog 自愈 + 电机 OTA 互斥拒绝" 前缀检查。
+     *  beginGd32Storage / beginEsp32Ota 共用此逻辑。
+     * @param tag  日志标签（如 "GD32 存储" / "ESP32 OTA"）
+     * @param out_lock 成功时输出锁句柄（调用方负责 unlock）
+     * @return ESP_OK=前缀通过可继续；ESP_ERR_INVALID_STATE=被拒绝（已 unlock） */
+    esp_err_t beginLockedWithChecks(const char *tag, bool &out_lock);
 
     // ★ 已持锁版本的 ESP32 状态切换 helper：设置 m_sysState 并打印一条 INFO 日志。
     //   供 notifyEsp32*Complete / notifyEsp32Rebooting 等锁内路径复用，避免重复样板代码。

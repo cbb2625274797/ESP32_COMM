@@ -2,9 +2,7 @@
  * gd32_adc_feedback.cpp - GD32 ADC 调试反馈解析与缓存
  */
 #include "monitor/gd32_adc_feedback.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "monitor/spi_ring_cache.h"
 
 #include <string.h>
 
@@ -16,29 +14,6 @@ constexpr size_t   kPayloadLen = 20U;
 static SemaphoreHandle_t s_mux = nullptr;
 static gd32_adc_feedback_t s_latest = {};
 static bool s_have = false;
-
-/** @brief 读小端 u16。 */
-static uint16_t rdU16Le(const uint8_t *p)
-{
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-
-/** @brief 读小端 u32。 */
-static uint32_t rdU32Le(const uint8_t *p)
-{
-    return static_cast<uint32_t>(p[0])
-         | (static_cast<uint32_t>(p[1]) << 8)
-         | (static_cast<uint32_t>(p[2]) << 16)
-         | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-/** @brief 懒创建快照互斥量。 */
-static void ensureMux()
-{
-    if (s_mux == nullptr) {
-        s_mux = xSemaphoreCreateMutex();
-    }
-}
 
 } // namespace
 
@@ -80,7 +55,7 @@ bool onGd32AdcFeedbackEvent(const uint8_t *payload, size_t len)
     fb.uptime_sec = uptime;
     fb.recv_ms = esp_timer_get_time() / 1000;
 
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) {
         return false;
     }
@@ -103,7 +78,7 @@ bool getLatestGd32AdcFeedback(gd32_adc_feedback_t *out)
     if (out == nullptr) {
         return false;
     }
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) {
         return false;
     }
@@ -124,7 +99,7 @@ bool getLatestGd32AdcFeedback(gd32_adc_feedback_t *out)
  */
 uint32_t gd32AdcFeedbackAgeMs(void)
 {
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) {
         return UINT32_MAX;
     }
@@ -135,16 +110,5 @@ uint32_t gd32AdcFeedbackAgeMs(void)
         recv = s_latest.recv_ms;
         xSemaphoreGive(s_mux);
     }
-    if (!have || recv <= 0) {
-        return UINT32_MAX;
-    }
-    const int64_t now = esp_timer_get_time() / 1000;
-    if (now < recv) {
-        return 0U;
-    }
-    const int64_t age = now - recv;
-    if (age > static_cast<int64_t>(UINT32_MAX)) {
-        return UINT32_MAX;
-    }
-    return static_cast<uint32_t>(age);
+    return ringCacheAgeMs(have, recv);
 }

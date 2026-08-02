@@ -100,6 +100,24 @@ void OtaCoordinator::watchdogCheckLocked()
     doAbortLocked();
 }
 
+esp_err_t OtaCoordinator::beginLockedWithChecks(const char *tag, bool &out_lock)
+{
+    out_lock = lock();
+    if (!out_lock) return ESP_ERR_INVALID_STATE;
+
+    // ★ 卡死自愈检查
+    watchdogCheckLocked();
+
+    // ★ 电机 OTA 互斥：电机喂数期间禁止新的 GD32/ESP32 OTA
+    if (motorOtaIsActive()) {
+        DEBUG_WARN(TAG, "电机 OTA 进行中，拒绝 %s", tag);
+        unlock(true);
+        out_lock = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
 // ============================================================
 // 初始化
 // ============================================================
@@ -138,24 +156,15 @@ void OtaCoordinator::init()
 // ============================================================
 esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t channel)
 {
-    bool h = lock();
-
-    // ★ 先做卡死自愈检查：若之前忙状态卡死，自动转 ERROR 继续后续流程
-    if (h) watchdogCheckLocked();
-
-    // ★ 电机 OTA 互斥：电机喂数任务与 GD32 固件共用 gd32_ota 分区，
-    //   电机喂数期间禁止新的 GD32 存储，避免分区被并发覆写。
-    if (h && motorOtaIsActive()) {
-        DEBUG_WARN(TAG, "电机 OTA 进行中，拒绝 GD32 存储");
-        unlock(h);
-        return ESP_ERR_INVALID_STATE;
-    }
+    bool h;
+    esp_err_t pre = beginLockedWithChecks("GD32 存储", h);
+    if (pre != ESP_OK) return pre;
 
     // ★ 同类型重启：若上一次 GD32 存储仍在进行中（STORING）且来自同一通道，
     //   自动中止旧存储并重新开始。覆盖"上传过程中刷新网页再上传"场景。
     //   跨通道（BLE→WiFi 或 WiFi→BLE）仍拒绝，保持互斥。
     //   RELAYING 是中继阶段，不可中断，也拒绝。
-    if (h && m_sysState == OTA_SYS_GD32_STORING) {
+    if (m_sysState == OTA_SYS_GD32_STORING) {
         if (m_otaChannel != channel) {
             DEBUG_WARN(TAG, "GD32存中 ch=%d 拒跨通道 ch=%d",
                        (int)m_otaChannel, (int)channel);
@@ -169,33 +178,31 @@ esp_err_t OtaCoordinator::beginGd32Storage(uint32_t total_size, ota_channel_t ch
 
     // 系统忙检查：仅拒绝真正"在传输"的活跃状态
     //   STORED / COMPLETE 是"待中继/已中继"的非活跃状态 → 允许新存储覆盖
-    if (h && (m_sysState == OTA_SYS_ESP32_RECEIVING ||
+    if (m_sysState == OTA_SYS_ESP32_RECEIVING ||
         m_sysState == OTA_SYS_ESP32_FINALIZING ||
         m_sysState == OTA_SYS_ESP32_REBOOTING ||
-        m_sysState == OTA_SYS_GD32_RELAYING)) {
+        m_sysState == OTA_SYS_GD32_RELAYING) {
         DEBUG_WARN(TAG, "系统忙 (state=%d)，拒绝 GD32 存储请求", (int)m_sysState);
         unlock(h);
         return ESP_ERR_INVALID_STATE;
     }
 
     // 如果之前已有存储但未中继（STORED）或刚中继完（COMPLETE），允许新存储覆盖。
-    //   注意：清理 NVS meta 不在此处做，避免与紧跟的 prepareGd32Storage 内
-    //   clearGd32Meta + saveGd32Meta 重复一次写入，仅做状态注释说明。
-    if (h && (m_sysState == OTA_SYS_GD32_STORED || m_sysState == OTA_SYS_GD32_COMPLETE)) {
+    if (m_sysState == OTA_SYS_GD32_STORED || m_sysState == OTA_SYS_GD32_COMPLETE) {
         DEBUG_INFO(TAG, "覆盖旧 GD32 存储状态，开始新存储 (size=%" PRIu32 ")", total_size);
     }
 
-    if (h) {
-        m_otaEpoch++;  // ★ 新会话开始，递增 epoch
-        m_otaChannel = channel;  // ★ 记录发起通道
-        m_sysState = OTA_SYS_GD32_STORING;
-        m_gd32StorageDone = false;
-        m_busySinceTick = xTaskGetTickCount();  // ★ 记录忙状态起始时刻
-        DEBUG_DBG(TAG, "GD32存开始 %" PRIu32 "B →STORING ep=%u ch=%d",
-                   total_size, m_otaEpoch, (int)channel);
-    }
+    m_otaEpoch++;  // ★ 新会话开始，递增 epoch
+    m_otaChannel = channel;  // ★ 记录发起通道
+    m_sysState = OTA_SYS_GD32_STORING;
+    m_gd32StorageDone = false;
+    m_busySinceTick = xTaskGetTickCount();  // ★ 记录忙状态起始时刻
+    DEBUG_DBG(TAG, "GD32存开始 %" PRIu32 "B →STORING ep=%u ch=%d",
+               total_size, m_otaEpoch, (int)channel);
+    // ★ 预分配 flashWriteChunk 对齐缓冲（OTA 期消除逐块 malloc；非 OTA 期零占用）
+    Gd32FlashStore::acquireAlignBufForOta();
     unlock(h);
-    return h ? ESP_OK : ESP_ERR_INVALID_STATE;
+    return ESP_OK;
 }
 
 esp_err_t OtaCoordinator::prepareGd32Storage(uint32_t total_size, ota_channel_t channel)
@@ -416,23 +423,14 @@ void OtaCoordinator::notifyBleCoexEnd()
 // ============================================================
 esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t channel)
 {
-    bool h = lock();
-
-    // ★ 卡死自愈检查
-    if (h) watchdogCheckLocked();
-
-    // ★ 电机 OTA 互斥：ESP32 自身 OTA 会重启设备，中断正在进行的电机喂数，
-    //   电机 OTA 期间拒绝 ESP32 OTA。
-    if (h && motorOtaIsActive()) {
-        DEBUG_WARN(TAG, "电机 OTA 进行中，拒绝 ESP32 OTA");
-        unlock(h);
-        return ESP_ERR_INVALID_STATE;
-    }
+    bool h;
+    esp_err_t pre = beginLockedWithChecks("ESP32 OTA", h);
+    if (pre != ESP_OK) return pre;
 
     // ★ 同类型重启：若上一次 ESP32 OTA 仍在接收中（RECEIVING）且来自同一通道，
     //   自动中止旧会话并重新开始。覆盖"上传完成后刷新网页再上传"场景。
     //   跨通道（BLE→WiFi 或 WiFi→BLE）仍拒绝，保持互斥。
-    if (h && m_sysState == OTA_SYS_ESP32_RECEIVING) {
+    if (m_sysState == OTA_SYS_ESP32_RECEIVING) {
         if (m_otaChannel != channel) {
             DEBUG_WARN(TAG, "ESP32收中 ch=%d 拒跨通道 ch=%d",
                        (int)m_otaChannel, (int)channel);
@@ -447,7 +445,7 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
     // ★ FINALIZING 残留自愈：SHA 不匹配时 core 已 abort，但旧固件可能未把协调器
     //   复位到 IDLE。core 已空闲 ⇒ 协调器状态是假占用，允许清掉后开新会话。
     //   core 仍 active ⇒ 真正在收尾，拒绝（不可 forceCleanup，防并发写分区）。
-    if (h && m_sysState == OTA_SYS_ESP32_FINALIZING) {
+    if (m_sysState == OTA_SYS_ESP32_FINALIZING) {
         if (!Esp32OtaCore::instance().isActive()) {
             DEBUG_WARN(TAG, "FINALIZING残留(core空闲),强制复位");
             doAbortLocked();
@@ -459,28 +457,25 @@ esp_err_t OtaCoordinator::beginEsp32Ota(uint32_t total_size, ota_channel_t chann
     }
 
     // 系统忙检查：GD32 传输/中继进行中，或 ESP32 重启中，均拒绝。
-    if (h && (m_sysState == OTA_SYS_GD32_STORING ||
-              m_sysState == OTA_SYS_GD32_RELAYING ||
-              m_sysState == OTA_SYS_ESP32_REBOOTING)) {
+    if (m_sysState == OTA_SYS_GD32_STORING ||
+        m_sysState == OTA_SYS_GD32_RELAYING ||
+        m_sysState == OTA_SYS_ESP32_REBOOTING) {
         DEBUG_WARN(TAG, "忙 state=%d(%s) 拒ESP32 OTA",
                    (int)m_sysState, stateToString(m_sysState));
         unlock(h);
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t err = ESP_ERR_INVALID_STATE;
-    if (h) {
-        // 委托 Esp32OtaCore 处理分区/互斥逻辑
-        err = Esp32OtaCore::instance().begin(total_size);
-        if (err == ESP_OK) {
-            m_otaEpoch++;  // ★ 新会话开始，递增 epoch（使旧 handler 的 abortCurrentIfEpoch 失效）
-            m_otaChannel = channel;  // ★ 记录发起通道
-            m_sysState = OTA_SYS_ESP32_RECEIVING;
-            m_busySinceTick = xTaskGetTickCount();  // ★ 记录起始时刻
-            pauseCanFeedbackTask(true);
-        } else {
-            DEBUG_WARN(TAG, "ESP32 OTA begin 失败: %s", esp_err_to_name(err));
-        }
+    // 委托 Esp32OtaCore 处理分区/互斥逻辑
+    esp_err_t err = Esp32OtaCore::instance().begin(total_size);
+    if (err == ESP_OK) {
+        m_otaEpoch++;  // ★ 新会话开始，递增 epoch（使旧 handler 的 abortCurrentIfEpoch 失效）
+        m_otaChannel = channel;  // ★ 记录发起通道
+        m_sysState = OTA_SYS_ESP32_RECEIVING;
+        m_busySinceTick = xTaskGetTickCount();  // ★ 记录起始时刻
+        pauseCanFeedbackTask(true);
+    } else {
+        DEBUG_WARN(TAG, "ESP32 OTA begin 失败: %s", esp_err_to_name(err));
     }
 
     unlock(h);
@@ -622,9 +617,11 @@ void OtaCoordinator::doAbortLocked()
 
     if (m_sysState == OTA_SYS_GD32_STORING) {
         Gd32FlashStore::instance().metaClear();
+        Gd32FlashStore::releaseAlignBufForOta();   // 释放 OTA 期对齐缓冲
     } else if (m_sysState == OTA_SYS_GD32_RELAYING) {
         /* 中继中止必须 CANCEL 远端，否则 GD32 停在 WAITING_* 半会话 */
         OtaRelay::instance().abortRemoteAndReset(true);
+        Gd32FlashStore::releaseAlignBufForOta();   // 中继阶段也可能写过 flash
     } else if (m_sysState == OTA_SYS_ESP32_RECEIVING ||
                m_sysState == OTA_SYS_ESP32_FINALIZING) {
         Esp32OtaCore::instance().abort();
@@ -759,12 +756,6 @@ const char* OtaCoordinator::stateToString(ota_system_state_t s)
         case OTA_SYS_ERROR:             return "ERROR";
         default:                        return "UNKNOWN";
     }
-}
-
-/** @brief 获取 GD32 APP 存活状态（委托 OtaRelay）。 */
-bool OtaCoordinator::getGd32AppAlive() const
-{
-    return OtaRelay::getGd32AppAlive();
 }
 
 // ============================================================

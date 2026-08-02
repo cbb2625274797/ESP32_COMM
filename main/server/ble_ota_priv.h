@@ -61,6 +61,7 @@
 struct BleOtaDataBatch {
     uint8_t *data;
     size_t   len;
+    int      pool_idx;   ///< 静态池槽索引（>=0 为池内，<0 为 heap malloc，需 free）
 };
 
 struct BleGd32RelayWaitCtx {
@@ -87,6 +88,8 @@ extern bool s_wifi_ps_boosted;
 extern bool s_conn_fallback_requested;
 
 void drainOtaDataQueue();
+/** @brief 归还 DATA_IN 静态池槽（drainOtaDataQueue / 会话清理跨 TU 调用）。 */
+void ble_ota_pool_release(int idx);
 void ble_ota_start_advertising(void);
 void sendWindowAck(uint8_t cmd, uint16_t seq, uint32_t completed_bytes);
 void sendFinishEvent(uint8_t stage, uint32_t value);

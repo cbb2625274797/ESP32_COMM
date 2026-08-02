@@ -2,9 +2,7 @@
  * motor_state.cpp - GD32 多电机状态推送解析与缓存 (SPI TYPE 0xC5)
  */
 #include "monitor/motor_state.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "monitor/spi_ring_cache.h"
 
 #include <string.h>
 
@@ -12,21 +10,6 @@ namespace {
 
 static SemaphoreHandle_t s_mux = nullptr;
 static motor_state_table_t s_table = {};
-
-static uint32_t rdU32Le(const uint8_t *p)
-{
-    return static_cast<uint32_t>(p[0])
-         | (static_cast<uint32_t>(p[1]) << 8)
-         | (static_cast<uint32_t>(p[2]) << 16)
-         | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-static void ensureMux()
-{
-    if (s_mux == nullptr) {
-        s_mux = xSemaphoreCreateMutex();
-    }
-}
 
 } // namespace
 
@@ -51,7 +34,7 @@ bool onMotorStateEvent(const uint8_t *payload, size_t len)
         return false;
     }
 
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) return false;
     if (xSemaphoreTake(s_mux, pdMS_TO_TICKS(20)) != pdTRUE) return false;
 
@@ -102,7 +85,7 @@ bool onMotorStateEvent(const uint8_t *payload, size_t len)
 bool getLatestMotorState(motor_state_table_t *out)
 {
     if (out == nullptr) return false;
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) return false;
 
     bool ok = false;
@@ -118,7 +101,7 @@ bool getLatestMotorState(motor_state_table_t *out)
 
 uint32_t motorStateAgeMs(void)
 {
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) return UINT32_MAX;
 
     int64_t recv = 0;
@@ -128,11 +111,5 @@ uint32_t motorStateAgeMs(void)
         recv = s_table.recv_ms;
         xSemaphoreGive(s_mux);
     }
-    if (!have || recv <= 0) return UINT32_MAX;
-
-    const int64_t now = esp_timer_get_time() / 1000;
-    if (now < recv) return 0U;
-    const int64_t age = now - recv;
-    return (age > static_cast<int64_t>(UINT32_MAX)) ? UINT32_MAX
-                                                     : static_cast<uint32_t>(age);
+    return ringCacheAgeMs(have, recv);
 }

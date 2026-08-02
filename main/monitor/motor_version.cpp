@@ -4,9 +4,7 @@
  * 镜像 motor_state.cpp 的互斥保护缓存模型。
  */
 #include "monitor/motor_version.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "monitor/spi_ring_cache.h"
 
 #include <string.h>
 
@@ -14,21 +12,6 @@ namespace {
 
 static SemaphoreHandle_t s_mux = nullptr;
 static motor_version_table_t s_table = {};
-
-static uint32_t rdU32Le(const uint8_t *p)
-{
-    return static_cast<uint32_t>(p[0])
-         | (static_cast<uint32_t>(p[1]) << 8)
-         | (static_cast<uint32_t>(p[2]) << 16)
-         | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-static void ensureMux()
-{
-    if (s_mux == nullptr) {
-        s_mux = xSemaphoreCreateMutex();
-    }
-}
 
 } // namespace
 
@@ -40,7 +23,7 @@ bool onMotorVersionEvent(const uint8_t *payload, size_t len)
 
     const uint8_t count = payload[0];
 
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) return false;
     if (xSemaphoreTake(s_mux, pdMS_TO_TICKS(20)) != pdTRUE) return false;
 
@@ -69,7 +52,7 @@ bool onMotorVersionEvent(const uint8_t *payload, size_t len)
 bool getLatestMotorVersion(motor_version_table_t *out)
 {
     if (out == nullptr) return false;
-    ensureMux();
+    ringCacheEnsureMux(&s_mux);
     if (s_mux == nullptr) return false;
 
     bool ok = false;

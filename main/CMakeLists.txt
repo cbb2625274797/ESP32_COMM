@@ -35,7 +35,6 @@ idf_component_register(
     REQUIRES
         transport                     # M5: 传输层组件（SPI/CANFD/协议）
         app_update                    # ESP32 OTA API
-        cjson                         # JSON 解析/生成
         esp_driver_tsens              # 温度传感器驱动
         esp_driver_uart               # UART 驱动（调试日志）
         esp_wifi                      # WiFi STA/AP 模式

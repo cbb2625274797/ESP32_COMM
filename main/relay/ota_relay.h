@@ -118,16 +118,6 @@ public:
      */
     ota_result_t forwardFirmware();
 
-    // ── 事件驱动接口 ──
-    /**
-     * @brief 向状态机投递事件，驱动状态转换.
-     * @param event 事件类型.
-     * @param payload 关联数据（响应载荷等），可为nullptr.
-     * @param len 数据长度.
-     * @return 当前操作结果码（OTA_RESULT_OK 表示事件已处理且可继续）.
-     */
-    ota_result_t processEvent(relay_event_t event, const uint8_t *payload, size_t len);
-
     // ── 状态查询（线程安全）──
     /**
      * @brief 获取当前中继状态.
@@ -145,31 +135,6 @@ public:
      * @return 中继进度快照。
      */
     static RelaySnapshot getSnapshot();
-    /**
-     * @brief 设置中继状态.
-     * @param s 目标状态。
-     */
-    static void setState(relay_state_t s);
-    /**
-     * @brief 设置中继当前序号.
-     * @param seq 序号值。
-     */
-    static void setRelaySeq(uint32_t seq);
-    /**
-     * @brief 设置中继总包数.
-     * @param total 总包数。
-     */
-    static void setRelayTotalPackets(uint32_t total);
-    /**
-     * @brief 设置GD32 APP存活标志位.
-     * @param alive true 表示存活。
-     */
-    static void setGd32AppAlive(bool alive);
-    /**
-     * @brief 设置GD32固件版本.
-     * @param ver 版本信息结构体引用。
-     */
-    static void setGd32Version(const gd32_version_t &ver);
     /**
      * @brief 获取 OTA 中继任务句柄。
      * @return FreeRTOS 任务句柄。
@@ -195,11 +160,6 @@ public:
      * @param listener 监听器指针，传 nullptr 取消注册。
      */
     static void setRelayListener(IRelayListener *listener);
-    /**
-     * @brief 获取当前注册的监听器。
-     * @return 监听器指针，未注册时为 nullptr。
-     */
-    static IRelayListener* getRelayListener();
 
     // ── 队列访问器 ──
     /**
@@ -222,6 +182,19 @@ public:
      * @return true 探测成功，false 失败。
      */
     static bool probeAndCacheAppAlive(uint32_t timeout_ms, uint32_t *out_uptime = nullptr);
+
+    /** @brief 统一 "HELLO(role=APP) → PING 探测" 循环（doWaitForAppAlive + taskEntry 共用）。 */
+    static bool helloAndProbeApp(uint32_t timeout_ms, uint32_t ping_interval_ms,
+                                 uint32_t max_attempts, bool allow_hello_shortcut);
+
+    // ── 内部状态写入（仅 ota_relay.cpp 使用，无外部调用）──
+    static void setState(relay_state_t s);
+    static void setRelaySeq(uint32_t seq);
+    static void setRelayTotalPackets(uint32_t total);
+    static void setGd32AppAlive(bool alive);
+    static void setGd32Version(const gd32_version_t &ver);
+    static IRelayListener* getRelayListener();
+    ota_result_t processEvent(relay_event_t event, const uint8_t *payload, size_t len);
 
     // ── 线程安全锁 ──
     static void initMutex();                  ///< 初始化状态互斥锁（taskEntry 首行调用）

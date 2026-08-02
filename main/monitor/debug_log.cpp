@@ -509,7 +509,12 @@ esp_err_t DebugLog::uartSend(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    const int ret = uart_write_bytes(UART_NUM_0, data, len);
+    /* 非阻塞直写 FIFO：满了丢弃（日志必进 ring，web /logs 仍完整）。
+     * 旧实现 uart_write_bytes 在 TX buffer=0 时同步阻塞到整行发完
+     * （115200 下 ~5-8ms/条），OTA 期间日志密集会把 ota_relay(prio 23)
+     * / spi_worker(prio 6) 阻塞数 ms~数十 ms——50ms ACK 窗口被拖爆，
+     * 表现为改短重试后超时重发频繁（线上 12/777）。 */
+    const int ret = uart_tx_chars(UART_NUM_0, (const char *)data, (int)len);
     if (ret < 0) {
         return ESP_FAIL;
     }
@@ -646,7 +651,10 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
 
         if (sock >= 0) {
             const size_t send_len = len > 1024 ? 1024 : len;
-            const int ret = ::sendto(sock, data, send_len, 0,
+            /* MSG_DONTWAIT：非阻塞发送。lwIP 在 ARP 未解析/路由未就绪时
+             * sendto 会排队等待（可达 SO_SNDTIMEO 200ms），会阻塞打日志的
+             * 业务任务（OTA relay/worker）——日志转发必须尽力而为。 */
+            const int ret = ::sendto(sock, data, send_len, MSG_DONTWAIT,
                                      (struct sockaddr *)&m_debugAddr, sizeof(m_debugAddr));
             if (ret >= 0) {
                 udp_ret = ESP_OK;

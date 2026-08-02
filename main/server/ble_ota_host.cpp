@@ -227,7 +227,8 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
             BleOtaDataBatch stale;
             size_t dropped = 0;
             while (xQueueReceive(s_otaDataQueue, &stale, 0) == pdTRUE) {
-                free(stale.data);
+                if (stale.pool_idx >= 0) ble_ota_pool_release(stale.pool_idx);
+                else free(stale.data);
                 dropped++;
             }
             if (dropped > 0) {

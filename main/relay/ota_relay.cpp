@@ -349,10 +349,14 @@ ota_result_t OtaRelay::handleTransferring(relay_event_t event, const uint8_t *pa
 
     DEBUG_INFO("OTA", "=== 阶段3: 数据包传输 (%" PRIu32 " 包) ===", m_transferTotalPackets);
 
-    /* 转发预算：自本阶段起算。正常 ~15ms/包，预算 40ms/包 + 20s 底（上限 120s）。 */
-    constexpr uint32_t kXferMinMs = 20U * 1000U;
+    /* 转发预算：自本阶段起算。正常 ~2ms/包（12MHz+ 读预算收紧后实测），
+     * 单包失败重发最坏 ~95ms/轮 × 3 轮 ≈ 285ms（底层 3 次尝试 + relay 50ms 窗口）。
+     * 预算按"正常 + 重发余量"：25ms/包 ≈ 正常 2ms + 约 10% 包重发 1 次的平均，
+     * 底 10s 覆盖慢启动/握手余量（777 包正常仅 ~1.6s）；上限 120s 兜极端慢速。
+     * 跨包卡死（10s 无成功帧）由 kStallTimeoutMs 单独检测，总预算不重复兜底。 */
+    constexpr uint32_t kXferMinMs = 10U * 1000U;
     constexpr uint32_t kXferMaxMs = 120U * 1000U;
-    constexpr uint32_t kXferPerPktMs = 40U;
+    constexpr uint32_t kXferPerPktMs = 25U;
     uint32_t xfer_ms = kXferMinMs + m_transferTotalPackets * kXferPerPktMs;
     if (xfer_ms > kXferMaxMs) {
         xfer_ms = kXferMaxMs;
@@ -448,9 +452,6 @@ ota_result_t OtaRelay::forwardFirmware()
 
     DEBUG_INFO("OTA", "开始固件转发: %" PRIu32 " 字节", meta.total_size);
 
-    /* 中继全程禁止 worker 把 OTA ACK/WAIT 当 EVENT 偷读 */
-    SpiMaster::instance().setSuppressRingService(true);
-
     /* 完整性门控（避免与 /ota/relay·BLE 触发前的 verifyGd32Firmware 二次全盘 SHA）：
      * - meta 必须完整 stored≥total
      * - checksum 非全零：触发路径已 finalize+比对，此处信任 meta，跳过再扫 Flash
@@ -500,10 +501,8 @@ ota_result_t OtaRelay::forwardFirmware()
         DEBUG_ERR("OTA", "中继失败: result=%d, state=%d", (int)res, (int)getState());
         /* 必须通知 GD32 CANCEL，否则远端停在 WAITING_* 半会话 */
         abortRemoteAndReset(true);
-    } else {
-        /* 成功路径：解除按铃抑制（reset 也会做，成功时状态机可能停在 DONE） */
-        SpiMaster::instance().setSuppressRingService(false);
     }
+    /* 成功/失败统一由 reset() 解除 ring 抑制（relay task 侧持有 ref） */
     return res;
 }
 
@@ -1174,7 +1173,10 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
      * - 等 ACK 期间可预组下一包（与从机处理重叠）。
      */
     constexpr uint32_t kMaxDataSends = 3U;
-    constexpr uint32_t kAckWaitMs = 6000U;   /* 单次发送后等 ACK 上限（覆盖 GD32 增量 drain） */
+    /* 单次发送后等 ACK 上限：GD32 正常 ms 级回 ACK（ISR 回 WAIT、主循环回 ACK），
+     * 50ms 未到即重发（DUP-SEQ 回放捞回），不再干等 6s（用户指定 50ms）。
+     * credit==0 的排空积压由 transact 内部 credit 背压消化，此处无需长等。 */
+    constexpr uint32_t kAckWaitMs = 50U;
     constexpr uint32_t kPollSliceMs = 50U;   /* 略紧：DATA_READY 驱动，缩短空切片 */
 
     TickType_t pkt_start = xTaskGetTickCount();
@@ -1204,9 +1206,11 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
         {
             resp_len = 0;
             resp_type = 0;
+            /* 等首响应上限 10ms：一次 SPI 事务最多 5ms（用户指定），
+             * 超时立即进入下方 50ms poll 窗口，不再干等 200ms。 */
             esp_err_t err = SpiMaster::instance().transact(
                 SPI_OTA_CMD_DATA, tx_buf, 64,
-                &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 1200);
+                &resp_type, resp_payload, sizeof(resp_payload), &resp_len, 10);
             logRespPayload("DATA_PACKET", resp_type, resp_payload, resp_len);
             if (err == ESP_OK && resp_type == SPI_OTA_RSP_WAIT) {
                 saw_wait = true;
@@ -1412,6 +1416,58 @@ bool OtaRelay::probeAndCacheAppAlive(uint32_t timeout_ms, uint32_t *out_uptime)
     return false;
 }
 
+/**
+ * @brief 统一 "HELLO(role=APP) → 可选 PING 探测" 循环（doWaitForAppAlive + taskEntry 共用）。
+ *
+ * 两处原循环差异仅：taskEntry 在 HELLO 已带身份(gd32IdKnown)时跳过 PING 直接成功。
+ * 用 allow_hello_shortcut 参数统一：true 时启用 HELLO 身份快路径。
+ *
+ * @param timeout_ms      PING 超时
+ * @param ping_interval_ms 每轮间隔
+ * @param max_attempts    最大轮数
+ * @param allow_hello_shortcut  true=HELLO 带身份即成功（taskEntry 场景）
+ * @return true=APP 存活已确认
+ */
+bool OtaRelay::helloAndProbeApp(uint32_t timeout_ms, uint32_t ping_interval_ms,
+                                uint32_t max_attempts, bool allow_hello_shortcut)
+{
+    bool session_ok = false;
+    for (uint32_t attempt = 0; attempt < max_attempts; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(ping_interval_ms));
+
+        if (!session_ok) {
+            if (SpiMaster::instance().hello(1500U, V2_ROLE_APP) == ESP_OK &&
+                SpiMaster::instance().gd32Role() == V2_ROLE_APP) {
+                session_ok = true;
+                /* HELLO 已带身份时直接缓存版本/开关，无需再等 PING 才亮版本 */
+                if (allow_hello_shortcut && SpiMaster::instance().gd32IdKnown()) {
+                    StateLockGuard lock;
+                    gd32Version  = SpiMaster::instance().gd32VersionCached();
+                    gd32AppAlive = true;
+                    DEBUG_INFO("OTA", "HELLO就绪 APP=v%d.%d.%d.%d",
+                               gd32Version.app_major, gd32Version.app_minor,
+                               gd32Version.app_patch, gd32Version.app_build);
+                    DEBUG_INFO("OTA", "HELLO就绪 BOOT=v%d.%d.%d.%d",
+                               gd32Version.boot_major, gd32Version.boot_minor,
+                               gd32Version.boot_patch, gd32Version.boot_build);
+                    return true;
+                }
+            } else {
+                DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/%u)", attempt + 1U, (unsigned)max_attempts);
+                continue;
+            }
+        }
+        /* HELLO 成功但无身份（旧固件），或 doWaitForAppAlive 路径：回退 APP PING */
+        if (probeAndCacheAppAlive(timeout_ms)) {
+            return true;
+        }
+        /* PING 失败：清 session，下轮重 HELLO（避免 sticky 假会话） */
+        session_ok = false;
+        DEBUG_INFO("OTA", "等待 GD32 APP 存活... (%" PRIu32 "/%u)", attempt + 1U, (unsigned)max_attempts);
+    }
+    return false;
+}
+
 /** @brief 协议子步骤：发送 FINISH_OTA 指令并等待 GD32 ACK（10 次重试）。 */
 ota_result_t OtaRelay::doSendFinishOta()
 {
@@ -1485,30 +1541,8 @@ ota_result_t OtaRelay::doWaitForAppAlive(uint32_t timeout_ms)
     /* FINISH 后短暂安静，避免 jump/APP SPI arm 窗口被 HELLO 打乱（对齐既有 300ms 节拍）。 */
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    /* APP 起机约数秒；HELLO 须 role=APP 再建 session，再 appPing。 */
-    bool session_established = false;
-    for (uint32_t attempt = 0; attempt < 20; ++attempt) {
-        vTaskDelay(pdMS_TO_TICKS(300));
-
-        if (!session_established) {
-            esp_err_t hr = SpiMaster::instance().hello(1500U, V2_ROLE_APP);
-            if (hr == ESP_OK && SpiMaster::instance().gd32Role() == V2_ROLE_APP) {
-                session_established = true;
-            } else {
-                DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
-                continue;
-            }
-        }
-
-        if (probeAndCacheAppAlive(timeout_ms)) {
-            break;
-        }
-        /* PING 失败：清 session，下轮重 HELLO（避免 sticky 假会话） */
-        session_established = false;
-        DEBUG_INFO("OTA", "等待 GD32 APP 启动... (%" PRIu32 "/20)", attempt + 1);
-    }
-
-    if (!getGd32AppAlive()) {
+    /* doWaitForAppAlive 不启用 HELLO 身份快路径：OTA 完成后必须 PING 确认 APP 真正运行 */
+    if (!helloAndProbeApp(timeout_ms, 300U, 20U, /*allow_hello_shortcut=*/false)) {
         DEBUG_ERR("OTA", "GD32 APP 启动确认超时，OTA 失败");
         /* APP 未起来时 CANCEL 可能无效，仍尽力清理 BOOT 半会话 */
         abortRemoteAndReset(true);
@@ -1562,42 +1596,7 @@ void OtaRelay::taskEntry(void *pvParameters)
     /* 启动 GD32 探测：先 hello 建 v2 session，再 appPing。 */
     {
         DEBUG_INFO("OTA", "启动初始 GD32 探测 (hello+probe)...");
-        bool session_ok = false;
-        bool alive = false;
-        for (uint32_t attempt = 0; attempt < 20U; ++attempt) {
-            vTaskDelay(pdMS_TO_TICKS(300));
-            if (!session_ok) {
-                if (SpiMaster::instance().hello(1500U, V2_ROLE_APP) == ESP_OK &&
-                    SpiMaster::instance().gd32Role() == V2_ROLE_APP) {
-                    session_ok = true;
-                    /* HELLO 已带身份时直接缓存版本/开关，无需再等 PING 才亮版本 */
-                    if (SpiMaster::instance().gd32IdKnown()) {
-                        StateLockGuard lock;
-                        gd32Version  = SpiMaster::instance().gd32VersionCached();
-                        gd32AppAlive = true;
-                        alive = true;
-                        DEBUG_INFO("OTA", "HELLO就绪 APP=v%d.%d.%d.%d",
-                                   gd32Version.app_major, gd32Version.app_minor,
-                                   gd32Version.app_patch, gd32Version.app_build);
-                        DEBUG_INFO("OTA", "HELLO就绪 BOOT=v%d.%d.%d.%d",
-                                   gd32Version.boot_major, gd32Version.boot_minor,
-                                   gd32Version.boot_patch, gd32Version.boot_build);
-                        break;
-                    }
-                } else {
-                    DEBUG_INFO("OTA", "等待 GD32 APP... (%" PRIu32 "/20)", attempt + 1U);
-                    continue;
-                }
-            }
-            /* 旧固件无 HELLO 身份：回退 APP PING */
-            if (probeAndCacheAppAlive(2000)) {
-                alive = true;
-                break;
-            }
-            session_ok = false;
-            DEBUG_INFO("OTA", "等待 GD32 APP 存活... (%" PRIu32 "/20)", attempt + 1U);
-        }
-        if (!alive) {
+        if (!helloAndProbeApp(2000U, 300U, 20U, /*allow_hello_shortcut=*/true)) {
             DEBUG_WARN("OTA", "启动 GD32 探测未成功（中继前仍可再 hello）");
         }
     }
@@ -1610,6 +1609,11 @@ void OtaRelay::taskEntry(void *pvParameters)
         }
 
         DEBUG_INFO("OTA", "收到 OTA 调度信号: %" PRIu32 "，开始转发...", msg);
+        /* 尽早抑制 ring service：onRelayStarted 可能因协调器锁（/system/status
+         * 等争锁）阻塞，此窗口内 worker 会把上一阶段残留 RESPONSE 当 EVENT 偷读
+         * （线上 log#1：TRANSFERRING 起始瞬间 serviceRing 读到 type=0x80）。
+         * forwardFirmware 不再重复设置；释放统一走 reset()。 */
+        SpiMaster::instance().setSuppressRingService(true);
         // 通过 IRelayListener 接口回调通知协调器
         IRelayListener *listener = getRelayListener();
         if (listener) listener->onRelayStarted();

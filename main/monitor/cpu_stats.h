@@ -11,8 +11,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-/** 单次快照最多跟踪的任务数 */
-static constexpr size_t CPU_TASK_SNAPSHOT_MAX = 32;
+/** 单次快照最多跟踪的任务数。
+ *  系统常驻任务 ~14（app）+ ~5（IDF: tiT/wifi/nimble/hci/ble）= ~19，
+ *  按需短暂任务（ble_finish/restart/cancel/gd32_wait/ota_feed）不常驻。
+ *  20 覆盖常驻集 + 余量 1；偶发按需任务多出时 uxTaskGetSystemState 截断，
+ *  仅影响该拍 CPU 统计显示，不影响功能。原 32 浪费 ~1KB BSS。 */
+static constexpr size_t CPU_TASK_SNAPSHOT_MAX = 20;
 
 /** 采样周期（ms）— 窗口 sample_ms 应对齐此值 */
 static constexpr uint32_t CPU_STATS_SAMPLE_MS = 1000;

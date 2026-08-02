@@ -11,7 +11,11 @@ void drainOtaDataQueue()
 {
     BleOtaDataBatch stale;
     while (s_otaDataQueue && xQueueReceive(s_otaDataQueue, &stale, 0) == pdTRUE) {
-        if (stale.data) free(stale.data);
+        if (stale.pool_idx >= 0) {
+            ble_ota_pool_release(stale.pool_idx);   // 静态池槽：归还
+        } else if (stale.data) {
+            free(stale.data);                        // heap 回退路径：释放
+        }
     }
 }
 

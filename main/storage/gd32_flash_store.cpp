@@ -14,6 +14,7 @@
 #include "mbedtls/private/sha256.h"
 
 #include "gd32_flash_store.h"
+#include "app_config.h"   // OTA_BLOCK_SIZE（flashWriteChunk 静态对齐缓冲容量）
 #include "monitor/debug_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -147,6 +148,54 @@ esp_err_t Gd32FlashStore::ensureErasedForWrite(uint32_t offset, size_t len)
     return ESP_OK;
 }
 
+// ============================================================
+// OTA 期对齐缓冲池（2026-08 内存优化）
+//
+// flashWriteChunk 在非 4 字节对齐写入时需要临时缓冲读回 padding。
+// 原实现每次 malloc/free，OTA 收流时与非对齐块叠加产生堆抖动。
+// 现改为 OTA begin 时一次性 calloc，end/abort 时 free，消除抖动
+// 又不增加常驻 BSS（非 OTA 期零占用）。
+// ============================================================
+static uint8_t *s_align_buf = nullptr;
+static constexpr size_t kAlignBufCap = OTA_BLOCK_SIZE + 8;
+
+void Gd32FlashStore::acquireAlignBufForOta()
+{
+    if (!s_align_buf) {
+        s_align_buf = (uint8_t *)calloc(1, kAlignBufCap);
+        if (!s_align_buf) {
+            DEBUG_WARN("OTA", "对齐缓冲分配失败,回退 malloc free=%u",
+                       (unsigned)esp_get_free_heap_size());
+        }
+    }
+}
+
+void Gd32FlashStore::releaseAlignBufForOta()
+{
+    if (s_align_buf) {
+        free(s_align_buf);
+        s_align_buf = nullptr;
+    }
+}
+
+/** @brief 取对齐缓冲。优先用 OTA 期预分配；未分配或太小则临时 malloc。 */
+static uint8_t *acquireAlignBuf(size_t needed)
+{
+    if (s_align_buf && needed <= kAlignBufCap) {
+        return s_align_buf;
+    }
+    // OTA 未预分配（begin 失败）或包过大：回退临时 malloc
+    return (uint8_t *)malloc(needed);
+}
+
+/** @brief 归还对齐缓冲。OTA 池的不释放；临时 malloc 的 free。 */
+static void releaseAlignBuf(uint8_t *buf)
+{
+    if (buf && buf != s_align_buf) {
+        free(buf);
+    }
+}
+
 /** @brief 向 gd32_ota 分区写入数据块，自动处理非 4 字节对齐的读写。 */
 esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, size_t len)
 {
@@ -188,9 +237,12 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
                    offset, len, head_pad);
     }
 
-    uint8_t *aligned_buf = (uint8_t *)malloc(aligned_len);
+    /* OTA 期按需对齐缓冲（OTA begin 时 calloc，end/abort 时 free）：
+     * 消除每非对齐块的 malloc/free 抖动，又不增加常驻 BSS。
+     * 容量 = OTA_BLOCK_SIZE(4KB) + 最多 3 字节 tail pad。 */
+    uint8_t *aligned_buf = acquireAlignBuf(aligned_len);
     if (!aligned_buf) {
-        DEBUG_ERR("OTA", "flashWriteChunk malloc失败: %zu字节", aligned_len);
+        DEBUG_ERR("OTA", "flashWriteChunk 对齐缓冲不足/未分配: %zu", aligned_len);
         return ESP_ERR_NO_MEM;
     }
 
@@ -200,7 +252,7 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
         if (err != ESP_OK) {
             DEBUG_ERR("OTA", "flashWriteChunk读回head失败: offset=%" PRIu32 " head=%zu err=%s",
                       aligned_offset, head_pad, esp_err_to_name(err));
-            free(aligned_buf);
+            releaseAlignBuf(aligned_buf);
             return err;
         }
     }
@@ -215,13 +267,13 @@ esp_err_t Gd32FlashStore::flashWriteChunk(uint32_t offset, const uint8_t *data, 
         if (err != ESP_OK) {
             DEBUG_ERR("OTA", "flashWriteChunk读回tail失败: offset=%" PRIu32 " tail=%zu err=%s",
                       aligned_offset + total, tail_pad, esp_err_to_name(err));
-            free(aligned_buf);
+            releaseAlignBuf(aligned_buf);
             return err;
         }
     }
 
     esp_err_t err = esp_partition_write(part, aligned_offset, aligned_buf, aligned_len);
-    free(aligned_buf);
+    releaseAlignBuf(aligned_buf);
     return err;
 }
 

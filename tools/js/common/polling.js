@@ -216,11 +216,19 @@ export async function pollStatus() {
       if (window.isEsp32Rebooting ||
           window.otaSessionState === window.OtaSessionState.REBOOTING) {
         var rbElapsed = Math.round((Date.now() - window.rebootStartTime) / 1000);
-        // pre-reboot 窗口：后端发响应后约 1s 才 esp_restart，期间设备仍响应轮询，
-        // 保持"重启中"状态，不清除标志，不推进阶段。
-        // ★ 真正的"重启完成"由 pollLogs 收到启动 banner 触发；
-        //   这里只在已观察到下线（rebootObservedDown）或超 10s 安全阈值时接受恢复。
-        if (window.rebootObservedDown || rbElapsed >= 10) {
+        /* 重启完成的证据（任一即可）：
+         *  1) rebootObservedDown：已观察到设备下线后恢复。
+         *  2) freshBoot：设备回报 uptime 很小（<120s，与 resolveEsp32VerifyAmbiguous
+         *     的 freshBoot 阈值一致）。★ 关键：设备掉线仅 3~5s 时（FAST_SCAN 生效后
+         *     常见），在途轮询的 TCP SYN 重传会在设备起来后完成握手、全部成功，
+         *     rebootObservedDown 永远不置位，旧逻辑只能干等 10s 兜底——
+         *     实测设备 3s 就绪、页面却 10s 才恢复。uptime 是新固件启动的权威信号。
+         *  3) rbElapsed >= 10：安全兜底（兼容 uptime 缺失 / 设备未真重启）。
+         * pre-restart 窗口（finalize 响应后约 1s 设备仍在跑旧固件）uptime 很大，
+         * 不会误判为 freshBoot。 */
+        var upS = Number(data && data.uptime_sec);
+        var freshBoot = Number.isFinite(upS) && upS >= 0 && upS < 120;
+        if (window.rebootObservedDown || freshBoot || rbElapsed >= 10) {
           markEsp32RebootComplete();
         }
       }

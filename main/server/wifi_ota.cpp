@@ -299,7 +299,10 @@ esp_err_t WifiOta::initSta()
     country.policy = WIFI_COUNTRY_POLICY_MANUAL;
 
     wifi_config_t wifi_config = {};
-    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    /* FAST_SCAN：扫到目标 SSID 即停并连接（多 AP 同名时取先扫到的，可能非最强）。
+     * 原 ALL_CHANNEL_SCAN 要把 13 信道全扫完才连，OTA 重启后页面恢复要多等 3~8s。
+     * esp_restart 不清 nvs.net80211 缓存，驱动可复用上次 AP 信息，恢复更快。 */
+    wifi_config.sta.scan_method = WIFI_FAST_SCAN;
     wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_config.sta.pmf_cfg.capable = true;
@@ -821,6 +824,12 @@ void WifiOta::taskEntry(void *pvParameters)
 
     /* 启动日志 burst 已过：环 64→16 槽，释放大约 7.5KB 给业务堆 */
     DebugLog::instance().shrinkRingAfterBoot();
+
+    /* ★ 重启完成判定信号（前端 polling.js 匹配 /OTA Relay .*启动/ + tag=MAIN）：
+     *  必须在本函数（httpd 就绪、shrinkRingAfterBoot 之后）打印——main.cpp 的
+     *  早期 banner 在环缩容时会被裁掉，前端首轮 /logs 拉不到，只能干等 10s
+     *  安全阈值才恢复页面。此处是环内最新日志，前端一定能拉到。 */
+    DEBUG_INFO("MAIN", "ESP32-C3 OTA Relay v%s 启动", FW_VERSION);
 
     // WiFi 状态监控
     // 每秒一次循环：每 10 秒检查 RSSI

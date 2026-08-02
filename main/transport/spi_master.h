@@ -100,6 +100,31 @@ public:
     /** @brief SPI worker 任务句柄（栈水位 /system/status 与 health 巡检用）。 */
     TaskHandle_t getWorkerTaskHandle() const { return m_workerTask; }
 
+    /** @brief 最近一次 worker job 实际执行耗时（µs，worker 内计时）。
+     *        测速页用 RTT − 本值拆出"提交/调度/唤醒"开销，定位抖动归属。 */
+    uint32_t lastWorkerExecUs() const { return m_lastWorkerExecUs; }
+
+    /**
+     * @brief 单次 transact 的分段耗时剖析（测速页诊断用）。
+     * 5 段：提交/调度(t_submit0→t_w0)、发送帧(t_send0→t_send1)、
+     * 等应答(t_wait0→t_wait1)、读响应(t_wait1→t_read1)、唤醒(t_w1→t_submit1)。
+     * 写入顺序由 done 信号量保证 happens-before（worker 先写全再 give，调用方 take 后读）。
+     */
+    struct SpiProfile {
+        uint64_t t_submit0 = 0;  ///< 调用方 transact 入口
+        uint64_t t_w0 = 0;       ///< worker executeJob 开始
+        uint64_t t_send0 = 0;    ///< 发送帧开始
+        uint64_t t_send1 = 0;    ///< 发送帧结束
+        uint64_t t_wait0 = 0;    ///< 进入 poll（等 READY）
+        uint64_t t_wait1 = 0;    ///< READY 就绪（wait 段结束）
+        uint64_t t_read1 = 0;    ///< 响应帧读取完成
+        uint64_t t_w1 = 0;       ///< worker executeJob 结束
+        uint64_t t_submit1 = 0;  ///< 调用方 submitJob 返回
+    };
+
+    /** @brief 最近一次 transact 的剖析快照（仅测速/诊断用）。 */
+    SpiProfile lastProfile() const { return m_lastProfile; }
+
     /** @brief SPI 任务队列当前待处理 job 数（固定 Job pool 槽，无堆分配）。
      *        供 /system/heap_low_log 堆低水位快照采样，定位"低谷是不是 SPI 队列堆积引起"。 */
     UBaseType_t getPendingJobCount() const { return m_jobQueue ? uxQueueMessagesWaiting(m_jobQueue) : 0; }
@@ -107,8 +132,17 @@ public:
     /**
      * @brief OTA 中继期间禁止 worker 将 DATA_READY 当 EVENT 读取。
      * 中继开始设 true，结束/复位设 false。
+     * 实现为引用计数：GD32 中继与电机 OTA feed 可并发持有，任一持有者
+     * 退出都不会提前解除抑制（避免电机 OTA 收尾把 GD32 中继的抑制误清）。
      */
     void setSuppressRingService(bool suppress);
+
+    /**
+     * @brief ESP32 自我 OTA 期间暂停全部 SPI 活动（GD32 按铃读 + 业务 transact）。
+     * 暂停后 worker 空转不读 SPI，submitJob 快速返回 ESP_ERR_INVALID_STATE
+     * （业务立即失败，不阻塞排队）；恢复时唤醒 worker 恢复正常。幂等。
+     */
+    void setSpiPaused(bool paused);
 
     /**
      * @brief 业务层确认当前请求已成功时推进/对齐 m_txSeq。
@@ -282,12 +316,22 @@ private:
     SpiLinkState m_linkState;
     /** GD32 主动按铃标志：GPIO 下降沿 ISR 置位，仅 SPI worker 消费。 */
     volatile bool m_gd32RequestPending = false;
+    /** ring service 抑制引用计数（setSuppressRingService 内部使用，临界区保护）。 */
+    uint32_t m_ringSuppressRefs = 0;
     /** OTA 中继时为 true：worker 不 serviceRing，避免偷读 OTA ACK/WAIT。 */
     volatile bool m_suppressRingService = false;
+    /** ESP32 自我 OTA 期间为 true：worker 空转、submitJob 快速拒绝。 */
+    volatile bool m_spiPaused = false;
+    /** 最近一次主动请求类型（otaTransferUnlocked 发送时记录；poll 读预算按它收紧）。 */
+    volatile uint8_t m_lastReqType = 0xFFU;
     /** SPI worker 任务句柄（ISR 唯一通知目标）。 */
     TaskHandle_t m_spiTaskHandle = NULL;
     TaskHandle_t m_workerTask = NULL;
     QueueHandle_t m_jobQueue = NULL;
+    /** 最近一次 job 执行耗时（µs，worker 写入、业务只读；单核 32 位读原子）。 */
+    uint32_t m_lastWorkerExecUs = 0;
+    /** 最近一次 transact 分段剖析（worker 与调用方交叉写入，done 信号量同步）。 */
+    SpiProfile m_lastProfile;
     /** 事件计数信号量（worker push / takeEvent pop）。 */
     SemaphoreHandle_t m_eventSem = NULL;
 
@@ -405,6 +449,19 @@ private:
     /** @brief GPIO 边沿中断回调（注册到 ESP-IDF GPIO ISR 服务）。 */
     static void IRAM_ATTR onReadyEdgeISR(void *arg);
 
+    /** @brief APP 独有业务 TYPE：见到即可纠正 m_gd32Role（BOOT 不会发这些）。 */
+    static bool isAppOnlySpiType(uint8_t type);
+
+    // ── 去重辅助 ──
+    /** @brief 把 otaFindFrame 找到的帧拷贝到调用方输出缓冲（安全截断）。 */
+    static void copyFoundFrame(uint8_t *resp_type, uint8_t found_type,
+                               uint8_t *resp_payload, size_t resp_max,
+                               const uint8_t *found_payload, size_t found_len,
+                               size_t *resp_len);
+
+    /** @brief 见到 APP 独有 TYPE 时纠正粘滞的 boot role（3 处调用合并）。 */
+    void correctRoleFromType(uint8_t found_type, const char *src);
+
     // 内部 SPI 传输
     /**
      * @brief 执行底层 SPI 时钟同步传输。
@@ -430,13 +487,15 @@ private:
     /**
      * @brief 读一帧响应：单 CS 固定时钟预算（BOOT=128 / APP=256），再 v2_parse 截真实长度。
      * 调用者须已持锁。不用两段 KEEP_ACTIVE（Boot 中途断 CS 会清 pending → 全 0xFF）。
-     * @param out_frame  完整帧输出（含头+payload+CRC）
-     * @param out_max    输出缓冲容量
-     * @param out_len    实际帧长
-     * @param timeout_ms 单次 SPI 超时
+     * @param out_frame    完整帧输出（含头+payload+CRC）
+     * @param out_max      输出缓冲容量
+     * @param out_len      实际帧长
+     * @param timeout_ms   单次 SPI 超时
+     * @param budget_hint  读预算提示（0=按角色默认；>0 时取 min(hint, 角色预算)，
+     *                     主动 poll 按最近请求类型收紧，省 0xFF 填充时钟）
      */
     esp_err_t readV2FrameVarlen(uint8_t *out_frame, size_t out_max, size_t *out_len,
-                                uint32_t timeout_ms);
+                                uint32_t timeout_ms, size_t budget_hint = 0U);
 
     // 无锁内部版本（供已持锁的公共方法调用，避免递归死锁）
     /**

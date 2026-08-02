@@ -12,6 +12,7 @@
 #include "driver/temperature_sensor.h"
 #include "esp_timer.h"
 #include "app_config.h"
+#include "task_stack.h"  // TaskStackMetric（maybeRecordHeapLowWater 可选参数）
 
 // T9.3: 健康状态等级
 typedef enum {
@@ -133,7 +134,11 @@ public:
     /** @brief 检测并可能覆盖写入唯一快照槽（线程安全）。
      *         由 health_mon 5s 巡检调用，仅当 internal_min_free 出现新低时写入。
      *         设备只保留最新 1 条；多条历史由网页 IndexedDB 累积。 */
-    void maybeRecordHeapLowWater();
+    /** @brief 检测并可能覆盖写入唯一快照槽（线程安全）。
+     *         由 health_mon 5s 巡检调用，仅当 internal_min_free 出现新低时写入。
+     *         设备只保留最新 1 条；多条历史由网页 IndexedDB 累积。
+     * @param pre_metrics  巡检循环已采集的任务栈指标（避免二次遍历）；null 时内部自采 */
+    void maybeRecordHeapLowWater(const TaskStackMetric *pre_metrics = nullptr, size_t pre_count = 0);
 
     /** @brief 将唯一快照序列化为 JSON：{"count":0|1,"records":[...]}。线程安全。 */
     int dumpHeapLowWaterJson(char *buf, size_t cap, int offset) const;

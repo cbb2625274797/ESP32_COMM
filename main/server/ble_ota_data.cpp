@@ -55,6 +55,132 @@ bool s_ble_gd32_meta_active = false;
 bool s_conn_fallback_requested = false;
 
 // ============================================================
+// DATA_IN 缓冲池（2026-08 内存优化）
+//
+// 背景：原 DATA_IN 路径每包 malloc(recv_len) + worker free(item.data)，
+//   BLE 高速下发时高频堆抖动制造碎片，挤掉 lwip pbuf 连续块导致网络断连。
+//
+// 策略：OTA begin 时一次性 calloc 池（连续大块，比高频 per-pack malloc
+//   碎片小得多），DATA_IN 借槽拷贝 → 入队 → worker 处理后归还；
+//   OTA end/abort/断连时 free 整个池。
+//   - 非 OTA 期间：池指针为 NULL，零占用，堆基线不受影响。
+//   - OTA 期间：借/还 O(1) 标志位操作，无堆抖动。
+//   - 池满/包过大回退 malloc + 负 ACK（保留原语义，避免功能回退）。
+//
+// 池容量 8 槽 × 512B = 4KB（2026-08-01 修正）：
+//   原 8×4096B=32KB 使 OTA 全程多占 28KB 堆，刷写 1MB 固件收尾时
+//   （0xF8 后需创建 finish task + image verify）直接 ESP_ERR_NO_MEM。
+//   单次 ATT 写入上限 = MTU 512B（BLE_MTU_SIZE），常态包 ≤512B 全走池；
+//   NimBLE 合并的大 batch（≤4096B，经 BLE_OTA_BUF_SIZE 截断）回退
+//   malloc，与无池时代行为一致。4KB 固定占用对收尾任务足够安全。
+// ============================================================
+struct BleDataPool {
+    static constexpr size_t kSlots = 8;
+    static constexpr size_t kSlotSize = 512;    // 单次 ATT 写入上限（MTU）；大 batch 回退 malloc
+    uint8_t  *buf[kSlots];          // kSlots 个独立槽（calloc 一次分配 kSlots*kSlotSize 后切分）
+    volatile bool in_use[kSlots];
+};
+static BleDataPool *s_data_pool = nullptr;
+
+// 前向声明（poolAlloc 与 poolFree 互相引用）
+static void poolFree();
+
+/** @brief OTA begin 时分配池。失败返回 false（调用方回退纯 malloc 路径）。
+ *  安全性：上次会话遗留的池仅当全部槽空闲才复用。若 worker 仍持有在途
+ *  batch（in_use=true），强制复位复用会让新会话 DATA_IN 覆写旧 worker
+ *  正在解析的内存 → flash 写坏 → 收尾 SHA/verify 失败。此时本会话回退
+ *  malloc，旧池留待 worker 归还后由下次 poolFree 释放。 */
+static bool poolAlloc()
+{
+    if (s_data_pool) {
+        // 上次会话遗留池：检查是否全部空闲（in_use 仅由 worker/队列消费侧复位）
+        for (size_t i = 0; i < BleDataPool::kSlots; ++i) {
+            if (s_data_pool->in_use[i]) {
+                DEBUG_WARN(TAG, "DATA_IN 池槽仍被占用,本会话回退 malloc");
+                return false;
+            }
+        }
+        return true;  // 全部空闲：安全复用
+    }
+    s_data_pool = (BleDataPool *)calloc(1, sizeof(BleDataPool));
+    if (!s_data_pool) return false;
+    // 一次性分配所有槽的负载数据（连续大块，碎片友好）
+    uint8_t *blob = (uint8_t *)calloc(BleDataPool::kSlots, BleDataPool::kSlotSize);
+    if (!blob) {
+        free(s_data_pool);
+        s_data_pool = nullptr;
+        return false;
+    }
+    for (size_t i = 0; i < BleDataPool::kSlots; ++i) {
+        s_data_pool->buf[i] = blob + i * BleDataPool::kSlotSize;
+        s_data_pool->in_use[i] = false;
+    }
+    return true;
+}
+
+/** @brief OTA end/abort/断连时释放整个池。
+ *  安全性：仅当所有槽均空闲时才释放；若 worker 仍有 in-flight batch
+ *  占用槽（in_use=true），跳过本次释放，留待下次 poolFree 全部空闲时
+ *  再释放。这避免了 worker 访问已释放内存的竞态（单核抢占：
+ *  session_reset 运行在 NimBLE host task，worker 是独立任务，二者仅
+ *  通过队列交接，无显式同步）。 */
+static void poolFree()
+{
+    if (!s_data_pool) return;
+    for (size_t i = 0; i < BleDataPool::kSlots; ++i) {
+        if (s_data_pool->in_use[i]) {
+            // 有槽仍被 worker 占用，跳过释放（下次 poolFree 再试）
+            DEBUG_DBG(TAG, "DATA_IN 池延迟释放: 槽%u in_use", (unsigned)i);
+            return;
+        }
+    }
+    // buf[0] 是连续 blob 的起始（一次 calloc 分配）
+    if (s_data_pool->buf[0]) {
+        free(s_data_pool->buf[0]);
+    }
+    free(s_data_pool);
+    s_data_pool = nullptr;
+}
+
+/** @brief 从池借一个槽，返回索引；无空闲或池未分配返回 -1。仅 DATA_IN（host task）调用。 */
+static int poolAcquire()
+{
+    if (!s_data_pool) return -1;
+    for (size_t i = 0; i < BleDataPool::kSlots; ++i) {
+        if (!s_data_pool->in_use[i]) {
+            s_data_pool->in_use[i] = true;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/** @brief 归还槽到池。仅 worker / drain（队列消费侧）调用。 */
+static void poolRelease(int idx)
+{
+    if (!s_data_pool) return;
+    if (idx >= 0 && idx < (int)BleDataPool::kSlots) {
+        s_data_pool->in_use[idx] = false;
+    }
+}
+
+/** @brief 借槽拷贝数据；返回槽索引或 -1（池满/未分配/包过大）。 */
+static int poolCopyIn(const uint8_t *src, size_t len)
+{
+    if (!s_data_pool || len > BleDataPool::kSlotSize) return -1;
+    int idx = poolAcquire();
+    if (idx < 0) return -1;
+    memcpy(s_data_pool->buf[idx], src, len);
+    return idx;
+}
+
+/** @brief 归还池槽（跨 TU 调用入口：drainOtaDataQueue / 会话清理）。 */
+void ble_ota_pool_release(int idx)
+{
+    poolRelease(idx);
+}
+
+// ============================================================
 // DATA_IN 丢包负反馈：把 malloc 失败 / 队列满从"静默丢包"变成
 // "主动发缺口 ACK 让前端按 completed_bytes 续传退避"。
 //
@@ -394,6 +520,11 @@ esp_err_t ble_esp32_ota_begin(size_t total_size)
     BleOta::instance().m_esp32LastSeq = 0xFFFFU;
     // ★ 分配 reorder buffer（失败则自动回退丢弃策略）
     esp32_reorder_alloc();
+    // ★ 分配 DATA_IN 缓冲池（失败则 DATA_IN 回退 per-pack malloc 路径）
+    if (!poolAlloc()) {
+        DEBUG_WARN(TAG, "DATA_IN 池分配失败,回退 malloc free=%u",
+                   (unsigned)esp_get_free_heap_size());
+    }
     // ★ BLE OTA 开始：降低 WiFi 射频占用
     ble_ota_boost_wifi_ps();
     /* 刷写前再要一次高速连接参数（连接时若未谈妥，此处补刀） */
@@ -439,6 +570,8 @@ void ble_ota_session_reset()
     BleOta::instance().m_esp32RebootPending = false;
     // 释放 ESP32 reorder buffer（无 buffer 时为空操作）
     esp32_reorder_free();
+    // 释放 DATA_IN 缓冲池（非 OTA 期间零占用，恢复堆基线）
+    poolFree();
     // 复位 GD32 路径乱序包计数器（节流 ACK 计数），保证下次 GD32 上传从干净状态开始
     s_gd32_ooo_count = 0;
     s_ble_gd32_meta = {};
@@ -697,28 +830,41 @@ int ble_ota_data_in_access(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
-    // 将数据拷贝到堆上并送入工作队列，避免在 NimBLE host task 中执行
+    // 将数据拷贝到队列缓冲并送入工作线程，避免在 NimBLE host task 中执行
     // 耗时的 flash 操作（esp_ota_begin / esp_ota_write）导致 BLE 连接断开。
+    // ★ 优先走静态池（消除高频 malloc/free 堆抖动）；池满回退 malloc + 负 ACK。
     if (s_otaDataQueue) {
         // 解析 cmd 字节供负 ACK 区分 ESP32/GD32 续传分支（与 worker 解析一致）
         uint8_t cmd = parse_cmd_from_batch(buf, (size_t)recv_len);
-        uint8_t *heap_buf = (uint8_t *)malloc((size_t)recv_len);
-        if (heap_buf) {
-            memcpy(heap_buf, buf, (size_t)recv_len);
-            BleOtaDataBatch item = { heap_buf, (size_t)recv_len };
+        int pool_idx = poolCopyIn(buf, (size_t)recv_len);
+        if (pool_idx >= 0) {
+            BleOtaDataBatch item = { s_data_pool->buf[pool_idx], (size_t)recv_len, pool_idx };
             if (xQueueSend(s_otaDataQueue, &item, 0) != pdTRUE) {
-                // 队列满：发缺口 ACK 让前端按 completed_bytes 续传退避，
+                // 队列满：归还池槽 + 发缺口 ACK 让前端按 completed_bytes 续传退避，
                 // 而非等满 8s 窗口超时后整窗口重发 → 重传风暴叠加低堆二次失败
                 s_ota_drop_queue_full += 1;
+                poolRelease(pool_idx);
                 DEBUG_WARN(TAG, "DATA_IN满 丢%dB 等重传", recv_len);
-                free(heap_buf);
                 sendNegativeAckIfDue(cmd);
             }
         } else {
-            // malloc 失败：同上，发缺口 ACK 形成可恢复协议反馈，避免静默丢包
-            s_ota_drop_malloc_fail += 1;
-            DEBUG_ERR(TAG, "DATA_IN 堆内存不足 (%d 字节)，丢弃", recv_len);
-            sendNegativeAckIfDue(cmd);
+            // 池满或包过大：回退 malloc（保留原负 ACK 语义，避免静默丢包）
+            uint8_t *heap_buf = (uint8_t *)malloc((size_t)recv_len);
+            if (heap_buf) {
+                memcpy(heap_buf, buf, (size_t)recv_len);
+                BleOtaDataBatch item = { heap_buf, (size_t)recv_len, -1 };
+                if (xQueueSend(s_otaDataQueue, &item, 0) != pdTRUE) {
+                    s_ota_drop_queue_full += 1;
+                    free(heap_buf);
+                    DEBUG_WARN(TAG, "DATA_IN满 丢%dB 等重传", recv_len);
+                    sendNegativeAckIfDue(cmd);
+                }
+            } else {
+                // malloc 失败：同上，发缺口 ACK 形成可恢复协议反馈，避免静默丢包
+                s_ota_drop_malloc_fail += 1;
+                DEBUG_ERR(TAG, "DATA_IN 堆内存不足 (%d 字节)，丢弃", recv_len);
+                sendNegativeAckIfDue(cmd);
+            }
         }
     }
 
@@ -1096,7 +1242,8 @@ void ble_ota_data_worker_task(void *pvParameters)
         BleOtaDataBatch item;
         if (xQueueReceive(s_otaDataQueue, &item, portMAX_DELAY) == pdTRUE) {
             if (!item.data || item.len == 0) {
-                free(item.data);
+                if (item.pool_idx >= 0) poolRelease(item.pool_idx);
+                else free(item.data);
                 continue;
             }
 
@@ -1104,12 +1251,14 @@ void ble_ota_data_worker_task(void *pvParameters)
             if (!BleOta::instance().isConnected() ||
                 BleOta::instance().isSuspendedForWifiOta()) {
                 DEBUG_DBG(TAG, "BLE不可用 丢%zuB队列", item.len);
-                free(item.data);
+                if (item.pool_idx >= 0) poolRelease(item.pool_idx);
+                else free(item.data);
                 continue;
             }
 
             ble_ota_process_data_batch(item.data, item.len);
-            free(item.data);
+            if (item.pool_idx >= 0) poolRelease(item.pool_idx);
+            else free(item.data);
         }
     }
 }

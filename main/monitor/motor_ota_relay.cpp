@@ -35,6 +35,59 @@ static int64_t nowMs() {
     return esp_timer_get_time() / 1000;
 }
 
+/* ── 共享辅助：终态判断 + QUERY SPI 事务 ── */
+
+/** @brief GD32 侧已进终态（IDLE/FINISHED/ERROR），喂数据应停止。 */
+static inline bool isTerminalState(motor_ota_state_t s)
+{
+    return s == MOTOR_OTA_IDLE || s == MOTOR_OTA_FINISHED || s == MOTOR_OTA_ERROR;
+}
+
+/**
+ * @brief 发 SPI 0xD0 QUERY 查询 GD32 真实状态。
+ * @param out_state   非 null 时写入 GD32 返回的 state
+ * @param out_err     非 null 时写入 error_code
+ * @param update_status  true 时把结果同步写回 s_status（持锁）
+ * @return true=QUERY 成功且 ACK 有有效数据；false=SPI 失败或无 ACK
+ *
+ * 消除 feedTask 中 4 处重复的 qcmd[1]={2} + transact + parse qp[0..5] 块。
+ */
+static bool queryMotorOtaStatus(motor_ota_state_t *out_state = nullptr,
+                                uint8_t *out_err = nullptr,
+                                bool update_status = false)
+{
+    uint8_t qcmd[1] = {2U};  /* cmd=QUERY */
+    uint8_t qt = 0, qp[16] = {0};
+    size_t ql = 0;
+    if (SpiMaster::instance().transact(
+            kSpiMotorOtaCmd, qcmd, 1, &qt, qp, sizeof(qp), &ql, 300U) != ESP_OK
+        || qt != kRspAck || ql < 1U) {
+        return false;
+    }
+    const motor_ota_state_t qst = static_cast<motor_ota_state_t>(qp[0]);
+    if (out_state) *out_state = qst;
+    if (out_err)   *out_err   = (ql >= 2U) ? qp[1] : 0U;
+    if (update_status && s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_status.state      = qst;
+        s_status.error_code = (ql >= 2U) ? qp[1] : 0U;
+        if (ql >= 6U) {
+            s_status.packets_acked = static_cast<uint16_t>(qp[2])
+                | (static_cast<uint16_t>(qp[3]) << 8);
+            s_status.total_packets = static_cast<uint16_t>(qp[4])
+                | (static_cast<uint16_t>(qp[5]) << 8);
+        }
+        if (ql >= 10U) {
+            s_status.fw_size = static_cast<uint32_t>(qp[6])
+                | (static_cast<uint32_t>(qp[7]) << 8)
+                | (static_cast<uint32_t>(qp[8]) << 16)
+                | (static_cast<uint32_t>(qp[9]) << 24);
+        }
+        s_status.last_update_ms = nowMs();
+        xSemaphoreGive(s_mutex);
+    }
+    return true;
+}
+
 /* ═══════════════════ 喂数据 task ═══════════════════ */
 
 static void feedTask(void *arg)
@@ -87,8 +140,7 @@ static void feedTask(void *arg)
          * (0xD2 ring 延迟到达) 覆写 s_status 导致 feedTask 误判退出发 CANCEL。 */
         const motor_ota_status_t st = motorOtaGetStatus();
         if (nowMs() >= grace_end_ms) {
-            if (st.state == MOTOR_OTA_IDLE || st.state == MOTOR_OTA_FINISHED ||
-                st.state == MOTOR_OTA_ERROR) {
+            if (isTerminalState(st.state)) {
                 ESP_LOGW(TAG, "GD32 终态 0x%02X，停止喂数据 offset=%u/%u",
                          (int)st.state, (unsigned)s_fw_offset, (unsigned)s_fw_size);
                 break;
@@ -127,36 +179,17 @@ const uint32_t remaining = s_fw_size - s_fw_offset;
 	            vTaskDelay(pdMS_TO_TICKS(10));  /* 快速重试（原 100ms 太慢导致吐量低） */
 	            /* suppress 期间 s_status 不更新，连续失败时主动 QUERY GD32 真实状态，
 	             * 避免 GD32 已进 ERROR 终态但 feedTask 不知道、盲重试空转到 120s 超时。 */
-	            if (++consec_fail >= kQueryAfterFails) {
-	                consec_fail = 0U;
-	                uint8_t qcmd[1] = {2U};  /* cmd=QUERY */
-	                uint8_t qt = 0, qp[16] = {0};
-	                size_t ql = 0;
-	                if (SpiMaster::instance().transact(
-	                        kSpiMotorOtaCmd, qcmd, 1, &qt, qp, sizeof(qp), &ql, 300U) == ESP_OK
-	                    && qt == kRspAck && ql >= 1U) {
-	                    motor_ota_state_t qst = static_cast<motor_ota_state_t>(qp[0]);
-	                    if (qst == MOTOR_OTA_IDLE || qst == MOTOR_OTA_FINISHED ||
-	                        qst == MOTOR_OTA_ERROR) {
-	                        ESP_LOGW(TAG, "QUERY 检测到 GD32 终态 0x%02X err=0x%02X，停止喂数据 offset=%u/%u",
-	                                 (int)qst, (unsigned)qp[1],
-	                                 (unsigned)s_fw_offset, (unsigned)s_fw_size);
-	                        if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-	                            s_status.state = qst;
-	                            s_status.error_code = qp[1];
-	                            if (ql >= 6U) {
-	                                s_status.packets_acked = static_cast<uint16_t>(qp[2])
-	                                    | (static_cast<uint16_t>(qp[3]) << 8);
-	                                s_status.total_packets = static_cast<uint16_t>(qp[4])
-	                                    | (static_cast<uint16_t>(qp[5]) << 8);
-	                            }
-	                            s_status.last_update_ms = nowMs();
-	                            xSemaphoreGive(s_mutex);
-	                        }
-	                        break;
-	                    }
-	                }
-	            }
+                    if (++consec_fail >= kQueryAfterFails) {
+                        consec_fail = 0U;
+                        motor_ota_state_t qst;
+                        uint8_t qerr;
+                        if (queryMotorOtaStatus(&qst, &qerr, true) && isTerminalState(qst)) {
+                            ESP_LOGW(TAG, "QUERY 检测到 GD32 终态 0x%02X err=0x%02X，停止喂数据 offset=%u/%u",
+                                     (int)qst, (unsigned)qerr,
+                                     (unsigned)s_fw_offset, (unsigned)s_fw_size);
+                            break;
+                        }
+                    }
 	            continue;  /* 不推进 offset，同 offset 重发 */
 	        }
 	        consec_fail = 0U;
@@ -177,13 +210,8 @@ const uint32_t remaining = s_fw_size - s_fw_offset;
 
             /* 握手未确认时定期 QUERY：确认 GD32 已过握手阶段才标 TRANSFER */
             if (!handshake_confirmed && (ack_n & 7U) == 0U) {
-                uint8_t qcmd[1] = {2U};
-                uint8_t qt = 0, qp[16] = {0};
-                size_t ql = 0;
-                if (SpiMaster::instance().transact(
-                        kSpiMotorOtaCmd, qcmd, 1, &qt, qp, sizeof(qp), &ql, 300U) == ESP_OK
-                    && qt == kRspAck && ql >= 1U) {
-                    motor_ota_state_t qst = static_cast<motor_ota_state_t>(qp[0]);
+                motor_ota_state_t qst;
+                if (queryMotorOtaStatus(&qst, nullptr, false)) {
                     if (qst == MOTOR_OTA_ERASE || qst == MOTOR_OTA_TRANSFER ||
                         qst == MOTOR_OTA_FINISH_OTA || qst == MOTOR_OTA_WAIT_APP_RUN) {
                         handshake_confirmed = true;
@@ -216,16 +244,11 @@ const uint32_t remaining = s_fw_size - s_fw_offset;
 	            vTaskDelay(pdMS_TO_TICKS(2));
 	            /* 连续 WAIT 超限：可能 GD32 auto-retry 重置了 s_fw_fed=0，
 	             * 当前 offset 被 gap 拒收（永远不会变 ACK）。QUERY 确认真实状态。 */
-	            if (++consec_wait >= kQueryAfterWaits) {
-	                consec_wait = 0U;
-	                uint8_t qcmd[1] = {2U};  /* cmd=QUERY */
-	                uint8_t qt = 0, qp[16] = {0};
-	                size_t ql = 0;
-	                if (SpiMaster::instance().transact(
-	                        kSpiMotorOtaCmd, qcmd, 1, &qt, qp, sizeof(qp), &ql, 300U) == ESP_OK
-	                    && qt == kRspAck && ql >= 2U) {
-	                    const motor_ota_state_t qst = static_cast<motor_ota_state_t>(qp[0]);
-	                    const uint8_t qerr = qp[1];
+            if (++consec_wait >= kQueryAfterWaits) {
+                consec_wait = 0U;
+                motor_ota_state_t qst;
+                uint8_t qerr;
+                if (queryMotorOtaStatus(&qst, &qerr, false)) {
                     if (qst != MOTOR_OTA_TRANSFER) {
                         /* GD32 不在传输态（auto-retry 回了 kPreCancel/握手）：
                          * 重置 offset 从头喂，配合 GD32 重新擦除+握手。 */
@@ -237,21 +260,20 @@ const uint32_t remaining = s_fw_size - s_fw_offset;
                     } else {
                         handshake_confirmed = true;  /* GD32 在 transfer，确认握手完成 */
                     }
-	                    /* 终态仍 break */
-	                    if (qst == MOTOR_OTA_IDLE || qst == MOTOR_OTA_FINISHED ||
-	                        qst == MOTOR_OTA_ERROR) {
-	                        ESP_LOGW(TAG, "QUERY(WAIT) 终态 0x%02X err=0x%02X，停止",
-	                                 (unsigned)qst, (unsigned)qerr);
-	                        if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-	                            s_status.state = qst;
-	                            s_status.error_code = qerr;
-	                            s_status.last_update_ms = nowMs();
-	                            xSemaphoreGive(s_mutex);
-	                        }
-	                        break;
-	                    }
-	                }
-	            }
+                    /* 终态仍 break */
+                    if (isTerminalState(qst)) {
+                        ESP_LOGW(TAG, "QUERY(WAIT) 终态 0x%02X err=0x%02X，停止",
+                                 (unsigned)qst, (unsigned)qerr);
+                        if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            s_status.state = qst;
+                            s_status.error_code = qerr;
+                            s_status.last_update_ms = nowMs();
+                            xSemaphoreGive(s_mutex);
+                        }
+                        break;
+                    }
+                }
+            }
 	        } else {
 	            /* 非 ACK/WAIT（含 ERROR/陈旧 type）：不 break 整次 OTA。
 	             * 曾因 poll 读到 EVENT/错 type 直接 break → fed 卡首 chunk。 */
@@ -273,53 +295,29 @@ const uint32_t remaining = s_fw_size - s_fw_offset;
 	        const uint32_t exit_deadline = nowMs() + kExitPollMs;
 	        bool got_terminal = false;
 	        while (nowMs() < exit_deadline) {
-	            /* 优先吃 ring 推送（已恢复 suppress） */
-	            {
-	                const motor_ota_status_t st = motorOtaGetStatus();
-	                if (st.state == MOTOR_OTA_FINISHED || st.state == MOTOR_OTA_ERROR ||
-	                    st.state == MOTOR_OTA_IDLE) {
-	                    ESP_LOGI(TAG, "feedTask 退出，ring 终态: state=%u err=%u pkt=%u/%u",
-	                             (unsigned)st.state, (unsigned)st.error_code,
-	                             (unsigned)st.packets_acked, (unsigned)st.total_packets);
-	                    got_terminal = true;
-	                    break;
-	                }
-	            }
-	            uint8_t qcmd[1] = {2U};  /* cmd=QUERY */
-	            uint8_t qresp_type = 0;
-	            uint8_t qresp[16] = {0};
-	            size_t qresp_len = 0;
-	            esp_err_t qr = SpiMaster::instance().transact(
-	                kSpiMotorOtaCmd, qcmd, 1,
-	                &qresp_type, qresp, sizeof(qresp), &qresp_len, 300U);
-	            if (qr == ESP_OK && qresp_type == kRspAck && qresp_len >= 10U) {
-	                const motor_ota_state_t qst = static_cast<motor_ota_state_t>(qresp[0]);
-	                if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-	                    s_status.state         = qst;
-	                    s_status.error_code    = qresp[1];
-	                    s_status.packets_acked = static_cast<uint16_t>(qresp[2])
-	                        | (static_cast<uint16_t>(qresp[3]) << 8);
-	                    s_status.total_packets = static_cast<uint16_t>(qresp[4])
-	                        | (static_cast<uint16_t>(qresp[5]) << 8);
-	                    s_status.fw_size       = static_cast<uint32_t>(qresp[6])
-	                                           | (static_cast<uint32_t>(qresp[7]) << 8)
-	                                           | (static_cast<uint32_t>(qresp[8]) << 16)
-	                                           | (static_cast<uint32_t>(qresp[9]) << 24);
-	                    s_status.last_update_ms = nowMs();
-	                    xSemaphoreGive(s_mutex);
-	                }
-	                if (qst == MOTOR_OTA_FINISHED || qst == MOTOR_OTA_ERROR ||
-	                    qst == MOTOR_OTA_IDLE) {
-	                    ESP_LOGI(TAG, "feedTask 退出，QUERY 终态: state=%u err=%u pkt=%u/%u",
-	                             (unsigned)qst, (unsigned)qresp[1],
-	                             (unsigned)(static_cast<uint16_t>(qresp[2])
-	                                        | (static_cast<uint16_t>(qresp[3]) << 8)),
-	                             (unsigned)(static_cast<uint16_t>(qresp[4])
-	                                        | (static_cast<uint16_t>(qresp[5]) << 8)));
-	                    got_terminal = true;
-	                    break;
-	                }
-	            }
+            /* 优先吃 ring 推送（已恢复 suppress） */
+            {
+                const motor_ota_status_t st = motorOtaGetStatus();
+                if (isTerminalState(st.state)) {
+                    ESP_LOGI(TAG, "feedTask 退出，ring 终态: state=%u err=%u pkt=%u/%u",
+                             (unsigned)st.state, (unsigned)st.error_code,
+                             (unsigned)st.packets_acked, (unsigned)st.total_packets);
+                    got_terminal = true;
+                    break;
+                }
+            }
+            motor_ota_state_t qst;
+            uint8_t qerr;
+            if (queryMotorOtaStatus(&qst, &qerr, true)) {
+                if (isTerminalState(qst)) {
+                    const motor_ota_status_t snap = motorOtaGetStatus();
+                    ESP_LOGI(TAG, "feedTask 退出，QUERY 终态: state=%u err=%u pkt=%u/%u",
+                             (unsigned)qst, (unsigned)qerr,
+                             (unsigned)snap.packets_acked, (unsigned)snap.total_packets);
+                    got_terminal = true;
+                    break;
+                }
+            }
 	            vTaskDelay(pdMS_TO_TICKS(kExitGapMs));
 	        }
 	        if (!got_terminal) {
