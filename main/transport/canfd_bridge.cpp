@@ -20,9 +20,14 @@
 namespace {
 
 constexpr uint8_t kSpiCanFrameType   = 0xC0U;
+constexpr uint8_t kSpiCanBurstType   = 0xC7U;
 constexpr uint8_t kSpiCanSetModeType = 0xC2U;
 constexpr uint8_t kFeedbackFixedHeader = 28U;
 constexpr uint8_t kFeedbackMaxPage     = 1U;  /* GD32 仅 page 0/1 */
+
+/* 突发 payload 上限 = V2_MAX_PAYLOAD(236)；头 4B = count+dlc+suffix(2)。 */
+constexpr uint8_t  kBurstHeaderLen = 4U;
+constexpr uint16_t kBurstPayloadCap = 236U;
 
 /**
  * @brief 经 SPI 发送一帧 CAN，并解析 ACK/ERROR。
@@ -167,6 +172,108 @@ int canFdSend(can_channel_t channel, uint32_t ext_id,
     }
     return sendCanFrameOverSpi(channel, ext_id, data, dlc,
                                recv_buf, recv_max, timeout_ms, gd32_err_out);
+}
+
+/**
+ * @brief 给定统一 DLC，返回单次突发最多可容纳的帧数。
+ *        payload = 4B 头 + count*(1+dlc)，须 ≤ 236B；并受 GD32 硬上限约束。
+ */
+uint8_t canBurstCapacity(uint8_t dlc)
+{
+    if (dlc > CAN_MAX_DLC) {
+        return 0U;
+    }
+    const uint16_t entry_len = static_cast<uint16_t>(1U + dlc);
+    const uint16_t avail = (kBurstPayloadCap > kBurstHeaderLen)
+        ? static_cast<uint16_t>(kBurstPayloadCap - kBurstHeaderLen)
+        : 0U;
+    const uint16_t cap = static_cast<uint16_t>(avail / entry_len);
+    return static_cast<uint8_t>((cap < CAN_BURST_HARD_MAX) ? cap : CAN_BURST_HARD_MAX);
+}
+
+/**
+ * @brief 发送一次 CAN 突发（SPI 0xC7）。
+ *
+ * GD32 在 CS 释放 ISR 内对每帧调用非阻塞 transmitFrame（仅装载邮箱），
+ * 全部装载完成后才回 ACK，因此各通道帧近同时上线；ESP32 这里等待的只是
+ * 这一个 ACK，并非逐帧等待，不会破坏组内同时性。
+ *
+ * 返回值: count 成功, -1 参数错误, -2 SPI 通信失败, -3 GD32 拒绝。
+ */
+int canFdSendBurst(uint16_t id_suffix, uint8_t dlc,
+                   const can_burst_entry_t *entries, uint8_t count,
+                   uint8_t *status_out, uint8_t status_max,
+                   uint32_t timeout_ms, uint8_t *gd32_err_out)
+{
+    if (gd32_err_out) {
+        *gd32_err_out = 0U;
+    }
+    if (dlc > CAN_MAX_DLC || entries == nullptr || count == 0U) {
+        return -1;
+    }
+    if (count > canBurstCapacity(dlc)) {
+        return -1;
+    }
+
+    uint8_t tx_buf[240];
+    size_t tx_len = 0U;
+    tx_buf[tx_len++] = count;
+    tx_buf[tx_len++] = dlc;
+    tx_buf[tx_len++] = static_cast<uint8_t>((id_suffix >> 8) & 0xFFU);
+    tx_buf[tx_len++] = static_cast<uint8_t>(id_suffix & 0xFFU);
+    for (uint8_t i = 0U; i < count; ++i) {
+        tx_buf[tx_len++] = entries[i].chnode;
+        if (dlc > 0U) {
+            if (entries[i].data == nullptr) {
+                return -1;
+            }
+            memcpy(&tx_buf[tx_len], entries[i].data, dlc);
+            tx_len += dlc;
+        }
+    }
+
+    uint8_t resp[32];
+    uint8_t resp_type = 0U;
+    size_t resp_len = 0U;
+    esp_err_t ret = ESP_OK;
+    /* 与 0xC0 相同：排空可能残留的陈旧 WAIT，直到读到本次真正的 ACK/ERROR */
+    for (uint8_t attempt = 0U; attempt < 4U; ++attempt) {
+        resp_type = 0U;
+        resp_len = 0U;
+        ret = SpiMaster::instance().transact(
+            kSpiCanBurstType, tx_buf, tx_len,
+            &resp_type, resp, sizeof(resp), &resp_len, timeout_ms);
+        if (resp_type != SPI_OTA_RSP_WAIT) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(3));
+    }
+
+    if (ret != ESP_OK) {
+        DEBUG_WARN("CAN", "BURST SPI fail n=%u %s",
+                   (unsigned)count, esp_err_to_name(ret));
+        return -2;
+    }
+    if (resp_type == SPI_OTA_RSP_ACK) {
+        /* resp[0]=count, resp[1..count]=每帧状态（CanTxResult 码） */
+        const uint8_t n = (resp_len > 0U) ? resp[0] : 0U;
+        if (status_out != nullptr && status_max > 0U) {
+            const uint8_t copy_n = (n < status_max) ? n : status_max;
+            for (uint8_t i = 0U; i < copy_n; ++i) {
+                status_out[i] = (static_cast<size_t>(1U + i) < resp_len)
+                    ? resp[1U + i] : 0xFFU;
+            }
+        }
+        return static_cast<int>(n);
+    }
+
+    const uint8_t gd32_err = (resp_len > 0U) ? resp[0] : 0xFFU;
+    if (gd32_err_out) {
+        *gd32_err_out = gd32_err;
+    }
+    DEBUG_WARN("CAN", "BURST拒 n=%u r=%02X e=%02X",
+               (unsigned)count, resp_type, gd32_err);
+    return -3;
 }
 
 /**

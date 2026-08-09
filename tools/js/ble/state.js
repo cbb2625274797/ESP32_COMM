@@ -38,8 +38,7 @@ export const state = {
 
 export const $ = (id) => document.getElementById(id);
 export const els = {
-  connectBtn: $('connectBtn'),
-  disconnectBtn: $('disconnectBtn'),
+  bleConnectToggle: $('bleConnectToggle'),
   autoFlashBtn: $('autoFlashBtn'),
   abortBtn: $('abortBtn'),
   uploadZone: $('uploadZone'),
@@ -129,8 +128,15 @@ export function setConnectionState(connected) {
     }
     if (els.gattState) els.gattState.textContent = connected ? 'GATT 已就绪' : '未就绪';
   }
-  els.connectBtn.disabled = connected;
-  els.disconnectBtn.disabled = !connected;
+  // launch 风格按钮：checked 与 data-ble-state 由连接结果驱动
+  // connecting 态由点击时设置；此处仅在连接结束（成功→connected / 失败→idle）时收口
+  if (els.bleConnectToggle) {
+    if (els.bleConnectToggle.checked !== connected) {
+      els.bleConnectToggle.checked = !!connected;
+    }
+  }
+  var btn = document.querySelector('.ble-launch-btn');
+  if (btn) btn.setAttribute('data-ble-state', connected ? 'connected' : 'idle');
   els.autoFlashBtn.disabled = !idle;
   els.abortBtn.disabled = !state.uploading;
 

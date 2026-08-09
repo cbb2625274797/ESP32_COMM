@@ -54,6 +54,44 @@ int canFdSend(can_channel_t channel, uint32_t ext_id,
               uint8_t *gd32_err_out = nullptr);
 
 // ============================================================
+// CAN 跨通道突发发送（SPI 0xC7）
+// 一次 SPI 事务携带多帧，GD32 背靠背装载各通道 CAN 邮箱，
+// 组内近同时上线（偏差 <1ms），用于多电机同步驱动。
+// ============================================================
+#define CAN_BURST_HARD_MAX   (16)   ///< GD32 单次突发硬上限（帧数）
+
+/** @brief 突发条目：chnode=(ch<<4)|node，data 指向 dlc 字节数据。 */
+typedef struct {
+    uint8_t        chnode;   ///< (channel<<4) | node
+    const uint8_t *data;     ///< dlc 字节数据
+} can_burst_entry_t;
+
+/**
+ * @brief 给定统一 DLC，返回单次突发最多可容纳的帧数。
+ *        受 236B SPI payload（4B 头 + count*(1+dlc)）与 GD32 硬上限约束。
+ */
+uint8_t canBurstCapacity(uint8_t dlc);
+
+/**
+ * @brief 发送一次 CAN 突发（SPI 0xC7）。count 必须 <= canBurstCapacity(dlc)。
+ *        GD32 在 ISR 内对每帧调用非阻塞 transmitFrame，各通道邮箱背靠背装载。
+ * @param id_suffix    CAN ID 低 16 位（CMD=0x0200）；id=(node<<16)|suffix。
+ * @param dlc          所有条目统一数据长度（0~64）。
+ * @param entries      count 个条目（chnode + data）。
+ * @param count        条目数（1~canBurstCapacity(dlc)）。
+ * @param status_out   输出每帧状态（GD32 CanTxResult 码，0x00=成功），可为 nullptr。
+ * @param status_max   status_out 容量。
+ * @param timeout_ms   SPI 事务超时。
+ * @param gd32_err_out 返回 -3 时的 GD32 细分错误码；可为 nullptr。
+ * @return 成功返回 count；-1 参数错误；-2 SPI 通信失败；-3 GD32 ERROR。
+ */
+int canFdSendBurst(uint16_t id_suffix, uint8_t dlc,
+                   const can_burst_entry_t *entries, uint8_t count,
+                   uint8_t *status_out, uint8_t status_max,
+                   uint32_t timeout_ms,
+                   uint8_t *gd32_err_out = nullptr);
+
+// ============================================================
 // 不重复 ID 快照表（SPI 0xC3 协议配套）
 // ============================================================
 #define CANFD_ID_SNAPSHOT_MAX      16    ///< 每通道最大不重复 ID 条目数

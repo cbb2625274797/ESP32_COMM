@@ -193,7 +193,7 @@ function updateBootInitUi(data) {
 /* ==================== 状态任务列表：增量渲染 ====================
  * innerHTML 全量重建会重解析 HTML、重建每条 .status-task-bar（其 ::after 微光
  * 动画随之重启、合成层反复创建销毁），是主页每秒掉帧的主要来源之一。
- * 这里按 key（任务名）缓存行节点：集合不变时只改数字/宽度，排序变了仅移动节点。
+ * 这里按 key（任务名）缓存行节点：集合不变时只改数字/宽度，排序变了仅更新 CSS order。
  * 行结构统一：head(名称/占比) + bar + 3 项 meta。
  * items: [{ key, rowCls, pctText, width, fillCls, metaLabels[3], metas[3] }]
  */
@@ -264,11 +264,15 @@ function renderStatusTaskList(listEl, items) {
     return;
   }
   if (keyStr !== cache.keys) {
-    /* 集合相同仅排序变化：按新顺序移动既有节点，不重建、不解析 HTML */
-    for (var m = 0; m < keys.length; m++) listEl.appendChild(cache.rows[keys[m]]);
+    /* 集合相同仅排序变化：保留节点位置，避免带动画的光泽伪元素重启 */
     cache.keys = keyStr;
   }
-  for (var u = 0; u < items.length; u++) updateStatusTaskRow(cache.rows[keys[u]], items[u]);
+  for (var u = 0; u < items.length; u++) {
+    var row = cache.rows[keys[u]];
+    var order = String(u);
+    if (row.style.order !== order) row.style.order = order;
+    updateStatusTaskRow(row, items[u]);
+  }
 }
 
 /* 原始 JSON 折叠面板：收起时跳过 JSON.stringify + 大段文本重排；
@@ -359,7 +363,7 @@ export function updateHeapAndTaskStatusUi(data) {
     var sampleMs = Number(cpuData.sample_ms) || 0;
     var tasks = Array.isArray(cpuData.tasks) ? cpuData.tasks.slice() : [];
     /* 按占用率降序；占比相同再按任务号，保证排序稳定。
-     * renderStatusTaskList 在集合不变时只 appendChild 调序，不重建 DOM。 */
+     * renderStatusTaskList 在集合不变时只更新 CSS order，不移动或重建 DOM。 */
     tasks.sort(function (a, b) {
       var d = (Number(b.usage_pct) || 0) - (Number(a.usage_pct) || 0);
       if (d !== 0) return d;

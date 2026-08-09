@@ -20,6 +20,8 @@ esp_err_t restart_handler(httpd_req_t *req);
 esp_err_t logs_handler(httpd_req_t *req);
 /** @brief CAN 发送（唯一入口）：同通道 1~N 帧，单帧即 frames 长度为 1。 */
 esp_err_t can_send_batch_handler(httpd_req_t *req);
+/** @brief CAN 跨通道突发发送：多帧经 0xC7 一次/多次 SPI 事务背靠背发出，近同时。 */
+esp_err_t can_send_burst_handler(httpd_req_t *req);
 esp_err_t spi_send_handler(httpd_req_t *req);
 esp_err_t system_status_handler(httpd_req_t *req);
 esp_err_t system_probe_handler(httpd_req_t *req);

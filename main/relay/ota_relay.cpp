@@ -1172,7 +1172,7 @@ bool OtaRelay::sendRelayPacketWithRetry(uint32_t seq, const uint8_t tx_buf[64], 
      *   实现“重发快且不漏”（旧逻辑见 WAIT 后只能干 poll 到 stall，ACK 丢了就永丢）。
      * - 等 ACK 期间可预组下一包（与从机处理重叠）。
      */
-    constexpr uint32_t kMaxDataSends = 3U;
+    constexpr uint32_t kMaxDataSends = 5U;
     /* 单次发送后等 ACK 上限：GD32 正常 ms 级回 ACK（ISR 回 WAIT、主循环回 ACK），
      * 50ms 未到即重发（DUP-SEQ 回放捞回），不再干等 6s（用户指定 50ms）。
      * credit==0 的排空积压由 transact 内部 credit 背压消化，此处无需长等。 */

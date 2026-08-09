@@ -14,8 +14,8 @@
 // 固件版本
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 76
-#define FW_VERSION_STRING "0.3.76"   // 重启恢复提速2：httpd就绪后再打 MAIN「启动」banner（防环缩容裁掉）；前端用 uptime<120s 判重启完成，不再干等10s
+#define FW_VERSION_PATCH 78
+#define FW_VERSION_STRING "0.3.78"   // 版本查询checkVersionWait移到tickInFlight释放后异步触发，避免/motor/version请求拖长tick导致tickStuck误报通道闪黄
 
 // Git 信息（手动填写）
 #define GIT_HASH "770ae14"

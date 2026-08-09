@@ -62,8 +62,6 @@ window.sharedFirmwareFiles = window.sharedFirmwareFiles || {
     var bleBtn = document.getElementById('modeBleBtn');
     if (wifiCards) wifiCards.style.display = isBle ? 'none' : '';
     if (bleCards) bleCards.style.display = isBle ? '' : 'none';
-    var headBtns = document.getElementById('bleHeadActions');
-    if (headBtns) headBtns.style.display = isBle ? '' : 'none';
     if (wifiBtn) wifiBtn.className = isBle ? 'btn btn-outline' : 'btn btn-primary';
     if (bleBtn) bleBtn.className = isBle ? 'btn btn-primary' : 'btn btn-outline';
     applySharedModeUi();

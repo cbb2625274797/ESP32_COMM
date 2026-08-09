@@ -477,6 +477,7 @@ esp_err_t WifiOta::httpServerStart()
         {"/system/probe",  HTTP_GET,  system_probe_handler},
         {"/system/heap_low_log", HTTP_GET,  system_heap_low_log_handler},
         {"/can/send_batch", HTTP_POST, can_send_batch_handler},
+        {"/can/send_burst", HTTP_POST, can_send_burst_handler},
         {"/can/feedback",  HTTP_GET,  can_feedback_handler},
         {"/can/mode",      HTTP_GET,  can_mode_handler},
         {"/can/mode",      HTTP_POST, can_mode_handler},

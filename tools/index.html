@@ -14,7 +14,7 @@
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="css/base.css?v=857f83a5">
 <link rel="stylesheet" href="css/layout.css?v=acd17001">
-<link rel="stylesheet" href="css/components.css?v=7bc7d5db">
+<link rel="stylesheet" href="css/components.css?v=a2c3d4e5">
 <link rel="stylesheet" href="css/can.css?v=c06f5688">
 <link rel="stylesheet" href="css/responsive.css?v=46449483">
 </head>
@@ -57,12 +57,7 @@
 
       <!-- 1. Connection -->
       <div class="card card--ble">
-        <div class="card-head"><span class="ico">🔗</span> 设备连接
-          <span id="bleHeadActions" style="display:none;margin-left:auto;">
-            <button id="connectBtn" class="btn btn-sm btn-primary">连接设备</button>
-            <button id="disconnectBtn" class="btn btn-sm btn-outline" disabled>断开连接</button>
-          </span>
-        </div>
+        <div class="card-head"><span class="ico">🔗</span> 设备连接</div>
         <div class="card-body">
           <div style="display:flex;gap:6px;margin-bottom:14px;">
             <button id="modeWifiBtn" class="btn btn-primary" style="flex:1;font-size:12px;padding:7px 10px;" data-action="set-console-mode" data-arg="wifi">WiFi OTA</button>
@@ -76,6 +71,69 @@
               <button id="testConnBtn" class="btn btn-outline" data-action="test-connection">测试</button>
             </div>
           </div>
+          </div>
+          <!-- BLE 模式：launch 风格连接按钮（checkbox 驱动：勾选=已连接） -->
+          <div id="bleModeCards" style="display:none;">
+            <div class="ble-launch-wrap">
+              <label class="ble-launch-btn" for="bleConnectToggle" data-ble-state="idle">
+                <input id="bleConnectToggle" type="checkbox">
+                <div class="back">
+                  <div class="spot-shadow"></div>
+                  <div class="mid">
+                    <div class="spot-main"></div>
+                    <div class="ble-dial">
+                      <div class="spot-light"></div>
+                      <div class="center">
+                        <div class="icon">
+                          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <g filter="url(#bleIconGlow)">
+                              <path d="M7 7 L17 17 L12 22 V2 L17 7 L7 17"
+                                    stroke="#BBE7E9" stroke-width="3"
+                                    stroke-linecap="round" stroke-linejoin="round" fill="none"
+                                    shape-rendering="geometricPrecision"/>
+                            </g>
+                            <defs>
+                              <filter id="bleIconGlow" x="-50%" y="-50%" width="200%" height="200%"
+                                      filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+                                <feFlood flood-opacity="0" result="bg"/>
+                                <feColorMatrix in="SourceAlpha" type="matrix"
+                                  values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="a"/>
+                                <feOffset/>
+                                <feGaussianBlur stdDeviation="2"/>
+                                <feComposite in2="a" operator="out"/>
+                                <feColorMatrix type="matrix"
+                                  values="0 0 0 0 0.37 0 0 0 0 0.66 0 0 0 0 1 0 0 0 0.88 0"/>
+                                <feBlend mode="normal" in2="bg" result="g"/>
+                                <feBlend mode="normal" in="SourceGraphic" in2="g" result="shape"/>
+                              </filter>
+                            </defs>
+                          </svg>
+                        </div>
+                        <div class="launch">
+                          <div style="--i:1">蓝</div>
+                          <div style="--i:2">牙</div>
+                          <div style="--i:3">连</div>
+                          <div style="--i:4">接</div>
+                        </div>
+                        <div class="start">
+                          <div class="text1">等待连接</div>
+                          <div class="text2">
+                            <span style="--n:0">已</span>
+                            <span style="--n:1">连</span>
+                            <span style="--n:2">接</span>
+                            <span style="--n:3">.</span>
+                            <span style="--n:4">.</span>
+                            <span style="--n:5">.</span>
+                          </div>
+                          <div class="text3">连接中...</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </label>
+              <div class="ble-launch-hint">点击按钮连接 / 断开蓝牙设备</div>
+            </div>
           </div>
           <!-- 连接文案只在顶栏 #pillConnTxt 显示，此处不再重复 -->
         </div>
@@ -335,12 +393,7 @@
             <div class="can-launch-actions">
               <a class="btn btn-primary can-launch-primary" href="can.html">进入 CAN 页面</a>
               <button class="btn btn-outline can-launch-secondary" type="button" onclick="window.open('can.html','_blank','noopener')">新窗口打开</button>
-              <a class="btn btn-outline can-launch-secondary" href="can.html" title="发送页右侧抽屉内嵌监控">CAN 发送 + 监控</a>
               <a class="btn btn-outline can-launch-secondary" href="can_monitor.html">监控全屏</a>
-            </div>
-            <div class="can-launch-foot">
-              <span class="can-launch-foot-label">说明</span>
-              <span>手工 CAN 表单已迁到独立页面，避免和 OTA 控制流混在一起。</span>
             </div>
           </div>
         </div>
@@ -370,12 +423,74 @@
               </div>
             </div>
             <div class="can-launch-actions">
-              <a class="btn btn-primary can-launch-primary motor-launch-primary" href="motor.html">进入电机控制</a>
               <button class="btn btn-outline can-launch-secondary" type="button" onclick="window.open('motor.html','_blank','noopener')">新窗口打开</button>
             </div>
             <div class="can-launch-foot">
               <span class="can-launch-foot-label">说明</span>
               <span>请先在上方「设备连接」配置并测试 ESP32 IP；电机页只消费同一连接，不单独建连。</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 硬件诊断:LAN9252 通断测试 + SPI 测速 -->
+      <div class="card collapsed">
+        <div class="card-head" onclick="toggleCollapse(this)">
+          <span class="ico">🧰</span> 硬件诊断
+          <span class="collapse-arrow">▼</span>
+        </div>
+        <div class="card-body">
+          <div style="display:grid;gap:14px;">
+            <!-- LAN9252 continuity test -->
+            <div class="can-launch-card">
+              <div class="can-launch-copy">
+                <div class="can-launch-top">
+                  <div>
+                    <div class="can-launch-kicker">Hardware Diag</div>
+                    <h3>LAN9252 HBI 硬件通断测试</h3>
+                  </div>
+                  <span class="can-launch-badge">DIAG</span>
+                </div>
+                <p class="can-launch-desc">GD32 驱动 EXMC 数据线/控制线输出已知电平,用万用表测 LAN9252 端引脚电压,定位断线/虚焊。通过 SPI 0xA2 命令触发,不点按钮时引脚高阻安全。与主页共用设备 IP（<code>dcu_esp_ip</code>）。</p>
+                <div class="can-launch-points">
+                  <span class="can-launch-point">16 根数据线 pattern</span>
+                  <span class="can-launch-point">5 根控制线逐个测</span>
+                  <span class="can-launch-point">共用主页连接</span>
+                </div>
+              </div>
+              <div class="can-launch-actions">
+                <button class="btn btn-outline can-launch-secondary" type="button" onclick="window.open('continuity_test.html','_blank','noopener')">新窗口打开</button>
+              </div>
+              <div class="can-launch-foot">
+                <span class="can-launch-foot-label">说明</span>
+                <span>请先在上方「设备连接」配置并测试 ESP32 IP；通断测试页只消费同一连接,不单独建连。</span>
+              </div>
+            </div>
+
+            <!-- SPI speed test -->
+            <div class="can-launch-card">
+              <div class="can-launch-copy">
+                <div class="can-launch-top">
+                  <div>
+                    <div class="can-launch-kicker">SPI Link Probe</div>
+                    <h3>SPI 链路测速</h3>
+                  </div>
+                  <span class="can-launch-badge">SPI</span>
+                </div>
+                <p class="can-launch-desc">0xA1 探针压测 ESP32↔GD32 SPI 链路真实 RTT 与等效吞吐,定位速度瓶颈与调度抖动。可调帧数/载荷,支持空载 RTT 与 2000 帧满载压力测试。</p>
+                <div class="can-launch-points">
+                  <span class="can-launch-point">RTT 平均/最快/最慢</span>
+                  <span class="can-launch-point">单帧 5 段剖析</span>
+                  <span class="can-launch-point">等效吞吐 KB/s</span>
+                </div>
+              </div>
+              <div class="can-launch-actions">
+                <a class="btn btn-outline can-launch-secondary" href="spi_test.html">打开测速页</a>
+              </div>
+              <div class="can-launch-foot">
+                <span class="can-launch-foot-label">说明</span>
+                <span>临时诊断工具 SPI-SPEEDTEST；满帧 236B = 等效电机 OTA 0xD1 数据节奏,载荷 0 = 纯握手往返。</span>
+              </div>
             </div>
           </div>
         </div>
@@ -513,7 +628,22 @@
 </div>
 
 <script type="module" src="js/app.js?v=20260727a"></script>
-<script type="module" src="js/ota/console-mode.js?v=06b7189e"></script>
-<script type="module" src="js/ble_ota.js?v=01d3cb4e"></script>
+<script type="module" src="js/ota/console-mode.js?v=06b7189f"></script>
+<script type="module" src="js/ble_ota.js?v=eb2f1a"></script>
+<!-- 内联兜底：同步 BLE 按钮 data-ble-state 与 checkbox.checked
+     不依赖 ES 模块（子模块可能被浏览器缓存为旧版，不含 data-ble-state 逻辑）。
+     connecting 态由 session.js click handler 设置，此处跳过不覆盖。 -->
+<script type="module">
+  setInterval(function() {
+    var btn = document.querySelector('.ble-launch-btn');
+    if (!btn || !btn.offsetParent) return;
+    var st = btn.getAttribute('data-ble-state');
+    if (st === 'connecting') return;
+    var toggle = document.getElementById('bleConnectToggle');
+    if (!toggle) return;
+    var expected = toggle.checked ? 'connected' : 'idle';
+    if (st !== expected) btn.setAttribute('data-ble-state', expected);
+  }, 500);
+</script>
 </body>
 </html>

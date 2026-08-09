@@ -1330,6 +1330,234 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * @brief POST /can/send_burst — CAN 跨通道突发发送（一次 SPI 事务多帧近同时）。
+ *
+ * JSON: { "suffix": 512, "dlc": 32, "frames": [ { "ch":0, "node":1, "data":"HEX" }, ... ] }
+ *   suffix = CAN ID 低 16 位（CMD=0x0200），id=(node<<16)|suffix；dlc 为本批统一数据长度。
+ *   frames 可超过单次突发容量：内部按 canBurstCapacity(dlc) 分块，块与块之间背靠背
+ *   连续发起 SPI 事务（间隔 ~<1ms），实现「组内近同时、组间尽量紧」的多电机同步驱动。
+ *
+ * 返回: { "status":"ok","sent":N,"results":[ {"status":"ok"} | {"status":"error","code":c,"gd32_err":g}, ... ] }
+ *   单帧总线故障(0xE2/0xE3)/邮箱满(0xE4)等经 ACK 的每帧状态字节透传，前端据此处理冷却。
+ */
+esp_err_t can_send_burst_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    constexpr int      kMaxTotalFrames  = 24;    /* 单次请求帧数上限（一步同步电机数上限） */
+    constexpr uint32_t kBurstTimeoutMs  = 200U;  /* 单次突发 SPI 事务超时 */
+    constexpr int      kMaxBody         = 49152;
+
+    int content_len = req->content_len;
+    if (content_len <= 0 || content_len > kMaxBody) {
+        return http_send_json_error(req, "400 Bad Request", "bad_body",
+                                    "body 长度无效或过大");
+    }
+
+    BatchBodyReader reader(req, content_len);
+
+    auto findKey = [&](const char *key) -> bool {
+        const size_t kl = strlen(key);
+        size_t match = 0;
+        int c;
+        while ((c = reader.nextChar()) != -1) {
+            if (c == key[match]) {
+                if (++match == kl) return true;
+            } else {
+                match = (c == key[0]) ? 1 : 0;
+            }
+        }
+        return false;
+    };
+    auto skipWs = [&]() {
+        int c;
+        while ((c = reader.peekChar()) != -1) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                reader.nextChar();
+            } else {
+                break;
+            }
+        }
+    };
+    auto findChar = [&](char target) -> bool {
+        int c;
+        while ((c = reader.nextChar()) != -1) {
+            if (c == target) return true;
+        }
+        return false;
+    };
+    auto readInt = [&]() -> long {
+        skipWs();
+        long sign = 1;
+        int c = reader.peekChar();
+        if (c == '-') { reader.nextChar(); sign = -1; }
+        long v = 0;
+        while ((c = reader.peekChar()) != -1 && c >= '0' && c <= '9') {
+            v = v * 10 + (c - '0');
+            reader.nextChar();
+        }
+        return v * sign;
+    };
+    char frameJson[320];
+    auto readFrameObj = [&]() -> int {
+        skipWs();
+        int c = reader.peekChar();
+        if (c != '{') return -1;
+        reader.nextChar();
+        frameJson[0] = '{';
+        size_t n = 1;
+        int depth = 1;
+        while ((c = reader.nextChar()) != -1) {
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    if (n + 1 >= sizeof(frameJson)) return -1;
+                    frameJson[n++] = '}';
+                    frameJson[n] = '\0';
+                    return (int)n;
+                }
+            }
+            if (n + 1 >= sizeof(frameJson)) return -1;
+            frameJson[n++] = (char)c;
+        }
+        return -1;
+    };
+
+    /* ── prefix：suffix / dlc / frames ── */
+    if (!findKey("\"suffix\"") || !findChar(':')) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "缺少 suffix 字段");
+    }
+    long suffix_val = readInt();
+    if (!findKey("\"dlc\"") || !findChar(':')) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "缺少 dlc 字段");
+    }
+    long dlc_val = readInt();
+    if (dlc_val < 0 || dlc_val > CAN_MAX_DLC) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "dlc 超出范围");
+    }
+    if (!findKey("\"frames\"") || !findChar('[')) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "缺少 frames 字段");
+    }
+
+    const uint8_t  dlc    = static_cast<uint8_t>(dlc_val);
+    const uint16_t suffix = static_cast<uint16_t>(suffix_val & 0xFFFF);
+    const uint8_t  cap    = canBurstCapacity(dlc);
+    if (cap == 0U) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "dlc 过大无法突发");
+    }
+
+    /* 静态缓冲：httpd 单线程，避免大栈占用 */
+    static uint8_t s_chnode[kMaxTotalFrames];
+    static uint8_t s_data[kMaxTotalFrames][CAN_MAX_DLC];
+    static uint8_t s_status[kMaxTotalFrames];
+
+    int total = 0;
+    while (total < kMaxTotalFrames) {
+        skipWs();
+        int c = reader.peekChar();
+        if (c == -1 || c == ']') break;
+        if (c == ',') { reader.nextChar(); continue; }
+        if (c != '{') { reader.nextChar(); continue; }
+        int flen = readFrameObj();
+        if (flen <= 0) break;
+
+        JsonView fr = jsonParse(frameJson);
+        if (!fr.valid) {
+            return http_send_json_error(req, "400 Bad Request", "bad_frame", "帧 JSON 非法");
+        }
+        JsonView ch_it   = jsonGet(&fr, "ch");
+        JsonView node_it = jsonGet(&fr, "node");
+        JsonView data_it = jsonGet(&fr, "data");
+        if (!jsonIsNumber(&ch_it) || !jsonIsNumber(&node_it)) {
+            return http_send_json_error(req, "400 Bad Request", "bad_frame", "帧缺少 ch/node");
+        }
+        const int chv   = static_cast<int>(jsonGetNumberValue(&ch_it));
+        const int nodev = static_cast<int>(jsonGetNumberValue(&node_it));
+        if (chv < 0 || chv >= CAN_CHANNEL_MAX) {
+            return http_send_json_error(req, "400 Bad Request", "bad_frame", "ch 非法(0~2)");
+        }
+
+        uint8_t data_buf[CAN_MAX_DLC];
+        uint8_t nbytes = 0U;
+        if (jsonIsString(&data_it)) {
+            size_t hex_len = 0U;
+            const char *hex = jsonGetStringValue(&data_it, &hex_len);
+            if (hex) {
+                nbytes = static_cast<uint8_t>(
+                    http_hex_to_bytes_n(hex, hex_len, data_buf, CAN_MAX_DLC));
+            }
+        }
+        if (nbytes != dlc) {
+            return http_send_json_error(req, "400 Bad Request", "bad_frame",
+                                        "帧 data 长度与 dlc 不一致");
+        }
+        s_chnode[total] = static_cast<uint8_t>(((chv & 0x0F) << 4) | (nodev & 0x0F));
+        if (dlc > 0U) {
+            memcpy(s_data[total], data_buf, dlc);
+        }
+        total++;
+    }
+    if (total == 0) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "frames 为空");
+    }
+
+    /* ── 分块背靠背突发发送 ── */
+    pauseCanFeedbackTask(true);
+    bool aborted = false;
+    for (int off = 0; off < total && !aborted; off += cap) {
+        const int n = ((total - off) > cap) ? cap : (total - off);
+        can_burst_entry_t entries[CAN_BURST_HARD_MAX];
+        for (int i = 0; i < n; ++i) {
+            entries[i].chnode = s_chnode[off + i];
+            entries[i].data   = s_data[off + i];
+        }
+        uint8_t chunk_status[CAN_BURST_HARD_MAX];
+        uint8_t gerr = 0U;
+        (void)esp_task_wdt_reset();
+        const int rc = canFdSendBurst(suffix, dlc, entries, static_cast<uint8_t>(n),
+                                      chunk_status, sizeof(chunk_status),
+                                      kBurstTimeoutMs, &gerr);
+        if (rc < 0) {
+            /* SPI 失败/协议错误：本块及之后标记失败并中止 */
+            const uint8_t code = (rc == -3) ? gerr : 0xEEU;
+            for (int i = 0; i < n; ++i) s_status[off + i] = code;
+            for (int j = off + n; j < total; ++j) s_status[j] = 0xEEU;
+            aborted = true;
+            break;
+        }
+        for (int i = 0; i < n; ++i) s_status[off + i] = chunk_status[i];
+    }
+    pauseCanFeedbackTask(false);
+
+    /* ── 组装 JSON 响应 ── */
+    static char resp_buf[1600];
+    int off = snprintf(resp_buf, sizeof(resp_buf),
+                       "{\"status\":\"ok\",\"sent\":%d,\"results\":[", total);
+    for (int i = 0; i < total; ++i) {
+        const uint8_t st = s_status[i];
+        int w;
+        if (st == 0x00U) {
+            w = snprintf(resp_buf + off, sizeof(resp_buf) - off,
+                         "%s{\"status\":\"ok\"}", (i == 0) ? "" : ",");
+        } else {
+            w = snprintf(resp_buf + off, sizeof(resp_buf) - off,
+                         "%s{\"status\":\"error\",\"code\":-3,\"gd32_err\":%u}",
+                         (i == 0) ? "" : ",", (unsigned)st);
+        }
+        if (w < 0 || off + w >= (int)sizeof(resp_buf)) break;
+        off += w;
+    }
+    if (off < (int)sizeof(resp_buf) - 2) {
+        resp_buf[off++] = ']';
+        resp_buf[off++] = '}';
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp_buf, off);
+}
+
 esp_err_t spi_send_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);

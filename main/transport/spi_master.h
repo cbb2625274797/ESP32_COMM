@@ -322,6 +322,10 @@ private:
     volatile bool m_suppressRingService = false;
     /** ESP32 自我 OTA 期间为 true：worker 空转、submitJob 快速拒绝。 */
     volatile bool m_spiPaused = false;
+    /** GD32 重启检测（响应帧 session=0）置位：worker 空闲时 HELLO 重同步。 */
+    volatile bool m_resyncPending = false;
+    /** 上次 HELLO 重同步时刻（冷却 5s，防 GD32 不响应时反复 HELLO）。 */
+    volatile uint32_t m_lastResyncTick = 0;
     /** 最近一次主动请求类型（otaTransferUnlocked 发送时记录；poll 读预算按它收紧）。 */
     volatile uint8_t m_lastReqType = 0xFFU;
     /** SPI worker 任务句柄（ISR 唯一通知目标）。 */

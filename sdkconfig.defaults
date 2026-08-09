@@ -14,7 +14,9 @@ CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 
 # DCU SPI clock -- 13.3 MHz（2026-08-02：80MHz/6 整除，比 12M 再省 ~8%；
 #   半周期 37.5ns，MISO 输出延迟 + GPIO 矩阵延迟 ~45ns 预算已近上限，需实测；
-#   ≥16MHz 全双工不可行。写 13333333：若写 13000000 驱动取整 80/7=11.4M 反而更慢）
+#   ≥16MHz 全双工不可行。写 13333333：若写 13000000 驱动取整 80/7=11.4M 反而更慢。
+#   2026-08-09 注：曾怀疑 13.33M 是 relay 重发率高（~4.4%）的根因，改 12M 实测
+#   重发率几乎不变 → 时钟不是主因，回到 13.33M，继续找逻辑层瓶颈。）
 CONFIG_DCU_SPI_CLOCK_HZ=13333333
 
 # GD32 OTA 包间节奏：不用固定 PACKET_INTERVAL；依赖 SpiMaster CREDIT 背压
@@ -98,9 +100,13 @@ CONFIG_BT_NIMBLE_SVC_GAP_PPCP_MAX_CONN_INTERVAL=16
 CONFIG_BT_NIMBLE_SVC_GAP_PPCP_SLAVE_LATENCY=0
 CONFIG_BT_NIMBLE_SVC_GAP_PPCP_SUPERVISION_TMO=200
 
-# Brownout detector threshold (LVL5)
+# Brownout detector threshold (LVL7, ~2.8V)
+# 长时间断电后 CHIP_EN RC 充电慢，LVL5 可能停在半复位状态；提高到 LVL7 确保电源稳定后才启动。
 CONFIG_ESP_BROWNOUT_DET=y
-CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5=y
+# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5 is not set
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
+# CONFIG_ESP32C3_BROWNOUT_DET_LVL_SEL_5 is not set
+CONFIG_ESP32C3_BROWNOUT_DET_LVL_SEL_7=y
 
 # ── 控制台/调试 UART 波特率 3M（debug_log.h UART_DEBUG_BAUD_RATE 与此对齐）──
 # 注意：仅改 defaults 不会覆盖已有 sdkconfig，构建前须同步写入 sdkconfig 或删 sdkconfig 重生。

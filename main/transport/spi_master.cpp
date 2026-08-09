@@ -70,15 +70,17 @@ static size_t spiRespReadBudget(void)
 
 /**
  * @brief 已知"短响应"的主动请求类型：应答帧 ≤ ~70B（实测 0xA1 PING ~60-70B、
- * DATA/REQ/FINISH ACK ~30-40B、0xB5/0xC0/0xC2/0xD1 ACK 均短）。
+ * DATA/REQ/FINISH ACK ~30-40B、0xB5/0xC0/0xC2/0xD1 ACK 均短、0xC4 ADC 20B）。
  * 对这些类型的主动 poll 可把读预算从 256 收紧到 96B，省 ~160B 0xFF 填充时钟
- * （@13.3MHz ≈ 96µs/帧）。排除 0xC3（ID 快照响应可能很长）与被动 0xC1 事件读。
+ * （@13.3MHz ≈ 96µs/帧）。排除 0xC3（ID 快照响应可能很长）、0xC1/0xC5
+ * （分页响应 ~236B）与被动 0xC1 事件读。
  */
 static bool isShortRespType(uint8_t type)
 {
     switch (type) {
     case 0xA1U: case 0x02U: case 0x01U: case 0xF7U:
     case 0xB0U: case 0xC0U: case 0xC2U: case 0xD1U:
+    case 0xC4U: case 0xC7U:
         return true;
     default:
         return false;
@@ -86,6 +88,24 @@ static bool isShortRespType(uint8_t type)
 }
 /** 短响应读预算（覆盖最长 ~70B 应答 + 余量）。 */
 static constexpr size_t kShortRespReadBudget = 96U;
+
+/**
+ * @brief 已知 GD32 APP 在 onCsRelease ISR 内 µs 级装载响应的主动请求类型。
+ * 这些类型 CS 释放后无需 5ms 静默：waitSpiDataReady 由下降沿 ISR 精确唤醒
+ * （与 0xD1/0xA1 同机制）。仅 BOOT 主循环处理的 OTA 命令（0x01/0x02/0x03）
+ * 保留 5ms——过早盲读会打断 BOOT 的 EXTI/DMA 时序（实测 CHALLENGE 超时）。
+ */
+static bool isAppIsrFastRespType(uint8_t type)
+{
+    switch (type) {
+    case 0xA1U: case 0xC0U: case 0xC1U: case 0xC2U:
+    case 0xC3U: case 0xC4U: case 0xC5U: case 0xC7U: case 0xD1U:
+    case 0xF7U:
+        return true;
+    default:
+        return false;
+    }
+}
 
 /** APP 独有业务 TYPE：见到即可纠正 m_gd32Role（BOOT 不会发这些）。 */
 bool SpiMaster::isAppOnlySpiType(uint8_t type)
@@ -646,6 +666,19 @@ void SpiMaster::workerLoop()
             continue;
         }
 
+        /* 无 job：先处理 GD32 重启重同步（session=0 响应置位；5s 冷却防空转）。
+         * OTA 中继/暂停期间不 HELLO，避免干扰在途 OTA 事务。 */
+        if (m_resyncPending && !m_suppressRingService && !m_spiPaused) {
+            const TickType_t now_tick = xTaskGetTickCount();
+            if ((uint32_t)(now_tick - m_lastResyncTick) >= pdMS_TO_TICKS(5000)) {
+                m_lastResyncTick = now_tick;
+                m_resyncPending = false;
+                DEBUG_INFO("SPI", "GD32 session=0，HELLO 重同步...");
+                (void)hello(1500U, 0U);
+                continue;
+            }
+        }
+
         /* 无 job：等 GPIO / 提交唤醒。
          * 超时只是无事件时的兜底回扫周期；ISR 的 xTaskNotifyFromISR 会立即唤醒
          * 本任务，响应延迟不由这里决定。过短会令 spi_worker(优先级6) 忙转压住
@@ -981,6 +1014,9 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
                     DEBUG_WARN("SPI", "GD32 session=0 (对端已重启?) 放行 RESPONSE t=0x%02X #%lu",
                                hdr.type, (unsigned long)s_sess0_logs);
                 }
+                /* GD32 重启后 v2 未激活：置重同步标志，worker 空闲时 HELLO 重建 session。
+                 * 功能由 session=0 放行兜底，重同步只是把链路拉回校验态。 */
+                self.m_resyncPending = true;
             }
             static uint32_t s_evt_sess0_logs = 0U;
             if (is_event && (++s_evt_sess0_logs % 64U) == 1U) {
@@ -1641,13 +1677,13 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         }
 
         /* CS 释放后的静默期分型处理：
-         * - 0xD1（电机 OTA 数据）/ 0xA1（APP PING）：GD32 APP 在 onCsRelease ISR
-         *   内 µs 级装好响应并拉低 PB6 → 零盲等，waitSpiDataReady 由下降沿 ISR
-         *   精确唤醒，旧 1ms 固定延时压制喂速～47KB/s，现由事件驱动提速。
-         * - 其他类型（GD32 relay/BOOT AES/HELLO 等）：保留 5ms——BOOT 在主循环
+         * - APP ISR 响应类型（0xC1/0xC4/0xC5 查询、0xD1 电机 OTA、0xA1 PING 等）：
+         *   GD32 APP 在 onCsRelease ISR 内 µs 级装好响应并拉低 PB6 → 零盲等，
+         *   waitSpiDataReady 由下降沿 ISR 精确唤醒（见 isAppIsrFastRespType）。
+         * - 其他类型（BOOT OTA 命令 0x01/0x02/0x03 等）：保留 5ms——BOOT 在主循环
          *   处理 CHALLENGE/flash，poll 前 2 轮盲读 CS 过早打进去会打断其
          *   EXTI/DMA 时序（实测去掉后 CHALLENGE 超时）。 */
-        if (type != 0xD1U && type != 0xA1U) {
+        if (!isAppIsrFastRespType(type)) {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
 

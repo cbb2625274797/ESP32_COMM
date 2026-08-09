@@ -1,13 +1,16 @@
 /*
- * can_feedback_task.cpp - 被动监听 GD32 主动推送的事件
+ * can_feedback_task.cpp - GD32 周期查询 + 事件消费任务
  *
  * 架构（2026-08 改造后）：
- *   0xC1 CAN 反馈已改为请求驱动（前端请求时 ESP32 主动向 GD32 查询），
- *   不再被动缓存。本任务仅保留 0xC4/0xC5/0xC6/0xD2 事件分发：
- *     0xC4 ADC 调试反馈、0xC5 多电机状态、0xC6 多电机版本、0xD2 电机 OTA 进度
- *   这些仍由 GD32 主动推送，ESP32 被动接收。
+ *   0xC1 CAN 反馈：请求驱动（HTTP 侧 canFdQueryFeedback），本任务不处理。
+ *   0xC4 ADC / 0xC5 电机状态：由 GD32 主动按铃推送改为本任务周期查询——
+ *     0xC5 每 250ms 查 6 页、0xC4 每 1s 查 1 帧，查询响应 payload 格式与推送
+ *     一致，复用 onMotorStateEvent()/onGd32AdcFeedbackEvent() 解析入库。
+ *     消除 OTA 期间 GD32 悬空按铃（ESP32 抑制 ring 不读）导致“按铃超时取消”刷屏。
+ *   0xC6 电机版本 / 0xD2 电机 OTA 进度：仍由 GD32 事件驱动推送，本任务 takeEvent 消费。
  *
- *   OTA 期间通过 pauseCanFeedbackTask(true) 暂停本任务，避免与 OTA 抢占 SPI。
+ *   OTA 期间通过 pauseCanFeedbackTask(true) 暂停本任务（不查询不消费）；
+ *   电机 OTA 期间（motorOtaIsActive()）也暂停，避免与 0xD1 喂数抢占 SPI。
  */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,78 +30,127 @@
 
 namespace {
 
-constexpr uint32_t kWaitRingMs      = 500U;    ///< 单次等待 GD32 按铃超时
-constexpr uint32_t kPauseDelayMs    = 100U;    ///< 暂停时的轮询间隔
-constexpr uint8_t  kSpiAdcFeedbackType = 0xC4U;  ///< GD32 ADC 调试反馈
-constexpr uint8_t  kSpiMotorStateType  = 0xC5U;  ///< GD32 多电机状态推送
-constexpr uint8_t  kSpiMotorVersionType = 0xC6U; ///< GD32 多电机版本推送（事件驱动）
-constexpr uint8_t  kSpiMotorOtaStatusType = 0xD2U; ///< GD32 电机 OTA relay 进度推送
-constexpr size_t   kRingPayloadMax  = SPI_OTA_FRAME_MAX;  ///< 与变长读一致，避免截断
-constexpr const char *kTag           = "CAN_FB";
+constexpr uint32_t kQueryMotorStateMs = 250U;   ///< 0xC5 电机状态查询周期
+constexpr uint32_t kQueryAdcMs        = 1000U;  ///< 0xC4 ADC 查询周期
+constexpr uint32_t kEventWaitMs       = 20U;    ///< 单次等 0xC6/0xD2 事件超时
+constexpr uint32_t kPauseDelayMs      = 100U;   ///< 暂停时的轮询间隔
+constexpr uint8_t  kSpiAdcFeedbackType    = 0xC4U;  ///< GD32 ADC 调试反馈
+constexpr uint8_t  kSpiMotorStateType     = 0xC5U;  ///< GD32 多电机状态查询
+constexpr uint8_t  kSpiMotorVersionType   = 0xC6U;  ///< GD32 多电机版本推送（事件驱动）
+constexpr uint8_t  kSpiMotorOtaStatusType = 0xD2U;  ///< GD32 电机 OTA relay 进度推送
+constexpr size_t   kPayloadMax = SPI_OTA_FRAME_MAX; ///< 与变长读一致，避免截断
+constexpr const char *kTag     = "CAN_FB";
 
 static volatile bool s_paused = false;
 
 /**
- * @brief can_fb 任务主循环：takeEvent 分发 0xC4/0xC5/0xC6/0xD2 推送事件。
- *   0xC1 CAN 反馈已改为请求驱动（canFdQueryFeedback），不再在此处理。
+ * @brief 按页查询 GD32 电机状态（0xC5 请求驱动，替代 GD32 250ms 推送）。
+ *   任一页失败立即中断本轮：GD32 未就绪/瞬时错误时不空耗 6×200ms，下轮再试；
+ *   page0 会刷新全局字段（active_count/boot_active），部分页成功即部分更新。
+ */
+static void queryMotorStatePages(void)
+{
+    uint8_t req[1] = {0U};
+    for (uint8_t page = 0U; page < MOTOR_TOTAL_PAGES; ++page) {
+        req[0] = page;
+        uint8_t resp_type = 0U;
+        uint8_t resp_buf[kPayloadMax] = {};
+        size_t resp_len = 0U;
+        esp_err_t err = SpiMaster::instance().transact(
+            kSpiMotorStateType, req, sizeof(req),
+            &resp_type, resp_buf, sizeof(resp_buf), &resp_len, 200U);
+        if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK ||
+            resp_len < MOTOR_PAGE_HEADER) {
+            return;
+        }
+        (void)onMotorStateEvent(resp_buf, resp_len);
+    }
+}
+
+/**
+ * @brief 查询 GD32 ADC 调试快照（0xC4 请求驱动，替代 GD32 1Hz 推送）。
+ *   GD32 0xC4 handler 回自身类型 0xC4（异于 0xC1/0xC5 的 0x80），两者皆接受。
+ */
+static void queryAdcFeedback(void)
+{
+    uint8_t req[1] = {0U};
+    uint8_t resp_type = 0U;
+    uint8_t resp_buf[kPayloadMax] = {};
+    size_t resp_len = 0U;
+    esp_err_t err = SpiMaster::instance().transact(
+        kSpiAdcFeedbackType, req, sizeof(req),
+        &resp_type, resp_buf, sizeof(resp_buf), &resp_len, 200U);
+    if (err != ESP_OK || resp_len < 1U) {
+        return;
+    }
+    if (resp_type != kSpiAdcFeedbackType && resp_type != SPI_OTA_RSP_ACK) {
+        return;
+    }
+    (void)onGd32AdcFeedbackEvent(resp_buf, resp_len);
+}
+
+/**
+ * @brief 消费剩余事件驱动推送（0xC6 电机版本 / 0xD2 电机 OTA 进度）。
+ *   0xC4/0xC5 已改请求驱动，不再有对应推送；未知类型静默跳过。
+ */
+static void drainPushEvents(uint32_t wait_ms)
+{
+    uint8_t ring_type = 0U;
+    uint8_t ring_payload[kPayloadMax] = {};
+    size_t ring_len = 0U;
+    if (!SpiMaster::instance().takeEvent(&ring_type, ring_payload,
+                                         sizeof(ring_payload), &ring_len,
+                                         wait_ms)) {
+        return;
+    }
+    if (ring_type == kSpiMotorVersionType) {
+        (void)onMotorVersionEvent(ring_payload, ring_len);
+    } else if (ring_type == kSpiMotorOtaStatusType) {
+        onMotorOtaStatusPush(ring_payload, ring_len);
+    }
+}
+
+/**
+ * @brief can_fb 任务主循环：周期查询 0xC5/0xC4 + 消费 0xC6/0xD2 推送。
+ *   OTA / 电机 OTA 期间暂停，SPI 交由 OTA 独占。
  */
 static void taskLoop(void *)
 {
-    DEBUG_INFO(kTag, "事件监听任务启动 (0xC4 ADC / 0xC5 motor / 0xC6 ver / 0xD2 ota)");
+    DEBUG_INFO(kTag, "请求驱动查询任务启动 (0xC5 250ms / 0xC4 1s / 0xC6,0xD2 推送)");
 
-    /* 冷启动延后开始监听，错开上电初始化窗口 */
+    /* 冷启动延后开始查询，错开上电初始化窗口 */
     {
         esp_reset_reason_t rr = esp_reset_reason();
         if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
             constexpr uint32_t kCanFbDeferMs = 1500U;
-            DEBUG_INFO(kTag, "冷启动: %lu ms 后开始事件监听",
+            DEBUG_INFO(kTag, "冷启动: %lu ms 后开始查询",
                        (unsigned long)kCanFbDeferMs);
             vTaskDelay(pdMS_TO_TICKS(kCanFbDeferMs));
         }
     }
 
-    uint8_t  ring_type = 0U;
-    uint8_t  ring_payload[kRingPayloadMax] = {};
-    size_t   ring_len = 0U;
+    TickType_t last_motor_q = xTaskGetTickCount();
+    TickType_t last_adc_q   = xTaskGetTickCount();
 
     for (;;) {
-        if (s_paused) {
+        if (s_paused || motorOtaIsActive()) {
             vTaskDelay(pdMS_TO_TICKS(kPauseDelayMs));
             continue;
         }
 
-        /* 阻塞等待 GD32 按铃事件（超时则重试） */
-        if (!SpiMaster::instance().takeEvent(&ring_type, ring_payload,
-                                             sizeof(ring_payload), &ring_len,
-                                             kWaitRingMs)) {
-            continue;
+        /* 周期查询：到期才执行（时间差对比，暂停恢复后立即补一次） */
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - last_motor_q) >= pdMS_TO_TICKS(kQueryMotorStateMs)) {
+            queryMotorStatePages();
+            last_motor_q = xTaskGetTickCount();
+        }
+        if ((now - last_adc_q) >= pdMS_TO_TICKS(kQueryAdcMs)) {
+            queryAdcFeedback();
+            last_adc_q = xTaskGetTickCount();
         }
 
-        /* 0xC4 ADC 调试反馈：GD32 关开关则不推；ESP32 始终可解析（无本地开关） */
-        if (ring_type == kSpiAdcFeedbackType) {
-            (void)onGd32AdcFeedbackEvent(ring_payload, ring_len);
-            continue;
-        }
-
-        /* 0xC5 多电机状态推送：GD32 250ms 分页推送，ESP32 解析入缓存 */
-        if (ring_type == kSpiMotorStateType) {
-            (void)onMotorStateEvent(ring_payload, ring_len);
-            continue;
-        }
-
-        /* 0xC6 多电机版本推送：GD32 收到电机版本应答(0x00FF)后事件驱动推送 */
-        if (ring_type == kSpiMotorVersionType) {
-            (void)onMotorVersionEvent(ring_payload, ring_len);
-            continue;
-        }
-
-        /* 0xD2 电机 OTA relay 进度推送 */
-        if (ring_type == kSpiMotorOtaStatusType) {
-            onMotorOtaStatusPush(ring_payload, ring_len);
-            continue;
-        }
-
-        /* 0xC1 已改为请求驱动，不再在此处理；未知类型静默跳过 */
+        /* 消费 0xC6/0xD2：短阻塞等 worker 入队（事件驱动唤醒） */
+        drainPushEvents(kEventWaitMs);
     }
 }
 
@@ -130,7 +182,7 @@ bool startCanFeedbackTask()
 }
 
 /**
- * @brief 暂停/恢复事件监听。
+ * @brief 暂停/恢复周期查询与事件消费。
  * @param pause true=OTA 期间暂停；false=恢复
  */
 void pauseCanFeedbackTask(bool pause)
@@ -138,9 +190,9 @@ void pauseCanFeedbackTask(bool pause)
     if (s_paused == pause) return;  // 幂等：状态未变时不重复日志
     s_paused = pause;
     if (pause) {
-        DEBUG_DBG(kTag, "事件监听已暂停（OTA 进行中）");
+        DEBUG_DBG(kTag, "周期查询已暂停（OTA 进行中）");
     } else {
-        DEBUG_DBG(kTag, "事件监听已恢复");
+        DEBUG_DBG(kTag, "周期查询已恢复");
     }
 }
 

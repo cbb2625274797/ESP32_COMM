@@ -6,7 +6,7 @@
 <title>电机控制台 — Motor CAN FD Console</title>
 <!-- 空 favicon：阻止浏览器自动请求 /favicon.ico（本地静态服务无此文件会 404） -->
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/motor.css?v=20260730a">
+<link rel="stylesheet" href="css/motor.css?v=20260808c">
 </head>
 <body>
 
@@ -144,6 +144,7 @@
       <button class="tab-btn" data-tab="version">版本信息</button>
       <button class="tab-btn" data-tab="nodeid">节点 ID</button>
       <button class="tab-btn" data-tab="ota">电机 OTA</button>
+      <button class="tab-btn" data-tab="seq">命令序列</button>
     </nav>
     <div class="tab-content">
       <!-- CONFIG TAB -->
@@ -231,6 +232,27 @@
           <div class="log-info">[就绪] 电机 Bootloader OTA · 先上传固件到 ESP32 → 发 0x000N0000 进 BOOT → 触发转发 → GD32 本地 relay（AES-128 + CAN stop-and-wait）</div>
           <div>[信息] 选固件 → 上传并比对 flash SHA-256（失败重传≤2次）→ 发进BOOT命令 → 触发 /motor/ota/relay → GD32 完成握手/加密/传输 · 每包 48 B · 48 KB 上限</div>
         </div>
+      </div>
+      <!-- 命令序列 TAB -->
+      <div class="tab-page" id="tab-seq">
+        <div class="seq-toolbar">
+          <label class="repeat-period" title="整序列循环次数，0 = 无限循环">
+            <span>循环</span>
+            <input type="number" id="seqLoops" value="0" min="0" max="9999" step="1" />
+            <span>次（0=无限）</span>
+          </label>
+          <button class="btn btn-sm" id="seqAddBtn">+ 添加步骤</button>
+          <button class="btn btn-sm" id="seqClearBtn">清空</button>
+          <button class="btn" id="seqStartBtn">▶ 开始序列</button>
+          <span class="seq-status" id="seqStatus">未运行</span>
+        </div>
+        <div class="seq-list" id="seqList"></div>
+        <p class="seq-hint">
+          命令序列：每步为一个「同步动作组」，组内每个动作 = 一台电机目标（通道/节点/模式/电压/电流/速度/角度/PID）；
+          执行本步时组内全部动作经一次突发请求近同时下发（同组偏差微秒级；超过单次容量自动分组，组间约 1-2ms），
+          发送成功后保持「保持 ms」再进入下一步。每步可「+」添加多个电机动作，支持多通道、多电机混合搭配，独立于左侧选中节点。
+          循环 0 = 无限循环，与「周期发送」互斥。「+ 添加步骤」会复制当前 CMD 表单已提交的值及当前通道/选中节点。
+        </p>
       </div>
     </div>
   </section>
@@ -345,6 +367,6 @@
   </div>
 </div>
 
-<script type="module" src="js/motor/main.js?v=20260801b"></script>
+<script type="module" src="js/motor/main.js?v=20260808d"></script>
 </body>
 </html>

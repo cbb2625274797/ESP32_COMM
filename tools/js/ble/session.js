@@ -111,8 +111,45 @@ export async function abortTask() {
 }
 
 export function bindEvents() {
-  els.connectBtn.addEventListener('click', connectBle);
-  els.disconnectBtn.addEventListener('click', disconnectBle);
+  if (els.bleConnectToggle) {
+    // launch 风格按钮：用 click 而非 change 触发——navigator.bluetooth.requestDevice
+    // 必须在 user gesture 内调用，change 事件不被识别为 user gesture，会报
+    // "Must be handling a user gesture to show a permission request."
+    // preventDefault 阻止 label 默认勾选，checked 由 setConnectionState 按实际结果驱动。
+    els.bleConnectToggle.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (state._bleConnecting) return;          // 连接进行中，忽略重复点击
+      var btn = document.querySelector('.ble-launch-btn');
+      if (state.server) {
+        els.bleConnectToggle.checked = false;
+        if (btn) btn.setAttribute('data-ble-state', 'idle');
+        disconnectBle();                          // → resetUiAfterDisconnect 置 idle
+      } else {
+        state._bleConnecting = true;
+        els.bleConnectToggle.checked = true;     // 即时视觉反馈
+        if (btn) btn.setAttribute('data-ble-state', 'connecting');
+        // 连接结束后按实际结果收口：成功→connected / 失败→idle
+        // 不依赖 state.js 的 setConnectionState（ES 模块子导入可能被浏览器缓存为旧版）
+        connectBle().finally(() => {
+          state._bleConnecting = false;
+          var b = document.querySelector('.ble-launch-btn');
+          if (b) b.setAttribute('data-ble-state', state.server ? 'connected' : 'idle');
+        });
+      }
+    });
+
+    // 兜底：自动断开（onDisconnected）、重连等路径绕过 click handler，
+    // 用轮询同步 data-ble-state，确保按钮状态始终与 state.server 一致。
+    setInterval(function() {
+      if (state._bleConnecting) return;            // 连接中不干扰
+      var btn = document.querySelector('.ble-launch-btn');
+      if (!btn || !btn.offsetParent) return;        // 按钮不可见（WiFi 模式）时跳过
+      var expected = state.server ? 'connected' : 'idle';
+      if (btn.getAttribute('data-ble-state') !== expected) {
+        btn.setAttribute('data-ble-state', expected);
+      }
+    }, 800);
+  }
   els.autoFlashBtn.addEventListener('click', autoFlash);
   els.abortBtn.addEventListener('click', abortTask);
   // 上传区事件由 app.js 的 setupSharedUploadZone 统一处理

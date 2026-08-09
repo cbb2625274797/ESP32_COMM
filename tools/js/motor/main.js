@@ -6,7 +6,7 @@
 /* ═══════════════════════════════════════════════════════════════
    电机控制台 — 共用 OTA 主页设备 IP（localStorage dcu_esp_ip），本页无连接配置
    数据源:
-     GET  /motor/state     1Hz  → 节点列表 + STATUS 解码
+     GET  /motor/state     refreshIntervalMs 驱动（默认 250ms，50~5000 可调）→ 节点列表 + STATUS 解码
      POST /can/send_batch  唯一发送入口（CMD / CONFIG / VERSION / OTA）
      GET  /can/feedback    1Hz  → 状态栏 RX/TX/ERR/TEC/REC/BUS
      GET  /system/status   进入页自动探测 + 5s 健康检查 / 断线 2s 探测
@@ -74,6 +74,8 @@ const state = {
   poll: { tick: null, probe: null, status: null, feedback: null },
   pollGen: 0,              // 递增使在途 tick 失效
   tickInFlight: false,
+  tickStuck: 0,             // 连续未按时完成的 motor 轮询拍数（>0 = 卡顿，通道下拉框变黄）
+  versionWait: null,        // 挂载到主 tick 的版本等待 {node,prevSeq,deadline,resolve,reject}；命中/超时由 pollLoop 检查
   feedbackInFlight: false, // /can/feedback 独立链路占用标记
   statusInFlight: false,   // /system/status 独立链路占用标记
   failCount: 0,            // 连续硬失败计数，达阈值才断线
@@ -81,6 +83,7 @@ const state = {
   lastConnToastAt: 0,      // toast 去抖
   offlineSince: 0,         // 进入离线时刻，短离线恢复不 toast
   tickN: 0,                // 轮询序号（每 5 轮附带 status）
+  recvTs: [],               // 最近 N 次数据到达时间戳滑动窗口（用于计算实际接收 Hz）
   statusTickN: 0,           // status lite/full 交替计数（4 lite + 1 full 循环）
   phaseDebug: { lastSlowReq: null, slowStats: {} },  // 慢请求诊断（>200ms）
 };
@@ -90,6 +93,8 @@ const state = {
  * 用法：控制台敲 motorDbg.state 。 */
 window.motorDbg = {
   state,                                                   // 完整 state 引用，方便深挖
+  get tickWorker() { return tickWorker; },                 // Worker 节拍源对象（null=未创建）
+  get tickUseFallback() { return tickUseFallback; },       // true=已回退到 setTimeout 兜底
 };
 /**
  * 连续「硬失败」多少次才判离线。
@@ -101,6 +106,9 @@ const CONN_TOAST_GAP_MS = 6000;
 const RECOVER_TOAST_MIN_OFFLINE_MS = 8000;
 /* 前端固定节拍：与 GD32 0xC5 推送周期对齐（250ms）。 */
 const TICK_INTERVAL_MS = 250;
+/* 固定节拍调度基准：pollLoop 完成后按绝对时间对齐下一个 tick，
+ * 使实际刷新周期 ≈ 设定值（单次请求耗时不再累加进周期）。 */
+let tickNextAt = 0;
 const PROBE_INTERVAL_MS = 2000;
 
 const MIN_CMD_PERIOD_MS = 80;
@@ -133,6 +141,10 @@ function saveUiState() {
       if (el) o[id] = el.value;
     }
     if (state.selectedNode != null) o.selectedNode = state.selectedNode;
+    /* 命令序列：步骤 + 循环次数（有内容才写入，保持旧数据兼容） */
+    if (seq.steps.length > 0 || seq.loops !== 0) {
+      o.seq = { loops: seq.loops, steps: seq.steps };
+    }
     /* 版本缓存：state.versions 是 Map<node, {soft,hard,boot}>，序列化为普通对象 */
     if (state.versions && state.versions.size > 0) {
       const vo = {};
@@ -156,6 +168,14 @@ function loadUiState() {
       if (el && o[id] != null) el.value = o[id];
     }
     if (o.selectedNode != null) state.selectedNode = o.selectedNode;
+    /* 恢复命令序列（旧数据无 seq 字段则保持空）；
+     * normStep 归一：新结构 {holdMs, actions[]} 直通，旧扁平步骤转单动作组 */
+    if (o.seq && Array.isArray(o.seq.steps)) {
+      seq.steps = o.seq.steps
+        .filter((s) => s && typeof s === "object")
+        .map(normStep);
+      seq.loops = clampNum(parseInt(o.seq.loops, 10) || 0, 0, 9999);
+    }
     /* 恢复版本缓存到 state.versions Map */
     if (o.versions && typeof o.versions === "object") {
       for (const [n, v] of Object.entries(o.versions)) {
@@ -372,19 +392,35 @@ function cmdVal(id) {
   return cmdCommitted[id] !== undefined ? cmdCommitted[id] : $("#" + id).value;
 }
 
-function buildCmdBytes() {
+/* 编码一条 CMD 帧（DLC 32）。values = {mode, voltage, current, velocity, angle,
+ * pidCurP, pidVelP, pidAngP}，字段值接受字符串/数字（与输入框值同构）。
+ * 表单版与命令序列步骤共用此编码，保证两种发送路径帧格式一致。 */
+function buildCmdBytes(values) {
   const buf = new ArrayBuffer(32);
   const dv = new DataView(buf);
-  const mode = parseInt($("#modeSelect").value, 10) || 0;
+  const mode = parseInt(values.mode, 10) || 0;
   dv.setUint8(0, mode);
-  dv.setUint16(1, Math.round((parseFloat(cmdVal("inVoltage")) || 0) * 1000) & 0xFFFF, true);
-  dv.setFloat32(3, parseFloat(cmdVal("inCurrent")) || 0, true);
-  dv.setFloat32(7, parseFloat(cmdVal("inVelocity")) || 0, true);
-  dv.setFloat32(11, parseFloat(cmdVal("inAngle")) || 0, true);
-  dv.setInt16(15, parseInt(cmdVal("pidCurP"), 10) || 0, true);
-  dv.setInt16(17, parseInt(cmdVal("pidVelP"), 10) || 0, true);
-  dv.setInt16(19, parseInt(cmdVal("pidAngP"), 10) || 0, true);
+  dv.setUint16(1, Math.round((parseFloat(values.voltage) || 0) * 1000) & 0xFFFF, true);
+  dv.setFloat32(3, parseFloat(values.current) || 0, true);
+  dv.setFloat32(7, parseFloat(values.velocity) || 0, true);
+  dv.setFloat32(11, parseFloat(values.angle) || 0, true);
+  dv.setInt16(15, parseInt(values.pidCurP, 10) || 0, true);
+  dv.setInt16(17, parseInt(values.pidVelP, 10) || 0, true);
+  dv.setInt16(19, parseInt(values.pidAngP, 10) || 0, true);
   return new Uint8Array(buf);
+}
+/* 表单版：读当前 CMD 输入区已提交值（cmdCommitted） */
+function buildFormCmdBytes() {
+  return buildCmdBytes({
+    mode: $("#modeSelect").value,
+    voltage: cmdVal("inVoltage"),
+    current: cmdVal("inCurrent"),
+    velocity: cmdVal("inVelocity"),
+    angle: cmdVal("inAngle"),
+    pidCurP: cmdVal("pidCurP"),
+    pidVelP: cmdVal("pidVelP"),
+    pidAngP: cmdVal("pidAngP"),
+  });
 }
 function bytesToHexStr(bytes) {
   let s = "";
@@ -428,6 +464,8 @@ async function sendBatch(frames, opts) {
   }
   state.sendInFlight = true;
   const n = frames.length;
+  /* 通道：默认用顶部选中通道；调用方可经 opts.ch 指定（命令序列每步独立通道） */
+  const txCh = (opts && Number.isInteger(opts.ch)) ? opts.ch : state.ch;
   /* 单帧 3s：ESP32 handler 内部单帧超时 1200ms + HTTP 排队余量；
    * 旧值 8s 会在 SPI 卡顿时长时间霸占互斥锁，阻塞后续周期 CMD */
   const timeoutMs = (n <= 1) ? 3000 : Math.max(15000, n * 500);
@@ -435,7 +473,7 @@ async function sendBatch(frames, opts) {
     const resp = await fetch(getBaseUrl() + "/can/send_batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ch: state.ch, frames: frames }),
+      body: JSON.stringify({ ch: txCh, frames: frames }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await resp.text();
@@ -465,6 +503,7 @@ async function sendBatch(frames, opts) {
       /* BUS_OFF / TEC 高：停止发送，3s 冷却 */
       state.busCooldownUntil = nowMs() + 3000;
       stopRepeat(true);
+      stopSeq("总线异常，命令序列已停止", true);
       toast("总线异常 (" + GD32_ERR_DESC[gerr] + ") — 停止发送，冷却 3s", "err");
       return { ok: false, results: results, busFault: gerr, desc: GD32_ERR_DESC[gerr] };
     }
@@ -500,6 +539,79 @@ async function sendOneFrameWhenFree(id, dlc, dataHex, opts) {
   const res = await sendOneFrame(id, dlc, dataHex, opts);
   if (res.busy) toast("发送通道仍忙（上一包未完成），请稍后重试", "warn");
   return res;
+}
+
+/**
+ * 突发（近同时）发送多个电机动作：POST /can/send_burst。
+ * ESP32 转 0xC7 SPI 突发，GD32 背靠背装载各通道 CAN 邮箱，组内偏差 µs 级；
+ * 超过单次突发容量时 ESP32 内部分块背靠背连发（组间 ~1-2ms）。
+ * 与 sendBatch 共享 state.sendInFlight 互斥；流控策略与 sendBatch 一致。
+ * @param {Array} actions [{ch,node,mode,voltage,current,velocity,angle,pid*}]
+ * @returns {Promise<{ok,results?,networkError?,busFault?,busy?,desc?}>}
+ */
+async function sendBurst(actions, opts) {
+  opts = opts || {};
+  if (state.sendInFlight) {
+    return { ok: false, desc: "上一次发送仍在进行（已跳过）", busy: true };
+  }
+  if (!state.connected && !opts.allowOffline) {
+    return { ok: false, desc: "设备未连接", networkError: true };
+  }
+  state.sendInFlight = true;
+  const frames = actions.map((a) => ({
+    ch: a.ch, node: a.node, data: bytesToHexStr(buildCmdBytes(a)),
+  }));
+  const timeoutMs = Math.max(3000, frames.length * 250);
+  try {
+    const resp = await fetch(getBaseUrl() + "/can/send_burst", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ suffix: 0x0200, dlc: 32, frames: frames }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await resp.text();
+    let json = {};
+    try { json = text ? JSON.parse(text) : {}; } catch (e) { throw new Error("响应非合法 JSON"); }
+    if (!resp.ok) throw new Error("HTTP " + resp.status + ": " + (json.message || text || "发送失败"));
+    if (!json.results || !Array.isArray(json.results)) throw new Error("响应缺少 results");
+
+    const results = json.results.slice();
+    while (results.length < frames.length) {
+      results.push({ status: "error", code: -2, gd32_err: 0 });
+    }
+
+    /* 流控：取第一个错误帧的状态（同 sendBatch 逻辑） */
+    const firstErr = results.find((r) => r.status !== "ok") || {};
+    const gerr = firstErr.gd32_err;
+    if (gerr === 0xE4 && !opts.retried) {
+      /* 邮箱满：随机退避 50~150ms 重试一次 */
+      state.sendInFlight = false;
+      const backoff = 50 + Math.floor(Math.random() * 101);
+      await sleep(backoff);
+      return sendBurst(actions, Object.assign({}, opts, { retried: true }));
+    }
+    if (gerr === 0xE2 || gerr === 0xE3) {
+      /* BUS_OFF / TEC 高：停止发送，3s 冷却 */
+      state.busCooldownUntil = nowMs() + 3000;
+      stopRepeat(true);
+      stopSeq("总线异常，命令序列已停止", true);
+      toast("总线异常 (" + GD32_ERR_DESC[gerr] + ") — 停止发送，冷却 3s", "err");
+      return { ok: false, results: results, busFault: gerr, desc: GD32_ERR_DESC[gerr] };
+    }
+    const allOk = results.every((r) => r.status === "ok");
+    return { ok: allOk, results: results, desc: allOk ? "ok" : describeResult(firstErr) };
+  } catch (e) {
+    noteHardFailure(e, "send");
+    return { ok: false, networkError: true, desc: e.message || "网络错误" };
+  } finally {
+    state.sendInFlight = false;
+    /* latest-wins 排空（与 sendBatch 一致） */
+    if (!opts.retried && state.pendingCmd && state.connected && nowMs() >= state.busCooldownUntil) {
+      const p = state.pendingCmd;
+      state.pendingCmd = null;
+      sendBatch([{ id: p.id, dlc: p.dlc, data: p.data }], { silent: true });
+    }
+  }
 }
 
 /* ═══════════════════════ 连接稳健性 ═══════════════════════
@@ -600,6 +712,7 @@ function enterDisconnected(msg, source) {
   state.failCount = 0;
   state.offlineSince = nowMs();
   stopRepeat(true);
+  stopSeq("连接中断，命令序列已停止", true);
   stopDataPolling();
   updateConnUi();
   $("#netBanner").classList.add("show");
@@ -739,6 +852,21 @@ function stopDataPolling() {
   stopTimer("status");
   state.tickInFlight = false;
   state.feedbackInFlight = false;
+  state.tickStuck = 0;   /* 停止轮询 → 清除卡顿标记 */
+  /* 清理挂起的版本等待：主 tick 已停，resolve(null) 让调用方走超时分支，避免 Promise 悬挂 */
+  if (state.versionWait) {
+    const w = state.versionWait;
+    state.versionWait = null;
+    w.resolve(null);
+  }
+  updateTickStuckUi();
+  /* 停止 Worker 节拍（后台节流兜底） */
+  if (tickWorker) {
+    tickWorker.postMessage({ type: "stop" });
+    try { tickWorker.terminate(); } catch (e) { /* ignore */ }
+    tickWorker = null;
+    tickUseFallback = false;
+  }
 }
 
 /**
@@ -749,6 +877,8 @@ function startPolling() {
   state.failCount = 0;
   state.tickN = 0;
   state.statusTickN = 0;
+  state.recvTs = [];   /* 清除旧的到达时间窗口，Hz 从新数据重新累积 */
+  tickNextAt = 0;   /* 节拍基准重置：首个 tick 立即执行后按新间隔对齐 */
   const gen = state.pollGen;
   schedulePollLoop(gen, 0);
   scheduleFeedbackPoll(gen, 0);
@@ -797,37 +927,121 @@ function scheduleFeedbackPoll(gen, delayMs) {
     });
   }, delayMs == null ? 1000 : delayMs);
 }
-function schedulePollLoop(gen, delayMs) {
+/* ═══════ Web Worker 节拍（后台标签页不节流） ═══════
+ * 浏览器对后台（隐藏）标签页的 setTimeout/setInterval 强制 ≥1s 节流，
+ * 使刷新速度在切后台后降到 ~1Hz。Dedicated Worker 的定时器不受此限制，
+ * 故把 motor 轮询的节拍源放到 tick.worker.js：Worker 按设定间隔定期发
+ * 'tick' 消息，主线程收到后才真正发起一次 fetchMotorState。
+ * 前台行为与原来一致；后台也能守住设定的刷新速度。 */
+const TICK_WORKER_URL = "js/motor/tick.worker.js?v=20260802g";
+let tickWorker = null;        /* Web Worker 节拍源（null = 未创建/失败） */
+let tickUseFallback = false;  /* Worker 创建/加载失败 → 回退到 setTimeout 兜底 */
+
+/**
+ * tick 统一入口：Worker 每 tick、或 setTimeout 兜底触达时调用。
+ * 负责单飞互斥 + 卡顿标记（是否跳过由 tickInFlight 决定）。
+ */
+function tickHandler() {
+  if (!state.connected || state.probing) return;
+  if (state.tickInFlight) {
+    /* 上一拍请求仍未完成（已超出一拍时长）→ 本拍跳过并标记卡顿 */
+    state.tickStuck = (state.tickStuck || 0) + 1;
+    updateTickStuckUi();
+    return;
+  }
+  pollLoop(state.pollGen);
+}
+
+/**
+ * 确保 Worker 就绪并按 interval 校时。Worker 已存在时只更新间隔。
+ * Worker 加载失败（如 404 或不被服务端支持）→ 回退到 setTimeout 兜底。
+ */
+function ensureTickWorker(interval) {
+  if (tickUseFallback) return;
+  if (tickWorker) {
+    tickWorker.postMessage({ type: "update", interval });
+    return;
+  }
+  try {
+    tickWorker = new Worker(TICK_WORKER_URL);
+  } catch (err) {
+    tickWorker = null;
+    tickUseFallback = true;
+    startTickFallback(state.pollGen);
+    return;
+  }
+  tickWorker.onmessage = (e) => { if (e.data === "tick") tickHandler(); };
+  tickWorker.onerror = () => {
+    try { tickWorker.terminate(); } catch (e) { /* ignore */ }
+    tickWorker = null;
+    tickUseFallback = true;
+    startTickFallback(state.pollGen);
+  };
+  tickWorker.postMessage({ type: "start", interval });
+}
+
+/* Worker 不可用时的兜底：留用原 setTimeout 固定节拍（前台正常，后台受节流）。 */
+function startTickFallback(gen) {
   if (gen !== state.pollGen) return;
   stopTimer("tick");
-  const delay = delayMs != null ? delayMs : (state.refreshIntervalMs || TICK_INTERVAL_MS);
+  tickNextAt = 0;
+  scheduleTickFallbackFrame(gen, 0);
+}
+function scheduleTickFallbackFrame(gen, delayMs) {
+  if (gen !== state.pollGen) return;
+  stopTimer("tick");
+  const iv = state.refreshIntervalMs || TICK_INTERVAL_MS;
+  let delay = delayMs != null ? delayMs : iv;
+  if (delayMs == null && tickNextAt > 0) {
+    /* 固定节拍对齐：按绝对时间调度，请求耗时不再拖慢周期 */
+    const remain = tickNextAt - nowMs();
+    if (remain <= 0) delay = (tickNextAt + iv < nowMs()) ? iv : 10;
+    else delay = remain;
+  }
   state.poll.tick = setTimeout(function () {
     state.poll.tick = null;
-    pollLoop(gen);
+    if (gen !== state.pollGen) return;
+    tickHandler();
+    tickNextAt = (tickNextAt > 0 ? tickNextAt : nowMs()) + (state.refreshIntervalMs || TICK_INTERVAL_MS);
+    scheduleTickFallbackFrame(gen, null);
   }, delay);
 }
 
 /**
  * motor 轮询主链：只跑 fetchMotorState，feedback/status 已剥离独立定时器。
- * motor 挂起 3s 超时期间，feedback 仍正常刷 CAN 统计（不再被 motor 拖）。
+ * 节拍由 Web Worker（或兜底 setTimeout）驱动；pollLoop 自身不重排，
+ * 单飞互斥和卡顿标记在 tickHandler 侧完成。失败/断线由上层停止调度。
  */
 async function pollLoop(gen) {
-  if (gen !== state.pollGen || !state.connected || state.probing) return;
-  if (state.tickInFlight) {
-    schedulePollLoop(gen);
-    return;
-  }
+  if (gen !== state.pollGen) return;
   state.tickInFlight = true;
   try {
     await fetchMotorState(gen);
-    if (gen !== state.pollGen || !state.connected || state.probing) return;
+    if (gen !== state.pollGen) return;
     state.tickN += 1;
   } finally {
     state.tickInFlight = false;
-    if (gen === state.pollGen && state.connected && !state.probing) {
-      schedulePollLoop(gen);
-    }
+    if (state.tickStuck) { state.tickStuck = 0; updateTickStuckUi(); }   /* 请求结束 → 卡顿解除 */
   }
+  /* 版本查询搭便车主 tick 节拍：tickInFlight 已释放，checkVersionWait 异步触发，
+   * 不阻塞下一拍 tickHandler（/motor/version 即使慢也不会触发 tickStuck 误报）。 */
+  if (state.versionWait) {
+    checkVersionWait();
+  }
+}
+
+/**
+ * 调度 motor 节拍。delayMs === 0 表示立即触发首拍并启动 Worker；
+ * 之后每拍由 Worker 自然驱动，不再从这里重排。
+ */
+function schedulePollLoop(gen, delayMs) {
+  if (gen !== state.pollGen) return;
+  if (tickUseFallback) {
+    if (delayMs === 0) startTickFallback(gen);
+    return;
+  }
+  ensureTickWorker(state.refreshIntervalMs || TICK_INTERVAL_MS);
+  if (delayMs === 0) setTimeout(tickHandler, 0);   /* 立即首拍，后续靠 Worker tick */
 }
 
 async function fetchSystemStatus(gen, wantFull) {
@@ -971,6 +1185,11 @@ function motorKey(m) { return m.ch + ":" + m.node; }
 function onMotorState(data) {
   const motors = (data && data.motors) ? data.motors : [];
   state.motors = motors;
+
+  /* 记录实际数据到达时间戳滑动窗口，用于 Hz 计算 */
+  const ts = state.recvTs;
+  ts.push(Date.now());
+  if (ts.length > RECV_HZ_WINDOW * 2) ts.splice(0, ts.length - RECV_HZ_WINDOW);
 
   /* 解码每个 节点×通道 的 STATUS 帧 */
   const decoded = new Map();
@@ -1193,19 +1412,43 @@ nodeListEl.addEventListener("keydown", (e) => {
 });
 
 /* ─── 节点相关标签更新 ─── */
+/* 数据到达记录：滑动窗口长度（足够在 50ms~5s 间隔下都平滑） */
+const RECV_HZ_WINDOW = 10;
+
+/* STATUS 面板右上角频率：基于实际数据到达时间计算，不用用户设定的数值做死算。
+ * 保持近 RECV_HZ_WINDOW 次的到达时间戳滑动窗口，平均间隔 → Hz。
+ * 窗口未满时回退到按 refreshIntervalMs 理论值（首次显示前不空窗）。 */
+function statusHzText() {
+  const ts = state.recvTs;
+  /* 过滤掉旧窗口残留（与最近一次间隔超过 2× 设定间隔的视为旧数据丢弃） */
+  const maxAge = (state.refreshIntervalMs || TICK_INTERVAL_MS) * 2 * RECV_HZ_WINDOW;
+  const cutoff = Date.now() - maxAge;
+  while (ts.length > 0 && ts[0] < cutoff) ts.shift();
+  if (ts.length >= 2) {
+    const span = ts[ts.length - 1] - ts[0];
+    const avg = span / (ts.length - 1);
+    if (avg > 0 && avg < 60000) {
+      const hz = 1000 / avg;
+      return (hz >= 10 ? hz.toFixed(0) : hz.toFixed(1)) + " Hz";
+    }
+  }
+  /* 窗口数据不足时回退到理论值，不让面板空着 */
+  const hz = 1000 / (state.refreshIntervalMs || TICK_INTERVAL_MS);
+  return (hz >= 10 ? hz.toFixed(0) : hz.toFixed(1)) + " Hz";
+}
 function updateNodeLabels() {
   const n = state.selectedNode;
   if (n == null) {
     $("#nodeBadge").textContent = "NODE -";
     $("#cmdIdLabel").textContent = "ID 0x000-0200 · DLC 32";
-    $("#statusIdLabel").textContent = "0x000-0100 · 1 Hz";
+    $("#statusIdLabel").textContent = "0x000-0100 · " + statusHzText();
     document.querySelectorAll(".cfgNodeNibble").forEach((el) => (el.textContent = "-"));
     return;
   }
   const hex = nodeHex(n);
   $("#nodeBadge").textContent = `NODE ${n}`;
   $("#cmdIdLabel").textContent = `ID ${hexId(ID_CMD(n))} · DLC 32`;
-  $("#statusIdLabel").textContent = `${hexId(ID_STATUS(n))} · 1 Hz`;
+  $("#statusIdLabel").textContent = `${hexId(ID_STATUS(n))} · ${statusHzText()}`;
   document.querySelectorAll(".cfgNodeNibble").forEach((el) => (el.textContent = hex));
 }
 
@@ -1299,6 +1542,19 @@ function busStateText(bs) {
   return parts.length ? parts.join("|") : ("0x" + bs.toString(16));
 }
 
+/* ─── 轮询卡顿指示（fixed-tick 下某拍未按时完成 = 上一次请求仍占用链路） ───
+ * 通道下拉框变黄 + 悬浮提示显示连续卡顿拍数；请求结束自动清除。 */
+function updateTickStuckUi() {
+  const sel = $("#chSelect");
+  if (!sel) return;
+  const stuck = (state.tickStuck || 0) > 0;
+  sel.classList.toggle("stuck", stuck);
+  sel.title = stuck
+    ? `电机状态轮询卡顿：连续 ${state.tickStuck} 拍未按时完成（上一次请求仍占用链路）`
+    : "";
+  updateChSelectOptions();   /* 同步选框字色：卡顿黄色优先于在线绿色 */
+}
+
 /** 根据通道启用/信号状态更新下拉框选项：
  *  - 禁用通道贴 "(禁用)" 标签并置灰
  *  - 有信号通道（存在在线电机）贴 "●N" 标记并着色 */
@@ -1314,10 +1570,12 @@ function updateChSelectOptions() {
     opt.style.color = !en ? "var(--fg-dim,#666)" : (cnt > 0 ? "var(--ok,#3ddc97)" : "");
   }
   /* 收起态的选框文本用的是 select 自身颜色（option 内联色仅展开时生效），
-   * 同步按当前选中通道的状态着色，避免选中有信号通道后绿色变回默认白 */
+   * 同步按当前选中通道的状态着色，避免选中有信号通道后绿色变回默认白。
+   * 卡顿优先：轮询卡顿时显示黄色，覆盖在线绿色（updateTickStuckUi 触发本函数同步） */
   const curEn = state.chEnabled[state.ch];
   const curCnt = state.chOnline[state.ch] || 0;
-  sel.style.color = !curEn ? "var(--fg-dim,#666)" : (curCnt > 0 ? "var(--ok,#3ddc97)" : "");
+  sel.style.color = (state.tickStuck || 0) > 0 ? "var(--warn,#f59e0b)"
+    : (!curEn ? "var(--fg-dim,#666)" : (curCnt > 0 ? "var(--ok,#3ddc97)" : ""));
 }
 
 function onFeedback(data) {
@@ -1376,7 +1634,7 @@ async function doSendCmd(silent) {
   if (!requireNode()) return;
   if (inBusCooldown()) return;
   const node = state.selectedNode;
-  const bytes = buildCmdBytes();
+  const bytes = buildFormCmdBytes();
   const id = ID_CMD(node);
   const dataHex = bytesToHexStr(bytes);
   const mode = parseInt($("#modeSelect").value, 10) || 0;
@@ -1418,6 +1676,7 @@ function getPeriod() {
 function startRepeat() {
   if (!state.connected) { toast("设备未连接", "err"); return; }
   if (!requireNode()) return;
+  stopSeq("周期发送已启动，命令序列已停止", true);   /* 与命令序列互斥 */
   const period = getPeriod();
   periodInput.value = period;
   stopTimer("repeat");
@@ -1438,6 +1697,335 @@ periodInput.addEventListener("change", () => {
   const p = getPeriod(); periodInput.value = p;
   if (repeatTimer) { stopRepeat(true); startRepeat(); }
 });
+
+/* ═══════════════════════ 命令序列发送（循环发送设定步骤） ═══════════════════════
+ * 每步 = 一个「同步动作组」：组内每个 action = 一个电机目标（ch/node/模式/电压/电流/
+ *   速度/角度/PID）。执行本步时把组内全部 action 经一次 POST /can/send_burst 下发
+ *   （ESP32 转 0xC7 突发，GD32 背靠背入各通道 CAN 邮箱），组内多电机近同时发送；
+ *   发完本步再等 holdMs 进下一步。循环次数 0 = 无限循环。与周期发送互斥。
+ * 目标完全独立于左侧选中节点：每个 action 自带 ch/node，可多通道、多电机混合搭配。
+ * 兼容旧数据：无 actions 的扁平旧步骤自动归一为单动作步骤（normStep）。
+ * 步骤持久化在 saveUiState/loadUiState（序列化到 o.seq）。 */
+const seq = {
+  running: false,
+  stopRequested: false,
+  steps: [],            /* [{holdMs, actions:[{ch,node,mode,voltage,current,velocity,angle,pidCurP,pidVelP,pidAngP}]}] */
+  loops: 0,             /* 循环次数，0 = 无限 */
+  round: 1,             /* 当前轮（1 起） */
+  stepIdx: 0,           /* 当前步索引 */
+  statusText: "未运行",
+};
+const seqListEl = $("#seqList");
+const seqStartBtn = $("#seqStartBtn");
+const seqLoopsInput = $("#seqLoops");
+
+function seqModeOptions(selected) {
+  return Object.entries(MODES).map(([v, m]) =>
+    `<option value="${v}"${String(v) === String(selected) ? " selected" : ""}>${v} — ${m.zh}</option>`).join("");
+}
+function seqChOptions(selected) {
+  return [0, 1, 2].map((c) =>
+    `<option value="${c}"${parseInt(selected, 10) === c ? " selected" : ""}>CH${c}</option>`).join("");
+}
+function seqNodeOptions(selected) {
+  return FIXED_MOTOR_NODES.map((n) =>
+    `<option value="${n}"${parseInt(selected, 10) === n ? " selected" : ""}>N${n}</option>`).join("");
+}
+/* 归一单个 action：补齐 ch/node/各参数默认值（ch/node 缺失时回退当前通道/选中节点） */
+function actionFromAny(a) {
+  a = a || {};
+  return {
+    ch: Number.isInteger(a.ch) ? clampNum(a.ch, 0, 2) : clampNum(state.ch || 0, 0, 2),
+    node: (Number.isInteger(a.node) && a.node >= 1 && a.node <= 9) ? a.node : (state.selectedNode || 1),
+    mode: a.mode != null ? String(a.mode) : "3",
+    voltage: a.voltage != null ? a.voltage : "24.000",
+    current: a.current != null ? a.current : "0",
+    velocity: a.velocity != null ? a.velocity : "100",
+    angle: a.angle != null ? a.angle : "0",
+    pidCurP: a.pidCurP != null ? a.pidCurP : "100",
+    pidVelP: a.pidVelP != null ? a.pidVelP : "100",
+    pidAngP: a.pidAngP != null ? a.pidAngP : "100",
+  };
+}
+/* 归一步骤：新结构 {holdMs, actions[]}；旧扁平步骤（含 mode 等顶层字段）→ 单动作组 */
+function normStep(s) {
+  s = s || {};
+  const holdMs = clampNum(parseInt(s.holdMs, 10) || 1000, 0, 600000);
+  if (Array.isArray(s.actions) && s.actions.length) {
+    return { holdMs: holdMs, actions: s.actions.map(actionFromAny) };
+  }
+  return { holdMs: holdMs, actions: [actionFromAny(s)] };
+}
+function cloneAction(a) { return Object.assign({}, actionFromAny(a)); }
+/* 读取当前 CMD 表单已提交值 + 当前通道/选中节点，作为一个新 action（与 buildFormCmdBytes 同源） */
+function defaultActionFromForm() {
+  return {
+    ch: clampNum(state.ch || 0, 0, 2),
+    node: (state.selectedNode >= 1 && state.selectedNode <= 9) ? state.selectedNode : 1,
+    mode: $("#modeSelect").value,
+    voltage: cmdVal("inVoltage"),
+    current: cmdVal("inCurrent"),
+    velocity: cmdVal("inVelocity"),
+    angle: cmdVal("inAngle"),
+    pidCurP: cmdVal("pidCurP"),
+    pidVelP: cmdVal("pidVelP"),
+    pidAngP: cmdVal("pidAngP"),
+  };
+}
+
+function renderSeqList() {
+  if (!seq.steps.length) {
+    seqListEl.innerHTML = '<div class="seq-empty">尚未添加步骤 — 点击「+ 添加步骤」把当前 CMD 表单（含当前通道/节点）存为一步；每步可再「+ 电机」加入多个动作，同一步内的动作近同时下发</div>';
+  } else {
+    seqListEl.innerHTML = seq.steps.map((s, i) => `
+      <div class="seq-step" data-idx="${i}">
+        <div class="seq-step-head">
+          <span class="seq-idx">步骤 ${i + 1}</span>
+          <span class="seq-count">${s.actions.length} 电机</span>
+          <span class="seq-hold-label">保持</span>
+          <input class="seq-num seq-hold" data-f="holdMs" type="number" value="${s.holdMs}" min="0" max="600000" step="100" aria-label="步骤 ${i + 1} 保持时间 ms" />
+          <span class="seq-hold-unit">ms</span>
+          <div class="seq-ops">
+            <button data-op="addAction" title="本步添加电机动作（复制最后一个动作）">
+              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M7 2.5v9M2.5 7h9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            </button>
+            <button data-op="up" title="上移" ${i === 0 ? "disabled" : ""}>
+              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3.5 8.5 7 5l3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button data-op="down" title="下移" ${i === seq.steps.length - 1 ? "disabled" : ""}>
+              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3.5 5.5 7 9l3.5-3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button data-op="dup" title="复制本步（含全部动作）">
+              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="4.5" y="4.5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.2"/><rect x="2.5" y="2.5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.2" opacity=".4"/></svg>
+            </button>
+            <button data-op="del" title="删除本步" class="seq-del">
+              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2.5 4h9M5.5 4V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1M3.5 4l.55 6.9A1 1 0 0 0 5.04 12h3.92a1 1 0 0 0 .99-.9L10.5 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="seq-actions">
+          ${s.actions.map((a, j) => `
+          <div class="seq-action" data-aidx="${j}">
+            <div class="seq-action-head">
+              <span class="seq-action-tag">电机 ${j + 1}</span>
+              <select class="seq-ch" aria-label="步骤 ${i + 1} 电机 ${j + 1} 通道" title="发送通道">${seqChOptions(a.ch)}</select>
+              <select class="seq-node" aria-label="步骤 ${i + 1} 电机 ${j + 1} 节点" title="目标节点">${seqNodeOptions(a.node)}</select>
+              <select class="seq-mode" aria-label="步骤 ${i + 1} 电机 ${j + 1} 控制模式">${seqModeOptions(a.mode)}</select>
+              <div class="seq-ops">
+                <button data-op="delAction" title="删除此电机动作" class="seq-del">
+                  <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2.5 4h9M5.5 4V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1M3.5 4l.55 6.9A1 1 0 0 0 5.04 12h3.92a1 1 0 0 0 .99-.9L10.5 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="seq-step-fields">
+              <label class="field"><span class="field-label">电压 <span class="field-unit">V</span></span><input class="seq-num" data-f="voltage" type="number" value="${a.voltage}" step="0.5" /></label>
+              <label class="field"><span class="field-label">电流 <span class="field-unit">mA</span></span><input class="seq-num" data-f="current" type="number" value="${a.current}" step="100" /></label>
+              <label class="field"><span class="field-label">速度 <span class="field-unit">deg/s</span></span><input class="seq-num" data-f="velocity" type="number" value="${a.velocity}" step="10" /></label>
+              <label class="field"><span class="field-label">角度 <span class="field-unit">deg</span></span><input class="seq-num" data-f="angle" type="number" value="${a.angle}" step="1" /></label>
+              <label class="field"><span class="field-label">电流环P</span><input class="seq-num" data-f="pidCurP" type="number" value="${a.pidCurP}" step="1" /></label>
+              <label class="field"><span class="field-label">速度环P</span><input class="seq-num" data-f="pidVelP" type="number" value="${a.pidVelP}" step="1" /></label>
+              <label class="field"><span class="field-label">角度环P</span><input class="seq-num" data-f="pidAngP" type="number" value="${a.pidAngP}" step="1" /></label>
+            </div>
+          </div>`).join("")}
+        </div>
+      </div>`).join("");
+  }
+  updateSeqUi();
+}
+
+function updateSeqUi() {
+  const running = seq.running;
+  seqStartBtn.textContent = running ? "■ 停止序列" : "▶ 开始序列";
+  seqStartBtn.classList.toggle("btn-primary", running);
+  const st = $("#seqStatus");
+  if (st) {
+    if (running) {
+      const cs = seq.steps[seq.stepIdx];
+      const cnt = cs ? cs.actions.length : 0;
+      st.textContent = `运行中 · 步骤 ${seq.stepIdx + 1}/${seq.steps.length} (${cnt} 电机) · 第 ${seq.round} 轮`;
+      st.classList.add("on");
+    } else {
+      st.textContent = seq.statusText || `未运行 · ${seq.steps.length} 步`;
+      st.classList.remove("on");
+    }
+  }
+  seqListEl.classList.toggle("seq-locked", running);
+  seqListEl.querySelectorAll(".seq-step").forEach((row) => {
+    row.classList.toggle("current", running && parseInt(row.dataset.idx, 10) === seq.stepIdx);
+  });
+  seqLoopsInput.disabled = running;
+  $("#seqAddBtn").disabled = running;
+  $("#seqClearBtn").disabled = running;
+}
+
+/* 读取当前 CMD 表单已提交值作为新步骤：单动作组（用户可再「+ 电机」扩展） */
+function seqReadStepFromForm() {
+  return { holdMs: 1000, actions: [defaultActionFromForm()] };
+}
+
+/* 步骤行编辑（input 事件同时覆盖 number 输入与 select 选择）：
+ * holdMs 归属步骤本身；ch/node/mode/各参数归属 .seq-action（data-aidx）对应的 action */
+seqListEl.addEventListener("input", (e) => {
+  const row = e.target.closest(".seq-step");
+  if (!row) return;
+  const step = seq.steps[parseInt(row.dataset.idx, 10)];
+  if (!step) return;
+  const t = e.target;
+  if (t.dataset.f === "holdMs") {
+    step.holdMs = clampNum(parseInt(t.value, 10) || 0, 0, 600000);
+  } else {
+    const actRow = t.closest(".seq-action");
+    const action = actRow ? step.actions[parseInt(actRow.dataset.aidx, 10)] : null;
+    if (!action) return;
+    if (t.classList.contains("seq-ch")) action.ch = clampNum(parseInt(t.value, 10) || 0, 0, 2);
+    else if (t.classList.contains("seq-node")) action.node = clampNum(parseInt(t.value, 10) || 1, 1, 9);
+    else if (t.classList.contains("seq-mode")) action.mode = t.value;
+    else if (t.dataset.f) action[t.dataset.f] = t.value;
+    else return;
+  }
+  debounceSaveUi();
+});
+
+/* 步骤操作：上移/下移/复制/删除 + 动作级增删（运行中锁定，指针事件被 .seq-locked 禁用） */
+seqListEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-op]");
+  if (!btn || seq.running) return;
+  const row = btn.closest(".seq-step");
+  if (!row) return;
+  const i = parseInt(row.dataset.idx, 10);
+  const step = seq.steps[i];
+  if (!step) return;
+  const op = btn.dataset.op;
+  if (op === "up" && i > 0) {
+    const t = seq.steps[i]; seq.steps[i] = seq.steps[i - 1]; seq.steps[i - 1] = t;
+  } else if (op === "down" && i < seq.steps.length - 1) {
+    const t = seq.steps[i]; seq.steps[i] = seq.steps[i + 1]; seq.steps[i + 1] = t;
+  } else if (op === "dup") {
+    seq.steps.splice(i + 1, 0, { holdMs: step.holdMs, actions: step.actions.map(cloneAction) });
+  } else if (op === "del") {
+    seq.steps.splice(i, 1);
+  } else if (op === "addAction") {
+    /* 默认复制本步最后一个动作（改个节点即成另一台电机）；空步骤则取自 CMD 表单 */
+    step.actions.push(step.actions.length
+      ? cloneAction(step.actions[step.actions.length - 1])
+      : defaultActionFromForm());
+  } else if (op === "delAction") {
+    const actRow = btn.closest(".seq-action");
+    if (!actRow) return;
+    step.actions.splice(parseInt(actRow.dataset.aidx, 10), 1);
+    if (!step.actions.length) seq.steps.splice(i, 1);   /* 无动作则整步删除 */
+  } else {
+    return;
+  }
+  renderSeqList();
+  saveUiState();
+});
+
+$("#seqAddBtn").addEventListener("click", () => {
+  if (seq.running) return;
+  seq.steps.push(seqReadStepFromForm());
+  renderSeqList();
+  saveUiState();
+});
+
+$("#seqClearBtn").addEventListener("click", async () => {
+  if (seq.running || seq.steps.length === 0) return;
+  const ok = await showModal("清空命令序列", `将删除全部 ${seq.steps.length} 个步骤。`);
+  if (!ok) return;
+  seq.steps = [];
+  renderSeqList();
+  saveUiState();
+});
+
+seqLoopsInput.addEventListener("change", () => {
+  seq.loops = clampNum(parseInt(seqLoopsInput.value, 10) || 0, 0, 9999);
+  seqLoopsInput.value = seq.loops;
+  saveUiState();
+});
+
+seqStartBtn.addEventListener("click", () => {
+  if (seq.running) { stopSeq("已手动停止"); return; }
+  startSeq();
+});
+
+function startSeq() {
+  if (!state.connected) { toast("设备未连接", "err"); return; }
+  if (seq.steps.length === 0) { toast("请先添加至少一个步骤", "warn"); return; }
+  if (inBusCooldown()) return;
+  stopRepeat(true);   /* 与周期发送互斥 */
+  seq.loops = clampNum(parseInt(seqLoopsInput.value, 10) || 0, 0, 9999);
+  seqLoopsInput.value = seq.loops;
+  seq.running = true;
+  seq.stopRequested = false;
+  seq.round = 1;
+  seq.stepIdx = 0;
+  seq.statusText = "";
+  updateSeqUi();
+  const totalActions = seq.steps.reduce((n, s) => n + s.actions.length, 0);
+  toast(`命令序列已启动 · ${seq.steps.length} 步 / ${totalActions} 电机动作 · 循环 ${seq.loops === 0 ? "无限" : seq.loops + " 次"}（同步动作组近同时下发）`, "ok");
+  seqRunLoop();
+}
+
+function stopSeq(reason, silent) {
+  seq.running = false;
+  seq.stopRequested = true;
+  seq.statusText = reason || "已停止";
+  updateSeqUi();
+  if (!silent) toast(reason || "命令序列已停止", "warn");
+}
+
+/* 序列主循环：stop-and-wait 逐步发送。每步把组内全部动作经一次 sendBurst
+ * （/can/send_burst → 0xC7 突发）近同时下发，发完等 holdMs 推进；
+ * 循环次数用尽或异常停止。 */
+async function seqRunLoop() {
+  while (seq.running && !seq.stopRequested) {
+    if (!state.connected || state.probing) { stopSeq("连接断开，序列已停止", true); return; }
+    if (nowMs() < state.busCooldownUntil) { await sleep(200); continue; }   /* 总线冷却等待 */
+    const step = seq.steps[seq.stepIdx];
+    if (!step || !Array.isArray(step.actions) || !step.actions.length) { stopSeq("序列数据无效，已停止"); return; }
+    let chBad = null;
+    for (const a of step.actions) {
+      if (!state.chEnabled[a.ch]) { chBad = a.ch; break; }
+    }
+    if (chBad != null) { stopSeq(`步骤 ${seq.stepIdx + 1} 的通道 CH${chBad} 已禁用，序列已停止`); return; }
+    updateSeqUi();
+    const targets = step.actions.map((a) => `CH${a.ch}·N${a.node}`).join(" ");
+    const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    $("#sbLastSend").textContent = `最近发送: 序列步${seq.stepIdx + 1} → ${step.actions.length} 电机 [${targets}] ${time}`;
+
+    /* 互斥发送：通道忙（手动 CMD 等在途）时小退避重试本步，不推进步骤 */
+    let res;
+    let busyTries = 0;
+    do {
+      res = await sendBurst(step.actions);
+      if (!seq.running) return;
+      if (res.busy && busyTries < 20) { busyTries++; await sleep(50); }
+    } while (res.busy && busyTries < 20);
+
+    if (res.busFault) { stopSeq("总线异常，序列已停止"); return; }
+    if (res.networkError) { stopSeq("网络错误，序列已停止"); return; }
+    if (!res.ok) { stopSeq("发送失败：" + (res.desc || "未知错误")); return; }
+    for (const a of step.actions) state.lastSentMode.set(a.node, parseInt(a.mode, 10) || 0);
+    state.txCount++;
+    renderNodeList();
+
+    if (!seq.running) return;
+    const holdMs = clampNum(parseInt(step.holdMs, 10) || 0, 0, 600000);
+    if (holdMs > 0) await sleep(holdMs);
+    if (!seq.running) return;
+
+    if (seq.stepIdx + 1 >= seq.steps.length) {
+      if (seq.loops > 0 && seq.round >= seq.loops) {
+        stopSeq(`已完成 ${seq.loops} 轮`);
+        return;
+      }
+      seq.round++;
+      seq.stepIdx = 0;
+    } else {
+      seq.stepIdx++;
+    }
+  }
+}
 
 /* ═══════════════════════ 配置操作（CMD_CONFIG，DLC 24） ═══════════════════════ */
 const CONFIG_ACTIONS = {
@@ -1570,15 +2158,39 @@ async function fetchMotorVersionNode(node) {
   }
 }
 
-/** 轮询直到 node 的版本 seq 超过 prevSeq（新应答）；超时返回 null。 */
-async function waitMotorVersion(node, prevSeq, timeoutMs) {
-  const deadline = nowMs() + (timeoutMs || 5000);
-  while (nowMs() < deadline) {
-    const v = await fetchMotorVersionNode(node);
-    if (v && (prevSeq == null || v.seq > prevSeq)) return v;
-    await sleep(200);
+/** 版本等待：挂载到主 tick（pollLoop），每拍检查一次 seq，命中或超时才 resolve。
+ *  节拍跟随 state.refreshIntervalMs（与 motor 状态轮询共用同一调度），
+ *  不再开独立 sleep 循环，避免与主 tick 节拍错位造成的窗口延迟。
+ *  超时返回 null（与原轮询语义一致）。 */
+function waitMotorVersionOnTick(node, prevSeq, timeoutMs) {
+  return new Promise((resolve) => {
+    state.versionWait = {
+      node,
+      prevSeq,
+      deadline: nowMs() + (timeoutMs || 5000),
+      resolve,
+    };
+  });
+}
+
+/** 主 tick 每拍调用：检查挂起的版本等待。
+ *  seq 增长 → resolve 并清空；超时 → resolve(null) 并清空。
+ *  瞬时错误忽略，下一拍重试。 */
+async function checkVersionWait() {
+  const w = state.versionWait;
+  if (!w) return;
+  if (nowMs() >= w.deadline) {
+    state.versionWait = null;
+    w.resolve(null);
+    return;
   }
-  return null;
+  try {
+    const v = await fetchMotorVersionNode(w.node);
+    if (v && (w.prevSeq == null || v.seq > w.prevSeq)) {
+      state.versionWait = null;
+      w.resolve(v);
+    }
+  } catch (e) { /* 瞬时 busy 忽略，下拍再查 */ }
 }
 
 $("#queryVerBtn").addEventListener("click", async () => {
@@ -1615,7 +2227,7 @@ $("#queryVerBtn").addEventListener("click", async () => {
   }
   state.txCount++;
 
-  const v = await waitMotorVersion(node, prevSeq, 5000);
+  const v = await waitMotorVersionOnTick(node, prevSeq, 5000);
   if (v && v.version) {
     const parsed = parseVersionPayload(v.version);
     if (parsed && (parsed.soft || parsed.hard || parsed.boot)) {
@@ -2040,6 +2652,7 @@ async function startOta() {
   if (!ok) return;
 
   stopRepeat(true);
+  stopSeq("OTA 开始，命令序列已停止", true);
   ota.running = true;
   ota.node = node;  /* 记录目标节点：finished 后 verifyNewApp 查版本用 */
   ota.startTime = performance.now();
@@ -2229,7 +2842,7 @@ function startOtaPoll() {
 	      const prevSeq = before ? before.seq : null;
 	      const res = await sendOneFrameWhenFree(ID_GET_VERSION_REQ(node), 24, bytesToHexStr(new Uint8Array(24)));
 	      if (res.ok) {
-	        const v = await waitMotorVersion(node, prevSeq, 4000);
+	        const v = await waitMotorVersionOnTick(node, prevSeq, 4000);
 	        if (v && v.version) {
 	          const parsed = parseVersionPayload(v.version);
 	          if (parsed && parsed.soft) {
@@ -2369,16 +2982,15 @@ function applyRefreshRate() {
   const v = clampNum(parseInt(refreshRateInput.value, 10) || 250, 50, 5000);
   refreshRateInput.value = v;
   state.refreshIntervalMs = v;
+  updateNodeLabels();   /* STATUS 面板右上角 Hz 跟随刷新速度 */
+  /* 后台节流兜底模式下清掉旧 setTimeout 节拍，避免双链 */
   if (state.poll.tick) {
     clearTimeout(state.poll.tick);
     state.poll.tick = null;
   }
-  /* HTTP 轮询驱动：清掉旧节拍后必须立即按新间隔重排 motor 链，
-   * 否则轮询链断死、STATUS 面板停更。
-   * tickInFlight 时在途 pollLoop 的 finally 也会重排，schedulePollLoop 内部
-   * stopTimer 保证不会双链并发。 */
   if (state.connected && !state.probing) {
-    schedulePollLoop(state.pollGen, 0);
+    tickNextAt = 0;   /* 节拍基准重置：立即按新间隔重新对齐 */
+    schedulePollLoop(state.pollGen, 0);   /* Worker 模式只更新间隔；兜底模式立即重排 */
     sendMotorPeriod(v);   /* 同步 GD32 0xC5 推送周期（复用 /spi/send，命令码 0xC5 + 子命令 0xFE） */
   }
   const hz = 1000 / v;
@@ -2668,6 +3280,8 @@ updateConnUi();
 renderNodeList();
 renderStatusPanel();
 restoreVersionUi(state.selectedNode);  /* 回填上次缓存的版本号 */
+renderSeqList();             /* 命令序列步骤渲染（依赖 loadUiState 恢复的数据） */
+seqLoopsInput.value = seq.loops;
 bindAutoSave();
 initCmdCommit();  /* CMD 输入提交制：必须在 loadUiState 回填之后初始化，否则初始提交值是 HTML 默认值 */
 otaRestorePersistedFirmware();  /* 异步恢复上次固件（无阻塞） */

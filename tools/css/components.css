@@ -699,9 +699,223 @@ code { color: var(--esp32-hi); font-family: var(--font-mono); }
   border-bottom: 1px solid rgba(255,255,255,.04);
 }
 .heap-low-table th { color: var(--text-dim); font-weight: 500; position: sticky; top: 0; background: var(--bg-elevated); text-align: right; }
-.heap-low-table td:nth-child(5), .heap-low-table td:nth-child(6),
-.heap-low-table td:nth-child(7), .heap-low-table td:nth-child(9) { text-align: left; }
-.heap-low-table td:first-child { color: var(--text-dim); }
+.ble-low-table td:nth-child(5), .ble-low-table td:nth-child(6),
+.ble-low-table td:nth-child(7), .ble-low-table td:nth-child(9) { text-align: left; }
+.ble-low-table td:first-child { color: var(--text-dim); }
+
+/* ================= BLE 连接按钮（launch 风格） =================
+   圆形物理按键：未连接=暗淡待机；勾选=已连接，蓝光环绕 + 文字波浪动画。
+   checkbox 隐藏，由 JS setConnectionState 驱动 checked，避免异步连接失败导致状态错位。 */
+.ble-launch-wrap {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 12px; padding: 6px 0 2px;
+}
+.ble-launch-btn {
+  cursor: pointer; position: relative;
+  display: flex; flex-direction: column; align-items: center;
+  margin: 0;
+}
+.ble-launch-btn input {
+  opacity: 0; width: 0; height: 0; display: none;
+}
+/* —— 三态：idle 待机 / connecting 连接中转圈 / connected 已连接变亮 —— */
+/* 默认 text3 隐藏 */
+.ble-launch-btn .back .mid .ble-dial .center .start .text3 {
+  opacity: 0;
+}
+
+/* connecting：仅光晕转圈（loading），按钮整体保持暗淡 */
+.ble-launch-btn[data-ble-state="connecting"] .back .spot-shadow,
+.ble-launch-btn[data-ble-state="connecting"] .back .mid .spot-main,
+.ble-launch-btn[data-ble-state="connecting"] .back .mid .ble-dial .spot-light {
+  opacity: 0.7;
+  animation: ble-spot-rot 1.4s linear infinite;
+}
+.ble-launch-btn[data-ble-state="connecting"] .back .mid .ble-dial .center .start .text1 {
+  opacity: 0;
+}
+.ble-launch-btn[data-ble-state="connecting"] .back .mid .ble-dial .center .start .text3 {
+  opacity: 1;
+  color: #9bb8d8;
+  animation: ble-text-pulse 1.2s ease-in-out infinite;
+}
+
+/* connected：整个按钮变亮 + 静态整圈蓝光晕（不转圈）+ 文字波浪 */
+/* spot 元素默认是横向条状（为转圈动画设计），connected 时改成整圈圆环 */
+.ble-launch-btn[data-ble-state="connected"] .back .spot-shadow {
+  transition: opacity 1.2s ease;
+  opacity: 0.9;
+  width: 106px; height: 106px;
+  border-radius: 50%;
+  filter: blur(12px) brightness(1.2);
+}
+.ble-launch-btn[data-ble-state="connected"] .back .mid .spot-main {
+  transition: opacity 1.2s ease;
+  opacity: 0.95;
+  width: 100px; height: 100px;
+  border-radius: 50%;
+  filter: blur(9px) brightness(1.6);
+}
+.ble-launch-btn[data-ble-state="connected"] .back .mid .ble-dial .spot-light {
+  transition: opacity 1.2s ease;
+  opacity: 0.9;
+  width: 92px; height: 92px;
+  border-radius: 50%;
+  filter: blur(8px) brightness(1.2);
+}
+.ble-launch-btn[data-ble-state="connected"] .back .mid .ble-dial .center .icon svg {
+  filter: brightness(1.15);
+}
+.ble-launch-btn[data-ble-state="connected"] .back .mid .ble-dial .center .launch {
+  color: #e9f0fa;
+}
+.ble-launch-btn[data-ble-state="connected"] .back .mid .ble-dial .center .launch > div {
+  animation: ble-wave-text 1.8s calc(var(--i) * -0.13s) infinite;
+}
+.ble-launch-btn[data-ble-state="connected"] .back .mid .ble-dial .center .start .text1 {
+  transition: transform 0.5s ease, opacity 0.5s ease;
+  transform: translateX(10px);
+  opacity: 0;
+}
+.ble-launch-btn[data-ble-state="connected"] .back .mid .ble-dial .center .start .text2 {
+  opacity: 1;
+  animation: ble-text2 0.5s forwards;
+}
+.ble-launch-btn:active .back .mid .ble-dial {
+  transform: scale(0.94);
+  box-shadow:
+    0 -1px 2px rgba(255,255,255,0.3),
+    inset 0 0 10px rgba(0,0,0,0.24),
+    inset 0 -13px 26px rgba(0,0,0,0.8);
+}
+
+/* —— 外圈金属环 —— */
+.ble-launch-btn .back {
+  position: relative; z-index: 200;
+  width: 128px; height: 128px;
+  display: flex; justify-content: center; align-items: center;
+  border-radius: 50%;
+  background-image: linear-gradient(0, #5e5e61 20%, #212123);
+  box-shadow:
+    inset 0 1px 1px rgba(255,255,255,0.3),
+    inset 0 3px 5px rgba(255,255,255,0.6),
+    inset 0 -4px 2px rgba(255,255,255,0.05),
+    inset 0 -2px 0 rgba(0,0,0,0.15),
+    inset -2px 4px 0 rgba(0,0,0,0.3),
+    inset 2px 4px 0 rgba(0,0,0,0.3),
+    0 -7px 16px 2px rgba(255,255,255,0.18),
+    0 4px 16px 2px rgba(0,0,0,0.5),
+    0 2px 5px #7c7c7c;
+  cursor: pointer;
+}
+.ble-launch-btn .back .spot-shadow {
+  position: absolute;
+  width: 96px; height: 27px;
+  background: rgba(95,168,255,0.9);
+  opacity: 0;
+  filter: blur(14px) brightness(1.1);
+}
+.ble-launch-btn .back .mid {
+  overflow: hidden; position: relative;
+  width: 106px; height: 106px;
+  display: flex; justify-content: center; align-items: center;
+  border-radius: 50%;
+  background: #000;
+  box-shadow: 0 0 4px #000, 0 1px 2px rgba(255,255,255,0.8);
+}
+.ble-launch-btn .back .mid::before {
+  content: ''; position: absolute; z-index: 500;
+  width: 100%; height: 100%; border-radius: 50%;
+  background: transparent;
+  box-shadow: inset 0 -12px 18px rgba(0,0,0,0.8);
+  pointer-events: none;
+}
+.ble-launch-btn .back .mid .spot-main {
+  position: absolute;
+  width: 110px; height: 20px;
+  background: #5fa8ff;
+  opacity: 0;
+  filter: blur(11px) brightness(1.5);
+}
+.ble-launch-btn .back .mid .ble-dial {
+  position: relative; z-index: 90;
+  display: flex; justify-content: center; align-items: center;
+  width: 100px; height: 100px; border-radius: 50%;
+  background: #424242;
+  box-shadow:
+    0 -1px 2px rgba(255,255,255,0.5),
+    inset 0 -9px 18px rgba(0,0,0,0.8);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.ble-launch-btn .back .mid .ble-dial .spot-light {
+  position: absolute;
+  width: 110px; height: 20px;
+  opacity: 0;
+  background: rgba(95,168,255,0.6);
+  filter: blur(14px) brightness(1.1);
+}
+.ble-launch-btn .back .mid .ble-dial .center {
+  position: relative; z-index: 100;
+  width: 86px; height: 86px;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 2px;
+  border-radius: 50%;
+  background: #232323;
+  cursor: pointer;
+}
+.ble-launch-btn .back .mid .ble-dial .center .icon svg {
+  margin-top: -3px;
+  width: 18px;
+  filter: brightness(1) grayscale(1);
+  transition: filter 1.5s ease;
+}
+.ble-launch-btn .back .mid .ble-dial .center .launch {
+  display: flex; margin-top: -3px;
+  font-size: 13px; color: #595959;
+  font-family: var(--font-display);
+  letter-spacing: 0.04em;
+}
+.ble-launch-btn .back .mid .ble-dial .center .start {
+  position: relative;
+  width: 100%; height: 11px;
+  font-size: 9px; color: #737373;
+  text-align: center;
+  font-family: var(--font-display);
+}
+.ble-launch-btn .back .mid .ble-dial .center .start > div {
+  position: absolute; left: 50%; top: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+.ble-launch-btn .back .mid .ble-dial .center .start .text2 {
+  opacity: 0;
+  display: inline-flex;
+}
+.ble-launch-btn .back .mid .ble-dial .center .start .text2 > span {
+  animation: ble-wave-text 1.8s calc(var(--n) * -0.13s) infinite;
+}
+.ble-launch-hint {
+  font-size: 11px; color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
+@keyframes ble-wave-text {
+  0% { opacity: 0.7; }
+  50% { color: #c6e0ff; opacity: 1; }
+  100% { opacity: 0.7; }
+}
+@keyframes ble-spot-rot {
+  0% { transform: rotate(0); }
+  100% { transform: rotate(360deg); }
+}
+@keyframes ble-text2 {
+  0% { transform: translateX(-80%); }
+  100% { transform: translateX(-50%); }
+}
+@keyframes ble-text-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
 .heap-low-table tbody tr:hover { background: rgba(255,255,255,.03); }
 .heap-low-table td.has-suspect { color: var(--red); font-weight: 500; }
 .heap-low-table td.idle-suspect { color: var(--gd32-hi); }
