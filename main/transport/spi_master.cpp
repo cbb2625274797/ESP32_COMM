@@ -455,6 +455,7 @@ SpiMaster::Job *SpiMaster::acquireJobSlot()
             slot->done = done;
             slot->finished = false;
             slot->abandoned = false;
+            slot->executing = false;
             slot->in_use = true;
             break;
         }
@@ -493,6 +494,7 @@ void SpiMaster::releaseJobSlot(Job *job)
     taskENTER_CRITICAL(&s_spiJobMux);
     job->finished = false;
     job->abandoned = false;
+    job->executing = false;
     job->in_use = false;
     taskEXIT_CRITICAL(&s_spiJobMux);
 }
@@ -567,6 +569,7 @@ esp_err_t SpiMaster::submitJob(Job &job)
     pool_job->result = ESP_FAIL;
     pool_job->finished = false;
     pool_job->abandoned = false;
+    pool_job->executing = false;
     /* done / in_use 保持 acquire 时状态 */
 
     const TickType_t qwait = pdMS_TO_TICKS(
@@ -578,8 +581,11 @@ esp_err_t SpiMaster::submitJob(Job &job)
     }
     xTaskNotify(m_workerTask, 0x10U, eSetBits);
 
+    /* dwait 覆盖 worker 单笔执行上界：otaSendAndPoll 最多 3 次尝试、每次 ≈
+     * timeout_ms，故 3×timeout+10s 保证"已开始执行的 job"必然在提交方放弃前
+     * 完成（执行中 worker 在写本函数调用方的栈缓冲，栈帧必须存活到 finished）。 */
     const TickType_t dwait = pdMS_TO_TICKS(
-        (job.timeout_ms > 0U ? job.timeout_ms : 1000U) + 10000U);
+        3U * (job.timeout_ms > 0U ? job.timeout_ms : 1000U) + 10000U);
     if (xSemaphoreTake(pool_job->done, dwait) == pdTRUE) {
         const esp_err_t result = pool_job->result;
         /* worker 在 give 后才写 finished；等其退出临界区后再由本侧独占 release。 */
@@ -596,10 +602,15 @@ esp_err_t SpiMaster::submitJob(Job &job)
         return result;
     }
 
-    /* 超时：标记 abandoned；若 worker 已跑完则本侧 release，否则 finishPoolJob release。 */
+    /* 超时：按 worker 是否已开始执行分型（executing 由 workerLoop dequeue 时置位）。 */
     taskENTER_CRITICAL(&s_spiJobMux);
-    pool_job->abandoned = true;
+    const bool executing = pool_job->executing;
     const bool already_done = pool_job->finished;
+    if (!executing && !already_done) {
+        /* 尚未执行：标 abandoned，worker dequeue 时跳过 executeJob——
+         * 本函数即将返回，out_* 将指向已消亡栈帧，再执行即 use-after-return。 */
+        pool_job->abandoned = true;
+    }
     taskEXIT_CRITICAL(&s_spiJobMux);
 
     if (already_done) {
@@ -608,8 +619,38 @@ esp_err_t SpiMaster::submitJob(Job &job)
         releaseJobSlot(pool_job);
         return result;
     }
+    if (executing) {
+        /* 执行中：worker 此刻正写调用方栈缓冲，不可返回，须等 finished。
+         * 正常时执行上界已被 dwait 覆盖，这里只兜 dequeue/dwait 边界的尾差；
+         * 再等一整个 dwait（执行中意味着 dequeue 早于 dwait，S+dwait 执行上界
+         * ≤ 2×dwait 必然完成）。 */
+        if (xSemaphoreTake(pool_job->done, dwait) == pdTRUE) {
+            for (;;) {
+                taskENTER_CRITICAL(&s_spiJobMux);
+                const bool fin = pool_job->finished;
+                taskEXIT_CRITICAL(&s_spiJobMux);
+                if (fin) {
+                    break;
+                }
+                vTaskDelay(1);
+            }
+            const esp_err_t result = pool_job->result;
+            releaseJobSlot(pool_job);
+            return result;
+        }
+        /* 仅 worker 本身卡死才会走到这里（执行上界被打破）：标 abandoned
+         * 让 worker（若仍能收尾）释放槽，本侧放弃等待。 */
+        DEBUG_ERR("SPI", "worker 执行中 job 仍未完成 kind=%u（标放弃）",
+                  (unsigned)job.kind);
+        taskENTER_CRITICAL(&s_spiJobMux);
+        if (!pool_job->finished) {
+            pool_job->abandoned = true;
+        }
+        taskEXIT_CRITICAL(&s_spiJobMux);
+        return ESP_ERR_TIMEOUT;
+    }
 
-    DEBUG_ERR("SPI", "worker job done timeout kind=%u（池槽交 worker 释放）",
+    DEBUG_ERR("SPI", "worker job done timeout kind=%u（未执行已放弃，池槽交 worker 释放）",
               (unsigned)job.kind);
     return ESP_ERR_TIMEOUT;
 }
@@ -652,16 +693,29 @@ void SpiMaster::workerLoop()
 
         Job *job = nullptr;
         if (xQueueReceive(m_jobQueue, &job, pdMS_TO_TICKS(1)) == pdTRUE && job != nullptr) {
-            /* 计时 worker 实际执行段（取帧→发→读响应→完成）：
-             * 测速页 RTT − 本值 = 提交/调度/唤醒开销，用于区分
-             * "ESP32 侧任务抢占" vs "GD32 应答慢" 的抖动归属。 */
-            const int64_t w0 = esp_timer_get_time();
-            m_lastProfile.t_w0 = (uint64_t)w0;
-            executeJob(*job);
-            const int64_t w1 = esp_timer_get_time();
-            m_lastProfile.t_w1 = (uint64_t)w1;
-            const int64_t wus = w1 - w0;
-            m_lastWorkerExecUs = (wus > 0) ? (uint32_t)wus : 0U;
+            /* ★ 执行前原子检查 abandoned：提交方超时返回后 out_* 指向已消亡的
+             * 栈帧，此时执行会写悬垂指针（use-after-return → 调用方栈破坏）。
+             * executing 与 abandoned 判定同临界区：提交方超时路径据此区分
+             * "未执行（标 abandoned 跳过）"与"执行中（必须等写完才能返回）"。 */
+            taskENTER_CRITICAL(&s_spiJobMux);
+            const bool job_abandoned = job->abandoned;
+            job->executing = true;
+            taskEXIT_CRITICAL(&s_spiJobMux);
+            if (!job_abandoned) {
+                /* 计时 worker 实际执行段（取帧→发→读响应→完成）：
+                 * 测速页 RTT − 本值 = 提交/调度/唤醒开销，用于区分
+                 * "ESP32 侧任务抢占" vs "GD32 应答慢" 的抖动归属。 */
+                const int64_t w0 = esp_timer_get_time();
+                m_lastProfile.t_w0 = (uint64_t)w0;
+                executeJob(*job);
+                const int64_t w1 = esp_timer_get_time();
+                m_lastProfile.t_w1 = (uint64_t)w1;
+                const int64_t wus = w1 - w0;
+                m_lastWorkerExecUs = (wus > 0) ? (uint32_t)wus : 0U;
+            } else {
+                DEBUG_WARN("SPI", "跳过已放弃 job kind=%u（提交方已超时返回）",
+                           (unsigned)job->kind);
+            }
             finishPoolJob(job);
             continue;
         }
@@ -985,9 +1039,12 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
 
     SpiMaster &self = SpiMaster::instance();
 
-    /* 更新对端 credit */
-    self.m_remoteCredit = hdr.credit;
-
+    /* ★ credit 更新必须晚于 session 校验：被拒收的帧（session 不匹配且非 0/非 EVENT）
+     * 其 credit 字段不可信（可能是 GD32 旧 session 残留帧的背压值）。
+     * 若在拒收前更新 m_remoteCredit，一次 credit=0 的失配帧就会把 m_remoteCredit
+     * 锁存为 0，后续所有 transact 进入 otaTransferUnlocked 的 CREDIT 背压死循环
+     * （drain 读到的帧 session 仍不匹配 → 持续 return false → m_remoteCredit 永远 0）。
+     * 现象：一次通信后所有 SPI 出错，只有复位 GD32（发 session=0 触发 resync）才恢复。 */
     if (self.m_v2Active) {
         /* SESSION_ID 校验 */
         if (hdr.session_id != self.m_sessionId) {
@@ -1002,10 +1059,11 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
             if (!is_event && !is_sess0) {
                 static uint32_t s_sess_mm_logs = 0U;
                 if ((++s_sess_mm_logs % 32U) == 1U) {
-                    DEBUG_WARN("SPI", "v2 SES mismatch got=%08lX exp=%08lX t=%02X #%lu",
+                    DEBUG_WARN("SPI", "v2 SES mismatch got=%08lX exp=%08lX t=%02X #%lu (credit 不更新)",
                                (unsigned long)hdr.session_id, (unsigned long)self.m_sessionId,
                                hdr.type, (unsigned long)s_sess_mm_logs);
                 }
+                /* 拒收：不更新 m_remoteCredit，避免失配帧的 credit 污染背压状态机 */
                 return false;
             }
             if (is_sess0 && !is_event) {
@@ -1024,6 +1082,13 @@ bool SpiMaster::otaFindFrame(const uint8_t *buf, size_t buf_len,
                           (unsigned long)hdr.session_id, (unsigned long)self.m_sessionId, hdr.type);
             }
         }
+    }
+
+    /* session 校验通过（m_v2Active==false / 匹配 / sess0 放行 / EVENT 放行）：
+     * 此帧 credit 可信，更新对端 credit。 */
+    self.m_remoteCredit = hdr.credit;
+
+    if (self.m_v2Active) {
 
         /* 响应归属：ack_seq 应等于 m_lastSentSeq。
          *
@@ -1754,6 +1819,9 @@ esp_err_t SpiMaster::appRequestBootloader()
                 m_lastSentSeq = 0;
                 m_rxAckedSeq = 0;
                 m_expectedRxSeq = 0;
+                /* credit 复位：避免旧 session 锁存的 credit=0 跨重同步污染 */
+                m_localCredit = 8;
+                m_remoteCredit = 8;
                 uint8_t hf[V2_MAX_FRAME];
                 size_t hl = 0;
                 if (v2_build_hello_frame(m_sessionId, V2_ROLE_APP, hf, &hl)) {
@@ -2149,6 +2217,10 @@ esp_err_t SpiMaster::hello(uint32_t timeout_ms, uint8_t role_hint)
     m_expectedRxSeq = 0;
     m_gd32Role = 0;
     m_v2Active = false;
+    /* credit 与 init() 对齐：HELLO 成功时 m_remoteCredit 会被 ACK 覆盖，
+     * 失败时保持 8（而非残留旧值，避免上次通信锁存的 credit=0 跨 session 污染）。 */
+    m_localCredit = 8;
+    m_remoteCredit = 8;
 
     /* 2. 构建 HELLO 帧 */
     uint8_t hello_frame[V2_MAX_FRAME];

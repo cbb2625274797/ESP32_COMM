@@ -503,6 +503,35 @@ esp_err_t DebugLog::uartInit()
     return ESP_OK;
 }
 
+// ============================================================
+// UART0 RX 泵：把 RX(GPIO20) 收到的串口行转发进 ring buffer，
+// 经 HTTP /logs 出现在网页日志面板（tag=UART）。
+// 接线：H1/H2 排针上任意串口源 TX → ESP_RX(GPIO20)，3M 8N1。
+// ============================================================
+static void uartRxPumpTask(void *arg)
+{
+    (void)arg;
+    uint8_t chunk[64];
+    char line[128];
+    int pos = 0;
+
+    for (;;) {
+        const int n = uart_read_bytes(UART_NUM_0, chunk, sizeof(chunk), portMAX_DELAY);
+        for (int i = 0; i < n; i++) {
+            const char c = (char)chunk[i];
+            if (c == '\n' || pos >= (int)sizeof(line) - 1) {
+                if (pos > 0) {
+                    line[pos] = '\0';
+                    DebugLog::instance().log(DEBUG_LOG_INFO, "UART", "%s", line);
+                    pos = 0;
+                }
+            } else if (c != '\r') {
+                line[pos++] = c;
+            }
+        }
+    }
+}
+
 esp_err_t DebugLog::uartSend(const uint8_t *data, size_t len)
 {
     if (!m_uartInitialized || !m_uartAvailable) {
@@ -557,6 +586,15 @@ esp_err_t DebugLog::init()
     m_debugAddr.sin_family = AF_INET;
     m_debugAddr.sin_port = htons(DEBUG_LOG_PORT);
     m_debugAddr.sin_addr.s_addr = inet_addr(DEBUG_LOG_IP);
+
+    /* UART0 RX 泵：串口行 → ring → /logs 网页面板 */
+    if (m_uartAvailable) {
+        if (xTaskCreate(uartRxPumpTask, "uart_rx", 3072, nullptr, 1, nullptr) == pdPASS) {
+            ESP_LOGI(TAG, "UART0 RX 泵已启动 (GPIO%d → /logs)", UART_DEBUG_RX_GPIO);
+        } else {
+            ESP_LOGW(TAG, "UART0 RX 泵任务创建失败（堆不足？）");
+        }
+    }
 
     m_initialized = true;
     ESP_LOGI(TAG, "调试日志已初始化，上位机 %s:%d", DEBUG_LOG_IP, DEBUG_LOG_PORT);

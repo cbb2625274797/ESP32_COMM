@@ -97,6 +97,13 @@ public:
     /** @brief 读取本端剩余可接收 credit（SPEC §10.1，/system/status 展示用）。 */
     uint8_t localCredit() const { return m_localCredit; }
 
+    /** @brief credit 窗口复位到初始值（电机 OTA 取消等半会话终止后调用）。
+     *  credit 只随帧头传递：对端转空闲后不再发帧，传输期锁存的 credit=0
+     *  无法自愈 → 所有 transact 被 CREDIT 背压拒绝（死锁）。
+     *  GD32 端 resetToIdle 已恢复接收窗口（clearOtaSessionQueues 置满），
+     *  本侧同步复位与之对齐；此后每帧帧头 credit 会覆盖为真实值。 */
+    void resetCredit() { m_localCredit = 8; m_remoteCredit = 8; }
+
     /** @brief SPI worker 任务句柄（栈水位 /system/status 与 health 巡检用）。 */
     TaskHandle_t getWorkerTaskHandle() const { return m_workerTask; }
 
@@ -378,6 +385,7 @@ private:
         SemaphoreHandle_t done = nullptr; ///< 池槽静态 binary，init 创建，永不 delete
         volatile bool finished = false;   ///< worker 已 execute + give
         volatile bool abandoned = false;  ///< 提交方已超时返回，worker 负责 release 槽
+        volatile bool executing = false;  ///< worker 已 dequeue（即将/正在写 out_*；超时放弃分型用）
         bool in_use = false;              ///< 池槽占用（critical 保护）
     };
     /** 队列深度；池 = 队列 + 1（在途执行槽），覆盖 queued + executing。 */

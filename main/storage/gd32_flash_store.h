@@ -29,6 +29,21 @@ typedef struct {
 } ota_meta_t;
 
 /**
+ * @brief gd32_ota 分区中存储镜像的身份分类（包级防呆）。
+ *
+ * 判定依据是镜像自身内容（Cortex-M 向量表前两个字），不依赖文件名：
+ * SHA-256 只能证明"传对了"，不能证明"传的是对的包"。
+ * 把 BOOT 包（或任意非 APP 包）中继进 GD32 APP 区会擦掉好固件，
+ * 因此触发中继前必须确认镜像身份为 kApp。
+ */
+enum class Gd32ImageIdentity : uint8_t {
+    kApp = 0,        ///< 复位向量落在 APP 区 → 合法 GD32 APP 固件
+    kBootloader,     ///< 复位向量落在 BOOT 区（0x08000000~0x08011FFF）→ Bootloader 包，禁止刷入 APP
+    kInvalid,        ///< 向量表非法 → 非 GD32 APP 固件（ESP32 镜像 / 文本 / 损坏数据）
+    kReadFailed,     ///< 分区读取失败，无法判定
+};
+
+/**
  * @brief GD32 OTA 固件 Flash 存储抽象层（纯静态工具类）。
  *
  * 封装 gd32_ota 分区的读写、NVS 元数据持久化、SHA-256 校验。
@@ -138,6 +153,17 @@ public:
      */
     esp_err_t verifyFrontendSha(const uint8_t frontend_sha32[32],
                                 uint8_t out_device_sha[32]);
+
+    /**
+     * @brief 读取 gd32_ota 分区镜像开头的 Cortex-M 向量表并判定包身份。
+     *
+     * 检查初始 MSP 是否落在 GD32E508 SRAM、复位向量是否落在 APP 区
+     * （0x08048000~0x0807DFFB，与 BOOT 侧 validateApplication() 同一判据）。
+     * 复位向量落在 BOOT 区（0x08000000~0x08011FFF）则判为 Bootloader 包。
+     * 供中继触发前的包级防呆使用（WiFi /ota/relay 与 BLE 0xF7 共用）。
+     * @return 镜像身份分类；调用方仅应在 kApp 时允许中继。
+     */
+    Gd32ImageIdentity validateStoredImageIdentity();
 
     /**
      * @brief 获取分区指针（懒初始化）。

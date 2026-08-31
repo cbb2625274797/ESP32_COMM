@@ -230,6 +230,15 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
 
+    /* chunked 请求（无 Content-Length 头）时 IDF 置 content_len=-1：
+     * ESP32 分支无符号比较使收流循环失去长度上界，GD32 分支则一字节
+     * 不写却返回 progress:100 假成功——必须前置拒绝 */
+    if (req->content_len <= 0) {
+        return http_send_json_error(req, "400 Bad Request",
+                                    "bad_content_len",
+                                    "missing or invalid Content-Length");
+    }
+
     uint8_t *recv_buf = s_ota_upload_recv;
     DEBUG_WARN("WIFI", "POST /ota/upload clen=%d free=%lu big=%lu",
                req->content_len,
@@ -580,7 +589,27 @@ esp_err_t ota_relay_trigger_handler(httpd_req_t *req)
                                     "sha_compute_failed", "SHA compute failed");
     }
 
+    /* ★ 包级防呆：SHA 匹配只证明传输无误，不证明包内容正确。
+     * 上传 BOOT 包（或其他非 APP 包）时在此拒绝，GD32 不会被擦除 APP 区。 */
+    const Gd32ImageIdentity identity = Gd32FlashStore::instance().validateStoredImageIdentity();
+    if (identity != Gd32ImageIdentity::kApp) {
+        (void)BleOta::instance().resumeStack();
+        const char *msg = (identity == Gd32ImageIdentity::kBootloader)
+            ? "检测到 Bootloader 固件（复位向量在 0x08000000 区），已拒绝刷入 APP 区，请选择 APP 固件"
+            : (identity == Gd32ImageIdentity::kInvalid)
+            ? "固件向量表非法，疑似非 GD32 APP 固件，已拒绝刷写"
+            : "固件存储读取失败，无法校验身份，请重新上传";
+        DEBUG_ERR("OTA", "GD32 固件身份校验失败 identity=%d，拒绝中继", (int)identity);
+        return http_send_json_error(req, "400 Bad Request", "firmware_identity_mismatch", msg);
+    }
+
     esp_err_t trigger_err = OtaCoordinator::instance().triggerGd32Relay();
+    if (trigger_err == ESP_ERR_INVALID_SIZE) {
+        /* 兜底：triggerGd32Relay 内部身份校验拒绝（与上方同判据，正常不会走到） */
+        (void)BleOta::instance().resumeStack();
+        return http_send_json_error(req, "400 Bad Request", "firmware_identity_mismatch",
+                                    "固件身份校验失败，已拒绝刷写");
+    }
     if (trigger_err != ESP_OK) {
         (void)BleOta::instance().resumeStack();
         return http_send_json_error(req, "400 Bad Request",
@@ -1145,6 +1174,9 @@ esp_err_t can_send_batch_handler(httpd_req_t *req)
         return http_send_json_error(req, "400 Bad Request", "bad_args", "ch 字段格式错误");
     }
     long ch_val = readInt();
+    if (ch_val < 0 || ch_val >= CAN_CHANNEL_MAX) {
+        return http_send_json_error(req, "400 Bad Request", "bad_args", "ch 非法(0~2)");
+    }
     if (!findKey("\"frames\"")) {
         return http_send_json_error(req, "400 Bad Request", "bad_args", "缺少 frames 字段");
     }
@@ -2184,8 +2216,9 @@ esp_err_t motor_state_handler(httpd_req_t *req)
      *            count  u8  (有效 entry 数)
      *            rsvd   u16 = 0
      *   Entry:   node u8, ch u8, online u8, dlc u8,
-     *            rx_count u32, seq u32, data[32]
-     * 27 槽（9 node × 3 ch，node×channel 双键）最大 12 + 27*44 = 1200B。
+     *            rx_count u32, seq u32, data[32],
+     *            config_rx_count u32, config_seq u32, config_data[24]
+     * 27 槽（9 node × 3 ch，node×channel 双键）最大 12 + 27*76 = 2064B。
      * 无 have_data 时仍发 header（count=0），让前端区分「无数据」与「空总线」。 */
     bool want_bin = http_query_bool(req, "bin");
     if (want_bin) {
@@ -2234,6 +2267,21 @@ esp_err_t motor_state_handler(httpd_req_t *req)
                 buf[off++] = (uint8_t)((sq >> 24) & 0xFF);
                 memcpy(&buf[off], s.data, MOTOR_STATUS_DLC);
                 off += MOTOR_STATUS_DLC;
+                /* config_rx_count LE */
+                uint32_t cr = s.config_rx_count;
+                buf[off++] = (uint8_t)(cr & 0xFF);
+                buf[off++] = (uint8_t)((cr >> 8) & 0xFF);
+                buf[off++] = (uint8_t)((cr >> 16) & 0xFF);
+                buf[off++] = (uint8_t)((cr >> 24) & 0xFF);
+                /* config_seq LE */
+                uint32_t csq = s.config_seq;
+                buf[off++] = (uint8_t)(csq & 0xFF);
+                buf[off++] = (uint8_t)((csq >> 8) & 0xFF);
+                buf[off++] = (uint8_t)((csq >> 16) & 0xFF);
+                buf[off++] = (uint8_t)((csq >> 24) & 0xFF);
+                /* config_data[24] */
+                memcpy(&buf[off], s.config_data, MOTOR_CONFIG_DLC);
+                off += MOTOR_CONFIG_DLC;
                 count++;
             }
         }
@@ -2257,7 +2305,9 @@ esp_err_t motor_state_handler(httpd_req_t *req)
     }
 
     char *w = s_http_json_work;
-    int off = snprintf(w, HTTP_JSON_WORK_CAP,
+    /* http_json_append 截断时钳制在 cap-1；snprintf 截断返回期望长度，
+     * off += snprintf 会越过 cap 导致 resp_send 越界读 */
+    int off = http_json_append(w, HTTP_JSON_WORK_CAP, 0,
         "{\"have_data\":true,\"active_count\":%u,\"boot_active\":%s,\"age_ms\":%lu,\"motors\":[",
         (unsigned)tbl.active_count, tbl.boot_active ? "true" : "false", (unsigned long)age);
 
@@ -2269,22 +2319,28 @@ esp_err_t motor_state_handler(httpd_req_t *req)
         /* data hex */
         char hex[MOTOR_STATUS_DLC * 2 + 1];
         http_bytes_to_hex_upper(s.data, MOTOR_STATUS_DLC, hex);
+        char chex[MOTOR_CONFIG_DLC * 2 + 1];
+        http_bytes_to_hex_upper(s.config_data, MOTOR_CONFIG_DLC, chex);
 
-        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off,
+        off = http_json_append(w, HTTP_JSON_WORK_CAP, off,
             "%s{\"node\":%u,\"ch\":%u,\"online\":%s,\"dlc\":%u,"
-            "\"rx_count\":%lu,\"seq\":%lu,\"data\":\"%s\"}",
+            "\"rx_count\":%lu,\"seq\":%lu,\"data\":\"%s\","
+            "\"config_rx_count\":%lu,\"config_seq\":%lu,\"config_data\":\"%s\"}",
             first ? "" : ",",
             (unsigned)s.node_id, (unsigned)s.channel,
             s.online ? "true" : "false",
             (unsigned)s.dlc,
             (unsigned long)s.rx_count,
             (unsigned long)s.seq,
-            hex);
+            hex,
+            (unsigned long)s.config_rx_count,
+            (unsigned long)s.config_seq,
+            chex);
         first = false;
     }
 
-    if (off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 2) {
-        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off, "]}");
+    if (off > 0) {
+        off = http_json_append(w, HTTP_JSON_WORK_CAP, off, "]}");
     }
 
     esp_err_t ret = httpd_resp_send(req, w, off > 0 ? off : 0);
@@ -2325,7 +2381,8 @@ esp_err_t motor_version_handler(httpd_req_t *req)
 
     const int64_t now_ms = esp_timer_get_time() / 1000;
     char *w = s_http_json_work;
-    int off = snprintf(w, HTTP_JSON_WORK_CAP, "{\"have_data\":true,\"nodes\":[");
+    int off = http_json_append(w, HTTP_JSON_WORK_CAP, 0,
+                               "{\"have_data\":true,\"nodes\":[");
 
     bool first = true;
     for (uint8_t i = 0; i < MOTORVER_MAX_NODES && off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 128; ++i) {
@@ -2337,7 +2394,7 @@ esp_err_t motor_version_handler(httpd_req_t *req)
         const long age = (s.recv_ms > 0 && now_ms >= s.recv_ms)
                              ? static_cast<long>(now_ms - s.recv_ms) : 0L;
 
-        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off,
+        off = http_json_append(w, HTTP_JSON_WORK_CAP, off,
             "%s{\"node\":%u,\"seq\":%lu,\"age_ms\":%ld,\"version\":\"%s\"}",
             first ? "" : ",",
             (unsigned)s.node_id,
@@ -2347,8 +2404,8 @@ esp_err_t motor_version_handler(httpd_req_t *req)
         first = false;
     }
 
-    if (off > 0 && (size_t)off < HTTP_JSON_WORK_CAP - 2) {
-        off += snprintf(w + off, HTTP_JSON_WORK_CAP - off, "]}");
+    if (off > 0) {
+        off = http_json_append(w, HTTP_JSON_WORK_CAP, off, "]}");
     }
 
     esp_err_t ret = httpd_resp_send(req, w, off > 0 ? off : 0);
@@ -2364,7 +2421,14 @@ esp_err_t motor_ota_upload_handler(httpd_req_t *req)
 {
     http_set_cors_headers(req);
 
-    uint8_t channel = static_cast<uint8_t>(http_query_u32(req, "ch", 0));
+    const uint32_t ch_q = http_query_u32(req, "ch", 0);
+    if (ch_q >= CAN_CHANNEL_MAX) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"bad channel (0~2)\"}");
+        return ESP_FAIL;
+    }
+    uint8_t channel = static_cast<uint8_t>(ch_q);
 
     const int content_len = req->content_len;
     if (content_len <= 0 || content_len > (int)MOTOR_OTA_MAX_FW_SIZE) {
@@ -2480,7 +2544,14 @@ esp_err_t motor_ota_relay_handler(httpd_req_t *req)
     http_set_keepalive_hdr(req);
     DEBUG_INFO("MOTOR_OTA", "=== HTTP: POST /motor/ota/relay ===");
 
-    uint8_t channel = static_cast<uint8_t>(http_query_u32(req, "ch", 0));
+    const uint32_t ch_q = http_query_u32(req, "ch", 0);
+    if (ch_q >= CAN_CHANNEL_MAX) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"bad channel (0~2)\"}");
+        return ESP_FAIL;
+    }
+    uint8_t channel = static_cast<uint8_t>(ch_q);
 
     /* 读 meta 拿 fw_size（motorOtaStart 参数的唯一来源）。
      * total_size==0 = 无固件可刷（未上传过，或上次 relay 成功后 metaClear 已消费）。

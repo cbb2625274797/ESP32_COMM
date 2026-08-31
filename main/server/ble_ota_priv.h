@@ -57,6 +57,7 @@
 #define BLE_OTA_FINISH_ERR_GD32_SIZE 0x84
 #define BLE_OTA_FINISH_ERR_SHA_MISMATCH 0x85
 #define BLE_OTA_FINISH_ERR_GD32_RELAY 0x86
+#define BLE_OTA_FINISH_ERR_FW_IDENTITY 0x87  ///< 包身份不符（疑似 Bootloader/非 APP 包），拒绝中继
 
 struct BleOtaDataBatch {
     uint8_t *data;

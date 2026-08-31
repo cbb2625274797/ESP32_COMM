@@ -310,6 +310,16 @@ esp_err_t OtaCoordinator::triggerGd32Relay()
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* ★ 包级防呆：SHA 匹配只证明"传对了"，不证明"传的是对的包"。
+     * 把 BOOT 包中继进 APP 区会擦掉好固件，触发前必须确认镜像身份为 APP。
+     * 返回 ESP_ERR_INVALID_SIZE 供调用方（WiFi/BLE）映射成具体错误提示。 */
+    const Gd32ImageIdentity identity = Gd32FlashStore::instance().validateStoredImageIdentity();
+    if (identity != Gd32ImageIdentity::kApp) {
+        DEBUG_ERR(TAG, "拒绝中继：GD32 固件身份校验失败 (identity=%d)", (int)identity);
+        unlock(h);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     if (OtaRelay::getState() != RELAY_IDLE &&
         OtaRelay::getState() != RELAY_DONE &&
         OtaRelay::getState() != RELAY_ERROR) {

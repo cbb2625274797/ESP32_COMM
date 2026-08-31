@@ -619,3 +619,56 @@ esp_err_t Gd32FlashStore::verifyFrontendSha(const uint8_t frontend_sha32[32],
     }
     return ESP_OK;
 }
+
+// ============================================================
+// 包级身份校验（向量表内容判定）
+// ============================================================
+
+/* GD32E508 Flash 布局常量，与 GD32E50X_BOOT sys/config.h 对齐：
+ *   BOOT   0x08000000 ~ 0x08011FFF（72KB）
+ *   APP    0x08048000 ~ 0x0807DFFB（APPLATEST_START + APP_MAX_SIZE，216KB-4）
+ *   SRAM   0x20000000 ~ 0x2001FFFF（128KB）
+ * APP 固件链接基址 0x08048000、BOOT 链接基址 0x08000000，
+ * 两者向量表第二字（Reset_Handler）必然落在各自区域内，据此区分包类型。
+ * 注意：BOOT 侧 validateApplication() 使用同一判据，修改需两边同步。 */
+static constexpr uint32_t kGd32BootRegionStart = 0x08000000U;
+static constexpr uint32_t kGd32BootRegionEnd   = 0x08012000U;
+static constexpr uint32_t kGd32AppRegionStart  = 0x08048000U;
+static constexpr uint32_t kGd32AppRegionEnd    = 0x08048000U + 0x00035FFCU;
+static constexpr uint32_t kGd32SramStart       = 0x20000000U;
+static constexpr uint32_t kGd32SramEnd         = 0x20020000U;
+
+static inline uint32_t rd_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+Gd32ImageIdentity Gd32FlashStore::validateStoredImageIdentity()
+{
+    uint8_t vec[8] = {0};
+    if (flashReadChunk(0, vec, sizeof(vec)) != ESP_OK) {
+        DEBUG_ERR("OTA", "身份校验：读取向量表失败");
+        return Gd32ImageIdentity::kReadFailed;
+    }
+
+    const uint32_t msp   = rd_le32(&vec[0]);
+    const uint32_t reset = rd_le32(&vec[4]) & ~1U;  // 清除 Thumb 位
+
+    const bool msp_valid   = (msp >= kGd32SramStart && msp < kGd32SramEnd);
+    const bool reset_is_app = (reset >= kGd32AppRegionStart && reset < kGd32AppRegionEnd);
+    const bool reset_is_boot = (reset >= kGd32BootRegionStart && reset < kGd32BootRegionEnd);
+
+    if (msp_valid && reset_is_app) {
+        return Gd32ImageIdentity::kApp;
+    }
+
+    if (reset_is_boot) {
+        DEBUG_ERR("OTA", "身份校验：检测到 Bootloader 包 (MSP=0x%08lX RH=0x%08lX)，禁止刷入 APP 区",
+                  (unsigned long)msp, (unsigned long)reset);
+        return Gd32ImageIdentity::kBootloader;
+    }
+
+    DEBUG_ERR("OTA", "身份校验：向量表非法 (MSP=0x%08lX RH=0x%08lX)，非 GD32 APP 固件",
+              (unsigned long)msp, (unsigned long)reset);
+    return Gd32ImageIdentity::kInvalid;
+}

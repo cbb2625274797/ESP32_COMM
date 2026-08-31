@@ -288,13 +288,16 @@ const uint32_t remaining = s_fw_size - s_fw_offset;
 
 	    /* feedTask 字节喂完 ≠ GD32/电机已完成。suppress 期间 0xD2 被丢；
 	     * 末包 CAN ACK / 跳转 APP 还要数百 ms。只 QUERY 一次会把前端卡在 kTransfer。
-	     * 退出后轮询 QUERY，直到 GD32 进 FINISHED/ERROR/IDLE，或最多 ~8s。 */
+	     * 退出后轮询 QUERY，直到 GD32 进 FINISHED/ERROR/IDLE，或最多 ~8s。
+	     * 用户取消（s_feed_running 已被 motorOtaCancel 置 false）时跳过：
+	     * 设备端已进 IDLE、GD32 已 resetToIdle，无终态可等——立即收尾退出，
+	     * 把 cancel task 的等待窗口压到最短（也消除强删窗口）。 */
 	    {
 	        constexpr uint32_t kExitPollMs = 8000U;
 	        constexpr uint32_t kExitGapMs  = 150U;
 	        const uint32_t exit_deadline = nowMs() + kExitPollMs;
 	        bool got_terminal = false;
-	        while (nowMs() < exit_deadline) {
+	        while (s_feed_running && nowMs() < exit_deadline) {
             /* 优先吃 ring 推送（已恢复 suppress） */
             {
                 const motor_ota_status_t st = motorOtaGetStatus();
@@ -395,6 +398,25 @@ int motorOtaStart(uint32_t fw_size, uint8_t channel)
         &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
         300U);  /* 300ms: fire-and-forget，让 worker 有足够时间完成 START。
                  * 原 500ms 偏保守；GD32 收到 START 立即进 kPreCancel，<50ms 响应。 */
+    if (ret == ESP_OK && resp_type != kRspAck && resp_len >= 1U &&
+        resp_payload[0] == 0xE5U) {
+        /* 0xE5 = GD32 端 relay 会话残留（上次 CANCEL 丢失/未达）：不清会直接
+         * 让本次 OTA 空转失败。补发 CANCEL（GD32 resetToIdle 归 kIdle）后
+         * 重试一次 START，一次自愈即恢复，无需用户重试或刷新。 */
+        DEBUG_WARN(TAG, "START 0xE5（GD32 残留会话）→ 补发 CANCEL 后重试 START");
+        uint8_t ccmd[1] = {1U};
+        uint8_t crt = 0;
+        uint8_t crp[4] = {0};
+        size_t crl = 0;
+        SpiMaster::instance().resetCredit();  /* 解除背压，保证 CANCEL 发出 */
+        (void)SpiMaster::instance().transact(
+            kSpiMotorOtaCmd, ccmd, 1, &crt, crp, sizeof(crp), &crl, 500U);
+        SpiMaster::instance().resetCredit();  /* GD32 已 resetToIdle，窗口对齐满 */
+        ret = SpiMaster::instance().transact(
+            kSpiMotorOtaCmd, cmd, 6,
+            &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
+            300U);
+    }
     if (ret != ESP_OK || resp_type != kRspAck) {
         DEBUG_WARN(TAG, "START SPI 未确认 ACK (ret=%s resp=0x%02X)——fire-and-forget 继续",
                    esp_err_to_name(ret), resp_type);
@@ -441,7 +463,7 @@ void motorOtaCancel(void)
     }
 
     /* 通知 GD32 取消 relay 状态机 + 等 feedTask 退出是耗时操作
-     *（SPI transact 最多 1s + feedTask 退出最多 2s），不能在 httpd 线程
+     *（SPI transact 最多 1s + feedTask 退出最长 ~8.2s），不能在 httpd 线程
      * 同步阻塞，否则 cancel HTTP 请求本身会超时（"Failed to fetch"），
      * 且 httpd 单线程会饿死其他端点。
      * 用独立 task 异步执行，HTTP handler 立即返回。 */
@@ -453,7 +475,12 @@ void motorOtaCancel(void)
     }
 
     auto do_cancel = [](void *) {
-        /* 通知 GD32 取消 relay 状态机 */
+        /* ★ 先复位 credit 再发 CANCEL：取消的典型时机恰是传输卡住（GD32 缓冲满，
+         * 最后一帧 RESPONSE credit=0 已锁存进 m_remoteCredit）——不先解除背压，
+         * CANCEL 自己会被 CREDIT 背压 refuse，GD32 端 relay 会话收不到取消而残留，
+         * 下次 START 被 GD32 0xE5 拒 → "取消后重新开始没法开始"。
+         * GD32 收到 CANCEL 后 resetToIdle 恢复满窗口，与复位值对齐。 */
+        SpiMaster::instance().resetCredit();
         uint8_t cmd[1] = {1U};  /* cmd=CANCEL */
         uint8_t resp_type = 0;
         uint8_t resp_payload[4];
@@ -462,22 +489,43 @@ void motorOtaCancel(void)
             kSpiMotorOtaCmd, cmd, 1,
             &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
             1000U);
+        if (ret != ESP_OK) {
+            /* 重试一次：再复位 credit（防首次期间又被失配帧锁 0）后重发 */
+            vTaskDelay(pdMS_TO_TICKS(50));
+            SpiMaster::instance().resetCredit();
+            ret = SpiMaster::instance().transact(
+                kSpiMotorOtaCmd, cmd, 1,
+                &resp_type, resp_payload, sizeof(resp_payload), &resp_len,
+                1000U);
+        }
         DEBUG_WARN(TAG, "cancel: GD32 resp ret=%s type=0x%02X", esp_err_to_name(ret), resp_type);
 
-        /* 等待 feedTask 真正退出（最多 2s），避免 s_feed_running 已清但 task
-         * 仍卡在 SpiMaster::transact 阻塞中，导致 motorOtaIsActive() 瞬时仍 true。 */
+        /* 等待 feedTask 真正退出。feedTask 最坏存活：主循环收尾 ≤0.2s +
+         * 退出轮询 8s ≈ 8.2s（120s 整体超时路径同样有界），等待上限取 10s
+         * 覆盖之——正常路径 feedTask 因 s_status 已被置 IDLE 在 ~0.3s 内退出，
+         * 这里只是兜底；尽量不强删（强删会泄漏 job 槽 + worker 悬垂栈写）。 */
         TaskHandle_t t = s_feed_task;
         if (t) {
-            for (int i = 0; i < 200 && s_feed_task != nullptr; i++) {
+            for (int i = 0; i < 1000 && s_feed_task != nullptr; i++) {
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
             if (s_feed_task != nullptr) {
-                DEBUG_ERR(TAG, "cancel: feedTask 未在 2s 内退出，强制删除");
+                DEBUG_ERR(TAG, "cancel: feedTask 未在 10s 内退出，强制删除");
                 vTaskDelete(s_feed_task);
                 s_feed_task = nullptr;
+                /* 强删绕过了 feedTask 收尾，suppress 必须在此恢复，
+                 * 否则 ring service 永久关闭 → GD32 推送全部收不到。 */
+                SpiMaster::instance().setSuppressRingService(false);
             }
         }
         s_feed_running = false;  /* 双保险 */
+        /* credit 复位：取消的典型时机是传输卡住（GD32 缓冲满）——最后一帧
+         * RESPONSE 的 credit=0（session 合法）被锁存进 m_remoteCredit。
+         * GD32 resetToIdle 后转空闲不再发帧，relay 又跑在 APP（不重启、
+         * 无 session=0 帧）→ 没有任何 resync 入口能把 credit 送回来，
+         * 后续所有 transact 被 CREDIT 背压拒绝 → 网页所有消息收不到。
+         * GD32 端 clearOtaSessionQueues 已把接收窗口恢复满，此处对齐复位。 */
+        SpiMaster::instance().resetCredit();
         cancel_task = nullptr;
         vTaskDelete(NULL);
     };
@@ -487,6 +535,7 @@ void motorOtaCancel(void)
         DEBUG_ERR(TAG, "cancel: failed to create cancel task, doing sync cancel");
         cancel_task = nullptr;
         /* 降级：同步执行（极端 OOM 情况） */
+        SpiMaster::instance().resetCredit();  /* 先解除背压，保证 CANCEL 能发出 */
         uint8_t cmd[1] = {1U};
         uint8_t resp_type = 0;
         uint8_t resp_payload[4];
@@ -503,9 +552,11 @@ void motorOtaCancel(void)
             if (s_feed_task != nullptr) {
                 vTaskDelete(s_feed_task);
                 s_feed_task = nullptr;
+                SpiMaster::instance().setSuppressRingService(false);
             }
         }
         s_feed_running = false;
+        SpiMaster::instance().resetCredit();  /* 同 do_cancel：防 credit=0 锁存死锁 */
     }
     DEBUG_WARN(TAG, "cancel: dispatched feed_running=%d", (int)s_feed_running);
 }

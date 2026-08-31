@@ -14,8 +14,8 @@
 // 固件版本
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 78
-#define FW_VERSION_STRING "0.3.78"   // 版本查询checkVersionWait移到tickInFlight释放后异步触发，避免/motor/version请求拖长tick导致tickStuck误报通道闪黄
+#define FW_VERSION_PATCH 82
+#define FW_VERSION_STRING "0.3.82"   // DebugLog 新增 UART0 RX 泵任务(GPIO20, 3M 8N1)：收到的串口行按 \n 切行、剥 \r，以 tag=UART 推入 ring → HTTP /logs 出现在网页日志面板；接线=任意串口源 TX→H1/H2 的 ESP_RX。0.3.81 GD32 OTA 包级防呆：中继触发前校验 gd32_ota 镜像向量表身份(Gd32FlashStore::validateStoredImageIdentity)，BOOT 包/非 APP 包在 WiFi /ota/relay 与 BLE 0xF7 均拒绝，GD32 APP 区不再被错误包擦除；BLE 新增 0x87 完成码
 
 // Git 信息（手动填写）
 #define GIT_HASH "770ae14"

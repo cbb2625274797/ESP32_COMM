@@ -76,6 +76,18 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
 
             DEBUG_INFO(TAG, "GD32就绪 SHA匹配 %" PRIu32 "/%" PRIu32 ",触发中继",
                        meta.stored_size, meta.total_size);
+
+            /* ★ 包级防呆：SHA 匹配只证明传输无误。BOOT 包/非 APP 包在此拒绝，
+             * 不进入 SPI 中继，GD32 APP 区不会被擦除。 */
+            const Gd32ImageIdentity identity = Gd32FlashStore::instance().validateStoredImageIdentity();
+            if (identity != Gd32ImageIdentity::kApp) {
+                DEBUG_ERR(TAG, "GD32 固件身份校验失败 identity=%d，拒中继", (int)identity);
+                sendFinishEvent(BLE_OTA_FINISH_ERR_FW_IDENTITY,
+                                packBleFinishValue(session_id,
+                                    (identity == Gd32ImageIdentity::kBootloader) ? 1 : 2));
+                return 0;
+            }
+
             if (OtaRelay::getResultQueue()) {
                 uint32_t stale = 0;
                 while (xQueueReceive(OtaRelay::getResultQueue(), &stale, 0) == pdTRUE) {
@@ -83,6 +95,13 @@ int ble_ota_ctrl_access(uint16_t conn_handle, uint16_t attr_handle,
                 }
             }
             esp_err_t trig_err = OtaCoordinator::instance().triggerGd32Relay();
+            if (trig_err == ESP_ERR_INVALID_SIZE) {
+                /* 兜底：triggerGd32Relay 内部身份校验拒绝（与上方同判据） */
+                DEBUG_ERR(TAG, "GD32 固件身份校验失败（trigger 兜底），拒中继");
+                sendFinishEvent(BLE_OTA_FINISH_ERR_FW_IDENTITY,
+                                packBleFinishValue(session_id, 2));
+                return 0;
+            }
             if (trig_err != ESP_OK) {
                 DEBUG_ERR(TAG, "GD32 中继触发失败: %s", esp_err_to_name(trig_err));
                 sendFinishEvent(BLE_OTA_FINISH_ERR_GD32_RELAY,

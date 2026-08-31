@@ -6,10 +6,12 @@
  *
  * payload 格式（每页）：
  *   [0] page, [1] total_pages, [2] entry_count, [3] active_count
- *   [4..] 每个 entry 44B:
+ *   [4..] 每个 entry 76B:
  *     [0] node_id, [1] channel, [2] online, [3] dlc,
  *     [4..7] rx_count (LE), [8..11] seq (LE),
  *     [12..43] data[32] (原始 STATUS payload)
+ *     [44..47] config_rx_count (LE), [48..51] config_seq (LE),
+ *     [52..75] config_data[24] (原始 CONFIG payload, 目标值回报)
  *
  * 同一节点号可能同时挂在多个 CAN 通道（两台电机同号异线），
  * 缓存表与 GD32 端一致按 node×channel 双键存储（27 槽）。
@@ -29,9 +31,10 @@ extern "C" {
 #define MOTOR_CHANNELS       3
 #define MOTOR_MAX_SLOTS      (MOTOR_MAX_NODES * MOTOR_CHANNELS)
 #define MOTOR_STATUS_DLC     32
-#define MOTOR_ENTRY_SIZE     44
+#define MOTOR_CONFIG_DLC     24
+#define MOTOR_ENTRY_SIZE     76
 #define MOTOR_PAGE_HEADER    4
-#define MOTOR_TOTAL_PAGES    6
+#define MOTOR_TOTAL_PAGES    9
 
 /** @brief 单电机状态快照。 */
 typedef struct {
@@ -42,6 +45,9 @@ typedef struct {
     uint32_t rx_count;                   ///< 累计收到帧数
     uint32_t seq;                        ///< GD32 侧更新序号
     uint8_t  data[MOTOR_STATUS_DLC];     ///< 原始 STATUS payload
+    uint32_t config_rx_count;            ///< 累计收到 CONFIG 帧数
+    uint32_t config_seq;                 ///< CONFIG 更新序号
+    uint8_t  config_data[MOTOR_CONFIG_DLC]; ///< 原始 CONFIG payload (目标值回报)
 } motor_slot_t;
 
 /** @brief 全局电机状态表。 */
