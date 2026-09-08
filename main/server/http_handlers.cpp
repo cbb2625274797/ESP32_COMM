@@ -1996,6 +1996,58 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)ls.stats.max_resp_latency_us);
     }
 
+    /* ── GD32 APP 初始化状态（GD32 1.5.34+）──
+     * state 来自身份块 [15]（HELLO/PING 自动刷新，零成本）；
+     * 详情（模块位图/失败位图/复位源）惰性查询 0xA3：仅 APP 角色、缓存无效、
+     * 距上次尝试 ≥10s（失败退避，老固件不认识 0xA3 时每 10s 才多发一帧）。
+     * init 状态静态不变，成功一次即终身缓存（session 重建时 SpiMaster 自清）。 */
+    {
+        const uint8_t init_state = SpiMaster::instance().gd32InitState();
+        const bool state_known = (init_state != GD32_INIT_STATE_UNKNOWN);
+        gd32_init_status_t ist = {};
+        bool detail_known = SpiMaster::instance().gd32InitStatusCached(&ist);
+
+        static uint32_t s_initStatusLastTryMs = 0;
+        const uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (!detail_known && SpiMaster::instance().gd32Role() == V2_ROLE_APP &&
+            (now_ms - s_initStatusLastTryMs) >= 10000U) {
+            s_initStatusLastTryMs = now_ms;
+            if (SpiMaster::instance().appInitStatus(300U, nullptr) == ESP_OK) {
+                detail_known = SpiMaster::instance().gd32InitStatusCached(&ist);
+            }
+        }
+
+        if (detail_known) {
+            len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
+                ",\"gd32_init\":{\"state\":%u,\"state_known\":%s,\"detail_known\":true,"
+                "\"module_mask\":%lu,\"critical_fail_mask\":%lu,\"reset_cause\":%u",
+                (unsigned)ist.init_state,
+                state_known ? "true" : "false",
+                (unsigned long)ist.module_mask,
+                (unsigned long)ist.critical_fail_mask,
+                (unsigned)ist.reset_cause);
+            /* GD32 1.5.36+：每模块 1B 故障码数组（前端按位序解码中文原因） */
+            if (len > 0 && ist.has_fault_codes) {
+                len = http_json_append(resp, HTTP_JSON_WORK_CAP, len, ",\"fault_codes\":[");
+                for (uint8_t fi = 0; fi < GD32_INIT_MODULE_COUNT && len > 0; ++fi) {
+                    len = http_json_append(resp, HTTP_JSON_WORK_CAP, len, "%s%u",
+                                           fi == 0 ? "" : ",", (unsigned)ist.fault_codes[fi]);
+                }
+                if (len > 0) {
+                    len = http_json_append(resp, HTTP_JSON_WORK_CAP, len, "]");
+                }
+            }
+            if (len > 0) {
+                len = http_json_append(resp, HTTP_JSON_WORK_CAP, len, "}");
+            }
+        } else {
+            len = http_json_append(resp, HTTP_JSON_WORK_CAP, len,
+                ",\"gd32_init\":{\"state\":%u,\"state_known\":%s,\"detail_known\":false}",
+                (unsigned)(state_known ? init_state : 0U),
+                state_known ? "true" : "false");
+        }
+    }
+
     {
         gd32_adc_feedback_t ga = {};
         const bool have = getLatestGd32AdcFeedback(&ga);
@@ -2207,18 +2259,18 @@ esp_err_t motor_state_handler(httpd_req_t *req)
     const uint32_t age = motorStateAgeMs();
 
     /* 二进制模式：?bin=1（前端默认走此路径，体积比 JSON 省 66%）。
-     * 协议（LE，Header 12B + 每节点 Entry 44B）:
+     * 协议（LE，Header 12B + 每节点 Entry 92B，v0.74: STATUS DLC 48）:
      *   Header:  magic  u16 = 0x4D53 ('MS')
-     *            ver    u8  = 1
+     *            ver    u8  = 2   (v0.74: entry 76→92 / data 32→48)
      *            flags  u8  = 0
      *            age_ms u32  (0xFFFFFFFF = 无数据)
      *            active u8  (在线电机数)
      *            count  u8  (有效 entry 数)
      *            rsvd   u16 = 0
      *   Entry:   node u8, ch u8, online u8, dlc u8,
-     *            rx_count u32, seq u32, data[32],
+     *            rx_count u32, seq u32, data[48],
      *            config_rx_count u32, config_seq u32, config_data[24]
-     * 27 槽（9 node × 3 ch，node×channel 双键）最大 12 + 27*76 = 2064B。
+     * 27 槽（9 node × 3 ch，node×channel 双键）最大 12 + 27*92 = 2508B。
      * 无 have_data 时仍发 header（count=0），让前端区分「无数据」与「空总线」。 */
     bool want_bin = http_query_bool(req, "bin");
     if (want_bin) {
@@ -2229,7 +2281,7 @@ esp_err_t motor_state_handler(httpd_req_t *req)
         size_t off = 0;
         /* magic 'MS' (LE: 0x53, 0x4D) */
         buf[off++] = 0x53U; buf[off++] = 0x4DU;
-        buf[off++] = 1U;            /* version */
+        buf[off++] = 2U;            /* version (v0.74: entry 92 / data 48) */
         /* flags bit0 = boot_active（总线有电机在 BOOT，0x103 心跳） */
         buf[off++] = (have && tbl.boot_active) ? 0x01U : 0x00U;
         /* age_ms LE u32 */

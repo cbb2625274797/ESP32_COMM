@@ -226,7 +226,11 @@ ota_result_t OtaRelay::handleIdle(relay_event_t event, const uint8_t *payload, s
 
     if (event == RELAY_EVT_START) {
         DEBUG_INFO("OTA", "=== 中继状态机启动: IDLE → HANDSHAKING ===");
-        reset();
+        /* 只清状态不清 ring 抑制：taskEntry 收到调度时已 setSuppressRingService(true)，
+         * 此处若解除，中继全程（握手/协商/传包）worker 都会偷读 OTA ACK/WAIT
+         * （serviceRing 读到 RESPONSE 告警、poll 空等→重发→失败）。
+         * 抑制由中继结束时的 reset()/abortRemoteAndReset() 统一释放。 */
+        reset(false);
         setState(RELAY_HANDSHAKING);
         return OTA_RESULT_OK;
     }
@@ -532,7 +536,7 @@ void OtaRelay::clearSessionCryptoState()
 // ============================================================
 // 状态机复位
 // ============================================================
-void OtaRelay::reset()
+void OtaRelay::reset(bool release_ring_suppress)
 {
     StateLockGuard lock;
     relayState = RELAY_IDLE;
@@ -543,7 +547,9 @@ void OtaRelay::reset()
     m_transferFlashOffset = 0;
     m_transferDeadline = 0;
     clearSessionCryptoState();
-    SpiMaster::instance().setSuppressRingService(false);
+    if (release_ring_suppress) {
+        SpiMaster::instance().setSuppressRingService(false);
+    }
     DEBUG_INFO("OTA", "状态机已复位 → IDLE");
 }
 

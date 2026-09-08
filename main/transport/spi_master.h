@@ -47,6 +47,26 @@ typedef struct {
     uint16_t boot_build;
 } gd32_version_t;
 
+/* GD32 APP init_state 编码（身份块 [15] 与 0xA3 payload[9]，见 spi_link_v2.h） */
+#define GD32_INIT_STATE_OK            (0x00)  /* 全部模块初始化成功 */
+#define GD32_INIT_STATE_DEGRADED      (0x01)  /* critical 全成，非 critical 有失败/跳过 */
+#define GD32_INIT_STATE_CRITICAL_FAIL (0x02)  /* 有 critical 模块失败 */
+#define GD32_INIT_STATE_UNKNOWN       (0xFF)  /* 本端尚未收到身份块 */
+
+// GD32 APP 初始化状态详情（SPI 0xA3 INIT_STATUS 响应解析结果）
+#define GD32_INIT_MODULE_COUNT 13  /* 模块数（fault_codes 长度，与 DCU_APP kModuleCount 一致） */
+typedef struct {
+    uint32_t module_mask;        /* 成功初始化的模块位图（DCU_APP AppInitializer::ModuleBit） */
+    uint32_t critical_fail_mask; /* 失败的 critical 模块位图（0=无 critical 失败） */
+    uint8_t  reset_cause;        /* 复位源位图（bit0 POR/bit1 EPR/bit2 FWDGT/bit3 WWDGT/bit4 SW/bit5 LP） */
+    uint8_t  init_state;         /* GD32_INIT_STATE_* */
+    /* 每模块 1B 故障码（GD32 1.5.36+，响应 25B 时填充；0=成功。
+     * 编码见 DCU_APP sys/initial.h；canfd = 原因码|(首个失败通道<<4)） */
+    uint8_t  fault_codes[GD32_INIT_MODULE_COUNT];
+    bool     has_fault_codes;    /* fault_codes 是否有效（响应 ≥25B） */
+    bool     valid;              /* 本结构是否已成功查询填充 */
+} gd32_init_status_t;
+
 /**
  * @brief SPI Master 驱动类（单例）
  *
@@ -252,6 +272,16 @@ public:
     /** @brief 向 GD32 APP 发送存活探测命令，等待 APP 回复 ALIVE ACK。 */
     esp_err_t appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_version_t *version = nullptr);
 
+    /** @brief 查询 GD32 APP 初始化状态（SPI 0xA3，12B：模块位图/失败位图/复位源/init_state）。
+     *  仅 APP 角色支持（BOOT 无此命令）；成功时填充 out 并置 valid=true，同时更新本端缓存。 */
+    esp_err_t appInitStatus(uint32_t timeout_ms, gd32_init_status_t *out);
+
+    /** @brief 身份块 [15] 带来的 init_state（HELLO/PING 自动刷新；0xFF=未知）。 */
+    uint8_t gd32InitState() const { return m_gd32InitState; }
+
+    /** @brief 读取缓存的 0xA3 查询结果；valid=false 表示尚未成功查询过。 */
+    bool gd32InitStatusCached(gd32_init_status_t *out) const;
+
     /**
      * @brief L0 本机自检（不依赖 GD32）：SPI 设备/互斥/worker/队列已就绪。
      */
@@ -366,6 +396,7 @@ private:
         EnterBoot,
         Ping,
         WaitBoot,
+        InitStatus,
     };
     struct Job {
         JobKind kind = JobKind::Transact;
@@ -381,6 +412,7 @@ private:
         size_t *out_len = nullptr;
         uint32_t *out_uptime = nullptr;
         gd32_version_t *out_version = nullptr;
+        gd32_init_status_t *out_init_status = nullptr;
         esp_err_t result = ESP_FAIL;
         SemaphoreHandle_t done = nullptr; ///< 池槽静态 binary，init 创建，永不 delete
         volatile bool finished = false;   ///< worker 已 execute + give
@@ -438,6 +470,8 @@ private:
     volatile uint32_t m_gd32FeatFlags = 0;  ///< V2_FEAT_*
     volatile bool     m_gd32IdKnown = false;   ///< 是否已缓存版本号
     gd32_version_t    m_gd32Version = {};      ///< HELLO/PING 缓存的版本
+    volatile uint8_t  m_gd32InitState = GD32_INIT_STATE_UNKNOWN; ///< 身份块 [15] init_state
+    gd32_init_status_t m_gd32InitStatus = {};  ///< 0xA3 查询缓存（valid 标志内置）
     volatile bool     m_v2Active = false;   ///< v2 session 是否激活
     /** 最近一次 otaFindFrame 解析到的 RESPONSE 是否与 m_lastSentSeq 归属匹配 */
     volatile bool     m_lastRxAckMatched = false;

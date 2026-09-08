@@ -65,9 +65,10 @@ bool onMotorStateEvent(const uint8_t *payload, size_t len)
         slot.rx_count = rdU32Le(&e[4]);
         slot.seq      = rdU32Le(&e[8]);
         memcpy(slot.data, &e[12], MOTOR_STATUS_DLC);
-        slot.config_rx_count = rdU32Le(&e[44]);
-        slot.config_seq      = rdU32Le(&e[48]);
-        memcpy(slot.config_data, &e[52], MOTOR_CONFIG_DLC);
+        /* v0.74: STATUS DLC 48，CONFIG 字段整体后移 16B */
+        slot.config_rx_count = rdU32Le(&e[60]);
+        slot.config_seq      = rdU32Le(&e[64]);
+        memcpy(slot.config_data, &e[68], MOTOR_CONFIG_DLC);
 
         offset += MOTOR_ENTRY_SIZE;
     }

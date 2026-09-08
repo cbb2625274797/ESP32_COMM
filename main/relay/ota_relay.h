@@ -144,8 +144,11 @@ public:
     /**
      * @brief 重置本端中继状态机到 IDLE（不主动通知 GD32）。
      *        中继失败/中止时请优先用 abortRemoteAndReset()。
+     * @param release_ring_suppress true（默认）解除 SPI ring 抑制引用；
+     *        状态机起点（IDLE→HANDSHAKING）必须传 false——taskEntry 在调度时
+     *        取的抑制引用要覆盖整个中继，否则中继全程 worker 会偷读 OTA ACK/WAIT。
      */
-    void reset();
+    void reset(bool release_ring_suppress = true);
 
     /**
      * @brief 通知 GD32 取消 OTA 会话（SPI CANCEL），再复位本端到 IDLE。

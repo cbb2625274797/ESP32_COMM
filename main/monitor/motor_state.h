@@ -6,12 +6,15 @@
  *
  * payload 格式（每页）：
  *   [0] page, [1] total_pages, [2] entry_count, [3] active_count
- *   [4..] 每个 entry 76B:
+ *   [4..] 每个 entry 92B (v0.74: STATUS DLC 48):
  *     [0] node_id, [1] channel, [2] online, [3] dlc,
  *     [4..7] rx_count (LE), [8..11] seq (LE),
- *     [12..43] data[32] (原始 STATUS payload)
- *     [44..47] config_rx_count (LE), [48..51] config_seq (LE),
- *     [52..75] config_data[24] (原始 CONFIG payload, 目标值回报)
+ *     [12..59] data[48] (原始 STATUS payload, 字节 32~35 = InitStatus)
+ *     [60..63] config_rx_count (LE), [64..67] config_seq (LE),
+ *     [68..91] config_data[24] (原始 CONFIG payload, 目标值回报)
+ *
+ * 注意：STATUS DLC 48 与页大小/页数变更（76→92、9→14 页）需 DCU GD32 与
+ * ESP32 固件成对升级，旧解析方会因长度校验失败拒收（不误解析）。
  *
  * 同一节点号可能同时挂在多个 CAN 通道（两台电机同号异线），
  * 缓存表与 GD32 端一致按 node×channel 双键存储（27 槽）。
@@ -30,18 +33,18 @@ extern "C" {
 #define MOTOR_MAX_NODES      9
 #define MOTOR_CHANNELS       3
 #define MOTOR_MAX_SLOTS      (MOTOR_MAX_NODES * MOTOR_CHANNELS)
-#define MOTOR_STATUS_DLC     32
+#define MOTOR_STATUS_DLC     48
 #define MOTOR_CONFIG_DLC     24
-#define MOTOR_ENTRY_SIZE     76
+#define MOTOR_ENTRY_SIZE     92
 #define MOTOR_PAGE_HEADER    4
-#define MOTOR_TOTAL_PAGES    9
+#define MOTOR_TOTAL_PAGES    14
 
 /** @brief 单电机状态快照。 */
 typedef struct {
     uint8_t  node_id;                    ///< 1-9, 0=空槽
     uint8_t  channel;                    ///< CAN 通道 (0/1/2)
     uint8_t  online;                     ///< 1=在线, 0=离线
-    uint8_t  dlc;                        ///< STATUS 帧 DLC (正常=32)
+    uint8_t  dlc;                        ///< STATUS 帧 DLC (正常=48)
     uint32_t rx_count;                   ///< 累计收到帧数
     uint32_t seq;                        ///< GD32 侧更新序号
     uint8_t  data[MOTOR_STATUS_DLC];     ///< 原始 STATUS payload

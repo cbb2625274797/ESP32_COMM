@@ -78,7 +78,7 @@ static size_t spiRespReadBudget(void)
 static bool isShortRespType(uint8_t type)
 {
     switch (type) {
-    case 0xA1U: case 0x02U: case 0x01U: case 0xF7U:
+    case 0xA1U: case 0xA3U: case 0x02U: case 0x01U: case 0xF7U:
     case 0xB0U: case 0xC0U: case 0xC2U: case 0xD1U:
     case 0xC4U: case 0xC7U:
         return true;
@@ -98,7 +98,7 @@ static constexpr size_t kShortRespReadBudget = 96U;
 static bool isAppIsrFastRespType(uint8_t type)
 {
     switch (type) {
-    case 0xA1U: case 0xC0U: case 0xC1U: case 0xC2U:
+    case 0xA1U: case 0xA3U: case 0xC0U: case 0xC1U: case 0xC2U:
     case 0xC3U: case 0xC4U: case 0xC5U: case 0xC7U: case 0xD1U:
     case 0xF7U:
         return true;
@@ -414,6 +414,9 @@ void SpiMaster::executeJob(Job &job)
     case JobKind::Ping:
         job.result = appPing(job.timeout_ms, job.out_uptime, job.out_version);
         break;
+    case JobKind::InitStatus:
+        job.result = appInitStatus(job.timeout_ms, job.out_init_status);
+        break;
     case JobKind::WaitBoot:
         job.result = waitForBootloaderReady(job.timeout_ms);
         break;
@@ -451,6 +454,7 @@ SpiMaster::Job *SpiMaster::acquireJobSlot()
             slot->out_len = nullptr;
             slot->out_uptime = nullptr;
             slot->out_version = nullptr;
+            slot->out_init_status = nullptr;
             slot->result = ESP_FAIL;
             slot->done = done;
             slot->finished = false;
@@ -489,6 +493,7 @@ void SpiMaster::releaseJobSlot(Job *job)
     job->out_len = nullptr;
     job->out_uptime = nullptr;
     job->out_version = nullptr;
+    job->out_init_status = nullptr;
     job->payload_len = 0U;
     job->result = ESP_FAIL;
     taskENTER_CRITICAL(&s_spiJobMux);
@@ -2014,7 +2019,7 @@ esp_err_t SpiMaster::waitForBootloaderReady(uint32_t timeout_ms)
  *
  * 布局与 HELLO_ACK 附加块 / APP PING body 相同（见 spi_link_v2.h V2_APP_IDENTITY_LEN）：
  *   [0..3] APP ver · [4..7] BOOT ver · [8..11] uptime_ms LE
- *   [12] feat_map_ver · [13..14] feature_flags LE · [15] rsv
+ *   [12] feat_map_ver · [13..14] feature_flags LE · [15] init_state
  *
  * @param id             身份块指针（至少 16 字节）
  * @param out_version    可选，输出解析后的版本结构
@@ -2049,6 +2054,16 @@ void SpiMaster::applyAppIdentity16(const uint8_t *id, gd32_version_t *out_versio
     if (id[12] == V2_FEAT_MAP_VER) {
         feat_flags = v2_get_u16le(&id[13]);
         feat_known = true;
+    }
+
+    /* [15] init_state（GD32 1.5.34+；旧固件恒 0=OK，与未知区分靠 feat_known 同帧到达） */
+    const uint8_t init_state = id[15];
+    if (init_state != m_gd32InitState) {
+        if (init_state != GD32_INIT_STATE_OK) {
+            DEBUG_WARN("SPI", "GD32 init_state=%u (0=OK 1=degraded 2=critical_fail)",
+                       (unsigned)init_state);
+        }
+        m_gd32InitState = init_state;
     }
 
     /* HELLO 与 PING 都会带同一份 16B 身份：仅版本/feat 变化时打 INFO，避免连打两遍 */
@@ -2151,6 +2166,114 @@ esp_err_t SpiMaster::appPing(uint32_t timeout_ms, uint32_t *uptime_sec, gd32_ver
     }
     DEBUG_DBG("SPI", "APP PING 成功 len=%u", (unsigned)resp_len);
     return ESP_OK;
+}
+
+/**
+ * @brief 查询 GD32 APP 初始化状态（SPI 0xA3 INIT_STATUS）。
+ *
+ * 两步法（持锁），机制与 appPing 相同。应答 ACK：
+ *   [0..3] module_mask LE · [4..7] critical_fail_mask LE
+ *   [8] reset_cause · [9] init_state · [10..11] reserved
+ *   [12..24] fault_codes[13]（GD32 1.5.36+，每模块 1B 故障码）
+ * 成功时填充 out（valid=true）并更新本端缓存 m_gd32InitStatus。
+ * 仅 APP 角色支持：BOOT 不认识 0xA3，角色不符时快速拒绝不打 SPI。
+ */
+esp_err_t SpiMaster::appInitStatus(uint32_t timeout_ms, gd32_init_status_t *out)
+{
+    if (!onWorker() && m_workerTask != nullptr) {
+        Job job{};
+        job.kind = JobKind::InitStatus;
+        job.timeout_ms = timeout_ms;
+        job.out_init_status = out;
+        return submitJob(job);
+    }
+
+    if (m_gd32Role != V2_ROLE_APP) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    LockGuard lock(m_mutex);
+    constexpr uint8_t kInitStatusType = 0xA3U;
+
+    uint8_t resp_type = 0;
+    uint8_t resp_payload[32];
+    size_t resp_len = 0U;
+
+    const uint32_t send_timeout = (timeout_ms > 100U) ? 100U : timeout_ms;
+    esp_err_t send_ret = otaTransferUnlocked(kInitStatusType, nullptr, 0U,
+                                             nullptr, nullptr, 0U, nullptr, send_timeout,
+                                             /*expect_stale=*/true);
+    if (send_ret != ESP_OK && send_ret != ESP_ERR_INVALID_RESPONSE) {
+        DEBUG_DBG("SPI", "INIT_STATUS send failed: %s", esp_err_to_name(send_ret));
+        return send_ret;
+    }
+
+    {
+        const TickType_t gap = (pdMS_TO_TICKS(1) > 0) ? pdMS_TO_TICKS(1) : 1;
+        vTaskDelay(gap);
+    }
+
+    const uint32_t poll_timeout = (timeout_ms > send_timeout)
+                                  ? (timeout_ms - send_timeout) : 500U;
+    esp_err_t err = otaPollResponseUnlocked(&resp_type, resp_payload, sizeof(resp_payload),
+                                            &resp_len, poll_timeout, SPI_OTA_RSP_ACK);
+    if (err != ESP_OK) {
+        DEBUG_DBG("SPI", "INIT_STATUS poll failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (resp_type != SPI_OTA_RSP_ACK || resp_len < 10U) {
+        DEBUG_DBG("SPI", "INIT_STATUS bad resp type=0x%02X len=%u", resp_type, (unsigned)resp_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    gd32_init_status_t st = {};
+    st.module_mask = v2_get_u32le(&resp_payload[0]);
+    st.critical_fail_mask = v2_get_u32le(&resp_payload[4]);
+    st.reset_cause = resp_payload[8];
+    st.init_state = resp_payload[9];
+    /* GD32 1.5.36+ 响应 25B：附带每模块 1B 故障码；1.5.34 仅 12B 无此数组 */
+    if (resp_len >= 25U) {
+        memcpy(st.fault_codes, &resp_payload[12], GD32_INIT_MODULE_COUNT);
+        st.has_fault_codes = true;
+    }
+    st.valid = true;
+
+    m_gd32InitStatus = st;
+    m_gd32InitState = st.init_state;
+    if (out) {
+        *out = st;
+    }
+    DEBUG_INFO("SPI", "INIT_STATUS state=%u mod=0x%08lX crit_fail=0x%08lX rst=0x%02X",
+               (unsigned)st.init_state, (unsigned long)st.module_mask,
+               (unsigned long)st.critical_fail_mask, (unsigned)st.reset_cause);
+    /* 故障码 hex 一行（编码见 GD32 sys/initial.h；canfd 高 4 位=通道号） */
+    if (st.has_fault_codes) {
+        char fc_hex[GD32_INIT_MODULE_COUNT * 2 + 1];
+        for (uint8_t fi = 0; fi < GD32_INIT_MODULE_COUNT; ++fi) {
+            fc_hex[fi * 2]     = "0123456789ABCDEF"[(st.fault_codes[fi] >> 4) & 0xFU];
+            fc_hex[fi * 2 + 1] = "0123456789ABCDEF"[st.fault_codes[fi] & 0xFU];
+        }
+        fc_hex[GD32_INIT_MODULE_COUNT * 2] = '\0';
+        DEBUG_INFO("SPI", "INIT_STATUS fault_codes=%s", fc_hex);
+    }
+    return ESP_OK;
+}
+
+/**
+ * @brief 读取缓存的 0xA3 查询结果（不打 SPI）。
+ * @param out  输出结构
+ * @return true=缓存有效（已至少成功查询一次）；false=无有效缓存
+ */
+bool SpiMaster::gd32InitStatusCached(gd32_init_status_t *out) const
+{
+    if (!m_gd32InitStatus.valid) {
+        return false;
+    }
+    if (out) {
+        *out = m_gd32InitStatus;
+    }
+    return true;
 }
 
 // ============================================================
@@ -2299,6 +2422,10 @@ esp_err_t SpiMaster::hello(uint32_t timeout_ms, uint8_t role_hint)
         /* payload[5]/hdr.credit 均为对端 credit_max → 写入 m_remoteCredit。
          * 勿写入 m_localCredit（本端 RX 窗口，init 为 8）。 */
         m_remoteCredit = (pload[5] != 0U) ? pload[5] : hdr.credit;
+        /* 新 session = GD32 可能重启过：0xA3 缓存与 init_state 失效，
+         * 由下方身份块 / 后续 PING 刷新。 */
+        m_gd32InitStatus = gd32_init_status_t{};
+        m_gd32InitState = GD32_INIT_STATE_UNKNOWN;
         /* APP：HELLO_ACK 带 16B 身份 → 建连即完成开机身份（与 PING 同布局） */
         if (m_gd32Role == V2_ROLE_APP &&
             hdr.payload_len >= V2_HELLO_ACK_APP_LEN) {
