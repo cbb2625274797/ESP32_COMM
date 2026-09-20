@@ -71,8 +71,9 @@ inline constexpr uint32_t TASK_STACK_BLE_RESTART   = 2048;  ///< 按需：延时
 // ============================================================
 // OTA 配置
 // ============================================================
-inline constexpr size_t  OTA_BLOCK_SIZE         = 4096;            ///< 上传接收块：4KB（吞吐优先；s_ota_upload_recv 静态 +2KB vs 2KB 块）
+inline constexpr size_t  OTA_BLOCK_SIZE         = 4096;            ///< 上传接收块：4KB（吞吐优先）；会话内 malloc，稳态不占 .bss
 // OTA_BLOCK_SIZE 演进：8KB→2KB(压堆)→4KB(试吞吐)→2KB(2026-07 回退)→4KB(2026-07-20 再提吞吐)。
+// 2026-09：s_ota_upload_recv 从常驻静态改为 OTA 会话内 RAII malloc，稳态省 4KB。
 inline constexpr size_t  OTA_MAX_FIRMWARE_SIZE  = 216 * 1024;  // 216KB = 221184B = 0x35F90，固件大小上限
 inline constexpr size_t  GD32_OTA_PACKET_SIZE   = 48;          // GD32 OTA 实际转发包载荷
 

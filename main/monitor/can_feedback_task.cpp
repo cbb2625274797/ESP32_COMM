@@ -4,9 +4,10 @@
  * 架构（2026-08 改造后）：
  *   0xC1 CAN 反馈：请求驱动（HTTP 侧 canFdQueryFeedback），本任务不处理。
  *   0xC4 ADC / 0xC5 电机状态：由 GD32 主动按铃推送改为本任务周期查询——
- *     0xC5 每 250ms 查 6 页、0xC4 每 1s 查 1 帧，查询响应 payload 格式与推送
- *     一致，复用 onMotorStateEvent()/onGd32AdcFeedbackEvent() 解析入库。
- *     消除 OTA 期间 GD32 悬空按铃（ESP32 抑制 ring 不读）导致“按铃超时取消”刷屏。
+ *     0xC5 每 250ms 查 MOTOR_TOTAL_PAGES 页，0xC4 每 1s 查 1 帧，查询响应
+ *     payload 格式与推送一致，复用 onMotorStateEvent()/onGd32AdcFeedbackEvent()
+ *     解析入库。消除 OTA 期间 GD32 悬空按铃（ESP32 抑制 ring 不读）导致
+ *     “按铃超时取消”刷屏。
  *   0xC6 电机版本 / 0xD2 电机 OTA 进度：仍由 GD32 事件驱动推送，本任务 takeEvent 消费。
  *
  *   OTA 期间通过 pauseCanFeedbackTask(true) 暂停本任务（不查询不消费）；

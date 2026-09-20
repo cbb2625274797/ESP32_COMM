@@ -72,6 +72,18 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
+# 本机调试 dump / 状态快照
+logs*.json
+st*.json
+st_new.json
+
+# IDE / 过程产物
+.trae/
+.agents/
+.worktrees/
+.qoder/
+.zcode/
+
 # User-specific configuration files
 *.user
 *.workspace # General workspace files, can be from various tools

@@ -25,6 +25,11 @@ constexpr uint8_t kSpiCanSetModeType = 0xC2U;
 constexpr uint8_t kFeedbackFixedHeader = 28U;
 constexpr uint8_t kFeedbackMaxPage     = 1U;  /* GD32 仅 page 0/1 */
 
+/* 0xC1 收到链路层 LINK_ERROR(0x7F) 的限流标记：见 canFdQueryFeedback。
+ * 一轮"拒绝风暴"（同一成因：GD32 刚复位、序号/session 对不上）只报第一条 WARN，
+ * 其后降级 DBG；任一次查询成功即复位，下一轮风暴仍能报出来。 */
+static bool s_linkErrLogged = false;
+
 /* 突发 payload 上限 = V2_MAX_PAYLOAD(236)；头 4B = count+dlc+suffix(2)。 */
 constexpr uint8_t  kBurstHeaderLen = 4U;
 constexpr uint16_t kBurstPayloadCap = 236U;
@@ -409,10 +414,31 @@ int canFdQueryFeedback(uint8_t channel, uint8_t page,
         return -2;
     }
     if (resp_type != SPI_OTA_RSP_ACK || resp_len < 1U) {
-        DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u 非ACK type=0x%02X len=%zu",
-                   (unsigned)channel, (unsigned)page, (unsigned)resp_type, resp_len);
+        /* 0x7F = 链路层 LINK_ERROR（payload = [错误码, 期望序号]）。成因几乎只有一种：
+         * GD32 刚被复位过（APP→BOOT 交接、BOOT→新 APP 跳转、上电），它的接收序号/session
+         * 从 0 重来，而 ESP32 仍按旧序号发 —— 于是一帧一条。此刻对面根本没有 CAN 桥
+         * （BOOT 不提供 0xC1），这些查询注定无果，属纯噪音。
+         * 一轮风暴只报第一条 WARN（含错误码与期望序号，够定位），其余降级 DBG；
+         * 成功一次即复位标记，下一轮风暴照样能报。避免 1Hz × 3 通道刷屏。 */
+        if (resp_type == V2_TYPE_LINK_ERROR) {
+            const uint8_t errc = (resp_len > 0U) ? resp_buf[0] : 0xFFU;
+            const uint8_t exp  = (resp_len > 1U) ? resp_buf[1] : 0xFFU;
+            if (!s_linkErrLogged) {
+                s_linkErrLogged = true;
+                DEBUG_WARN("CAN", "queryFeedback 链路层拒绝(0x7F code=0x%02X exp=%u)："
+                                  "GD32 正在复位/重同步（刷写交接或 BOOT↔APP），同类后续静默",
+                           errc, exp);
+            } else {
+                DEBUG_DBG("CAN", "queryFeedback 链路层拒绝(0x7F code=0x%02X exp=%u) 已静默",
+                          errc, exp);
+            }
+        } else {
+            DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u 非ACK type=0x%02X len=%zu",
+                       (unsigned)channel, (unsigned)page, (unsigned)resp_type, resp_len);
+        }
         return -1;
     }
+    s_linkErrLogged = false;   /* 通了一次：链路已重同步，标记复位 */
 
     /* 解析复用现有 canFdParseFeedbackPage（payload 格式与推送一致） */
     int parse_rc = canFdParseFeedbackPage(resp_buf, resp_len, out, entryIdx);

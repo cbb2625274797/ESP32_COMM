@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <algorithm>
 #include "freertos/FreeRTOS.h"
@@ -221,8 +222,36 @@ static int recv_json_header(httpd_req_t *req, char *buf, int buf_size)
     return total;
 }
 
-/* OTA 上传静态收块：避免 OTA 中途再 malloc(2KB) 与 TCP 窗口抢堆。 */
-static uint8_t s_ota_upload_recv[OTA_BLOCK_SIZE];
+/* OTA 上传收块：稳态不占堆；会话开始时一次性 malloc，结束/失败由 RAII 释放。
+ * 旧方案常驻静态 4KB（.bss），空闲时白占；本方案把 malloc 挪到 handler 入口
+ * （TCP 窗口尚未灌满、协调器已拦下并发 OTA），峰值与静态相当，稳态省 4KB。
+ * httpd 单线程 + OTA 协调器互斥，不会两路同时持有。 */
+class OtaUploadRecv {
+public:
+    uint8_t *buf = nullptr;
+
+    OtaUploadRecv()
+    {
+        buf = static_cast<uint8_t *>(malloc(OTA_BLOCK_SIZE));
+        if (buf == nullptr) {
+            DEBUG_ERR("WIFI", "OTA收块分配失败 free=%lu big=%lu",
+                      (unsigned long)esp_get_free_heap_size(),
+                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        }
+    }
+    ~OtaUploadRecv()
+    {
+        if (buf != nullptr) {
+            free(buf);
+            buf = nullptr;
+        }
+    }
+    OtaUploadRecv(const OtaUploadRecv &) = delete;
+    OtaUploadRecv &operator=(const OtaUploadRecv &) = delete;
+
+    bool ok() const { return buf != nullptr; }
+};
+
 static uint8_t s_ota_json_scratch[256];
 static uint8_t s_ota_preread[256];
 
@@ -239,7 +268,12 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
                                     "missing or invalid Content-Length");
     }
 
-    uint8_t *recv_buf = s_ota_upload_recv;
+    OtaUploadRecv upload_recv;
+    if (!upload_recv.ok()) {
+        return http_send_json_error(req, "500 Internal Server Error",
+                                    "oom_upload_buf", "OTA receive buffer alloc failed");
+    }
+    uint8_t *recv_buf = upload_recv.buf;
     DEBUG_WARN("WIFI", "POST /ota/upload clen=%d free=%lu big=%lu",
                req->content_len,
                (unsigned long)esp_get_free_heap_size(),
@@ -1630,8 +1664,9 @@ esp_err_t spi_send_handler(httpd_req_t *req)
         payload_len = http_hex_to_bytes_n(hex, hex_len, payload_data, SPI_OTA_FRAME_MAX);
     }
 
-    DEBUG_INFO("SPI", "WEB SPI: type=0x%02X, payload=%zu 字节",
-               frame_type, payload_len);
+    /* 诊断透传高频（网页 2s 轮询等），成功路径降为 DBG：默认 INFO 级不再刷串口 */
+    DEBUG_DBG("SPI", "WEB SPI: type=0x%02X, payload=%zu 字节",
+              frame_type, payload_len);
 
     char resp[1024];
     uint8_t resp_type = 0;
@@ -1648,8 +1683,8 @@ esp_err_t spi_send_handler(httpd_req_t *req)
             "{\"status\": \"ok\", \"type\": \"%02X\", \"payload_len\": %zu, \"resp_type\": \"%02X\", \"resp_len\": %zu, \"recv\": \"%s\"}",
             frame_type, payload_len, resp_type, resp_len, resp_hex);
         /* 日志只记 type/len，完整 payload 仅在 HTTP JSON 返回给前端 */
-        DEBUG_INFO("SPI", "WEB SPI ok: type=0x%02X len=%zu",
-                   resp_type, resp_len);
+        DEBUG_DBG("SPI", "WEB SPI ok: type=0x%02X len=%zu",
+                  resp_type, resp_len);
     } else {
         snprintf(resp, sizeof(resp),
             "{\"status\": \"error\", \"code\": %d, \"message\": \"%s\"}",
@@ -1905,6 +1940,10 @@ esp_err_t system_status_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
 
     /* ── 分块 1：核心状态 + OTA/WiFi ── */
+    /* GD32 版本只认 SPI 实时身份（HELLO/PING）。OtaRelay 那份缓存只在
+     * 中继/手动探测时写入，ECAT 直灌等旁路刷写后会永久过期——宁可报
+     * 0.0.0.0（前端显示未知/离线），也不回旧版本。 */
+    const gd32_version_t gver = SpiMaster::instance().gd32VersionCached();
     int len = snprintf(resp, HTTP_JSON_WORK_CAP,
         "{\"version\": \"%s\", \"build_time\": \"%s\", \"git_hash\": \"%s\", \"health\": %d, "
         "\"free_heap\": %lu, \"min_free_heap\": %lu, \"largest_free_block\": %lu, "
@@ -1938,10 +1977,10 @@ esp_err_t system_status_handler(httpd_req_t *req)
         (unsigned long)snap.relay.seq,
         (unsigned long)snap.relay.total_packets,
         snap.relay.gd32_app_alive ? "true" : "false",
-        snap.relay.version.app_major, snap.relay.version.app_minor,
-        snap.relay.version.app_patch, snap.relay.version.app_build,
-        snap.relay.version.boot_major, snap.relay.version.boot_minor,
-        snap.relay.version.boot_patch, snap.relay.version.boot_build);
+        gver.app_major, gver.app_minor,
+        gver.app_patch, gver.app_build,
+        gver.boot_major, gver.boot_minor,
+        gver.boot_patch, gver.boot_build);
     if (len < 0 || (size_t)len >= HTTP_JSON_WORK_CAP) {
         if (mux) {
             xSemaphoreGive(mux);
@@ -1979,7 +2018,13 @@ esp_err_t system_status_handler(httpd_req_t *req)
             "\"v2_active\":%s,\"local_credit\":%u,\"remote_credit\":%u,"
             "\"crc_errors\":%lu,\"duplicate_requests\":%lu,\"seq_errors\":%lu,"
             "\"retries\":%lu,\"ready_timeouts\":%lu,\"rx_overruns\":%lu,"
-            "\"resyncs\":%lu,\"max_resp_latency_us\":%lu}",
+            "\"resyncs\":%lu,\"max_resp_latency_us\":%lu,"
+            "\"rsp_err_0x82\":%lu,\"rsp_err_last_req\":\"0x%02X\",\"rsp_err_last_p0\":\"0x%02X\","
+            "\"rsp_err_last_p1\":%u,\"rsp_err_last_p2\":\"0x%02X\",\"rsp_err_last_p3\":\"0x%02X\","
+            "\"ring_steals\":%lu,\"ring_steal_last_type\":\"0x%02X\",\"ring_steal_last_ack\":%u,"
+            "\"ring_steal_last_p0\":\"0x%02X\",\"ring_steal_last_req\":\"0x%02X\","
+            "\"ring_steal_diag\":[%u,\"0x%02X\",\"0x%02X\"],"
+            "\"tx_total\":%lu,\"tx_retry\":%lu,\"tx_fail\":%lu,\"tx_fail_last_type\":\"0x%02X\"}",
             (unsigned)ls.version,
             role_str,
             (unsigned long)ls.session_id,
@@ -1993,7 +2038,25 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned long)ls.stats.ready_timeouts,
             (unsigned long)ls.stats.rx_overruns,
             (unsigned long)ls.stats.resyncs,
-            (unsigned long)ls.stats.max_resp_latency_us);
+            (unsigned long)ls.stats.max_resp_latency_us,
+            (unsigned long)ls.stats.rsp_err_0x82,
+            (unsigned)ls.stats.rsp_err_last_req,
+            (unsigned)ls.stats.rsp_err_last_p0,
+            (unsigned)ls.stats.rsp_err_last_p1,
+            (unsigned)ls.stats.rsp_err_last_p2,
+            (unsigned)ls.stats.rsp_err_last_p3,
+            (unsigned long)ls.stats.ring_steals,
+            (unsigned)ls.stats.ring_steal_last_type,
+            (unsigned)ls.stats.ring_steal_last_ack,
+            (unsigned)ls.stats.ring_steal_last_p0,
+            (unsigned)ls.stats.ring_steal_last_req,
+            (unsigned)ls.stats.ring_steal_last_p1,
+            (unsigned)ls.stats.ring_steal_last_p2,
+            (unsigned)ls.stats.ring_steal_last_p3,
+            (unsigned long)ls.stats.tx_total,
+            (unsigned long)ls.stats.tx_retry,
+            (unsigned long)ls.stats.tx_fail,
+            (unsigned)ls.stats.tx_fail_last_type);
     }
 
     /* ── GD32 APP 初始化状态（GD32 1.5.34+）──
@@ -2510,10 +2573,20 @@ esp_err_t motor_ota_upload_handler(httpd_req_t *req)
     coord.abortCurrent();
     (void)coord.clearGd32Meta();
 
-    /* ── 流式收固件写 flash（无整固件堆缓冲；复用 OTA 静态收块）──
+    /* ── 流式收固件写 flash（无整固件堆缓冲；会话内临时收块）──
      * ★ full_erase=true：强制擦除整个 gd32_ota 分区（252KB ~200ms），
      * 杜绝上次固件残留 + 擦除位错误导致的单 bit 翻转（0xAC20 处 0x19→0x18 根因）。 */
     Gd32FlashStore::instance().beginWriteSession(true);
+
+    OtaUploadRecv upload_recv;
+    if (!upload_recv.ok()) {
+        DEBUG_ERR("MOTOR_OTA", "收块分配失败 free=%lu",
+                  (unsigned long)esp_get_free_heap_size());
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"ota receive buffer alloc failed\"}");
+        return ESP_FAIL;
+    }
 
     int received = 0;
     while (received < content_len) {
@@ -2522,7 +2595,7 @@ esp_err_t motor_ota_upload_handler(httpd_req_t *req)
 
         otaUploadPaceIfHeapTight();
 
-        int r = httpd_req_recv(req, reinterpret_cast<char *>(s_ota_upload_recv), to_read);
+        int r = httpd_req_recv(req, reinterpret_cast<char *>(upload_recv.buf), to_read);
         if (r <= 0) {
             DEBUG_ERR("MOTOR_OTA", "upload interrupted: received=%d expected=%d", received, content_len);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
@@ -2530,7 +2603,7 @@ esp_err_t motor_ota_upload_handler(httpd_req_t *req)
         }
 
         esp_err_t werr = Gd32FlashStore::instance().flashWriteChunk(
-            (uint32_t)received, s_ota_upload_recv, (size_t)r);
+            (uint32_t)received, upload_recv.buf, (size_t)r);
         if (werr != ESP_OK) {
             DEBUG_ERR("MOTOR_OTA", "flash write fail @%d: %s", received, esp_err_to_name(werr));
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "flash write failed");

@@ -205,6 +205,27 @@ public:
         uint32_t rx_overruns;           ///< RX overrun 计数
         uint32_t resyncs;               ///< HELLO 重同步次数
         uint32_t max_resp_latency_us;   ///< 最大响应延迟（微秒）
+        /* 0.4.3 诊断：GD32 回 0x82 的量化归因（/system/status 直读，不依赖 /logs） */
+        uint32_t rsp_err_0x82;          ///< 收到 GD32 0x82 ERROR 响应总数
+        uint8_t  rsp_err_last_req;      ///< 最近一笔 0x82 对应的主动请求 TYPE
+        uint8_t  rsp_err_last_p0;       ///< 最近一笔 0x82 的 payload[0]（GD32 错误码）
+        uint8_t  rsp_err_last_p1;       ///< 0xE8 时=GD32 收到的 rxLen
+        uint8_t  rsp_err_last_p2;       ///< 0xE8 时=GD32 rxBuf[0]（期望 SOF0=0xE2?）
+        uint8_t  rsp_err_last_p3;       ///< 0xE8 时=GD32 rxBuf[1]（期望 SOF1）
+        uint32_t ring_steals;           ///< serviceRing 偷读迟到 RESPONSE 总数
+        uint8_t  ring_steal_last_type;  ///< 最近一笔偷读帧的 TYPE（0.4.5 归因）
+        uint8_t  ring_steal_last_ack;   ///< 最近一笔偷读帧 ack_seq 是否匹配 lastSent
+        uint8_t  ring_steal_last_p0;    ///< 最近一笔偷读帧 payload[0]（0.4.6）
+        uint8_t  ring_steal_last_req;   ///< 偷读时刻的 m_lastReqType（0.4.6）
+        uint8_t  ring_steal_last_p1;    ///< 0xE8 时=GD32 诊断 rxLen（0.4.8）
+        uint8_t  ring_steal_last_p2;    ///< 0xE8 时=GD32 诊断 rxBuf[0]（0.4.8）
+        uint8_t  ring_steal_last_p3;    ///< 0xE8 时=GD32 诊断 rxBuf[1]（0.4.8）
+        /* 0.4.9 诊断：透明重试会掩盖真实失败率（DBG 被编译裁掉、无计数）。
+         * tx_total 进入事务；tx_retry 走到重发；tx_fail 耗尽重试仍失败返回。 */
+        uint32_t tx_total;              ///< otaSendAndPoll 事务总数
+        uint32_t tx_retry;              ///< 因 send/poll 超时触发的重发总次数
+        uint32_t tx_fail;               ///< 重试后仍失败（返回非 OK）的事务数
+        uint8_t  tx_fail_last_type;     ///< 最近一笔最终失败的命令 TYPE
     };
 
     /** @brief v2 完整链路状态（SPEC §10.1，会话/credit + 统计）。 */

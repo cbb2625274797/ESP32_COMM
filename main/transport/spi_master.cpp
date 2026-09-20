@@ -21,7 +21,8 @@
 #include "esp_log.h"
 #include "esp_random.h"   // esp_random() for HELLO session_id
 #include "esp_intr_alloc.h"  // ESP_INTR_FLAG_IRAM
-#include "esp_timer.h"    // esp_timer_get_time()：worker job 执行耗时采样
+#include "esp_timer.h"
+#include "esp_rom_sys.h"    // esp_timer_get_time()：worker job 执行耗时采样
 #include "spi_master.h"
 #include "spi_link_v2.h"
 #include "app_config.h"
@@ -29,6 +30,10 @@
 
 
 static constexpr size_t kSpiTransferMaxBytes = 256U;
+
+/** @brief 上一笔 CS 事务结束时刻（µs，worker 单线程读写）。
+ *  transferClockedFlags 用它强制 CS 事务间最小间隔（0.4.4 RX 撕裂根因修复）。 */
+static int64_t s_lastCsEndUs = 0;
 
 /** @brief submitJob 池 Job 与 worker 之间的 finished/abandoned/in_use 交接。 */
 static portMUX_TYPE s_spiJobMux = portMUX_INITIALIZER_UNLOCKED;
@@ -357,23 +362,44 @@ esp_err_t SpiMaster::serviceRingOnce()
     const uint8_t *found_payload = nullptr;
     size_t found_len = 0;
     size_t frame_offset = 0;
+    uint8_t found_flags = 0U;
     if (!otaFindFrame(rx_raw, rx_len, &found_type, &found_payload,
-                      &found_len, &frame_offset)) {
+                      &found_len, &frame_offset, &found_flags)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     if (found_type == V2_TYPE_CREDIT_UPDATE) {
         DEBUG_DBG("SPI", "worker CREDIT_UPDATE credit=%u", (unsigned)m_remoteCredit);
         return ESP_ERR_NOT_FOUND;
     }
-    /* RESPONSE（OTA ACK/WAIT/ERROR）绝不能当 EVENT 入队；否则 OTA poll 丢响应。
-     * 此处帧已被时钟读走，只能记统计；真正防护靠 m_suppressRingService。 */
-    if (found_type == SPI_OTA_RSP_ACK || found_type == SPI_OTA_RSP_WAIT ||
-        found_type == SPI_OTA_RSP_ERROR || found_type == V2_TYPE_RSP_ACK ||
-        found_type == V2_TYPE_RSP_WAIT || found_type == V2_TYPE_RSP_ERROR) {
+    /* RESPONSE（ACK/WAIT/ERROR/LINK_ERROR，含 0xC4 等回自身类型的响应）绝不能当
+     * EVENT 入队；此处帧已被时钟读走，真正防护靠 m_suppressRingService。本分支
+     * 只在 poll 已超时放弃、GD32 忙导致响应迟到时可达。
+     * ★ 必须与 poll 成功路径一样推进 m_txSeq：ack_seq 匹配说明 GD32 已消费本端
+     * TX_SEQ（缓存响应待重放）。若不推进，下一条命令（含重试）复用旧序号 →
+     * GD32 判为重复请求直接回放缓存旧帧、新命令被吞 → 业务反复收到同一个
+     * 旧 0x82/旧响应，命令永远不再执行（"一直读到 0x82"的根因）。 */
+    if ((found_flags & V2_FLAG_RESPONSE) != 0U) {
+        const bool ack_matched = m_lastRxAckMatched;
+        if (ack_matched) {
+            m_txSeq = (uint8_t)(m_lastSentSeq + 1U);
+        }
+        m_stats.ring_steals++;  /* 0.4.3：量化归因（/system/status 直读，不依赖 /logs） */
+        m_stats.ring_steal_last_type = found_type;      /* 0.4.5：偷的什么帧 */
+        m_stats.ring_steal_last_ack = ack_matched ? 1U : 0U;
+        m_stats.ring_steal_last_p0 = (found_len > 0U) ? found_payload[0] : 0U;  /* 0.4.6 */
+        m_stats.ring_steal_last_req = m_lastReqType;
+        m_stats.ring_steal_last_p1 = (found_len > 1U) ? found_payload[1] : 0U;   /* 0.4.8 */
+        m_stats.ring_steal_last_p2 = (found_len > 2U) ? found_payload[2] : 0U;
+        m_stats.ring_steal_last_p3 = (found_len > 3U) ? found_payload[3] : 0U;
         static uint32_t s_steal_logs = 0U;
         if ((++s_steal_logs % 16U) == 1U) {
-            DEBUG_WARN("SPI", "serviceRing 读到 RESPONSE type=0x%02X（应禁止，log#%lu）",
-                       found_type, (unsigned long)s_steal_logs);
+            DEBUG_WARN("SPI", "serviceRing 偷读迟到 RESPONSE t=0x%02X p0=0x%02X "
+                       "ack_match=%u lastReq=0x%02X（poll 已超时，帧丢弃%s，log#%lu）",
+                       found_type,
+                       (found_len > 0U) ? found_payload[0] : 0U,
+                       (unsigned)ack_matched, (unsigned)m_lastReqType,
+                       ack_matched ? "、seq 已推进" : "",
+                       (unsigned long)s_steal_logs);
         }
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -866,6 +892,23 @@ esp_err_t SpiMaster::transferClockedFlags(const uint8_t *tx_buf, size_t tx_len,
         return ESP_ERR_INVALID_SIZE;
     }
 
+    /* 0.4.4：CS 事务间最小间隔（根因修复）。
+     * GD32 侧每个 CS 事务要跑一次 EXTI ISR（stop DMA → processCommand → re-arm，
+     * ~几十 µs）；该 ISR 抢占级 1，会被 ECAT SYNC0/CAN-RX（级 0）及同级 PDI ISR
+     * 周期性延迟。ESP32 背靠背 CS 脉冲（send→read µs 级间隙）一旦撞进其
+     * "pin 已回高但 re-arm 未完成"的窗口，GD32 的 RX DMA 就 mid-pulse 重装——
+     * 下一笔查询帧头部丢失、尾部被 256B 缓冲截断（GD32 诊断实测：rxLen=255、
+     * 缓冲全 FF + 帧残片）→ v2 解析失败回 0x82 0xE8 → 迟到被 serviceRing 偷读
+     * （"偷读迟到 RESPONSE"持续风暴的根因）。1ms 间隔给 GD32 留出确定性窗口，
+     * 换取查询循环 ~5% 吞吐，彻底消除 RX 撕裂。 */
+    {
+        const int64_t now_us = esp_timer_get_time();
+        const int64_t since_us = now_us - s_lastCsEndUs;
+        if (since_us >= 0 && since_us < 1000) {
+            esp_rom_delay_us((uint32_t)(1000 - since_us));
+        }
+    }
+
     uint8_t tx_staging[kSpiTransferMaxBytes];
     uint8_t rx_staging[kSpiTransferMaxBytes];
     const uint8_t *tx_ptr = tx_buf;
@@ -938,6 +981,8 @@ esp_err_t SpiMaster::transferClockedFlags(const uint8_t *tx_buf, size_t tx_len,
     if (rx_len > 0U && rx_ptr != rx_buf) {
         memcpy(rx_buf, rx_ptr, rx_len);
     }
+    /* CS 上升沿（事务结束）时间戳：供下一笔事务前的最小间隔判断 */
+    s_lastCsEndUs = esp_timer_get_time();
     return ESP_OK;
 }
 
@@ -1504,8 +1549,17 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
         now = xTaskGetTickCount();
         remain_ms = (deadline > now) ? ((deadline - now) * portTICK_PERIOD_MS) : 0U;
         const bool last_chance = (remain_ms == 0U) || (attempt >= 6U && !did_spi_read);
+        /* 0.4.4：APP ISR 快速响应类型禁用盲读。
+         * 盲读在 PB6 未低时强行打 256 时钟 0xFF——若 GD32 的 CS EXTI 还压着
+         * ECAT/CAN 中断没处理完上一笔（re-arm 未跑），盲读会撕碎其 RX 缓冲
+         * （实测 GD32 侧 rxLen=255 全 FF + 查询帧残片）→ 解析失败回 0x82 0xE8
+         * → 迟到被 serviceRing 偷读（"偷读迟到 RESPONSE 0xEE/E8"风暴的根因）。
+         * 快速类型的 PB6 是事件驱动（GD32 ISR µs 级拉低），纯等电平即可；
+         * 响应真丢了就走 timeout→重发（GD32 DUP 缓存回放兜底），无 corrupt。 */
+        const bool no_blind = isAppIsrFastRespType(m_lastReqType);
         /* 无 ready：前 2 轮盲读；之后每 8 轮盲读；deadline 末强制盲读一次 */
-        if (!ready && attempt > 2U && (attempt % 8U) != 0U && !last_chance) {
+        if (!ready && (no_blind ||
+                       (attempt > 2U && (attempt % 8U) != 0U && !last_chance))) {
             vTaskDelay(pdMS_TO_TICKS(CONFIG_DCU_OTA_POLL_BACKOFF_MS));
             continue;
         }
@@ -1587,10 +1641,19 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
 	             *   → fed 卡在首 chunk（日志 fed=232）、CAN 抽空后 0x01 超时。
 	             * BOOT OTA 见 WAIT 后只 poll 不重发 DATA，推进 seq 同样正确。 */
 	            if (m_lastRxAckMatched) {
-	                m_txSeq = (uint8_t)(m_lastSentSeq + 1U);
+		                m_txSeq = (uint8_t)(m_lastSentSeq + 1U);
+		            }
+	            /* 0.4.3 诊断：GD32 明确回 0x82 的量化归因（/system/status 直读） */
+	            if (found_type == V2_TYPE_RSP_ERROR) {
+	                m_stats.rsp_err_0x82++;
+	                m_stats.rsp_err_last_req = m_lastReqType;
+	                m_stats.rsp_err_last_p0 = (*resp_len > 0U) ? resp_payload[0] : 0U;
+	                m_stats.rsp_err_last_p1 = (*resp_len > 1U) ? resp_payload[1] : 0U;
+	                m_stats.rsp_err_last_p2 = (*resp_len > 2U) ? resp_payload[2] : 0U;
+	                m_stats.rsp_err_last_p3 = (*resp_len > 3U) ? resp_payload[3] : 0U;
 	            }
-	            m_linkState.exitBusy();
-	            return ESP_OK;
+		            m_linkState.exitBusy();
+		            return ESP_OK;
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -1693,6 +1756,10 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
                         resp_type, resp_payload, resp_max, resp_len, timeout_ms);
     }
 
+    /* 0.4.9：量化"透明重试"下的真实失败率（DBG 级日志被编译期裁掉，
+     * 旧实现里 send/poll 超时重试完全静默）。/system/status 直读：
+     *   tx_total=进入事务次数  tx_retry=走到重发的次数  tx_fail=耗尽重试仍失败 */
+    m_stats.tx_total++;
     LockGuard lock(m_mutex);
 
     /* 步骤 1: 发送命令（忽略延迟一拍的过期响应）。
@@ -1737,12 +1804,15 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         m_lastProfile.t_send1 = (uint64_t)esp_timer_get_time();
         if (send_ret != ESP_OK && send_ret != ESP_ERR_INVALID_RESPONSE) {
             if (attempt + 1U < kTxRetryMax) {
+                m_stats.tx_retry++;   /* 0.4.9：发送级失败→重发（原静默） */
                 DEBUG_DBG("SPI", "TX retry(%u/%u) send fail type=0x%02X %s",
                           (unsigned)(attempt + 1U), (unsigned)kTxRetryMax,
                           type, esp_err_to_name(send_ret));
                 vTaskDelay(pdMS_TO_TICKS(3));
                 continue;
             }
+            m_stats.tx_fail++;        /* 0.4.9：耗尽重试仍失败 */
+            m_stats.tx_fail_last_type = type;
             return send_ret;
         }
 
@@ -1764,12 +1834,15 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
             return ESP_OK;   /* 已读到有效响应帧（ACK/ERROR/陈旧） */
         }
         if (attempt + 1U < kTxRetryMax) {
+            m_stats.tx_retry++;   /* 0.4.9：poll 无响应→重发（原静默） */
             DEBUG_DBG("SPI", "TX retry(%u/%u) no resp type=0x%02X %s",
                       (unsigned)(attempt + 1U), (unsigned)kTxRetryMax,
                       type, esp_err_to_name(poll_ret));
             vTaskDelay(pdMS_TO_TICKS(3));
             continue;
         }
+        m_stats.tx_fail++;        /* 0.4.9：耗尽重试仍失败 */
+        m_stats.tx_fail_last_type = type;
         return poll_ret;
     }
     return ESP_ERR_TIMEOUT;  /* 不可达：循环必有返回 */
