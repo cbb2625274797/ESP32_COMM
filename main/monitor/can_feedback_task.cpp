@@ -43,51 +43,57 @@ constexpr size_t   kPayloadMax = SPI_OTA_FRAME_MAX; ///< 与变长读一致，�
 constexpr const char *kTag     = "CAN_FB";
 
 static volatile bool s_paused = false;
+static TaskHandle_t s_taskHandle = nullptr;
+
+/* 任务独占静态响应缓冲（消除每次在任务栈上分配 256B 大数组，防栈溢出） */
+static uint8_t s_motor_resp_buf[kPayloadMax] = {};
+static uint8_t s_adc_resp_buf[kPayloadMax]   = {};
+static uint8_t s_push_ring_buf[kPayloadMax]  = {};
 
 /**
  * @brief 按页查询 GD32 电机状态（0xC5 请求驱动，替代 GD32 250ms 推送）。
  *   任一页失败立即中断本轮：GD32 未就绪/瞬时错误时不空耗 6×200ms，下轮再试；
  *   page0 会刷新全局字段（active_count/boot_active），部分页成功即部分更新。
  */
-static void queryMotorStatePages(void)
+static bool queryMotorStatePages(void)
 {
     uint8_t req[1] = {0U};
     for (uint8_t page = 0U; page < MOTOR_TOTAL_PAGES; ++page) {
         req[0] = page;
         uint8_t resp_type = 0U;
-        uint8_t resp_buf[kPayloadMax] = {};
         size_t resp_len = 0U;
         esp_err_t err = SpiMaster::instance().transact(
             kSpiMotorStateType, req, sizeof(req),
-            &resp_type, resp_buf, sizeof(resp_buf), &resp_len, 200U);
+            &resp_type, s_motor_resp_buf, sizeof(s_motor_resp_buf), &resp_len, 200U);
         if (err != ESP_OK || resp_type != SPI_OTA_RSP_ACK ||
             resp_len < MOTOR_PAGE_HEADER) {
-            return;
+            return false;
         }
-        (void)onMotorStateEvent(resp_buf, resp_len);
+        (void)onMotorStateEvent(s_motor_resp_buf, resp_len);
     }
+    return true;
 }
 
 /**
  * @brief 查询 GD32 ADC 调试快照（0xC4 请求驱动，替代 GD32 1Hz 推送）。
  *   GD32 0xC4 handler 回自身类型 0xC4（异于 0xC1/0xC5 的 0x80），两者皆接受。
  */
-static void queryAdcFeedback(void)
+static bool queryAdcFeedback(void)
 {
     uint8_t req[1] = {0U};
     uint8_t resp_type = 0U;
-    uint8_t resp_buf[kPayloadMax] = {};
     size_t resp_len = 0U;
     esp_err_t err = SpiMaster::instance().transact(
         kSpiAdcFeedbackType, req, sizeof(req),
-        &resp_type, resp_buf, sizeof(resp_buf), &resp_len, 200U);
+        &resp_type, s_adc_resp_buf, sizeof(s_adc_resp_buf), &resp_len, 200U);
     if (err != ESP_OK || resp_len < 1U) {
-        return;
+        return false;
     }
     if (resp_type != kSpiAdcFeedbackType && resp_type != SPI_OTA_RSP_ACK) {
-        return;
+        return false;
     }
-    (void)onGd32AdcFeedbackEvent(resp_buf, resp_len);
+    (void)onGd32AdcFeedbackEvent(s_adc_resp_buf, resp_len);
+    return true;
 }
 
 /**
@@ -97,17 +103,16 @@ static void queryAdcFeedback(void)
 static void drainPushEvents(uint32_t wait_ms)
 {
     uint8_t ring_type = 0U;
-    uint8_t ring_payload[kPayloadMax] = {};
     size_t ring_len = 0U;
-    if (!SpiMaster::instance().takeEvent(&ring_type, ring_payload,
-                                         sizeof(ring_payload), &ring_len,
+    if (!SpiMaster::instance().takeEvent(&ring_type, s_push_ring_buf,
+                                         sizeof(s_push_ring_buf), &ring_len,
                                          wait_ms)) {
         return;
     }
     if (ring_type == kSpiMotorVersionType) {
-        (void)onMotorVersionEvent(ring_payload, ring_len);
+        (void)onMotorVersionEvent(s_push_ring_buf, ring_len);
     } else if (ring_type == kSpiMotorOtaStatusType) {
-        onMotorOtaStatusPush(ring_payload, ring_len);
+        onMotorOtaStatusPush(s_push_ring_buf, ring_len);
     }
 }
 
@@ -139,6 +144,16 @@ static void taskLoop(void *)
             continue;
         }
 
+        /* 链路在线自适应退避：若 SPI 处于离线状态，进入休眠退避，避免死循环重试和日志风暴 */
+        if (!SpiMaster::instance().isLinkOnline()) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            /* 尝试轻量查询一次作为探活 */
+            (void)queryMotorStatePages();
+            last_motor_q = xTaskGetTickCount();
+            last_adc_q = xTaskGetTickCount();
+            continue;
+        }
+
         /* 周期查询：到期才执行（时间差对比，暂停恢复后立即补一次） */
         const TickType_t now = xTaskGetTickCount();
         if ((now - last_motor_q) >= pdMS_TO_TICKS(kQueryMotorStateMs)) {
@@ -157,6 +172,11 @@ static void taskLoop(void *)
 
 } // namespace
 
+TaskHandle_t getCanFeedbackTaskHandle()
+{
+    return s_taskHandle;
+}
+
 /**
  * @brief 启动事件监听任务（幂等）。
  * @return true 表示任务已存在或创建成功。
@@ -172,7 +192,7 @@ bool startCanFeedbackTask()
         TASK_STACK_CAN_FB,
         nullptr,
         4,
-        nullptr,
+        &s_taskHandle,
         0);
     if (xRet != pdPASS) {
         DEBUG_ERR(kTag, "任务创建失败");

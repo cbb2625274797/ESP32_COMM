@@ -15,6 +15,7 @@
 #include "wifi_ota.h"
 #include "ble_ota.h"
 #include "spi_master.h"
+#include "can_feedback_task.h"
 #include "driver/uart.h"
 #include "esp_system.h"
 
@@ -76,6 +77,9 @@ size_t collectTaskStackMetrics(TaskStackMetric* out, size_t max)
     }
     if (n < max) {
         out[n++] = { "ble_ota_worker", BleOta::instance().getWorkerTaskHandle(), TASK_STACK_BLE_WORKER };
+    }
+    if (n < max) {
+        out[n++] = { "can_fb", getCanFeedbackTaskHandle(), TASK_STACK_CAN_FB };
     }
 
     return n;

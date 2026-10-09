@@ -43,7 +43,7 @@ typedef struct {
  * @param recv_buf 接收数据缓冲区（可为 nullptr）。
  * @param recv_max 接收缓冲区最大长度。
  * @param timeout_ms 超时时间（毫秒）。
- * @param gd32_err_out 可选输出，GD32 返回的细分错误码（0xE0/0xE1/0xE2/0xE3/0xE4/0xE5）；
+ * @param gd32_err_out 可选输出，GD32 返回的细分错误码（0xE0/0xE1/0xE2/0xE3/0xE4/0xE5/0xE6=通道静默拒发）；
  *                     仅在返回 -3 时有效，其它情况清零。可为 nullptr。
  * @return 成功时返回接收数据长度，失败返回 -1/-2/-3。
  */
@@ -137,7 +137,7 @@ typedef struct {
     uint32_t  error_count;
     uint8_t   tec;         /**< 硬件发送错误计数器 (0~255) */
     uint8_t   rec;         /**< 硬件接收错误计数器 (0~255) */
-    uint8_t   bus_state;   /**< 总线状态位图：bit0=init,bit1=sleep,bit2=error_passive,bit3=bus_off,bit4=error_warning */
+    uint8_t   bus_state;   /**< 总线状态位图：bit0=init,bit1=控制器sleep,bit2=error_passive,bit3=bus_off,bit4=error_warning,bit5=tx_silent(收发器Silent,只听不发) */
 } can_channel_feedback_t;
 
 /**
@@ -195,5 +195,21 @@ int canFdQueryFeedback(uint8_t channel, uint8_t page,
 int canFdSetRxMode(can_rx_mode_t mode,
                    can_rx_mode_t *actual,
                    uint32_t timeout_ms);
+
+/**
+ * @brief 切换指定 CAN 通道收发器的 Silent 模式（SPI 0xC8）：只听不发。
+ *        GD32 侧把该通道 TCAN1057AV 的 S 脚置高 → 驱动器关断、**接收机照常工作**
+ *        （手册 Table 8-4：RXD 仍镜像总线），所以静默期间接收与 0xC1 上报不受影响。
+ *        静默期间该通道所有发送（0xC0/0xC7/桥接/relay）回 0xE6=kErrSilent，不计错误。
+ * @param channel     目标通道 0/1/2。
+ * @param silent      true=进 Silent，false=回 Normal。
+ * @param actual      可选输出，GD32 实际生效状态（1=Silent，与其发送门控同一个值）。
+ * @param timeout_ms  SPI 事务超时。
+ * @return 0 成功，<0 失败（-1 参数/SPI 失败，-2 GD32 返回 ERROR）。
+ */
+int canFdSetTxSilent(uint8_t channel,
+                     bool silent,
+                     uint8_t *actual,
+                     uint32_t timeout_ms);
 
 #endif // CANFD_BRIDGE_H

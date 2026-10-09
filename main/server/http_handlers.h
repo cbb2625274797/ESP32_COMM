@@ -32,6 +32,8 @@ esp_err_t system_heap_low_log_handler(httpd_req_t *req);
 // CAN 反馈快照（被动 0xC1）与接收模式
 esp_err_t can_feedback_handler(httpd_req_t *req);
 esp_err_t can_mode_handler(httpd_req_t *req);
+// CAN 通道收发器 Silent（0xC8，只听不发）
+esp_err_t can_silent_handler(httpd_req_t *req);
 
 // 多电机状态（被动 0xC5）
 esp_err_t motor_state_handler(httpd_req_t *req);

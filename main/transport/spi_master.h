@@ -210,8 +210,10 @@ public:
         uint8_t  rsp_err_last_req;      ///< 最近一笔 0x82 对应的主动请求 TYPE
         uint8_t  rsp_err_last_p0;       ///< 最近一笔 0x82 的 payload[0]（GD32 错误码）
         uint8_t  rsp_err_last_p1;       ///< 0xE8 时=GD32 收到的 rxLen
-        uint8_t  rsp_err_last_p2;       ///< 0xE8 时=GD32 rxBuf[0]（期望 SOF0=0xE2?）
-        uint8_t  rsp_err_last_p3;       ///< 0xE8 时=GD32 rxBuf[1]（期望 SOF1）
+        uint8_t  rsp_err_last_p2;       ///< 0xE8 时=GD32 rxBuf[0]（期望 SOF0=0xA5）
+        uint8_t  rsp_err_last_p3;       ///< 0xE8 时=GD32 rxBuf[1]（期望 SOF1=0x5A）
+        uint8_t  rsp_err_last_p4;       ///< 0xE8 时=GD32 SpiParseResult 解析失败原因枚举
+        uint8_t  rsp_err_last_p5;       ///< 0xE8 时=GD32 SOF offset (0=正常, >0=漂移, 255=未找到)
         uint32_t ring_steals;           ///< serviceRing 偷读迟到 RESPONSE 总数
         uint8_t  ring_steal_last_type;  ///< 最近一笔偷读帧的 TYPE（0.4.5 归因）
         uint8_t  ring_steal_last_ack;   ///< 最近一笔偷读帧 ack_seq 是否匹配 lastSent
@@ -220,6 +222,8 @@ public:
         uint8_t  ring_steal_last_p1;    ///< 0xE8 时=GD32 诊断 rxLen（0.4.8）
         uint8_t  ring_steal_last_p2;    ///< 0xE8 时=GD32 诊断 rxBuf[0]（0.4.8）
         uint8_t  ring_steal_last_p3;    ///< 0xE8 时=GD32 诊断 rxBuf[1]（0.4.8）
+        uint8_t  ring_steal_last_p4;    ///< 0xE8 时=GD32 诊断 parse_res
+        uint8_t  ring_steal_last_p5;    ///< 0xE8 时=GD32 诊断 sof_offset
         /* 0.4.9 诊断：透明重试会掩盖真实失败率（DBG 被编译裁掉、无计数）。
          * tx_total 进入事务；tx_retry 走到重发；tx_fail 耗尽重试仍失败返回。 */
         uint32_t tx_total;              ///< otaSendAndPoll 事务总数
@@ -243,6 +247,15 @@ public:
 
     /** @brief v2 session 是否已激活。 */
     bool v2Active() const { return m_v2Active; }
+
+    /** @brief SPI 链路是否判定在线（连续失败未触发熔断，防 SPI 不通时死循环阻塞与堆栈耗尽）。 */
+    bool isLinkOnline() const { return m_linkOnline; }
+
+    /** @brief 当前连续失败次数。 */
+    uint32_t consecutiveFailures() const { return m_consecutiveFailures; }
+
+    /** @brief 检查当前是否允许发起常规业务 SPI 事务（离线熔断冷却期内快速失败）。 */
+    bool allowRegularTransact(uint8_t type) const;
 
     /** @brief 最近一次 HELLO 得到的 GD32 角色（0=unknown, 1=app, 2=boot）。 */
     uint8_t gd32Role() const { return m_gd32Role; }
@@ -384,6 +397,16 @@ private:
     volatile bool m_resyncPending = false;
     /** 上次 HELLO 重同步时刻（冷却 5s，防 GD32 不响应时反复 HELLO）。 */
     volatile uint32_t m_lastResyncTick = 0;
+    /** 链路在线状态及熔断状态：防 SPI 不通时死循环阻塞与堆栈耗尽 */
+    volatile bool m_linkOnline = true;
+    volatile uint32_t m_consecutiveFailures = 0;
+    volatile uint32_t m_lastFailureTick = 0;
+    static constexpr uint32_t kCircuitBreakerFailThreshold = 3U;   ///< 连续 3 次失败触发熔断
+    static constexpr uint32_t kCircuitBreakerCooloffMs = 2000U;     ///< 熔断后冷却 2 秒
+
+    void recordSpiSuccess();
+    void recordSpiFailure();
+
     /** 最近一次主动请求类型（otaTransferUnlocked 发送时记录；poll 读预算按它收紧）。 */
     volatile uint8_t m_lastReqType = 0xFFU;
     /** SPI worker 任务句柄（ISR 唯一通知目标）。 */

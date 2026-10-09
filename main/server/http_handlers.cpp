@@ -783,7 +783,7 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         for (uint8_t i = 0; i < CAN_CHANNEL_MAX; ++i) {
             can_feedback_result_t result = {};
             bool valid = false;
-            if (ch_en[i] && !spi_paused) {
+            if (ch_en[i] && !spi_paused && SpiMaster::instance().isLinkOnline()) {
                 uint8_t entryIdx = 0;
                 valid = (canFdQueryFeedback(i, 0, &result, &entryIdx) == 0);
             }
@@ -881,7 +881,7 @@ esp_err_t can_feedback_handler(httpd_req_t *req)
         /* 按需查询：page 0 重置 + 统计，page 1 追加 entries（OTA 暂停期间跳过） */
         can_feedback_result_t result = {};
         bool valid = false;
-        if (ch_en[i] && !spi_paused) {
+        if (ch_en[i] && !spi_paused && SpiMaster::instance().isLinkOnline()) {
             uint8_t entryIdx = 0;
             int rc0 = canFdQueryFeedback(i, 0, &result, &entryIdx);
             if (rc0 == 0) {
@@ -1066,6 +1066,64 @@ esp_err_t can_mode_handler(httpd_req_t *req)
     int len = snprintf(resp, sizeof(resp),
         "{\"ok\":%s,\"requested\":%d,\"actual\":%u}",
         rc == 0 ? "true" : "false", requested, (unsigned)actual);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, len);
+    return ESP_OK;
+}
+
+// ============================================================
+// POST /can/silent — 切换指定 CAN 通道收发器 Silent（只听不发，SPI 0xC8）
+// 当前状态不在本端点上报：由 /can/feedback 的 bus_state bit5 单一出处提供，
+// 前端据此渲染开关样式，避免本地乐观状态与后端不一致。
+// ============================================================
+esp_err_t can_silent_handler(httpd_req_t *req)
+{
+    http_set_cors_headers(req);
+
+    char buf[128] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "接收数据失败");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    JsonView root = jsonParse(buf);
+    JsonView ch_item = jsonGet(&root, "ch");
+    JsonView on_item = jsonGet(&root, "on");
+    if (!root.valid || !jsonIsNumber(&ch_item) || !jsonIsNumber(&on_item)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 ch/on 字段");
+        return ESP_FAIL;
+    }
+
+    const int ch = (int)jsonGetNumberValue(&ch_item);
+    const bool on = (jsonGetNumberValue(&on_item) != 0);
+
+    char resp[128];
+    int len;
+
+    /* OTA / send_batch 独占 SPI 且正在用 CAN 发帧：此时翻静默会让 relay 半途
+     * 拒发（0xE6），现场只会看到"OTA 莫名失败"。直接拒绝，不抢这条时间线。 */
+    if (canFeedbackPaused()) {
+        len = snprintf(resp, sizeof(resp),
+            "{\"ok\":false,\"ch\":%d,\"on\":%d,\"err\":\"paused\"}",
+            ch, on ? 1 : 0);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, len);
+        return ESP_OK;
+    }
+
+    uint8_t actual = 0U;
+    int rc = canFdSetTxSilent(static_cast<uint8_t>(ch), on, &actual, 2000);
+    if (rc != 0) {
+        len = snprintf(resp, sizeof(resp),
+            "{\"ok\":false,\"ch\":%d,\"on\":%d,\"err\":%d}",
+            ch, on ? 1 : 0, rc);
+    } else {
+        len = snprintf(resp, sizeof(resp),
+            "{\"ok\":true,\"ch\":%d,\"requested\":%d,\"actual\":%u}",
+            ch, on ? 1 : 0, (unsigned)actual);
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
     return ESP_OK;
@@ -2021,9 +2079,10 @@ esp_err_t system_status_handler(httpd_req_t *req)
             "\"resyncs\":%lu,\"max_resp_latency_us\":%lu,"
             "\"rsp_err_0x82\":%lu,\"rsp_err_last_req\":\"0x%02X\",\"rsp_err_last_p0\":\"0x%02X\","
             "\"rsp_err_last_p1\":%u,\"rsp_err_last_p2\":\"0x%02X\",\"rsp_err_last_p3\":\"0x%02X\","
+            "\"rsp_err_last_p4\":%u,\"rsp_err_last_p5\":%u,"
             "\"ring_steals\":%lu,\"ring_steal_last_type\":\"0x%02X\",\"ring_steal_last_ack\":%u,"
             "\"ring_steal_last_p0\":\"0x%02X\",\"ring_steal_last_req\":\"0x%02X\","
-            "\"ring_steal_diag\":[%u,\"0x%02X\",\"0x%02X\"],"
+            "\"ring_steal_diag\":[%u,\"0x%02X\",\"0x%02X\",%u,%u],"
             "\"tx_total\":%lu,\"tx_retry\":%lu,\"tx_fail\":%lu,\"tx_fail_last_type\":\"0x%02X\"}",
             (unsigned)ls.version,
             role_str,
@@ -2045,6 +2104,8 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned)ls.stats.rsp_err_last_p1,
             (unsigned)ls.stats.rsp_err_last_p2,
             (unsigned)ls.stats.rsp_err_last_p3,
+            (unsigned)ls.stats.rsp_err_last_p4,
+            (unsigned)ls.stats.rsp_err_last_p5,
             (unsigned long)ls.stats.ring_steals,
             (unsigned)ls.stats.ring_steal_last_type,
             (unsigned)ls.stats.ring_steal_last_ack,
@@ -2053,6 +2114,8 @@ esp_err_t system_status_handler(httpd_req_t *req)
             (unsigned)ls.stats.ring_steal_last_p1,
             (unsigned)ls.stats.ring_steal_last_p2,
             (unsigned)ls.stats.ring_steal_last_p3,
+            (unsigned)ls.stats.ring_steal_last_p4,
+            (unsigned)ls.stats.ring_steal_last_p5,
             (unsigned long)ls.stats.tx_total,
             (unsigned long)ls.stats.tx_retry,
             (unsigned long)ls.stats.tx_fail,

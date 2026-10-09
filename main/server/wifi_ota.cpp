@@ -481,6 +481,7 @@ esp_err_t WifiOta::httpServerStart()
         {"/can/feedback",  HTTP_GET,  can_feedback_handler},
         {"/can/mode",      HTTP_GET,  can_mode_handler},
         {"/can/mode",      HTTP_POST, can_mode_handler},
+        {"/can/silent",    HTTP_POST, can_silent_handler},
         {"/spi/send",      HTTP_POST, spi_send_handler},
         {"/motor/state",   HTTP_GET,  motor_state_handler},
         {"/motor/version", HTTP_GET,  motor_version_handler},

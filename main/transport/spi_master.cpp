@@ -28,6 +28,32 @@
 #include "app_config.h"
 #include "monitor/debug_log.h"
 
+/* ============================================================
+ * SPI 调试日志编译期门（app_config.h: CONFIG_SPI_DEBUG_LOG_LEVEL）
+ *
+ * 本文件内 DEBUG_xxx("SPI", ...) 的级别若高于门限，展开为不执行的空语句：
+ * 用 `if (false)` 保留对实参的引用，避免"变量只用于日志"触发
+ * -Wunused/-Werror，同时运行时不格式化、不写 UART/UDP/环。
+ * 恢复 SPI 联调明细（与改动前完全一致）：把 CONFIG_SPI_DEBUG_LOG_LEVEL 改回 3。
+ * ============================================================ */
+#if (CONFIG_SPI_DEBUG_LOG_LEVEL < 4)
+#define SPI_LOG_MUTED(tag, fmt, ...) \
+    do { if (false) DebugLog::instance().log(DEBUG_LOG_DBG, (tag), (fmt), ##__VA_ARGS__); } while (false)
+#undef DEBUG_DBG
+#define DEBUG_DBG(tag, fmt, ...)  SPI_LOG_MUTED(tag, fmt, ##__VA_ARGS__)
+#endif
+#if (CONFIG_SPI_DEBUG_LOG_LEVEL < 3)
+#undef DEBUG_INFO
+#define DEBUG_INFO(tag, fmt, ...) SPI_LOG_MUTED(tag, fmt, ##__VA_ARGS__)
+#endif
+#if (CONFIG_SPI_DEBUG_LOG_LEVEL < 2)
+#undef DEBUG_WARN
+#define DEBUG_WARN(tag, fmt, ...) SPI_LOG_MUTED(tag, fmt, ##__VA_ARGS__)
+#endif
+#if (CONFIG_SPI_DEBUG_LOG_LEVEL < 1)
+#undef DEBUG_ERR
+#define DEBUG_ERR(tag, fmt, ...)  SPI_LOG_MUTED(tag, fmt, ##__VA_ARGS__)
+#endif
 
 static constexpr size_t kSpiTransferMaxBytes = 256U;
 
@@ -391,6 +417,8 @@ esp_err_t SpiMaster::serviceRingOnce()
         m_stats.ring_steal_last_p1 = (found_len > 1U) ? found_payload[1] : 0U;   /* 0.4.8 */
         m_stats.ring_steal_last_p2 = (found_len > 2U) ? found_payload[2] : 0U;
         m_stats.ring_steal_last_p3 = (found_len > 3U) ? found_payload[3] : 0U;
+        m_stats.ring_steal_last_p4 = (found_len > 4U) ? found_payload[4] : 0U;
+        m_stats.ring_steal_last_p5 = (found_len > 5U) ? found_payload[5] : 0U;
         static uint32_t s_steal_logs = 0U;
         if ((++s_steal_logs % 16U) == 1U) {
             DEBUG_WARN("SPI", "serviceRing 偷读迟到 RESPONSE t=0x%02X p0=0x%02X "
@@ -641,6 +669,13 @@ esp_err_t SpiMaster::submitJob(Job &job)
         /* 尚未执行：标 abandoned，worker dequeue 时跳过 executeJob——
          * 本函数即将返回，out_* 将指向已消亡栈帧，再执行即 use-after-return。 */
         pool_job->abandoned = true;
+        /* ★ 立即清除输出缓冲指针，彻底杜绝 worker 迟到执行时踩坏已消亡栈帧 */
+        pool_job->out_type = nullptr;
+        pool_job->out_payload = nullptr;
+        pool_job->out_len = nullptr;
+        pool_job->out_uptime = nullptr;
+        pool_job->out_version = nullptr;
+        pool_job->out_init_status = nullptr;
     }
     taskEXIT_CRITICAL(&s_spiJobMux);
 
@@ -676,6 +711,13 @@ esp_err_t SpiMaster::submitJob(Job &job)
         taskENTER_CRITICAL(&s_spiJobMux);
         if (!pool_job->finished) {
             pool_job->abandoned = true;
+            /* ★ 立即清除输出缓冲指针，杜绝写入消亡栈帧 */
+            pool_job->out_type = nullptr;
+            pool_job->out_payload = nullptr;
+            pool_job->out_len = nullptr;
+            pool_job->out_uptime = nullptr;
+            pool_job->out_version = nullptr;
+            pool_job->out_init_status = nullptr;
         }
         taskEXIT_CRITICAL(&s_spiJobMux);
         return ESP_ERR_TIMEOUT;
@@ -1651,6 +1693,8 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
 	                m_stats.rsp_err_last_p1 = (*resp_len > 1U) ? resp_payload[1] : 0U;
 	                m_stats.rsp_err_last_p2 = (*resp_len > 2U) ? resp_payload[2] : 0U;
 	                m_stats.rsp_err_last_p3 = (*resp_len > 3U) ? resp_payload[3] : 0U;
+	                m_stats.rsp_err_last_p4 = (*resp_len > 4U) ? resp_payload[4] : 0U;
+	                m_stats.rsp_err_last_p5 = (*resp_len > 5U) ? resp_payload[5] : 0U;
 	            }
 		            m_linkState.exitBusy();
 		            return ESP_OK;
@@ -1661,13 +1705,63 @@ esp_err_t SpiMaster::otaPollResponseUnlocked(uint8_t *resp_type, uint8_t *resp_p
 
     m_linkState.exitBusy();
     m_stats.ready_timeouts++;
-    /* 短切片超时是 OTA 正常紧循环，勿 WARN 刷爆 ring/网页 */
+    /* 短切片超时是 OTA 正常紧循环，勿 WARN 刷爆 ring/网页；限频 5 秒避免 SPI 不通时日志风暴耗尽堆栈 */
     if (timeout_ms >= 200U) {
-        DEBUG_WARN("SPI", "OTA response timeout: %lu ms", (unsigned long)timeout_ms);
+        static TickType_t s_lastTimeoutWarnTick = 0;
+        const TickType_t now_tick = xTaskGetTickCount();
+        if (s_lastTimeoutWarnTick == 0 ||
+            (now_tick - s_lastTimeoutWarnTick) >= pdMS_TO_TICKS(5000)) {
+            s_lastTimeoutWarnTick = now_tick;
+            DEBUG_WARN("SPI", "OTA response timeout: %lu ms (限频5s)", (unsigned long)timeout_ms);
+        }
     } else {
         DEBUG_DBG("SPI", "OTA poll slice timeout: %lu ms", (unsigned long)timeout_ms);
     }
     return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief 检查当前是否允许发起常规业务 SPI 事务。
+ * 离线熔断机制：SPI 连续失败达到阈值后进入冷却期，冷却期内快速失败，
+ * 避免周期性业务查询（ADC/电机/CAN反馈）死循环重试阻塞 CPU 与排队破坏堆栈。
+ */
+bool SpiMaster::allowRegularTransact(uint8_t type) const
+{
+    /* 关键链路/握手命令（HELLO、ENTER_BOOT、OTA 等）不受熔断限制 */
+    if (type == V2_TYPE_LINK_HELLO || type == SPI_OTA_CMD_REQ ||
+        type == SPI_OTA_CMD_DATA || type == SPI_OTA_CMD_CANCEL ||
+        type == SPI_APP_ENTER_BOOT_CMD) {
+        return true;
+    }
+    if (m_linkOnline) {
+        return true;
+    }
+    /* 处于离线熔断状态：若已过冷却期，放行一笔作为探针尝试恢复 */
+    const TickType_t now = xTaskGetTickCount();
+    if ((now - m_lastFailureTick) >= pdMS_TO_TICKS(kCircuitBreakerCooloffMs)) {
+        return true;
+    }
+    return false;
+}
+
+void SpiMaster::recordSpiSuccess()
+{
+    m_consecutiveFailures = 0;
+    if (!m_linkOnline) {
+        m_linkOnline = true;
+        DEBUG_INFO("SPI", "SPI 链路恢复在线 (circuit breaker reset)");
+    }
+}
+
+void SpiMaster::recordSpiFailure()
+{
+    m_consecutiveFailures = m_consecutiveFailures + 1;
+    m_lastFailureTick = xTaskGetTickCount();
+    if (m_consecutiveFailures >= kCircuitBreakerFailThreshold && m_linkOnline) {
+        m_linkOnline = false;
+        DEBUG_WARN("SPI", "SPI 连续失败 %lu 次，触发熔断降频 (circuit breaker trip, 冷却 %lums)",
+                   (unsigned long)m_consecutiveFailures, (unsigned long)kCircuitBreakerCooloffMs);
+    }
 }
 
 /**
@@ -1683,6 +1777,10 @@ esp_err_t SpiMaster::transact(uint8_t type, const uint8_t *payload, size_t paylo
 {
     if (payload_len > SPI_OTA_FRAME_MAX) {
         return ESP_ERR_INVALID_SIZE;
+    }
+    if (!allowRegularTransact(type)) {
+        /* 离线熔断保护：快速返回超时，避免排队阻塞与无休止重试 */
+        return ESP_ERR_TIMEOUT;
     }
     if (!onWorker() && m_workerTask != nullptr) {
         Job job{};
@@ -1805,14 +1903,20 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         if (send_ret != ESP_OK && send_ret != ESP_ERR_INVALID_RESPONSE) {
             if (attempt + 1U < kTxRetryMax) {
                 m_stats.tx_retry++;   /* 0.4.9：发送级失败→重发（原静默） */
-                DEBUG_DBG("SPI", "TX retry(%u/%u) send fail type=0x%02X %s",
-                          (unsigned)(attempt + 1U), (unsigned)kTxRetryMax,
-                          type, esp_err_to_name(send_ret));
+                static TickType_t s_lastSendRetryTick = 0;
+                const TickType_t now_tick = xTaskGetTickCount();
+                if (s_lastSendRetryTick == 0 || (now_tick - s_lastSendRetryTick) >= pdMS_TO_TICKS(5000)) {
+                    s_lastSendRetryTick = now_tick;
+                    DEBUG_DBG("SPI", "TX retry(%u/%u) send fail type=0x%02X %s (限频5s)",
+                              (unsigned)(attempt + 1U), (unsigned)kTxRetryMax,
+                              type, esp_err_to_name(send_ret));
+                }
                 vTaskDelay(pdMS_TO_TICKS(3));
                 continue;
             }
             m_stats.tx_fail++;        /* 0.4.9：耗尽重试仍失败 */
             m_stats.tx_fail_last_type = type;
+            recordSpiFailure();
             return send_ret;
         }
 
@@ -1831,20 +1935,28 @@ esp_err_t SpiMaster::otaSendAndPoll(uint8_t type, const uint8_t *payload, size_t
         esp_err_t poll_ret = otaPollResponseUnlocked(resp_type, resp_payload, resp_max, resp_len,
                                                      poll_timeout, /*expected_type=*/0xFFU);
         if (poll_ret == ESP_OK) {
+            recordSpiSuccess();
             return ESP_OK;   /* 已读到有效响应帧（ACK/ERROR/陈旧） */
         }
         if (attempt + 1U < kTxRetryMax) {
             m_stats.tx_retry++;   /* 0.4.9：poll 无响应→重发（原静默） */
-            DEBUG_DBG("SPI", "TX retry(%u/%u) no resp type=0x%02X %s",
-                      (unsigned)(attempt + 1U), (unsigned)kTxRetryMax,
-                      type, esp_err_to_name(poll_ret));
+            static TickType_t s_lastPollRetryTick = 0;
+            const TickType_t now_tick = xTaskGetTickCount();
+            if (s_lastPollRetryTick == 0 || (now_tick - s_lastPollRetryTick) >= pdMS_TO_TICKS(5000)) {
+                s_lastPollRetryTick = now_tick;
+                DEBUG_DBG("SPI", "TX retry(%u/%u) no resp type=0x%02X %s (限频5s)",
+                          (unsigned)(attempt + 1U), (unsigned)kTxRetryMax,
+                          type, esp_err_to_name(poll_ret));
+            }
             vTaskDelay(pdMS_TO_TICKS(3));
             continue;
         }
         m_stats.tx_fail++;        /* 0.4.9：耗尽重试仍失败 */
         m_stats.tx_fail_last_type = type;
+        recordSpiFailure();
         return poll_ret;
     }
+    recordSpiFailure();
     return ESP_ERR_TIMEOUT;  /* 不可达：循环必有返回 */
 }
 

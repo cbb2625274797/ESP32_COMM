@@ -5,6 +5,7 @@
  *   0xC0 发 CAN 帧（canFdSend）
  *   0xC1 反馈页解析（canFdParseFeedbackPage；由 GD32 主动推送，本文件不轮询）
  *   0xC2 设 RX 模式（canFdSetRxMode）
+ *   0xC8 设通道收发器 Silent（canFdSetTxSilent，只听不发）
  *
  * 0xC1 线格式与 GD32 app_spi_cmd_can_feedback.cpp 对齐：
  *   固定头 28B + 条目 id(4LE)+dlc(1)+flags(1)+rsvd(2)+data(dlc)
@@ -22,6 +23,7 @@ namespace {
 constexpr uint8_t kSpiCanFrameType   = 0xC0U;
 constexpr uint8_t kSpiCanBurstType   = 0xC7U;
 constexpr uint8_t kSpiCanSetModeType = 0xC2U;
+constexpr uint8_t kSpiCanSetSilentType = 0xC8U;
 constexpr uint8_t kFeedbackFixedHeader = 28U;
 constexpr uint8_t kFeedbackMaxPage     = 1U;  /* GD32 仅 page 0/1 */
 
@@ -403,8 +405,13 @@ int canFdQueryFeedback(uint8_t channel, uint8_t page,
         &resp_type, resp_buf, sizeof(resp_buf), &resp_len, 200U);
 
     if (ret != ESP_OK) {
-        DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u SPI失败: %s",
-                   (unsigned)channel, (unsigned)page, esp_err_to_name(ret));
+        static TickType_t s_lastFailWarnTick = 0;
+        const TickType_t now_tick = xTaskGetTickCount();
+        if (s_lastFailWarnTick == 0 || (now_tick - s_lastFailWarnTick) >= pdMS_TO_TICKS(5000)) {
+            s_lastFailWarnTick = now_tick;
+            DEBUG_WARN("CAN", "queryFeedback ch=%u p=%u SPI失败: %s (限频5s)",
+                       (unsigned)channel, (unsigned)page, esp_err_to_name(ret));
+        }
         return -1;
     }
     if (resp_type == SPI_OTA_RSP_ERROR) {
@@ -484,6 +491,55 @@ int canFdSetRxMode(can_rx_mode_t mode,
 
     DEBUG_WARN("CAN", "SET_MODE fail want=%u %s r=0x%02X n=%u",
                (unsigned)mode,
+               esp_err_to_name(ret),
+               (unsigned)resp_type,
+               (unsigned)resp_len);
+    return -1;
+}
+
+/**
+ * @brief 切换指定 CAN 通道收发器 Silent（SPI 0xC8）：只听不发。
+ * @return 0 成功；-1 参数非法或 SPI/应答失败；-2 GD32 返回 ERROR。
+ * @note 与 canFdSetRxMode 同款单步事务：GD32 在 CS EXTI ISR 内直接回 ACK/ERROR，
+ *       不会回 WAIT（区别于 0xC0 那条要排空 OTA 残留 WAIT 的路径）。
+ *       ACK payload = [0]channel [1]实际 silent [2]通道使能位。
+ */
+int canFdSetTxSilent(uint8_t channel,
+                     bool silent,
+                     uint8_t *actual,
+                     uint32_t timeout_ms)
+{
+    if (channel > 2U) {
+        DEBUG_WARN("CAN", "SET_SILENT 非法 ch=%u", (unsigned)channel);
+        return -1;
+    }
+
+    uint8_t req[2] = { channel, static_cast<uint8_t>(silent ? 1U : 0U) };
+    uint8_t resp_buf[3] = {0};
+    uint8_t resp_type = 0U;
+    size_t  resp_len  = 0U;
+
+    esp_err_t ret = SpiMaster::instance().transact(
+        kSpiCanSetSilentType,
+        req, sizeof(req),
+        &resp_type, resp_buf, sizeof(resp_buf), &resp_len, timeout_ms);
+
+    if (ret == ESP_OK && resp_type == SPI_OTA_RSP_ACK && resp_len >= 2U) {
+        if (actual != nullptr) {
+            *actual = resp_buf[1];
+        }
+        return 0;
+    }
+
+    if (ret == ESP_OK && resp_type == SPI_OTA_RSP_ERROR) {
+        DEBUG_WARN("CAN", "SET_SILENT ch=%u want=%u GD32 err=0x%02X",
+                   (unsigned)channel, (unsigned)(silent ? 1U : 0U),
+                   (resp_len >= 1U) ? (unsigned)resp_buf[0] : 0U);
+        return -2;
+    }
+
+    DEBUG_WARN("CAN", "SET_SILENT ch=%u want=%u %s r=0x%02X n=%u",
+               (unsigned)channel, (unsigned)(silent ? 1U : 0U),
                esp_err_to_name(ret),
                (unsigned)resp_type,
                (unsigned)resp_len);

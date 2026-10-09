@@ -676,9 +676,13 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
         uart_ret = uartSend(data, len);
     }
 
-    /* UDP：堆紧 / 无 IP 时跳过 sendto */
+    /* UDP：堆紧 / 无 IP 时跳过 sendto；增加关闭后 10s 冷却退避，防连续失败时反复创建/销毁 socket 造成堆抖动 */
+    static TickType_t s_lastUdpCloseTick = 0;
+    const TickType_t now_tick = xTaskGetTickCount();
+    const bool udp_in_cooloff = (s_lastUdpCloseTick != 0) &&
+                                ((now_tick - s_lastUdpCloseTick) < pdMS_TO_TICKS(10000));
     if (m_initialized && free_now >= kSkipUdpFree && udpNetifHasIp()) {
-        if (m_udpSock < 0) {
+        if (m_udpSock < 0 && !udp_in_cooloff) {
             (void)ensureUdpSocket();
         }
 
@@ -703,12 +707,13 @@ esp_err_t DebugLog::send(const uint8_t *data, size_t len)
                 }
                 if (m_udpFailStreak >= kUdpFailRecreate) {
                     closeUdpSocket();
+                    s_lastUdpCloseTick = xTaskGetTickCount();
                     m_udpFailStreak = 0;
                     const TickType_t now = xTaskGetTickCount();
                     if (m_lastUdpFailWarnTick == 0 ||
                         (now - m_lastUdpFailWarnTick) >= warnIntervalTicks()) {
                         m_lastUdpFailWarnTick = now;
-                        static const char kMsg[] = "[W][LOG] UDP 连续失败，已重建 socket\n";
+                        static const char kMsg[] = "[W][LOG] UDP 连续失败，暂停发送 10s 后重建\n";
                         ringPush(kMsg, (int)sizeof(kMsg) - 1);
                     }
                 }

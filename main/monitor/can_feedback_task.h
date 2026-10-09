@@ -15,6 +15,9 @@ void pauseCanFeedbackTask(bool pause);
  *  请求驱动的 SPI 查询（canFdQueryFeedback）在暂停期间应跳过。 */
 bool canFeedbackPaused();
 
+/** @brief 获取 can_fb 任务句柄（用于栈水位监控）。 */
+TaskHandle_t getCanFeedbackTaskHandle();
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -57,13 +57,13 @@ inline constexpr uint16_t HTTP_SERVER_PORT      = 80;              ///< HTTP 服
 inline constexpr uint32_t HTTP_SERVER_STACK_SIZE   = 7168;  ///< httpd：peak~5.2KB + ~2KB → 7KB（原 8/10KB）
 inline constexpr uint32_t TASK_STACK_WIFI_OTA      = 3072;  ///< wifi_ota：peak~1.2KB + ~1.8KB → 3KB（原 4/8KB）
 inline constexpr uint32_t TASK_STACK_OTA_RELAY     = 2560;  ///< ota_relay：2.5KB（轻载 peak~1.3KB；转发突发不砍）
-inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 4096;  ///< spi_worker：peak~1.9KB + ~2KB → 4KB（原 5KB）
+inline constexpr uint32_t TASK_STACK_SPI_WORKER    = 5120;  ///< spi_worker：5KB（覆盖超时重试+日志深层调用栈安全余量）
 inline constexpr uint32_t TASK_STACK_BLE_OTA       = 2560;  ///< ble_ota：peak~0.9KB + ~1.5KB → 2.5KB（原 3KB）
 inline constexpr uint32_t TASK_STACK_BLE_WORKER    = 2560;  ///< ble_ota_worker：peak 1004B + ~1.5KB → 2.5KB（原 3KB）
 inline constexpr uint32_t TASK_STACK_HEALTH_MON    = 3072;  ///< health_mon：peak~1.8KB，余量~1.2KB，不砍
 inline constexpr uint32_t TASK_STACK_CPU_STATS     = 3072;  ///< cpu_stats：peak~1.8KB，余量~1.2KB，不砍
 inline constexpr uint32_t TASK_STACK_WIFI_RECONNECT = 2560; ///< wifi_reconnect：轻载，2.5KB 保持
-inline constexpr uint32_t TASK_STACK_CAN_FB        = 3072;  ///< can_fb：被动 takeEvent(0xC1)
+inline constexpr uint32_t TASK_STACK_CAN_FB        = 4096;  ///< can_fb：4KB（覆盖 0xC4/0xC5 周期查询超时与日志调用栈）
 inline constexpr uint32_t TASK_STACK_BLE_FINISH    = 4096;  ///< 按需：SHA finalize（保持）
 inline constexpr uint32_t TASK_STACK_BLE_GD32_WAIT = 3072;  ///< 按需：GD32 中继等待
 inline constexpr uint32_t TASK_STACK_BLE_RESTART   = 2048;  ///< 按需：延时重启
@@ -107,6 +107,16 @@ inline constexpr int      SPI_QUEUE_SIZE         = 4;     ///< SPI 事务队列�
 inline constexpr size_t   SPI_OTA_FRAME_MAX      = 256;   ///< 单 CS 最大帧长（APP 满缓冲）
 inline constexpr size_t   SPI_BOOT_TX_BUF_SIZE   = 128;   ///< BOOT TX DMA 满缓冲（读预算用）
 inline constexpr size_t   SPI_APP_TX_BUF_SIZE    = 256;   ///< APP TX DMA 满缓冲（读预算用）
+
+// ------------------------------------------------------------
+// SPI 调试日志级别（编译期裁剪，改完重编生效；用法见 spi_master.cpp 顶部门）
+//   3 = 全开（逐事务 DBG + INFO 明细，SPI 联调用）
+//   2 = 只留 ERR/WARN（★默认：真实故障仍可见，心跳/HELLO/INIT_STATUS 明细静默）
+//   1 = 只留 ERR      0 = 全静默
+// GD32 侧对应开关：DCU_APP/GD32E508_DCU_APP/sys/config.h
+//   CONFIG_SPI_APP_LOG_ENABLE / CONFIG_SPI_DIAG_PERIODIC_PRINT
+// ------------------------------------------------------------
+#define CONFIG_SPI_DEBUG_LOG_LEVEL 2
 
 // ============================================================
 // OTA 协调器
