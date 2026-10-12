@@ -1,630 +1,126 @@
-# ESP32-C3 OTA Relay
+# ESP32_COMM · DCU 通信与 OTA 中枢固件
 
-**固件版本: v0.3.12** | 构建时间: 2026-06-17 | 基于 ESP-IDF v6.0
+> **文档同步版本：v0.5.2（git 770ae14）· 2026-10-11**
+> 本 README 是 [docs/project_introduction.html](docs/project_introduction.html)（完整白皮书，含 21 幅 SVG 原理图）的**浓缩版**，两者须同步更新（见文末「文档同步说明」）。
 
-## 项目概述
-
-ESP32-C3FH4 OTA 中继固件，作为 **GD32E508VET6** 的 OTA 升级桥梁。通过 **WiFi (HTTP)** 或 **BLE (GATT)** 从上位机（手机/PC）接收固件，存储在本地 SPI Flash 的 `gd32_ota` 分区，再通过 **SPI 总线** 经四阶段安全握手协议转发给 GD32。
+ESP32-C3FH4 固件，作为 GD32E508 DCU 板的通信与 OTA 中枢：
 
 ```
-[手机/PC 上位机] --WiFi/BLE--> [ESP32-C3FH4] --SPI--> [GD32E508VET6]
-                                  |
-                                  +-- gd32_ota 分区 (252KB)
-                                  +-- 健康自检 (温度 + WiFi RSSI)
-                                  +-- 本机 OTA (ESP32 自升级)
+[上位机 PC/手机网页] --WiFi HTTP / BLE GATT--> [ESP32-C3FH4] --SPI Link v2 (13.33MHz, 5线)--> [GD32E508]
+                                                    |                                              |
+                                          gd32_ota 252KB 固件缓存                        3×CANFD 收发器(电机总线)
+                                          app0/app1 AB 自升级                            电机 OTA CAN 二次中继
 ```
 
-## 硬件平台
+- **OTA 中继**：GD32 固件（六阶段安全握手 + AES-128 逐包加密转发）、ESP32 自身 AB 分区升级、电机节点经 GD32 CAN 二次烧写
+- **SPI Link v2 主站**：会话 / 序号 / 信用流控 / CRC32 / HELLO 重同步 / 透明重试
+- **CAN 控制面**：单帧、批量、跨通道同步突发（0xC7）、只听模式（0xC8）、遥测回收（0xC4/C5/C6）
 
-| 项目 | 规格 |
+## 硬件与分区
+
+| 项 | 值 |
 |------|------|
-| **芯片** | ESP32-C3FH4 (RISC-V, 单核, 160MHz) |
-| **Flash** | 4MB |
-| **SPI 引脚** | MOSI=GPIO5, MISO=GPIO7, SCLK=GPIO6, CS=GPIO4, DATA_READY=GPIO10（GD32 PB6 开漏输出，ESP32 仅输入） |
-| **SPI 拓扑** | 5-wire SPI（4 线 SPI + 1 DATA_READY 通知线），SPI Link v2 协议（详见 `SPEC/spi_link_v2.md`） |
-| **SPI 速率** | 4MHz, Mode 0 |
-| **UART 调试** | TX=GPIO21, RX=GPIO20, 115200 baud |
-| **编译工具链** | ESP-IDF v6.0, riscv32-esp-elf |
+| 芯片 | ESP32-C3FH4（RISC-V 单核 160MHz）· 4MB Flash（DIO） |
+| SPI | MOSI=5, MISO=7, SCLK=6, CS=4, DATA_READY=10；13.33MHz Mode 0（`CONFIG_DCU_SPI_CLOCK_HZ`） |
+| 调试串口 | UART0 TX=21/RX=20，**3 Mbps**（115200 为 sdkconfig 控制台项）；UDP 日志 192.168.31.3:6666 |
+| 欠压 | LVL7（≈2.8V，防长断电半复位） |
 
-### 分区表 (`config/partitions.csv`)
-
-| 分区 | 类型 | 偏移 | 大小 | 用途 |
-|------|------|------|------|------|
-| nvs | data/nvs | 0x9000 | 24KB | NVS 存储 |
-| otadata | data/ota | 0xF000 | 8KB | OTA 启动信息 |
-| gd32_ota | data/spiffs | 0x11000 | 252KB | GD32 固件缓存 |
-| app0 | app/ota_0 | 0x50000 | 1.25MB | ESP32 OTA 槽位 0 |
-| app1 | app/ota_1 | 0x190000 | 1.25MB | ESP32 OTA 槽位 1 |
-| spiffs | data/spiffs | 0x2D0000 | 1.06MB | 文件系统 |
-
-## 功能模块
-
-| 模块 | 文件 | 描述 |
-|------|------|------|
-| **core** | `core/main.cpp` | 程序入口，初始化各模块并创建 4 个 FreeRTOS 任务 |
-| **health_monitor** | `monitor/health_monitor.{h,cpp}` | 温度 + WiFi RSSI 监控，OTA 前健康检查 |
-| **debug_log** | `monitor/debug_log.{h,cpp}` | 三路日志输出：UART0 + UDP + 环形缓冲区 |
-| **ota_coordinator** | `ota/ota_coordinator.{h,cpp}` | **全局 OTA 协调器**（单例）：串行化 GD32/ESP32 OTA 操作，统一传输层入口，9 状态系统级状态机 |
-| **ota_relay** | `relay/ota_relay.{h,cpp}` | GD32 OTA 中继**事件驱动状态机**（6 阶段 + ERROR）：通过 `dispatchQueue` 接收调度信号，`processEvent()` 驱动状态转换 |
-| **esp32_ota_core** | `ota/esp32_ota_core.{h,cpp}` | ESP32 本机 OTA 核心（begin/write/finalize/abort，WiFi/BLE 共用） |
-| **wifi_ota** | `server/wifi_ota.{h,cpp}` | WiFi AP/STA + HTTP OTA 服务器 + CAN 帧转发 |
-| **ble_ota** | `server/ble_ota.{h,cpp}` | BLE GATT 服务器（NimBLE 协议栈） |
-| **spi_master** | `transport/spi_master.{h,cpp}` | SPI 主站驱动 + CANFD 3 通道 + OTA 帧协议 |
-| **protocol** | `transport/protocol.{h,cpp}` | 协议层（nonce 搅伴生成、AES 会话密钥管理、运行时 SCRAMBLE_CONST） |
-
-## 目录结构
-
-```
-ESP32_COMM/
-├── CMakeLists.txt                    # 顶层 CMake 项目定义
-├── sdkconfig.defaults                # SDK 配置默认值 (WiFi RX/TX BA=6)
-├── config/
-│   └── partitions.csv                # 4MB Flash 分区表
-├── main/
-│   ├── CMakeLists.txt                # 注册 12 个源文件 + 依赖
-│   ├── include/
-│   │   ├── app_config.h              # 统一配置 (constexpr: WiFi/BLE/OTA/阈值/密钥)
-│   │   ├── version.h                 # 手动维护的版本信息 (v0.3.56)
-│   │   └── ota_mutex.h               # BLE/WiFi OTA 全局互斥
-│   ├── core/main.cpp                 # app_main 入口，4 个 FreeRTOS 任务
-│   ├── relay/ota_relay.{h,cpp}       # GD32 OTA 中继事件驱动状态机
-│   ├── ota/
-│   │   ├── esp32_ota_core.{h,cpp}    # ESP32 本机 OTA 核心
-│   │   └── ota_coordinator.{h,cpp}   # 全局 OTA 协调器
-│   ├── transport/
-│   │   ├── spi_master.{h,cpp}        # SPI 主站 + CANFD 3 通道
-│   │   └── protocol.{h,cpp}          # 协议层 (CRC16 / AES / nonce)
-│   ├── server/
-│   │   ├── wifi_ota.{h,cpp}          # WiFi OTA HTTP 服务器
-│   │   └── ble_ota.{h,cpp}           # BLE GATT OTA 服务器
-│   └── monitor/
-│       ├── health_monitor.{h,cpp}    # 温度 + RSSI 健康监控
-│       └── debug_log.{h,cpp}         # UART0 + UDP + 环形缓冲区日志
-├── components/
-│   └── cjson/                        # cJSON 组件
-├── managed_components/
-│   └── espressif__mdns/              # mDNS 组件
-├── tools/
-│   ├── index.html                    # WiFi OTA WebUI 控制台
-│   ├── ble_ota.html                  # BLE OTA WebUI 控制台 (Web Bluetooth)
-│   ├── app.js                        # WebUI JavaScript
-│   ├── style.css                     # WebUI 样式
-│   ├── serve.bat                     # Python HTTP 服务器启动脚本 (端口 8080)
-│   ├── serial_monitor.py             # 串口日志采集工具 (COM15)
-│   └── ota_upload_test.py            # OTA 上传测试脚本
-├── docs/
-│   ├── esp32_ota_relay_design.md     # 架构设计文档
-│   ├── DEVELOPMENT_GUIDE.md          # 开发者指南 (T0-T8)
-│   └── COMMUNICATION_AUDIT_2026-05-05.md  # 通信审计
-├── .vscode/                          # VS Code 调试/编译配置 (COM15, clangd)
-└── .devcontainer/                    # Docker 开发容器 (ESP-IDF 6.0)
-```
-
-## FreeRTOS 任务
-
-4 个主任务全部固定运行在 ESP32-C3 单核（核 0），通过 FreeRTOS 队列通信：
-
-| 任务名 | 函数 | 优先级 | 栈大小 | 职责 |
-|--------|------|--------|--------|------|
-| `health_mon` | `HealthMonitor::taskEntry` | configMAX_PRIORITIES - 4 | 4096 | 温度监控 (1s 定时器) + 堆巡检 (5s) + 健康状态管理 |
-| `wifi_ota` | `WifiOta::taskEntry` | configMAX_PRIORITIES - 3 | 8192 | WiFi (AP/STA) + HTTP 服务器 (端口 80) + 状态轮询 |
-| `ble_ota` | `BleOta::taskEntry` | configMAX_PRIORITIES - 3 | 8192 | BLE GATT 服务器初始化 + NimBLE Host 任务 + 心跳保活 |
-| `ota_relay` | `OtaRelay::taskEntry` | configMAX_PRIORITIES - 2 | 12288 | 等待 dispatchQueue 调度信号 → 事件驱动状态机（6 阶段）→ SPI 转发 → resultQueue 回传结果 |
-
-额外后台任务：
-
-| 任务名 | 优先级 | 栈大小 | 职责 |
-|--------|--------|--------|------|
-| `wifi_reconnect` | 5 | 4096 | STA 断线重连（退避算法，独立任务避免死锁）|
-| `ble_ota_finish` | 5 | 4096 | BLE ESP32 OTA 异步收尾（SHA 校验 + end + reboot）|
-| `nimble_host` | NimBLE 内部 | NimBLE 内部 | BLE 协议栈事件循环 |
-
-### 跨任务通信
-
-- **OTA 协调**: **OtaCoordinator** 管理系统级 OTA 状态（9 状态），提供 `beginGd32Storage/completeGd32Storage/triggerGd32Relay/beginEsp32Ota` 等统一入口，内部 mutex 保护状态读写
-- **OTA 调度**: WiFi/BLE 任务通过 `OtaRelay::dispatchQueue` (FreeRTOS 队列, 深度 4) 发送调度信号给 `ota_relay` 任务；结果通过 `resultQueue` 回传；OtaCoordinator 也向此队列投递中继触发命令
-- **OTA 互斥**: `g_esp32OtaMutex` (全局 Mutex) + `g_esp32OtaOccupied` 标志，防止 BLE 和 WiFi 同时操作 ESP32 OTA 分区
-- **中继状态**: `OtaRelay::s_stateMutex` 保护 relayState/relaySeq/relayTotalPackets 等跨任务状态（`StateLockGuard` RAII 封装）
-- **WiFi 状态**: `WifiOta::m_stateMutex` + `std::atomic` 保护 WiFi 连接状态和重连计数器
-- **健康状态**: `HealthMonitor::m_mutex` 保护 healthState/temperature/RSSI
-- **UDP 日志**: `DebugLog::m_logRingMutex` 保护 HTTP `/logs` 环形缓冲区
-
-## OTA 核心流程
-
-### 一、GD32 OTA 中继（事件驱动状态机，6 阶段 + ERROR）
-
-上位机上传 GD32 固件到 ESP32 本地 `gd32_ota` 分区（通过 **OtaCoordinator** 协调上传状态）→ 收到触发命令后由 **OtaRelay** 事件驱动状态机执行转发：
-
-```
-状态机总览：
-
-    IDLE ──(EVT_START)──→ HANDSHAKING ──→ SIZE_NEG ──→ TRANSFERRING
-     ↑                       │               │              │
-     │                    (error)         (error)        (error)
-     │                       ↓               ↓              ↓
-     └──── DONE ←── FINISHING ←────────────────────────── ERROR
-             │                    ↑                         │
-             └──── (EVT_START) ───┘           (EVT_START)───┘
-```
-
-| 阶段 | 状态 | 输入事件 | 输出/转换 |
-|------|------|----------|-----------|
-| **① 安全握手** | `HANDSHAKING` | EVT_START / EVT_RESP_OK | `doHandshakeReq()` → `doChallengeAndAuth()` → 建立 `K_session` AES 加密通道 |
-| **② 大小协商** | `SIZE_NEG` | EVT_START | `doSendFirmwareSize()` → 加载 NVS 元数据中的 `total_size` |
-| **③ 数据包转发** | `TRANSFERRING` | EVT_START | `doRelayPackets()` → 逐包 AES 加密转发 + 结构化 ACK 校验 + 健康检查 |
-| **④-⑤ 完成与验证** | `FINISHING` | EVT_START | `doFinishAndVerify()` → 发送 FINISH → PING 轮询 APP 存活（最多 30 次 × 500ms） |
-| **完成** | `DONE` | EVT_START → 重入 IDLE | 状态机复位 |
-| **错误** | `ERROR` | 任意错误超时/健康危险 | `reset()` → IDLE |
-
-#### 协调器系统级状态（OtaCoordinator）
-
-```
-状态流转：
-
-  IDLE ──→ GD32_STORING ──→ GD32_STORED ──→ GD32_RELAYING ──→ GD32_COMPLETE
-    │                                                    │
-    ├──→ ESP32_RECEIVING ──→ ESP32_FINALIZING ──→ ESP32_REBOOTING
-    └──→ ERROR (任意阶段)
-```
-
-| 系统状态 | 含义 |
-|----------|------|
-| `OTA_SYS_IDLE` | 空闲，可接受新请求 |
-| `OTA_SYS_GD32_STORING` | 传输层正在存储 GD32 固件到 Flash |
-| `OTA_SYS_GD32_STORED` | GD32 固件已完整存储，等待触发中继 |
-| `OTA_SYS_GD32_RELAYING` | SPI 中继转发进行中 |
-| `OTA_SYS_GD32_COMPLETE` | GD32 OTA 完成 |
-| `OTA_SYS_ESP32_RECEIVING` | 接收 ESP32 自身固件 |
-| `OTA_SYS_ESP32_FINALIZING` | SHA 校验 + end + set_boot |
-| `OTA_SYS_ESP32_REBOOTING` | 即将重启 |
-| `OTA_SYS_ERROR` | 错误状态 |
-
-#### 安全握手协议
-
-1. **握手请求**: ESP32 发送 `0x00 0xAC`（最多重试 10 次，200ms 超时）
-2. **Challenge**: GD32 回复 36B 数据包（12B UID + 8B nonce 片段 + 16B 加密会话密钥）
-3. **验证**: ESP32 验证 nonce 匹配，用 MasterKey 派生 `K_session = AES(MasterKey, nonce_server)` 并比对
-4. **确认**: ESP32 发送 `nonce_server ^ 0x55` 经 `K_session` AES-ECB 加密
-5. **完成**: GD32 回复 `0xBA 0xC0`，建立 AES 加密通道
-
-> **GD32 UID **: 运行时从握手 Challenge 包解包获得，不再使用编译期常量 `GD32_CHIP_UID`。
-
-#### 数据包转发
-
-- 每包 48 字节固件载荷，使用 `K_session` AES-ECB 加密
-- 包结构: `session(4B) + seq(4B) + encrypted48(48B) + if_end(4B) + crc32(4B)` = 64B
-- 每 32 包执行一次 OTA 健康检查（温度/堆）
-- 支持结构化 ACK 含 seq 校验 + 错误码（`0x04`=CRC 错误），残留 ACK 自动过滤
-- 单包最多 10 次重试，全局超时动态计算 5~10 分钟
-- **Flash 元数据**: 通过 NVS 记录固件 `total_size`/`stored_size`/`last_seq`/`checksum`，用于完整性校验和中继恢复判断
-
-### 二、ESP32 本机 OTA（WiFi + BLE 共用）
-
-核心逻辑封装在 `Esp32OtaCore` 单例中，WiFi 和 BLE 通道共用。  
-传输层通过 **OtaCoordinator** 统一入口（`beginEsp32Ota()`）发起操作，由协调器管理系统状态并委托 `Esp32OtaCore` 执行底层写入：
-
-| 步骤 | 方法 | 说明 |
-|------|------|------|
-| 1 | `begin(total_size)` | 选择非当前 OTA 分区，获取全局互斥，`esp_ota_begin` |
-| 2 | `write(data, len)` | 循环调用 `esp_ota_write`（WiFi 通过 HTTP 流，BLE 通过 GATT 块） |
-| 3 | `finalize(sha_hex, reboot)` | 从分区读回计算 SHA-256 → 比对前端 SHA → `esp_ota_end` → `esp_ota_set_boot_partition` → 可选重启 |
-| - | `abort()` | 中止并清理（释放 mutex + 复位状态） |
-
-**SHA-256 校验**: 固件写入完成后从 OTA 分区读回计算，不做增量 SHA。前端与设备端 SHA 比对一致才执行 finalize（`Esp32OtaCore::finalize()` → `esp_ota_end` → `esp_ota_set_boot_partition`），否则返回 `ESP_ERR_INVALID_VERSION`。过程中系统状态由 `OtaCoordinator` 跟踪（`ESP32_RECEIVING → ESP32_FINALIZING → ESP32_REBOOTING`）。
-
-**回滚保护**: `esp_ota_mark_app_valid_cancel_rollback()` 在启动时标记当前固件有效。启用 `CONFIG_APP_ROLLBACK_ENABLE` 后，新固件崩溃自动回退。
-
-## 通信协议
-
-### SPI Link v2 帧格式（底层传输，唯一现行）
-
-真相源：`spi_link/spi_link_v2.h` · ESP32 `SpiMaster::otaBuildFrame` / `otaFindFrame`：
-
-```
-| SOF0 0xA5 | SOF1 0x5A | VER 0x02 | FLAGS | SESSION 4B LE | TX_SEQ | ACK_SEQ | CREDIT | TYPE | LEN 2B LE | RSV 2B | PAYLOAD | CRC32 4B LE |
-```
-
-- 开销 `V2_OVERHEAD=20`（Header 16 + CRC32 4，MPEG-2 无反射）
-- APP 缓冲 256 → 最大 payload **236**；BOOT 缓冲 128 → 最大 payload **108**
-- ESP32 读预算：`spiRespReadBudget()` 按 HELLO role → APP=256 / BOOT=128
-- **无 v1 CRC8 路径**
-
-| TYPE | 名称 | 用途 |
-|------|------|------|
-| 0x00 | LINK_HELLO | 建链 / HELLO_ACK |
-| 0x01 | OTA_CMD_REQ | OTA 请求帧 |
-| 0x02 | OTA_CMD_DATA | OTA 数据帧 |
-| 0x03 | OTA_CMD_CANCEL | 取消 OTA |
-| 0xB0 | ENTER_BOOT | 通知 GD32 APP 进入 Bootloader（应答 TYPE 亦 0xB0，payload 0xB5） |
-| 0x80 | RSP_ACK | 响应：成功 |
-| 0x81 | RSP_WAIT | 响应：GD32 忙，请等待 |
-| 0x82 | RSP_ERROR | 响应：错误 |
-| 0xC0~C3 | CAN 业务 | 发送 / 反馈 / 模式 / ID 快照 |
-
-#### SPI Link v2 PC 自测（兼容性回归门禁）
-
-`spi_link_v2.cpp` 内置 `SPI_LINK_V2_SELFTEST` PC 端自测，以 `golden_vectors.h`
-中冻结的帧字节为交叉校验基准，覆盖 HELLO / OTA / CAN / PING / ENTER_BOOT /
-响应类型、最大 payload、CRC 翻转、错误版本、前导垃圾字节偏移解析等场景。
-向量字节由 `v2_build_frame` 现算后冻结，与协议实现互为交叉校验——任何一方
-漂移都会被对方测试捕获。
-
-独立 host CMake target（与 ESP-IDF 构建隔离，不影响固件构建）：
-
-```bash
-cmake -S spi_link/test -B build/host_test
-cmake --build build/host_test
-ctest --test-dir build/host_test --output-on-failure   # 期望 Passed: 10  Failed: 0
-```
-
-CI：`.github/workflows/spi-link-selftest.yml` 在触及 SPI Link 相关文件时自动
-运行自测。`spi_link/` 是三工程共享的兄弟协议目录（与 `ESP32_COMM` 同级，本仓
-通过 `../../../spi_link/` 相对路径引用），CI 检出需确保该兄弟目录就位。
-
-### CANFD 3 通道 SPI 协议
-
-ESP32 通过 SPI 转发 CAN 帧到 GD32（GD32 端驱动外部 CAN 收发器）：
-
-```
-| 通道编号(1B) | 扩展帧ID(4B BE) | 数据(1~64B) |
-```
-
-| 通道 | 用途 |
-|------|------|
-| CH0 | 主通信通道 |
-| CH1 | 备用通道 |
-| CH2 | 备用通道 |
-
-### GD32 命令 ID 定义
-
-| 域 | 命令 | ID |
-|------|------|------|
-| 系统 | PING / RESET / GET_VERSION / GET_STATUS / SET_STATUS | 0x0001~0x0005 |
-| Flash | ERASE / WRITE / READ / VERIFY | 0x1001~0x1004 |
-| OTA | START / DATA / END / ABORT | 0x2001~0x2004 |
-| 传感器 | READ / CONFIG | 0x3001~0x3002 |
-| Bootloader | ENTER / JUMP_APP | 0xF001~0xF002 |
-
-## WiFi 工作模式
-
-支持 AP/STA 双模式，启动时优先 STA，超时自动回退 AP。
-
-### AP 模式（设备当热点）
-
-| 参数 | 值 |
-|------|------|
-| SSID | `ESP32_OTA_RELAY` |
-| 密码 | `12345678` |
-| IP | 192.168.31.1 |
-| 信道 | 6 |
-| 最大客户端 | 4 |
-
-### STA 模式（连接路由器）
-
-| 参数 | 值 |
-|------|------|
-| SSID | `004舰桥` |
-| 连接超时 | 30 秒 |
-| 最大重试 | 5 次（超限后自动切换 AP 模式） |
-| IP 分配 | DHCP（可切换静态 IP 192.168.31.32）|
-| 国家码 | CN（允许信道 1-13）|
-
-**冷启动**: POWERON/BROWNOUT 时做短延时后初始化；清 WiFi 连接缓存；欠压复位后清 PHY 重校准；BOD 档位 LVL5。
-
-### mDNS 发现
-
-设备在局域网内通过 `esp32-ota-relay.local` 可发现（需 `managed_components/espressif__mdns` 组件）。
-
-## BLE GATT 服务
-
-基于 **NimBLE** 协议栈，设备名 `ESP32-OTA-RELAY`，ATT MTU 512 字节，支持 GD32 和 ESP32 两种 OTA 目标。
-
-| UUID | 特征 | 属性 | 用途 |
+| 分区 | 偏移 | 大小 | 用途 |
 |------|------|------|------|
-| 0xFFFF | Service | - | OTA GATT 服务 |
-| 0x0001 | CTRL | Write | 控制命令：`0xF7`=触发GD32中继, `0xF8+32B SHA`=ESP32 OTA, `0xF9+32B SHA`=仅SHA校验（不入库/不重启）, `0xFA`=重启ESP32 |
-| 0x0002 | DATA_IN | Write | 固件数据块：`cmd(1)+seq(2)+total_size(4)+payload` |
-| 0x0003 | DATA_OUT | Notify | 推送：ACK(窗口确认, 0xA1+8B) / FINISH(阶段事件, 0xB1+6B) / SHA256(0xC1+33B) |
-| 0x0004 | VERSION | Read | 固件版本字符串 |
+| nvs | 0x9000 | 24KB | 配置 + OTA 元数据（`ota_meta`：total/stored/last_seq/checksum） |
+| otadata | 0xF000 | 8KB | AB 启动标志 |
+| gd32_ota | 0x11000 | 252KB | GD32/电机固件缓存（互斥共用） |
+| app0 / app1 | 0x50000 / 0x190000 | 各 1.25MB | ESP32 AB 分区（回滚保护） |
+| spiffs | 0x2D0000 | 1.06MB | 用户数据 |
 
-### BLE 数据传输
+## 架构与任务
 
-- **ACK 窗口**: 每 32 包等待一次 DATA_OUT ACK（带累计字节数验证）
-- **窗口重传**: ACK 超时或字节数不足时重发整个窗口（最多 3 次）
-- **乱序重排**: Reorder buffer（32 槽）吸收 BLE 窗口内乱序到达的包，按 seq 排序后顺序写入 `Esp32OtaCore`
-- **ESP32 收尾**: BLE 传输完成后由前端发 `0xF8 + 32B 文件 SHA-256`，设备端读回 OTA 分区做 SHA 比对，通过后完成 `esp_ota_end`、设置启动分区并重启；`0xF9` 命令仅做 SHA 比对不入库（预检），FINISH 仅上报完成/重启/错误
-- **GD32 触发**: 传输完成后自动发 `0xF7` 触发 SPI 中继
-- **合并包**: NimBLE 可能将多个 writeWithoutResponse 合并到同一 mbuf，接收端支持一次解析多个数据包
-
-## HTTP API (WiFi WebUI)
-
-| 方法 | 端点 | 功能 | 请求体 | 响应 |
-|------|------|------|--------|------|
-| POST | `/ota/upload` | 上传固件 | JSON 头 + binary 数据 | `{"status":"ok", "target":"esp32"}` |
-| POST | `/ota/update` | 完成 ESP32 OTA | `{"sha256":"...","verify_only":true/false}` | `{"status":"ok","sha256":"..."}` |
-| POST | `/ota/relay` | 触发 GD32 中继 | - | `{"status":"ok"}` |
-| GET | `/system/status` | 系统状态 JSON | - | 含版本/WiFi/OTA/温度/堆/GD32 版本及**OtaCoordinator 系统级状态**等 |
-| GET | `/logs` | 拉取调试日志 | - | JSON 数组字符串 |
-| POST | `/can/send_batch` | CAN 发送（1~N 帧，单帧即 length=1） | `{"ch":0,"frames":[{"id":123,"dlc":8,"data":"0102..."}]}` | `{"status":"ok","results":[...]}` |
-| POST | `/spi/send` | SPI 直接发送 | `{"type":"01","data":"00AC","timeout_ms":1000}` | `{"status":"ok","resp_type":".."}` |
-| POST | `/restart` | 重启 ESP32 | - | 500ms 后 `esp_restart()` |
-
-### POST /ota/upload 协议
-
-通过 JSON 头中的 `type` 字段自动区分目标，传输层通过 **OtaCoordinator** 统一管理系统状态：
-
-```json
-// ESP32 OTA
-{"type": "esp32", "total_size": 524288}
-<binary firmware data...>
-
-// GD32 OTA
-{"type": "gd32", "total_size": 131072}
-<binary firmware data...>
+```
+接入层  server/: wifi_ota(STA/AP+路由表) · http_handlers(22 路由) · ble_ota*(GATT/窗口ACK/reorder/池)
+协调层  ota/:    OtaCoordinator(9 态单例, 唯一权威入口, 忙态看门狗 150s, epoch 保护) · Esp32OtaCore
+执行层  relay/ storage/: OtaRelay(7 态事件状态机) · Gd32FlashStore(擦除水位/NVS meta/SHA/包身份校验)
+        monitor/: MotorOtaRelay(0xD0/D1/D2 喂数)
+底层    transport/: SpiMaster(Link v2+worker 串行) · protocol(AES/nonce) · canfd_bridge(0xC0~C8)
+横切    monitor/: health_monitor · debug_log(3 路) · can_feedback_task · cpu_stats · task_stack 等
 ```
 
-- **ESP32 模式**: `OtaCoordinator::beginEsp32Ota()` → `Esp32OtaCore::write()` 流式写入 OTA 分区 → 前端调 `/ota/update` 收尾
-- **GD32 模式**: `OtaCoordinator::beginGd32Storage()` → 写入 `gd32_ota` 分区 → `OtaCoordinator::completeGd32Storage()` → 计算 SHA-256 → 自动触发 SPI 中继
+| 任务 | 优先级 | 栈 | 职责 |
+|------|-------|------|------|
+| ota_relay | 23 | 2560 | GD32 转发状态机 |
+| wifi_ota / ble_ota | 22 | 3072/2560 | WiFi/HTTP 与 NimBLE |
+| health_mon | 21 | 3072 | 温度 1s + 5s 巡检 |
+| ble_data_worker | 12 | 2560 | BLE 数据排空 |
+| spi_worker | 8 | 5120 | **唯一持 SPI**，串行 Job 池(7) |
+| motor_feed | 7 | 4096 | 电机 OTA 0xD1 喂数 |
+| wifi_reconnect / can_fb | 5/4 | 2560/4096 | 重连退避 / 0xC5(250ms)·0xC4(1s) 周期查询 |
+| cpu_stats / uart_rx | 1 | 3072 | 1Hz 统计 / 串口行→/logs |
 
-### curl 示例
+## 核心机制速记（细节见白皮书对应章节）
 
-```bash
-# 查询系统状态
-curl http://192.168.31.1/system/status | jq
+- **SPI Link v2**（§5）：帧 = 16B 头（SOF A5 5A/VER 02/FLAGS/SESSION 4LE/TX_SEQ/ACK_SEQ/CREDIT/TYPE/LEN）+ 载荷 ≤236B + CRC32-MPEG2。延迟一拍全双工：transact 两步法（发送丢弃陈旧 RX → poll 按 DATA_READY 边沿读真实响应）。credit 8/8 背压，credit=0 死锁有 PB6 强制放行 + `resetCredit()` 双破除。透明重试 `kTxRetryMax=3`（同 TX_SEQ，GD32 DUP-SEQ 去重兜底）。CS 事务间隔 ≥1ms + 快速类型（0xA1/0xA3/0xC0~C5/C7/D1/F7）禁盲读防撕裂；3 连败熔断 2s；session=0 自动 HELLO 重同步（5s 冷却）。
+- **安全握手**（§6）：GD32 OTA 数据面——0x00 0xAC → 36B challenge（UID 12B + nonce 回显 8B + AES(MASTER_KEY,K_session) 16B）→ `K_session = AES-128-ECB(MASTER_KEY, nonce_server)` → AES(K_session, nonce^0x55) → 0xBA 0xC0。nonce 由 scrambleGenerate（tick/栈址/0x12345678 ⊗ 每开机 RNG 扰码常数）生成。
+- **GD32 OTA 中继**（§7）：RELAY_IDLE→HANDSHAKING(20×1.6s)→SIZE_NEG(poll 500ms×120，GD32 擦 Flash)→TRANSFERRING(64B 包=4B session+2B seq+48B AES+4B if_end+4B CRC32(key 混入)；预算 10s+25ms/包 ≤120s；每 32 包健康检查；单包 5 次 DATA×50ms，末包 ACK=0xF0F0F0F0)→FINISHING(0x0A 0xAC×10 重试 + PING 实证 APP 存活)。失败必发 SPI CANCEL 清 GD32 半会话。**包级防呆**：Cortex-M 向量表判 kApp 才放行（BOOT 包禁入 APP 区）。
+- **ESP32 本机 OTA**（§7.4）：`OTA_WITH_SEQUENTIAL_WRITES` 边写边擦；finalize 分区读回算 SHA-256 与前端比对，不符回 `ESP_ERR_INVALID_VERSION`+设备 SHA；`mark_app_valid_cancel_rollback()` 回滚保护；期间 `setSpiPaused(true)`。
+- **BLE OTA**（§8）：GATT 0xFFFF/0x0001~0x0004，MTU 512，载荷 480B；**窗口 ACK 64**（累计字节校验）+ reorder 64 槽 + 负 ACK 续传（64 包/200ms 节流）；DATA_IN 池 8×512B（曾 32KB 致收尾 OOM）；CTRL 0xF7 触发 GD32 中继 / 0xF8 ESP32 收尾 / 0xFA 重启 / 0xFB 中止（0xF9 预留未实现）；BLE 与 WiFi OTA 软挂起共存（不 deinit 协议栈）。
+- **CANFD 桥接**（§10）：0xC0 单帧（最短 5B）/0xC1 统计+ID 快照分页（28B 头+条目 8+dlc，bus_state bit0~5，bit5=Silent）/0xC2 收模式（全收/过滤/CAN0→1/2 桥接）/0xC7 跨通道突发（ISR 内装载全部邮箱后回**一个** ACK，组内偏差 <1ms；单次 ≤16 帧，HTTP ≤24 帧，id=(node<<16)|suffix）/0xC8 收发器 Silent（TCAN1057AV S 脚 PA8/PB14/PB9，接收照常，不持久化，发送回 E6）。错误码 E0~E7：E2/E3(BUS_OFF/TEC>96) fatal 中止批量，E4 邮箱满，E5 电机 OTA 残留（自动 CANCEL→resetCredit→重试 START 自愈），E6 Silent，E7 被电机 OTA 独占。
+- **电机 OTA**（§11）：/motor/ota 上传（整区强制擦除）→ 0xD0 START（fire-and-forget）→ feedTask 0xD1 {绝对 offset+≤232B}（重传幂等；120s 整体超时；8 败/150 WAIT → QUERY）→ 0xD2 进度。
+- **监控**（§12）：健康 4 级（80°C/100°C；RSSI -80/-85/-88；堆 10KB）门控 OTA；日志三路（UART 3M 非阻塞 / UDP / 环 64→16 槽 →/logs）+ UART0 RX 泵；遥测 0xC5 电机状态 27 槽×14 页、0xC4 ADC（VCC=vin×11）、0xC6 电机版本、0xA3 初始化状态 13 模块故障码；CPU/任务栈/堆低水位快照/启动自检 16 位位图全进 /system/status。
 
-# 发送 CAN 帧（单帧也走 send_batch）
-curl -X POST http://192.168.31.1/can/send_batch \
-  -H "Content-Type: application/json" \
-  -d '{"ch":0,"frames":[{"id":0x18DA00F1,"dlc":8,"data":"0102030405060708"}]}'
+## HTTP API（22 条路由 / 21 路径，无认证，CORS 全开）
 
-# SPI 直接发送
-curl -X POST http://192.168.31.1/spi/send \
-  -H "Content-Type: application/json" \
-  -d '{"type":"01","data":"00AC","timeout_ms":1000}'
+| 方法 | 路径 | 功能 |
+|------|------|------|
+| POST | /ota/upload | 固件上传（JSON 头 `{"type":"esp32"\|"gd32","total_size":N}` + 二进制流式） |
+| POST | /ota/update | ESP32 OTA 收尾 `{sha256, verify_only}`（SHA 比对→set_boot→重启） |
+| POST | /ota/relay | 触发 GD32 中继（前端 SHA + kApp 身份校验） |
+| POST | /restart | 重启 |
+| GET | /logs | 日志环 chunked 流式 |
+| GET | /system/status | 全量状态（?lite=1 / ?layout=1；含 spi_link 统计、启动自检、GD32 版本/ADC） |
+| GET | /system/probe · /system/heap_low_log | GD32 存活探测 / 堆低水位快照 |
+| POST | /can/send_batch · /can/send_burst | 批量发送（≤128 帧）/ 跨通道突发（≤24 帧） |
+| GET·POST | /can/feedback · /can/mode · /can/silent | 快照查询 / 收模式 / Silent 只听 |
+| POST | /spi/send | 原始 SPI 帧透传 |
+| GET | /motor/state(?bin=1) · /motor/version | 电机状态二进制协议 / 版本 |
+| POST·GET | /motor/ota · /motor/ota/relay · /motor/ota/status · /motor/ota/cancel | 电机 OTA 全流程 |
+| GET | /spi/speedtest | SPI 性能测试（临时） |
 
-# 获取日志
-curl http://192.168.31.1/logs
-```
+WiFi：STA 优先（SSID「004舰桥」，FAST_SCAN，CN 1-13），冷启动退避 2s×retry≤3 / 否则 1s，5 次耗尽或 30s 超时降级 AP（`ESP32_OTA_RELAY`/`12345678`，192.168.31.1，信道 6，≤4 台）。**无 mDNS**，访问靠固定 IP。
 
-## WebUI 工具
+## BLE GATT 速查
 
-### WiFi OTA 控制台 (`tools/index.html`)
+| UUID | 特征 | 说明 |
+|------|------|------|
+| 0xFFFF | Service | 设备名 ESP32-OTA-RELAY |
+| 0x0001 | CTRL (Write) | 0xF7/0xF8/0xFA/0xFB（0xF9 预留） |
+| 0x0002 | DATA_IN (WriteNoRsp) | cmd 1B(0x00 GD32/0x01 ESP32)+seq u16+total u32+payload ≤480B |
+| 0x0003 | DATA_OUT (Notify) | 0xA1 ACK 8B / 0xB1 FINISH 6B / 0xC1 SHA 35B |
+| 0x0004 | VERSION (Read) | 版本+构建时间 |
 
-- ESP32 固件上传与 OTA 升级（含 SHA-256 前端校验）
-- GD32 固件上传（支持 .bin/.hex）与 SPI 中继触发
-- 实时 OTA 流程阶段显示（6 阶段进度追踪，含 **OtaCoordinator 系统级状态**）
-- CAN 帧手动发送面板
-- SPI 直接发送面板
-- 系统状态监控（温度、RSSI、空闲堆、最小堆、GD32 APP/BOOT 版本、OTA 缓存、**协调器系统状态**）
-- 调试日志面板（HTTP `/logs` 轮询，按级别过滤）
-- 一键重启 ESP32
-
-### BLE OTA 控制台 (`tools/ble_ota.html`)
-
-- **Web Bluetooth API** 连接（需 Chrome/Edge/Android Chromium）
-- GD32 与 ESP32 双目标切换
-- 一键刷写（自动重连）
-- 窗口 ACK 重传机制（最多 3 次重试）
-- SHA-256 前端+设备端比对校验（校验面板显示）
-- FINISH 阶段事件通知
-- 设备重启 + 自动重连（退避 1.6x 指数，最多 12 次）
-
-## 健康监控
-
-### 健康状态等级
-
-| 等级 | 名称 | 触发条件 | OTA 影响 |
-|------|------|----------|----------|
-| 0 | SYS_NORMAL | 正常 | 允许 |
-| 1 | SYS_WARNING | 温度 ≥ 80°C 或 RSSI < -80 dBm | 允许（带警告）|
-| 2 | SYS_CRITICAL | RSSI < -85 dBm | ESP32 OTA 禁止，SPI 中继允许 |
-| 3 | SYS_SAFE_SHUTDOWN | 温度 ≥ 100°C | 所有 OTA 禁止 |
-
-### 监控指标
-
-- **温度**: 1 秒定时器读取内部温度传感器（20°C~80°C 量程）
-- **WiFi RSSI**: WiFi 任务每 10 秒检查一次
-- **空闲堆**: 每 5 秒巡检，低于 10KB 触发警告
-
-### OTA 前健康检查
-
-- `checkBeforeOta()`: 完整检查（温度 + RSSI + WiFi 连接状态）
-- `checkBeforeOtaRelay()`: 仅检查温度（中继阶段不依赖 WiFi）
-
-## 诊断日志
-
-三条并行输出路径：
-
-1. **UART0**: GPIO21(TX), GPIO20(RX), 115200 baud — 本地串口调试
-2. **UDP 单播**: `192.168.31.3:6666` — 独立调试接收端
-3. **环形缓冲区**: 64 槽 × 256 字节，互斥保护 — 供 HTTP `GET /logs` 轮询拉取
-
-日志级别: `E`(错误) / `W`(警告) / `I`(信息) / `D`(调试)，运行时可调。
-
-UDP socket 延迟创建（首次 `send()` 时才分配），WiFi 未连接时 `sendto()` 静默跳过。
-
-**当前 WebUI 日志面板通过 HTTP `/logs` 轮询获取日志，不直接监听 UDP 6666。**
-
-## 配置参数 (`main/include/app_config.h`)
-
-| 分类 | 参数 | 默认值 | 说明 |
-|------|------|--------|------|
-| WiFi | `CONFIG_WIFI_MODE` | 1 (STA) | 0=AP, 1=STA |
-| WiFi | `WIFI_STA_SSID` | "004舰桥" | 路由器名称 |
-| WiFi | `WIFI_AP_SSID` | "ESP32_OTA_RELAY" | 热点名称 |
-| WiFi | `WIFI_RSSI_WARNING` | -80 dBm | RSSI 警告阈值 |
-| WiFi | `WIFI_RSSI_CRITICAL` | -85 dBm | RSSI 危险阈值 |
-| OTA | `OTA_BLOCK_SIZE` | 8192 | 读写块大小 |
-| OTA | `OTA_MAX_FIRMWARE_SIZE` | 216KB | GD32 固件上限 |
-| OTA | `GD32_OTA_PACKET_SIZE` | 48 | 每包载荷字节 |
-| OTA | `OTA_PACKET_HEALTH_CHECK_INTERVAL` | 32 | 每 N 包健康检查 |
-| OTA | 包间节奏 | CREDIT 背压 | `SpiMaster`：`remoteCredit==0` 时 wait/拒发，无固定包间 delay |
-| OTA | `OTA_WIFI_RSSI_CRITICAL` | -88 dBm | OTA 期间 RSSI 危险阈值 |
-| OTA | `OTA_WIFI_RSSI_SAMPLE_MAX_AGE_MS` | 15000 | OTA 前 RSSI 采样最大时效 |
-| 阈值 | `TEMP_WARNING` | 80°C | 温度警告阈值 |
-| 阈值 | `TEMP_CRITICAL` | 100°C | 温度危险阈值 |
-| 阈值 | `HEAP_WARNING_MIN` | 10240 B | 堆最小值警告 |
-| 调试 | `DEBUG_LOG_IP` | "192.168.31.3" | UDP 日志目标 IP |
-| 调试 | `DEBUG_LOG_PORT` | 6666 | UDP 日志端口 |
-| BLE | `BLE_DEVICE_NAME` | "ESP32-OTA-RELAY" | BLE 广播名称 |
-| BLE | `BLE_MTU_SIZE` | 512 | ATT MTU |
-| BLE | `BLE_OTA_ACK_WINDOW` | 32 | ACK 窗口大小 |
-| BLE | `BLE_OTA_CHUNK_PAYLOAD` | 480 | BLE 单包载荷 |
-| BLE | `BLE_OTA_REORDER_WINDOW` | 32 | 乱序重排缓冲区大小 |
-| BLE | `BLE_OTA_CTRL_VERIFY_SHA256` | 0xF9 | SHA-256 预检命令字 |
-
-## 安全配置
-
-| 参数 | 位置 | 说明 | 状态 |
-|------|------|------|------|
-| `MASTER_KEY[16]` | app_config.h | AES-128 主密钥 | ⚠️ 占位值，生产环境需更换 |
-| `SCRAMBLE_CONST[16]` | Protocol 类运行时生成 | Nonce 搅伴常量 | 每次启动由硬件 RNG 随机生成 |
-| `GD32_CHIP_UID[12]` | 运行时从握手 Challenge 包解包 | GD32 芯片 UID | 不再使用编译期常量 |
-| `K_session` | 运行时派生 | `AES(MasterKey, nonce_server)` | 每次 OTA 重新生成 |
-| SHA-256 | 最终校验 | 从分区读回计算，前端比对 | WiFi/BLE/GD32 均已实现 |
-
-## 构建与部署
-
-### 一、本地编译（Windows PowerShell + ESP-IDF v6.0）
-
-首次编译前需设置工具链环境变量（PowerShell）：
+## 构建与烧录
 
 ```powershell
-# ── 设置 ESP-IDF v6.0 工具链环境 ──
-$env:IDF_VERSION = "6.0"
-$env:IDF_PYTHON_ENV_PATH = "C:\Espressif\tools\python\v6.0\venv"
-$env:IDF_TOOLS_PATH = "C:\Espressif\tools"
-$env:IDF_PATH = "F:\.espressif\v6.0\esp-idf"
-$env:ESP_ROM_ELF_DIR = "C:\Espressif\tools\esp-rom-elfs\20241011"
-
-# ── 添加工具链到 PATH ──
-$env:PATH = "C:\Espressif\tools\ccache\4.12.1\ccache-4.12.1-windows-x86_64;" +
-            "C:\Espressif\tools\cmake\4.0.3\bin;" +
-            "C:\Espressif\tools\esp-clang\esp-20.1.1_20250829\esp-clang\bin;" +
-            "C:\Espressif\tools\idf-exe\1.0.3\;" +
-            "C:\Espressif\tools\ninja\1.12.1\;" +
-            "C:\Espressif\tools\riscv32-esp-elf\esp-15.2.0_20251204\riscv32-esp-elf\bin;" +
-            "C:\Espressif\tools\riscv32-esp-elf\esp-15.2.0_20251204\riscv32-esp-elf\riscv32-esp-elf\bin;" +
-            "C:\Espressif\tools\python\v6.0\venv\Scripts;" + $env:PATH
-```
-
-编译命令：
-
-```powershell
-# ── 进入项目目录 ──
+# ESP-IDF v6.0 环境（IDF_TOOLS_PATH/IDF_PATH/PATH，或用 .devcontainer）
 Set-Location "G:\Robot_v2\DCU\ESP32_COMM"
-
-# ── 全量编译（自动生成 version.h，确认零 error/warning）──
-& "C:\Espressif\tools\python\v6.0\venv\Scripts\python.exe" `
-  "F:\.espressif\v6.0\esp-idf\tools\idf.py" build
-
-# ── 目标文件 ──
-# build/ESP32_COMM.bin       ← OTA 烧录用
-# build/bootloader/bootloader.bin
-# build/partition_table/partition-table.bin
+python "F:\.espressif\v6.0\esp-idf\tools\idf.py" build    # 产物 build/ESP32_COMM.bin
+& "F:\.espressif\v6.0\esp-idf\tools\idf.py" -p COM15 flash monitor   # 串口烧录（恢复手段）
 ```
 
-### 二、烧录方式
+- **发版**：手动改 `main/include/version.h`（版本号+变更摘要注释+GIT_HASH）；构建时间自动生成
+- **网页升级**：控制台上传 `build/ESP32_COMM.bin` → SHA 比对 → 重启（前端按 banner「OTA Relay … 启动」+ uptime<120s 判定恢复）
+- **GD32**：上传 .bin/.hex → /ota/relay → 六阶段转发 → PING 确认；**电机**：/motor/ota → /motor/ota/relay
 
-#### 方式 A：串口烧录（首次 / 恢复）
+## 网页控制台
 
-连接 ESP32-C3 到串口（默认 COM15），直接在 PowerShell 中烧录：
+`tools/` 已移出仓库（快照 `.cache/ws_era_frontend_backup/`），`tools/serve.bat`（http.server:8080）托管，跨源调 REST API，改网页无需重编固件。页面：**index.html** OTA 控制台（双通道、阶段条、启动自检面板、堆/任务抽屉、日志）；**motor.html** 电机控制台（三轮询链路互不阻塞、波形）；**can.html / can_monitor.html**（DBC、报文编辑、收发监控）。
 
-```powershell
-# 全量烧录（固件 + bootloader + 分区表）
-& "F:\.espressif\v6.0\esp-idf\tools\idf.py" -p COM15 flash
+## 安全注意与已知限制
 
-# 仅烧录应用程序（分区不变时快速更新）
-& "F:\.espressif\v6.0\esp-idf\tools\idf.py" -p COM15 app-flash
+- ⚠️ **HTTP 无认证**（Bearer token 方案已设计未实施）；WiFi 凭据与 MASTER_KEY 占位值明文入仓（2026-08 审计项，待迁 NVS/Kconfig）
+- ⚠️ AES-ECB 确定性模式；无固件签名（仅 SHA-256 完整性 + GD32 侧挑战-应答）
+- Flash 必须锁 DIO（QIO 会致 OTA 读回 SHA 必错）；SPI ≥16MHz 全双工不可行
+- tools/ 不在仓库；`spi_link/` 为三工程共享兄弟目录（`../../../spi_link/`），协议改动需三侧同步
 
-# 烧录 + 监控
-& "F:\.espressif\v6.0\esp-idf\tools\idf.py" -p COM15 flash monitor
-```
+## 文档同步说明（HTML ↔ README）
 
-#### 方式 B：WiFi OTA 烧录（ESP32 自升级，无需串口线）
-
-前提：ESP32 已通过 WiFi 联网（或 AP 模式），上位机与 ESP32 在同一网络。
-
-**步骤 1 — 启动 WebUI 服务**：
-
-```powershell
-# 在项目目录下运行
-tools\serve.bat
-# 浏览器打开 http://localhost:8080/tools/index.html
-```
-
-**步骤 2 — 连接设备**：
-
-- 在页面顶部输入 ESP32 IP 地址（AP 模式为 `192.168.31.1`，STA 模式查路由器分配 IP）
-- 点击 **"测试"** 确认连通，状态指示应变为绿色
-
-**步骤 3 — 上传固件**：
-
-- 在 **"ESP32 自身升级"** 卡片中，拖拽或点击选择 `build/ESP32_COMM.bin`
-- 页面自动读取文件大小并计算 SHA-256
-- 点击 **"上传并升级 ESP32"**
-- WebUI 自动执行：上传 → OTA 写入 → SHA-256 校验 → 设置启动分区 → 重启
-- 重启后页面连接断开，ESP32 以新固件启动（约 10~15 秒）
-
-> ⚠️ 如果上传后 ESP32 无法正常启动（反复重启），说明固件有严重 bug，此时需用 **串口烧录** 恢复。
-
-#### 方式 C：BLE OTA 烧录（无需 WiFi）
-
-前提：上位机（手机/PC）支持 Web Bluetooth（Chrome / Edge / Android Chromium）。
-
-- 浏览器打开 `tools/ble_ota.html`
-- 点击 **"连接设备"**，在设备选择器中选择 `ESP32-OTA-RELAY`
-- 选择固件文件，点击 **"一键刷写"**
-- 通过 GATT Notify 实时查看进度和 SHA-256 校验结果
-
-### 三、GD32 SPI OTA 中继烧录
-
-GD32 固件通过 ESP32 中转烧录，不需要串口连接 GD32：
-
-**步骤 1** — 在 ESP32 WebUI 的 **"GD32 SPI 中继"** 卡片中上传 GD32 固件（.bin 或 .hex），上传过程由 **OtaCoordinator** 管理系统状态（`GD32_STORING → GD32_STORED`）
-
-**步骤 2** — 上传完成后系统自动计算 SHA-256 并校验完整性，通过后由 **OtaRelay 事件驱动状态机** 执行转发
-
-**步骤 3** — ESP32 通过六阶段安全握手协议（HANDSHAKING → SIZE_NEG → TRANSFERRING → FINISHING → DONE）将固件逐包转发给 GD32 Bootloader
-
-**步骤 4** — 转发完成后 GD32 APP 启动，ESP32 轮询 PING 确认 APP 存活（最多 15 秒）
-
-> 也可手动点击 **"触发 GD32 OTA 中继"** 按钮重新触发转发（通过 `OtaCoordinator::triggerGd32Relay()` 投递）。
-
-### 四、Python 辅助工具
-
-```powershell
-# 串口日志采集（COM15, 5 分钟）
-python serial_monitor.py
-
-# OTA 上传测试（HTTP）
-python ota_upload_test.py <esp32_ip> <firmware.bin>
-```
-
-### 五、开发容器
-
-`.devcontainer/` 提供 Docker 容器，含 ESP-IDF v6.0 工具链和 riscv32-esp-elf 编译器，支持 VS Code Remote-Containers 开箱即用。
-
-## SDK 配置 (`sdkconfig.defaults`)
-
-```ini
-CONFIG_ESP_WIFI_RX_BA_WIN=6
-CONFIG_ESP_WIFI_TX_BA_WIN=6
-CONFIG_LWIP_MAX_SOCKETS=10
-CONFIG_LWIP_TCP_WND_DEFAULT=11480
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
-```
-
-## OTA 回滚保护
-
-启用 `CONFIG_APP_ROLLBACK_ENABLE` 后：
-1. 新固件首次启动必须在主循环前调用 `esp_ota_mark_app_valid_cancel_rollback()`
-2. 若新固件在标记前崩溃/重启，bootloader 自动回退到上一个有效分区
-3. `main.cpp:145` 在任务创建完成后执行此标记
-
-## 固件版本管理
-
-版本信息位于 `main/include/version.h`，**手动维护**，不再由构建脚本自动生成：
-- **版本号**: `0.3.56`（发版时手动递增 `FW_VERSION_MAJOR/MINOR/PATCH` 及 `FW_VERSION_STRING`）
-- **构建时间**: `BUILD_TIME`，每次发版编译时手动填写
-- **Git Hash**: `GIT_HASH`，手动填写对应提交的 `git rev-parse --short HEAD` 结果
+- [docs/project_introduction.html](docs/project_introduction.html) = 完整白皮书（算法字节级细节、状态机、SVG 图解、事故沉淀）；本 README = 浓缩速查版，**内容同源**
+- **同步规则**：凡影响功能清单 / 协议与常量数值 / 状态机 / 端点表 / 实现状态的代码变更，须**同时更新两份文档**；变更摘要写 `main/include/version.h` 注释；细节以 HTML 为准；两文件顶部「文档同步版本」随变更递增（当前 v0.5.2 / 2026-10-11）

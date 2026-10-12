@@ -43,7 +43,7 @@ typedef struct {
  * @param recv_buf 接收数据缓冲区（可为 nullptr）。
  * @param recv_max 接收缓冲区最大长度。
  * @param timeout_ms 超时时间（毫秒）。
- * @param gd32_err_out 可选输出，GD32 返回的细分错误码（0xE0/0xE1/0xE2/0xE3/0xE4/0xE5/0xE6=通道静默拒发）；
+ * @param gd32_err_out 可选输出，GD32 返回的细分错误码（0xE0/0xE1/0xE2/0xE3/0xE4/0xE5/0xE6=通道静默拒发/0xE7=该通道被电机 OTA 独占）；
  *                     仅在返回 -3 时有效，其它情况清零。可为 nullptr。
  * @return 成功时返回接收数据长度，失败返回 -1/-2/-3。
  */

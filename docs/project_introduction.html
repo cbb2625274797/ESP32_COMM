@@ -1,0 +1,1580 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32_COMM 项目全景介绍 — 算法与功能实现白皮书</title>
+<style>
+  :root{
+    --ink:#1e293b; --muted:#64748b; --line:#e2e8f0;
+    --esp:#2563eb; --esp-bg:#eff6ff;
+    --gd:#059669;  --gd-bg:#ecfdf5;
+    --host:#7c3aed;--host-bg:#f5f3ff;
+    --can:#d97706; --can-bg:#fffbeb;
+    --warn:#dc2626;--warn-bg:#fef2f2;
+    --accent:#0ea5e9; --bg:#f6f8fb; --card:#ffffff;
+  }
+  *{box-sizing:border-box}
+  body{font-family:"Microsoft YaHei","PingFang SC","Segoe UI",Arial,sans-serif;
+       color:var(--ink);background:var(--bg);margin:0;line-height:1.78;font-size:15px}
+  .wrap{max-width:1100px;margin:0 auto;padding:28px 22px 90px}
+  .hero{background:linear-gradient(135deg,#0f2747 0%,#1e3a8a 60%,#2563eb 100%);
+        color:#fff;border-radius:14px;padding:30px 34px;margin-bottom:26px}
+  .hero h1{margin:0 0 6px;font-size:26px;letter-spacing:.5px}
+  .hero p{margin:4px 0;color:#dbeafe;font-size:14px}
+  .hero .meta{margin-top:12px;font-size:13px;color:#bfdbfe}
+  .hero .meta b{color:#fff}
+  h2{font-size:21px;margin:44px 0 12px;padding:6px 0 6px 14px;border-left:5px solid var(--esp);
+     background:linear-gradient(90deg,#eff6ff,transparent);border-radius:0 8px 8px 0}
+  h3{font-size:17px;margin:26px 0 8px;color:#0f2747}
+  p{margin:8px 0}
+  section.card, .block{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:18px 22px;margin:14px 0}
+  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13.5px;background:#fff}
+  th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+  th{background:#f1f5f9;font-weight:600;white-space:nowrap}
+  tr:nth-child(even) td{background:#fafcff}
+  code{background:#eef2f7;border:1px solid #e2e8f0;border-radius:4px;padding:1px 5px;
+       font-family:Consolas,"Courier New",monospace;font-size:12.5px;color:#0f2747}
+  pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px 16px;overflow-x:auto;
+      font-family:Consolas,"Courier New",monospace;font-size:12.5px;line-height:1.6}
+  pre code{background:none;border:none;color:inherit;padding:0}
+  figure.fig{background:#fff;border:1px solid var(--line);border-radius:12px;
+             padding:16px 14px 10px;margin:16px 0;overflow-x:auto}
+  figure.fig svg{max-width:100%;height:auto;display:block;margin:0 auto}
+  figcaption{text-align:center;color:var(--muted);font-size:13px;margin-top:8px;
+             border-top:1px dashed var(--line);padding-top:8px}
+  figcaption b{color:var(--ink)}
+  .toc{columns:2;column-gap:34px;font-size:14px;background:var(--card);
+       border:1px solid var(--line);border-radius:12px;padding:16px 26px}
+  .toc a{text-decoration:none;color:#1d4ed8;display:block;padding:2.5px 0}
+  .toc a:hover{text-decoration:underline}
+  @media (max-width:720px){.toc{columns:1}}
+  .chip{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px;margin:0 4px 2px 0;border:1px solid}
+  .chip.ok{background:#ecfdf5;color:#047857;border-color:#a7f3d0}
+  .chip.part{background:#fffbeb;color:#b45309;border-color:#fde68a}
+  .chip.no{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
+  .chip.info{background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe}
+  .note{border-left:4px solid var(--accent);background:#f0f9ff;padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0;font-size:14px}
+  .warnbox{border-left:4px solid var(--warn);background:#fef2f2;padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0;font-size:14px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:820px){.grid2{grid-template-columns:1fr}}
+  .kv{font-size:13.5px}
+  footer{margin-top:50px;color:var(--muted);font-size:13px;text-align:center;border-top:1px solid var(--line);padding-top:16px}
+  @media print{body{background:#fff}.hero{background:#1e3a8a!important;-webkit-print-color-adjust:exact}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>ESP32_COMM · DCU 通信与 OTA 中枢固件 — 项目全景介绍</h1>
+  <p>ESP32-C3FH4 × GD32E508 双 MCU 架构：WiFi / BLE 双通道 OTA 中继 · SPI Link v2 高速桥 · 三路 CANFD 电机总线控制</p>
+  <div class="meta">
+    固件版本 <b>v0.5.2</b>（git <b>770ae14</b>） · ESP-IDF v6.0 · 平台 ESP32-C3（RISC-V 单核 160MHz） ·
+    文档版本 2026-10-11 · 配套浓缩版 <b>README.md</b>（见文末「文档同步说明」）
+  </div>
+</header>
+
+<nav class="toc">
+  <a href="#s1">1. 项目概述与总体拓扑</a>
+  <a href="#s2">2. 硬件平台与 Flash 分区</a>
+  <a href="#s3">3. 软件架构与 FreeRTOS 任务模型</a>
+  <a href="#s4">4. 启动流程与自检（SystemBoot 位图）</a>
+  <a href="#s5">5. SPI Link v2 传输层（核心协议）</a>
+  <a href="#s6">6. 安全握手与加密算法</a>
+  <a href="#s7">7. OTA 体系（协调器 / 中继 / 本机 / 存储）</a>
+  <a href="#s8">8. BLE OTA（NimBLE）</a>
+  <a href="#s9">9. WiFi 管理与 HTTP API</a>
+  <a href="#s10">10. CANFD 桥接（0xC0~0xC8）</a>
+  <a href="#s11">11. 电机 OTA 中继（0xD0~0xD2）</a>
+  <a href="#s12">12. 监控与可观测性</a>
+  <a href="#s13">13. 诊断与容错机制总表</a>
+  <a href="#s14">14. 关键配置常量速查</a>
+  <a href="#s15">15. 目录结构</a>
+  <a href="#s16">16. 构建与烧录</a>
+  <a href="#s17">17. 网页控制台前端</a>
+  <a href="#s18">18. 功能实现状态清单</a>
+  <a href="#s19">19. 安全审计与已知限制</a>
+  <a href="#s20">20. 版本演进摘要</a>
+  <a href="#s21">21. 文档同步说明（HTML ↔ README）</a>
+</nav>
+
+<!-- ================================================================ -->
+<h2 id="s1">1. 项目概述与总体拓扑</h2>
+
+<section class="block">
+<p><b>ESP32_COMM</b> 是机器人 DCU（Domain Control Unit，域控制器）板上的 ESP32-C3 固件，承担三类职责：</p>
+<p>① <b>OTA 中继枢纽</b>：上位机通过 WiFi（HTTP）或 BLE（GATT）把固件交给 ESP32；ESP32 自身固件写入 AB 双分区升级，
+   GD32 固件缓存到本地 Flash 后经 SPI 安全通道转发烧写，电机节点固件经 GD32 的 CAN 总线二次中继。</p>
+<p>② <b>SPI Link v2 主站</b>：以 13.33 MHz 五线 SPI（含 DATA_READY 通知线）与 GD32E508 建立带会话、序号、
+   信用流控和 CRC32 校验的可靠链路，是所有跨芯片业务的唯一通道。</p>
+<p>③ <b>电机总线控制面</b>：把 HTTP/BLE 请求翻译成 GD32 上三路 CAN/CANFD 收发（单帧、批量、跨通道同步突发、
+   只听模式），并周期回收电机状态、ADC、版本等遥测，通过网页控制台呈现。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 980 340" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="arB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arE" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#059669"/>
+    </marker>
+  </defs>
+  <!-- 上位机 -->
+  <rect x="14" y="98" width="150" height="96" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.6"/>
+  <text x="89" y="126" text-anchor="middle" font-size="15" font-weight="bold" fill="#5b21b6">上位机</text>
+  <text x="89" y="148" text-anchor="middle" font-size="12" fill="#6b21a8">PC / 手机浏览器</text>
+  <text x="89" y="166" text-anchor="middle" font-size="12" fill="#6b21a8">网页控制台（tools/）</text>
+  <text x="89" y="184" text-anchor="middle" font-size="11" fill="#8b5cf6">固件上传 · 状态 · CAN · 电机</text>
+
+  <!-- ESP32 -->
+  <rect x="252" y="52" width="230" height="190" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="367" y="80" text-anchor="middle" font-size="16" font-weight="bold" fill="#1d4ed8">ESP32-C3FH4</text>
+  <text x="367" y="99" text-anchor="middle" font-size="12" fill="#1e40af">RISC-V 单核 160MHz · 4MB Flash</text>
+  <text x="367" y="122" text-anchor="middle" font-size="12" fill="#2563eb">HTTP 服务器（:80）</text>
+  <text x="367" y="140" text-anchor="middle" font-size="12" fill="#2563eb">NimBLE GATT（MTU 512）</text>
+  <text x="367" y="163" text-anchor="middle" font-size="12" fill="#2563eb">OtaCoordinator / OtaRelay</text>
+  <text x="367" y="181" text-anchor="middle" font-size="12" fill="#2563eb">SPI Link v2 主站</text>
+  <text x="367" y="204" text-anchor="middle" font-size="11" fill="#64748b">gd32_ota 分区 252KB 固件缓存</text>
+  <text x="367" y="221" text-anchor="middle" font-size="11" fill="#64748b">app0 / app1 AB 双分区自升级</text>
+
+  <!-- GD32 -->
+  <rect x="592" y="52" width="200" height="190" rx="12" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="692" y="80" text-anchor="middle" font-size="16" font-weight="bold" fill="#047857">GD32E508VET6</text>
+  <text x="692" y="99" text-anchor="middle" font-size="12" fill="#065f46">Cortex-M4 · DCU 业务主控</text>
+  <text x="692" y="124" text-anchor="middle" font-size="12" fill="#059669">Bootloader（72KB）/ APP（216KB）</text>
+  <text x="692" y="147" text-anchor="middle" font-size="12" fill="#059669">AES-128 会话解密 · Flash 烧写</text>
+  <text x="692" y="170" text-anchor="middle" font-size="12" fill="#059669">3×CANFD 控制器 + 收发器</text>
+  <text x="692" y="193" text-anchor="middle" font-size="12" fill="#059669">电机 OTA CAN 二次中继</text>
+  <text x="692" y="216" text-anchor="middle" font-size="11" fill="#64748b">ADC / ECAT(LAN9252) 等业务</text>
+
+  <!-- CAN 总线 -->
+  <rect x="848" y="60" width="120" height="52" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text x="908" y="82" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b45309">CAN 通道 0</text>
+  <text x="908" y="99" text-anchor="middle" font-size="11" fill="#92400e">CANFD 最高 64B</text>
+  <rect x="848" y="122" width="120" height="52" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text x="908" y="144" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b45309">CAN 通道 1</text>
+  <text x="908" y="161" text-anchor="middle" font-size="11" fill="#92400e">桥接 / 过滤可配</text>
+  <rect x="848" y="184" width="120" height="52" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text x="908" y="206" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b45309">CAN 通道 2</text>
+  <text x="908" y="223" text-anchor="middle" font-size="11" fill="#92400e">电机节点 ×9/通道</text>
+
+  <!-- 连线 -->
+  <line x1="164" y1="132" x2="252" y2="132" stroke="#7c3aed" stroke-width="2.2" marker-end="url(#arB)" marker-start="url(#arB)"/>
+  <text x="208" y="108" text-anchor="middle" font-size="11.5" fill="#7c3aed">WiFi HTTP</text>
+  <text x="208" y="158" text-anchor="middle" font-size="11.5" fill="#7c3aed">BLE GATT</text>
+
+  <line x1="482" y1="128" x2="592" y2="128" stroke="#2563eb" stroke-width="2.6" marker-end="url(#arE)" marker-start="url(#arE)"/>
+  <text x="537" y="84" text-anchor="middle" font-size="12" font-weight="bold" fill="#1d4ed8">SPI Link v2</text>
+  <text x="537" y="102" text-anchor="middle" font-size="9.5" fill="#475569">13.33MHz · Mode0 · 5线</text>
+  <text x="537" y="116" text-anchor="middle" font-size="9.5" fill="#475569">CS/MOSI/MISO/SCLK</text>
+  <text x="537" y="130" text-anchor="middle" font-size="9.5" fill="#475569">+ DATA_READY 通知</text>
+  <text x="537" y="152" text-anchor="middle" font-size="9.5" fill="#475569">OTA · CAN 遥测</text>
+  <text x="537" y="166" text-anchor="middle" font-size="9.5" fill="#475569">电机 OTA · AES-128</text>
+
+  <line x1="792" y1="86" x2="848" y2="86" stroke="#059669" stroke-width="2" marker-end="url(#arG)"/>
+  <line x1="792" y1="148" x2="848" y2="148" stroke="#059669" stroke-width="2" marker-end="url(#arG)"/>
+  <line x1="792" y1="210" x2="848" y2="210" stroke="#059669" stroke-width="2" marker-end="url(#arG)"/>
+  <text x="815" y="254" text-anchor="middle" font-size="11" fill="#475569">TCAN1057AV 收发器</text>
+  <text x="815" y="270" text-anchor="middle" font-size="11" fill="#475569">（S 脚可切 Silent 只听）</text>
+
+  <!-- UART 日志 -->
+  <path d="M 252 236 Q 200 290 120 266" fill="none" stroke="#94a3b8" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ar1)"/>
+  <text x="160" y="292" text-anchor="middle" font-size="11" fill="#64748b">UART0 日志 3Mbps（TX21/RX20 RX泵）+ UDP 日志 6666 → 网页 /logs</text>
+  <text x="490" y="316" text-anchor="middle" font-size="12" fill="#94a3b8">OTA 数据流：固件经 ESP32 缓存 / 直通，按 目标→通道 分发（详见 §7/§8/§11）</text>
+</svg>
+<figcaption><b>图 1-1 系统总体拓扑</b>：上位机仅经由 ESP32 接入；GD32 的所有远程操作（OTA、CAN、遥测）都以 SPI Link v2 为唯一通道</figcaption>
+</figure>
+
+<h3>1.1 固件版本与代码规模</h3>
+<table class="kv">
+<tr><th>项</th><th>值</th><th>说明</th></tr>
+<tr><td>固件版本</td><td><b>v0.5.2</b>（FW_VERSION_MAJOR/MINOR/PATCH）</td><td><code>main/include/version.h</code> 手动维护；构建时间由构建系统自动生成（<code>fwBuildTime()</code>）</td></tr>
+<tr><td>Git 提交</td><td><code>770ae14</code></td><td>手动填入 version.h</td></tr>
+<tr><td>平台 / 框架</td><td>ESP32-C3FH4 · ESP-IDF v6.0 · FreeRTOS</td><td>RISC-V 单核 160MHz，4MB Flash</td></tr>
+<tr><td>代码规模</td><td>约 19,000 行 C++（main/ 下 30 个源文件）</td><td>另含三工程共享协议 <code>spi_link/spi_link_v2.h</code>（兄弟目录）</td></tr>
+<tr><td>对端固件</td><td>GD32 Bootloader + GD32 DCU_APP + 电机节点</td><td>本仓只含 ESP32 侧；协议真源 <code>SPEC/spi_link_v2.md</code> 与 GD32 仓共享</td></tr>
+</table>
+
+<h3>1.2 功能一览（实现状态）</h3>
+<table>
+<tr><th>功能域</th><th>能力</th><th>状态</th><th>详见</th></tr>
+<tr><td rowspan="4">OTA 中继</td><td>GD32 固件 WiFi/BLE 上传 → SPI 加密转发（六阶段握手/协商/转发/验证）</td><td><span class="chip ok">已实现</span></td><td>§7</td></tr>
+<tr><td>ESP32 自身 AB 分区 OTA + SHA-256 回读校验 + 回滚保护</td><td><span class="chip ok">已实现</span></td><td>§7.5</td></tr>
+<tr><td>电机节点固件 CAN 二次中继（0xD0/D1/D2）</td><td><span class="chip ok">已实现</span></td><td>§11</td></tr>
+<tr><td>GD32 固件包级防呆（Cortex-M 向量表身份校验，禁止 BOOT 包刷入 APP 区）</td><td><span class="chip ok">已实现</span></td><td>§7.6</td></tr>
+<tr><td rowspan="3">传输链路</td><td>SPI Link v2：会话 / 序号 / 信用流控 / CRC32 / HELLO 重同步 / 延迟一拍协议</td><td><span class="chip ok">已实现</span></td><td>§5</td></tr>
+<tr><td>AES-128 会话密钥挑战-应答握手（GD32 OTA 数据面）</td><td><span class="chip ok">已实现</span></td><td>§6</td></tr>
+<tr><td>链路熔断（3 连败×2s 冷却）、透明重试（kTxRetryMax=3）、撕裂诊断 ring_steal_diag</td><td><span class="chip ok">已实现</span></td><td>§5.8/§13</td></tr>
+<tr><td rowspan="4">CAN 控制</td><td>0xC0 单帧 / 0xC7 跨通道同步突发（多电机同发 &lt;1ms 偏差）</td><td><span class="chip ok">已实现</span></td><td>§10</td></tr>
+<tr><td>0xC1 统计+ID 快照分页查询 / 0xC2 收模式（全收/过滤/桥接）/ 0xC3 完整快照</td><td><span class="chip ok">已实现</span></td><td>§10.2</td></tr>
+<tr><td>0xC8 收发器 Silent 只听不发（TCAN1057AV S 脚）</td><td><span class="chip ok">已实现</span></td><td>§10.4</td></tr>
+<tr><td>0xC1 GD32 1Hz 主动推送路径</td><td><span class="chip part">保留但默认请求驱动</span></td><td>§12.2</td></tr>
+<tr><td rowspan="3">接入通道</td><td>WiFi STA/AP 自动降级 + HTTP 22 端点</td><td><span class="chip ok">已实现</span></td><td>§9</td></tr>
+<tr><td>BLE GATT 窗口 ACK（64）+ 乱序重排 + 负 ACK 续传</td><td><span class="chip ok">已实现</span></td><td>§8</td></tr>
+<tr><td>BLE/WiFi 双通道互斥与射频共存（软挂起）</td><td><span class="chip ok">已实现</span></td><td>§8.5</td></tr>
+<tr><td rowspan="4">监控诊断</td><td>健康监控（温度/RSSI/堆，4 级状态，OTA 门控）</td><td><span class="chip ok">已实现</span></td><td>§12.1</td></tr>
+<tr><td>日志三路输出（UART 3M / UDP / 环形缓冲 → /logs）+ UART0 RX 泵</td><td><span class="chip ok">已实现</span></td><td>§12.3</td></tr>
+<tr><td>GD32 ADC 遥测（0xC4）/ 电机状态（0xC5×14 页）/ 电机版本（0xC6）/ 初始化状态（0xA3）</td><td><span class="chip ok">已实现</span></td><td>§12.2</td></tr>
+<tr><td>CPU 占用 / 任务栈水位 / 堆低水位快照 / 启动自检位图</td><td><span class="chip ok">已实现</span></td><td>§4/§12</td></tr>
+<tr><td rowspan="3">网页控制台</td><td>OTA 控制台 / 电机控制台 / CAN 工具 / CAN 监控 四页面</td><td><span class="chip ok">已实现</span></td><td>§17</td></tr>
+<tr><td>DBC 报文编辑、波形显示、启动自检面板、堆/任务抽屉</td><td><span class="chip ok">已实现</span></td><td>§17</td></tr>
+<tr><td>HTTP 接口认证（token）</td><td><span class="chip no">未实现</span></td><td>§19</td></tr>
+</table>
+<div class="note">🚫 顺带澄清两处历史文档讹误：本固件<b>没有 mDNS</b> 功能（仅 lwIP 具备 mDNS 解析编译项），设备访问走固定 IP；旧 README 的「115200 调试串口」已过时，日志 UART0 实为 <b>3 Mbps</b>（<code>debug_log.h:34</code>），115200 仅为 sdkconfig 控制台项。</div>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s2">2. 硬件平台与 Flash 分区</h2>
+
+<section class="block">
+<h3>2.1 硬件参数</h3>
+<table>
+<tr><th>项目</th><th>规格</th><th>备注</th></tr>
+<tr><td>芯片</td><td>ESP32-C3FH4（RISC-V 单核 160MHz，Wi-Fi 4 + BLE 5）</td><td>所有任务固定核 0</td></tr>
+<tr><td>Flash</td><td>4MB，DIO 模式</td><td>曾试 QIO 致 OTA 读回 SHA 必错，已锁定 DIO（sdkconfig 注释警告）</td></tr>
+<tr><td>SPI</td><td>MOSI=GPIO5 · MISO=GPIO7 · SCLK=GPIO6 · CS=GPIO4 · DATA_READY=GPIO10</td><td>13.33MHz（<code>CONFIG_DCU_SPI_CLOCK_HZ=13333333</code>）Mode 0；GD32 PB6 开漏驱动 DATA_READY</td></tr>
+<tr><td>调试 UART0</td><td>TX=GPIO21 · RX=GPIO20 · <b>3,000,000</b> baud</td><td>非阻塞直写 FIFO；RX 泵把外部串口行汇入 /logs</td></tr>
+<tr><td>欠压检测</td><td>LVL7（约 2.8V）</td><td>长断电后 CHIP_EN RC 充电慢，LVL5 会停在半复位状态</td></tr>
+<tr><td>GD32 侧存储</td><td>BOOT 0x08000000~0x08011FFF（72KB）· APP 0x08048000~0x0807DFFB（216KB）· SRAM 0x20000000~0x2001FFFF</td><td>固件身份校验的判据区间（§7.6）</td></tr>
+</table>
+
+<h3>2.2 4MB Flash 分区地图（<code>config/partitions.csv</code>）</h3>
+
+<figure class="fig">
+<svg viewBox="0 0 960 300" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <!-- 比例尺: 4MB -> 880px, 起点 x=40 -->
+  <!-- 0x0000~0x9000 bootloader -->
+  <rect x="40" y="60" width="37" height="44" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="58" y="52" text-anchor="middle" font-size="11" fill="#64748b">boot 36KB（放大显示）</text>
+  <!-- nvs 0x9000 24KB -->
+  <rect x="77" y="60" width="10" height="44" fill="#fef9c3" stroke="#ca8a04"/>
+  <text x="82" y="128" text-anchor="middle" font-size="11" fill="#a16207">nvs 24KB</text>
+  <line x1="82" y1="104" x2="82" y2="116" stroke="#ca8a04"/>
+  <!-- otadata 8KB -->
+  <rect x="87" y="60" width="3.4" height="44" fill="#fde68a" stroke="#ca8a04"/>
+  <text x="106" y="40" font-size="11" fill="#a16207">otadata 8KB（AB 启动标志）</text>
+  <line x1="90" y1="60" x2="103" y2="46" stroke="#ca8a04"/>
+  <!-- gd32_ota 252KB 0x11000 -->
+  <rect x="90.4" y="60" width="55.4" height="44" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="118" y="128" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#047857">gd32_ota 252KB</text>
+  <line x1="118" y1="104" x2="118" y2="116" stroke="#059669"/>
+  <!-- app0 1.25MB -->
+  <rect x="145.8" y="60" width="275" height="44" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="283" y="86" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">app0 — 1.25MB（ota_0 当前运行）</text>
+  <!-- app1 1.25MB -->
+  <rect x="420.8" y="60" width="275" height="44" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="558" y="86" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">app1 — 1.25MB（ota_1 OTA 目标）</text>
+  <!-- spiffs 1.06MB -->
+  <rect x="695.8" y="60" width="224" height="44" fill="#fae8ff" stroke="#a855f7" stroke-width="1.6"/>
+  <text x="808" y="86" text-anchor="middle" font-size="12.5" fill="#7e22ce">spiffs 1.06MB（用户数据）</text>
+
+  <line x1="40" y1="120" x2="920" y2="120" stroke="#475569" marker-end="url(#ar2)"/>
+  <g font-size="10.5" fill="#64748b">
+    <text x="40" y="136">0x0000</text>
+    <text x="77" y="146">0x9000</text>
+    <text x="87" y="136">0xF000</text>
+    <text x="90" y="158">0x11000</text>
+    <text x="146" y="136">0x50000</text>
+    <text x="421" y="146">0x190000</text>
+    <text x="696" y="136">0x2D0000</text>
+    <text x="895" y="136">0x400000</text>
+  </g>
+
+  <!-- 注解 -->
+  <rect x="60" y="184" width="840" height="96" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <g font-size="12.5" fill="#334155">
+    <text x="80" y="212">• <tspan font-weight="bold" fill="#047857">gd32_ota</tspan>：GD32 固件缓存区（spiffs 子类型，便于 esp_partition API 直接读写）；OTA 元数据存 NVS 命名空间 <tspan font-family="Consolas">ota_meta</tspan>（total_size / stored_size / last_seq / checksum）</text>
+    <text x="80" y="236">• <tspan font-weight="bold" fill="#1d4ed8">app0/app1</tspan>：ESP32 自身 AB 分区；配合 bootloader 回滚（CONFIG_APP_ROLLBACK_ENABLE）新固件崩溃自动回退</text>
+    <text x="80" y="260">• 擦除策略：GD32 存储按「擦除水位」按需擦扇区（4KB）；电机 OTA 上传则强制整区预擦除，杜绝 NOR 与逻辑残留叠加的单 bit 翻转</text>
+  </g>
+</svg>
+<figcaption><b>图 2-1 Flash 分区布局</b>（示意：早期小分区为可读性放大，app0 起按比例；GD32 OTA 中继与电机 OTA 共用 <code>gd32_ota</code> 分区，靠互斥串行化）</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s3">3. 软件架构与 FreeRTOS 任务模型</h2>
+
+<section class="block">
+<h3>3.1 模块分层</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 330" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <text x="30" y="34" font-size="14" font-weight="bold" fill="#334155">接入层（server/）</text>
+  <rect x="30" y="44" width="200" height="64" rx="9" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="130" y="70" text-anchor="middle" font-size="13" font-weight="bold" fill="#5b21b6">wifi_ota.cpp</text>
+  <text x="130" y="90" text-anchor="middle" font-size="11" fill="#6b21a8">STA/AP · 重连 · RSSI · 路由表</text>
+  <rect x="250" y="44" width="230" height="64" rx="9" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="365" y="70" text-anchor="middle" font-size="13" font-weight="bold" fill="#5b21b6">http_handlers.cpp</text>
+  <text x="365" y="90" text-anchor="middle" font-size="11" fill="#6b21a8">22 个端点 · 流式上传 · JSON 工作区</text>
+  <rect x="500" y="44" width="430" height="64" rx="9" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="715" y="70" text-anchor="middle" font-size="13" font-weight="bold" fill="#5b21b6">ble_ota / ble_ota_host / ble_ota_data</text>
+  <text x="715" y="90" text-anchor="middle" font-size="11" fill="#6b21a8">GATT 服务 · 窗口 ACK · 乱序重排 · 内存池 · 共存挂起</text>
+
+  <text x="30" y="140" font-size="14" font-weight="bold" fill="#334155">协调层（ota/）</text>
+  <rect x="30" y="150" width="480" height="58" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.8"/>
+  <text x="270" y="174" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#1d4ed8">OtaCoordinator（单例 · 9 状态系统级状态机）</text>
+  <text x="270" y="194" text-anchor="middle" font-size="11" fill="#1e40af">唯一权威入口 · 互斥 · 忙态看门狗自愈 · epoch 会话保护 · BLE 共存通知</text>
+  <rect x="530" y="150" width="400" height="58" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="730" y="174" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#1d4ed8">Esp32OtaCore（本机 OTA）</text>
+  <text x="730" y="194" text-anchor="middle" font-size="11" fill="#1e40af">begin/write/finalize/abort · SHA-256 读回 · 分区互斥 · SPI 暂停</text>
+
+  <text x="30" y="240" font-size="14" font-weight="bold" fill="#334155">执行层（relay/ · storage/）</text>
+  <rect x="30" y="250" width="330" height="58" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="195" y="274" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">OtaRelay（事件驱动状态机 ×7 态）</text>
+  <text x="195" y="294" text-anchor="middle" font-size="11" fill="#065f46">握手→协商→转发→收尾·验证 · 专用任务</text>
+  <rect x="380" y="250" width="250" height="58" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="505" y="274" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">Gd32FlashStore</text>
+  <text x="505" y="294" text-anchor="middle" font-size="11" fill="#065f46">gd32_ota 分区读写 · 擦除水位 · NVS 元数据 · SHA</text>
+  <rect x="650" y="250" width="120" height="58" rx="9" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text x="710" y="274" text-anchor="middle" font-size="13" font-weight="bold" fill="#b45309">MotorOtaRelay</text>
+  <text x="710" y="294" text-anchor="middle" font-size="11" fill="#92400e">电机 OTA 喂数任务</text>
+
+  <rect x="790" y="250" width="140" height="58" rx="9" fill="#dbeafe" stroke="#2563eb" stroke-width="1.8"/>
+  <text x="860" y="272" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">SpiMaster</text>
+  <text x="860" y="290" text-anchor="middle" font-size="11" fill="#1e40af">Link v2 链路 + worker</text>
+
+  <!-- 箭头 -->
+  <line x1="130" y1="108" x2="240" y2="150" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar3)"/>
+  <line x1="365" y1="108" x2="300" y2="150" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar3)"/>
+  <line x1="715" y1="108" x2="560" y2="150" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar3)"/>
+  <line x1="200" y1="208" x2="190" y2="250" stroke="#2563eb" stroke-width="1.6" marker-end="url(#ar3)"/>
+  <line x1="400" y1="208" x2="705" y2="205" stroke="#2563eb" stroke-width="1.6" marker-end="url(#ar3)"/>
+  <line x1="490" y1="208" x2="480" y2="250" stroke="#2563eb" stroke-width="1.6" marker-end="url(#ar3)"/>
+  <line x1="340" y1="279" x2="380" y2="279" stroke="#059669" stroke-width="1.4" marker-end="url(#ar3)"/>
+  <line x1="630" y1="279" x2="650" y2="279" stroke="#059669" stroke-width="1.4" marker-end="url(#ar3)"/>
+  <line x1="770" y1="279" x2="790" y2="279" stroke="#d97706" stroke-width="1.4" marker-end="url(#ar3)"/>
+  <line x1="730" y1="208" x2="840" y2="250" stroke="#2563eb" stroke-width="1.6" marker-end="url(#ar3)"/>
+
+  <text x="860" y="240" text-anchor="middle" font-size="11" fill="#64748b">transport/（底层）</text>
+  <text x="860" y="322" text-anchor="middle" font-size="11" fill="#64748b">monitor/ 横切：健康 · 日志 · 遥测 · 统计</text>
+</svg>
+<figcaption><b>图 3-1 模块分层与依赖</b>：传输层（wifi/ble）不直接触达 OtaRelay/Esp32OtaCore，一律经 OtaCoordinator 统一入口</figcaption>
+</figure>
+
+<h3>3.2 FreeRTOS 任务全景</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 440" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <!-- 优先级标尺 -->
+  <line x1="150" y1="30" x2="150" y2="346" stroke="#cbd5e1" stroke-width="2"/>
+  <g font-size="10.5" fill="#64748b" text-anchor="end">
+    <text x="142" y="56">23</text>
+    <text x="142" y="94">21</text>
+    <text x="142" y="132">22</text>
+    <text x="142" y="170">12</text>
+    <text x="142" y="208">8</text>
+    <text x="142" y="246">7</text>
+    <text x="142" y="284">5/4</text>
+    <text x="142" y="322">1</text>
+  </g>
+  <text x="150" y="14" text-anchor="middle" font-size="12" font-weight="bold" fill="#475569">优先级（C3 单核 0）</text>
+
+  <!-- 任务框：三列，宽 240 -->
+  <g font-size="10.5">
+    <rect x="170" y="40" width="240" height="28" rx="7" fill="#eff6ff" stroke="#2563eb"/><text x="180" y="58" fill="#1d4ed8">ota_relay（栈 2560）GD32 转发状态机</text>
+    <rect x="170" y="78" width="240" height="28" rx="7" fill="#fef2f2" stroke="#dc2626"/><text x="180" y="96" fill="#b91c1c">health_mon（3072）5s 巡检</text>
+    <rect x="170" y="116" width="240" height="28" rx="7" fill="#f5f3ff" stroke="#7c3aed"/><text x="180" y="134" fill="#5b21b6">wifi_ota（3072）WiFi / HTTP / 事件</text>
+    <rect x="490" y="116" width="240" height="28" rx="7" fill="#f5f3ff" stroke="#7c3aed"/><text x="500" y="134" fill="#5b21b6">ble_ota（2560）NimBLE host 初始化</text>
+    <rect x="490" y="154" width="240" height="28" rx="7" fill="#fff7ed" stroke="#ea580c"/><text x="500" y="172" fill="#c2410c">ble_data_worker（2560，prio 12）</text>
+    <rect x="170" y="192" width="240" height="28" rx="7" fill="#dbeafe" stroke="#2563eb"/><text x="180" y="210" fill="#1d4ed8">spi_worker（5120，prio 8）唯一持 SPI</text>
+    <rect x="490" y="230" width="240" height="28" rx="7" fill="#fffbeb" stroke="#d97706"/><text x="500" y="248" fill="#b45309">motor_feed（4096，prio 7）0xD1 喂数</text>
+    <rect x="170" y="268" width="240" height="28" rx="7" fill="#f1f5f9" stroke="#64748b"/><text x="180" y="286" fill="#334155">wifi_reconnect（2560，p5）退避重连</text>
+    <rect x="490" y="268" width="240" height="28" rx="7" fill="#f1f5f9" stroke="#64748b"/><text x="500" y="286" fill="#334155">can_fb（4096，p4）0xC5/C4 周期查询</text>
+    <rect x="170" y="306" width="240" height="28" rx="7" fill="#f1f5f9" stroke="#94a3b8"/><text x="180" y="324" fill="#475569">cpu_stats（3072，p1）1Hz 统计</text>
+    <rect x="490" y="306" width="240" height="28" rx="7" fill="#f1f5f9" stroke="#94a3b8"/><text x="500" y="324" fill="#475569">uart_rx 泵（3072，p1）串口行→/logs</text>
+    <rect x="760" y="154" width="190" height="28" rx="7" fill="#faf5ff" stroke="#a855f7"/><text x="770" y="172" fill="#7e22ce">httpd（7168，lprio）</text>
+    <rect x="760" y="192" width="190" height="28" rx="7" fill="#f5f3ff" stroke="#7c3aed"/><text x="770" y="210" fill="#6b21a8">ble_finish / gd32_wait / restart</text>
+    <rect x="760" y="230" width="190" height="28" rx="7" fill="#fffbeb" stroke="#d97706"/><text x="770" y="248" fill="#92400e">ota_cancel（3072，p4）</text>
+    <rect x="760" y="268" width="190" height="28" rx="7" fill="#eff6ff" stroke="#2563eb"/><text x="770" y="286" fill="#1e40af">DATA_IN 队列 144</text>
+    <rect x="760" y="306" width="190" height="28" rx="7" fill="#eff6ff" stroke="#2563eb"/><text x="770" y="324" fill="#1e40af">内存池 8×512B = 4KB</text>
+  </g>
+
+  <!-- 跨任务通信注释 -->
+  <rect x="30" y="356" width="900" height="74" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+  <g font-size="11" fill="#334155">
+    <text x="46" y="378">· 跨任务队列：wifi/ble → ota_relay 走 dispatchQueue/resultQueue（深度 4）；业务任务经 transact Job 池（7）提交 spi_worker 串行执行</text>
+    <text x="46" y="396">· DATA_READY（PB6）下降沿 ISR → 任务通知精确唤醒 spi_worker；EVENT 上报走 4 槽事件环（满丢最旧）+ takeEvent 消费</text>
+    <text x="46" y="414">· 另有 NimBLE host 内部任务；任务栈按板端水位实测收敛（S ≈ 峰值 + 1.5~2KB）；httpd 为 esp_http_server 内部任务（lprio）</text>
+  </g>
+</svg>
+<figcaption><b>图 3-2 任务与队列</b>：SPI 总线由 spi_worker 独占串行化，业务任务经 Job 池提交；OTA 优先级高于网络栈任务以保证 50ms ACK 窗口</figcaption>
+</figure>
+
+<p>关键设计约束（线上事故沉淀）：<b>UART 日志直写曾阻塞 ota_relay(23)/spi_worker(6) 数毫秒</b>，导致 50ms ACK 窗口拖爆、12/777 包重发——因此日志改非阻塞 FIFO 写、BLE worker 提到 prio 12 尽快排空队列、spi_worker 提到 prio 8（高于 motor_feed 的 7，低于状态机任务）。</p>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s4">4. 启动流程与自检（SystemBoot 位图）</h2>
+
+<section class="block">
+<figure class="fig">
+<svg viewBox="0 0 960 420" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="ar5r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+  <!-- 泳道时间线 -->
+  <g font-size="12">
+    <text x="30" y="46" font-weight="bold" fill="#334155">app_main 启动序列（每步成功 → SystemBoot::mark(bit)）</text>
+  </g>
+  <line x1="30" y1="58" x2="930" y2="58" stroke="#cbd5e1" stroke-width="2" marker-end="url(#ar5)"/>
+  <g font-size="9.5" fill="#475569" text-anchor="middle">
+    <rect x="40" y="64" width="122" height="58" rx="7" fill="#fffbeb" stroke="#d97706"/>
+    <text x="101" y="82" font-weight="bold">冷启动判定</text>
+    <text x="101" y="96">POWERON·BROWNOUT</text>
+    <text x="101" y="110">先延 200ms</text>
+
+    <rect x="168" y="64" width="122" height="58" rx="7" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="229" y="82" font-weight="bold">netif · 事件循环</text>
+    <text x="229" y="96">DebugLog 环 64 槽</text>
+
+    <rect x="296" y="64" width="122" height="58" rx="7" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="357" y="82" font-weight="bold">WifiOta.earlyInit</text>
+    <text x="357" y="96">冷启动清 wifi/phy</text>
+    <text x="357" y="110">NVS 连接缓存</text>
+
+    <rect x="424" y="64" width="122" height="58" rx="7" fill="#fef2f2" stroke="#dc2626"/>
+    <text x="485" y="82" font-weight="bold">HealthMonitor</text>
+    <text x="485" y="96">+ health 任务</text>
+    <text x="485" y="110">温度 1s · 巡检 5s</text>
+
+    <rect x="552" y="64" width="122" height="58" rx="7" fill="#ecfdf5" stroke="#059669"/>
+    <text x="613" y="82" font-weight="bold">Protocol.init</text>
+    <text x="613" y="96">RNG 生成扰码常数</text>
+
+    <rect x="680" y="64" width="122" height="58" rx="7" fill="#dbeafe" stroke="#2563eb"/>
+    <text x="741" y="82" font-weight="bold">SpiMaster.init</text>
+    <text x="741" y="96">L0 自检 · 对端</text>
+    <text x="741" y="110">HELLO 探测</text>
+
+    <rect x="808" y="64" width="122" height="58" rx="7" fill="#f5f3ff" stroke="#7c3aed"/>
+    <text x="869" y="82" font-weight="bold">创建业务任务</text>
+    <text x="869" y="96">relay·wifi·ble</text>
+    <text x="869" y="110">can_fb·feed</text>
+  </g>
+
+  <!-- 回滚 + banner -->
+  <g font-size="12">
+    <rect x="40" y="134" width="430" height="42" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+    <text x="55" y="160" font-size="12" fill="#166534">✔ 任务启动后 <tspan font-family="Consolas">mark_app_valid_cancel_rollback()</tspan> — 唯一回滚取消点</text>
+    <rect x="490" y="134" width="432" height="42" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="505" y="160" font-size="12" fill="#1e40af">打印 banner「OTA Relay v0.5.2 启动」— 前端正则匹配判定重启完成</text>
+  </g>
+  <path d="M 852 116 L 852 134" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#ar5)"/>
+  <path d="M 255 116 L 255 134" stroke="#16a34a" stroke-width="1.5" marker-end="url(#ar5)"/>
+
+  <!-- SystemBoot 位图 -->
+  <text x="30" y="212" font-size="13.5" font-weight="bold" fill="#334155">SystemBoot 16 位自检位图（/system/status → boot{...}，前端「启动自检」面板）</text>
+  <g font-size="8.5" text-anchor="middle">
+    <!-- 16 cells, 55px each, start x=30 y=224 -->
+    <g>
+      <rect x="30"  y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="57"  y="241">NETIF</text><text x="57" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="85"  y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="112" y="241">EVT_LOOP</text><text x="112" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="140" y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="167" y="241">DBG_LOG</text><text x="167" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="195" y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="222" y="241">WIFI_EARLY</text><text x="222" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="250" y="224" width="55" height="40" fill="#fef2f2" stroke="#dc2626"/><text x="277" y="241">HLTH_MON</text><text x="277" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="305" y="224" width="55" height="40" fill="#fef2f2" stroke="#dc2626"/><text x="332" y="241">HLTH_TASK</text><text x="332" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="360" y="224" width="55" height="40" fill="#f1f5f9" stroke="#94a3b8"/><text x="387" y="241">CPU_STATS</text><text x="387" y="257" font-size="8" fill="#64748b">非关键</text>
+      <rect x="415" y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="442" y="241">PROTOCOL</text><text x="442" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="470" y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="497" y="241">OTA_COORD</text><text x="497" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="525" y="224" width="55" height="40" fill="#dbeafe" stroke="#2563eb"/><text x="552" y="241">SPI</text><text x="552" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="580" y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="607" y="241">RELAY_TASK</text><text x="607" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="635" y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="662" y="241">WIFI_TASK</text><text x="662" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="690" y="224" width="55" height="40" fill="#eff6ff" stroke="#2563eb"/><text x="717" y="241">BLE_TASK</text><text x="717" y="257" font-size="8" fill="#64748b">critical</text>
+      <rect x="745" y="224" width="55" height="40" fill="#f1f5f9" stroke="#94a3b8"/><text x="772" y="241">CAN_LINK</text><text x="772" y="257" font-size="8" fill="#64748b">非关键</text>
+      <rect x="800" y="224" width="55" height="40" fill="#f1f5f9" stroke="#94a3b8"/><text x="827" y="241">CAN_FB</text><text x="827" y="257" font-size="8" fill="#64748b">非关键</text>
+      <rect x="855" y="224" width="55" height="40" fill="#f1f5f9" stroke="#94a3b8"/><text x="882" y="241">OTA_VALID</text><text x="882" y="257" font-size="8" fill="#64748b">非关键</text>
+    </g>
+  </g>
+
+  <!-- 失败分支 -->
+  <g font-size="12">
+    <rect x="30" y="292" width="430" height="52" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+    <text x="46" y="314" fill="#b91c1c" font-size="12">关键位失败 → DEBUG_ERR + 3 秒后 esp_restart()</text>
+    <text x="46" y="334" fill="#b91c1c" font-size="11">非关键位失败仅记录，report() 输出「OK (critical), skipped/failed: 清单」</text>
+    <rect x="490" y="292" width="432" height="52" rx="8" fill="#fffbeb" stroke="#d97706"/>
+    <text x="506" y="314" fill="#92400e" font-size="12">can_fb 任务：冷启动/欠压复位时额外延迟 1500ms 再开始查询</text>
+    <text x="506" y="334" fill="#92400e" font-size="11">错开 GD32 上电初始化窗口，避免无效查询风暴</text>
+  </g>
+  <text x="480" y="382" text-anchor="middle" font-size="11.5" fill="#64748b">WiFi 侧另有 NVS 不完整元数据检测（stored&lt;total → 清 meta + abort + GD32 APP 探测，防 Bootloader 卡死拖垮 HTTP socket）</text>
+</svg>
+<figcaption><b>图 4-1 启动时序与自检位图</b>：冷启动两级延时（主 200ms / can_fb 1500ms），关键位失败自动重启，全部结果经 /system/status 暴露</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s5">5. SPI Link v2 传输层（核心协议）</h2>
+
+<section class="block">
+<p>SPI Link v2 是三个工程（ESP32_COMM / GD32 DCU_APP / GD32 Bootloader）共享的链路协议，真源 <code>spi_link/spi_link_v2.h</code>，PC 端 golden-vector 自测交叉锁定。它解决了裸 SPI 没有「帧界、会话、背压、应答归属」的问题。</p>
+
+<h3>5.1 帧格式（16B 头 + 0~236B 载荷 + CRC32，总开销 20B）</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 250" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <!-- header 16B: 8 cells x 2B -->
+  <g font-size="11" text-anchor="middle">
+    <rect x="30" y="40" width="55" height="46" fill="#eff6ff" stroke="#2563eb"/><text x="57" y="58">SOF0</text><text x="57" y="75" font-family="Consolas">A5</text>
+    <rect x="85" y="40" width="55" height="46" fill="#eff6ff" stroke="#2563eb"/><text x="112" y="58">SOF1</text><text x="112" y="75" font-family="Consolas">5A</text>
+    <rect x="140" y="40" width="55" height="46" fill="#eff6ff" stroke="#2563eb"/><text x="167" y="58">VER</text><text x="167" y="75" font-family="Consolas">02</text>
+    <rect x="195" y="40" width="55" height="46" fill="#eff6ff" stroke="#2563eb"/><text x="222" y="58">FLAGS</text><text x="222" y="75" font-size="10">位图①</text>
+    <rect x="250" y="40" width="100" height="46" fill="#dbeafe" stroke="#2563eb"/><text x="300" y="58">SESSION_ID 4B LE</text><text x="300" y="75" font-size="10">会话归属</text>
+    <rect x="350" y="40" width="55" height="46" fill="#f0fdf4" stroke="#059669"/><text x="377" y="58">TX_SEQ</text><text x="377" y="75" font-size="10">发方序号</text>
+    <rect x="405" y="40" width="55" height="46" fill="#f0fdf4" stroke="#059669"/><text x="432" y="58">ACK_SEQ</text><text x="432" y="75" font-size="10">应答归属</text>
+    <rect x="460" y="40" width="55" height="46" fill="#fef9c3" stroke="#ca8a04"/><text x="487" y="58">CREDIT</text><text x="487" y="75" font-size="10">信用窗口</text>
+    <rect x="515" y="40" width="55" height="46" fill="#fce7f3" stroke="#db2777"/><text x="542" y="58">TYPE</text><text x="542" y="75" font-size="10">帧类型</text>
+    <rect x="570" y="40" width="55" height="46" fill="#eff6ff" stroke="#2563eb"/><text x="597" y="58">LEN 2B</text><text x="597" y="75" font-size="10">≤236</text>
+    <rect x="625" y="40" width="55" height="46" fill="#f1f5f9" stroke="#94a3b8"/><text x="652" y="58">RSVD 2B</text><text x="652" y="75" font-size="10">=0</text>
+  </g>
+  <rect x="680" y="40" width="150" height="46" fill="#ecfdf5" stroke="#059669"/>
+  <text x="755" y="58" text-anchor="middle" font-size="11" fill="#047857">PAYLOAD 0~236B</text>
+  <text x="755" y="75" text-anchor="middle" font-size="10" fill="#065f46">业务数据（APP 面）</text>
+  <rect x="830" y="40" width="100" height="46" fill="#fff7ed" stroke="#ea580c"/>
+  <text x="880" y="58" text-anchor="middle" font-size="11" fill="#c2410c">CRC32 4B LE</text>
+  <text x="880" y="75" text-anchor="middle" font-size="10" fill="#9a3412">MPEG-2 覆盖头+载荷</text>
+  <text x="30" y="30" font-size="12" font-weight="bold" fill="#334155">SPI Link v2 帧 = 16B Header + Payload + CRC32（V2_OVERHEAD=20）</text>
+
+  <g font-size="11" fill="#475569">
+    <text x="30" y="118">① FLAGS：0x01 REQUEST · 0x02 RESPONSE · 0x04 EVENT · 0x08 ACK_ONLY · 0x10 RESET_SESSION（HELLO 请求 = REQUEST|RESET_SESSION）</text>
+    <text x="30" y="140">② CRC32-MPEG2（多项式 0x04C11DB7，初值 0xFFFFFFFF，无反射），解析器支持帧在缓冲区内任意偏移（前导垃圾字节容忍）</text>
+    <text x="30" y="162">③ 读预算按 GD32 角色：BOOT=128B / APP=256B；短响应类型再收紧到 96B 省填充时钟；发送时钟字节数 clamp(帧长, 64, 256)</text>
+    <text x="30" y="196" font-weight="bold" fill="#334155">TYPE 分族：</text>
+  </g>
+  <g font-size="10.5" font-family="Consolas">
+    <text x="120" y="196" fill="#0f766e">0x00 HELLO · 0x7E CREDIT_UPDATE · 0x7F LINK_ERROR(err,期望seq)</text>
+    <text x="120" y="214" fill="#1d4ed8">0x01 OTA_REQ · 0x02 OTA_DATA · 0x03 OTA_CANCEL · 0xB0 ENTER_BOOT(ACK=0xB5)</text>
+    <text x="120" y="232" fill="#b45309">0xC0 CAN发 · 0xC1 反馈页 · 0xC2 收模式 · 0xC3 ID快照 · 0xC7 突发 · 0xC8 Silent</text>
+    <text x="120" y="246" fill="#7e22ce">0xA1 PING · 0xA3 INIT_STATUS · 0xC4 ADC · 0xC5 电机状态 · 0xC6 电机版本 · 0xD0/D1/D2 电机OTA · 0xF7</text>
+  </g>
+</svg>
+<figcaption><b>图 5-1 帧格式</b>：响应帧（0x80 ACK / 0x81 WAIT / 0x82 ERROR）复用同一帧头；LINK_ERROR 携带错误码与期望序号用于失步归因</figcaption>
+</figure>
+
+<h3>5.2 五线 SPI 与「延迟一拍」全双工</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 300" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <g font-size="11" font-family="Consolas" fill="#334155">
+    <!-- CS -->
+    <text x="30" y="40">CS(GP4)</text>
+    <path d="M100 30 H130 V60 H300 V30 H470 V60 H640 V30 H800" fill="none" stroke="#2563eb" stroke-width="2"/>
+    <!-- SCLK -->
+    <text x="30" y="90">SCLK(GP6)</text>
+    <path d="M100 80 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20 l8 -20 l8 20" fill="none" stroke="#64748b" stroke-width="1"/>
+    <!-- MOSI -->
+    <text x="30" y="140">MOSI(GP5)</text>
+    <rect x="130" y="124" width="170" height="22" fill="#dbeafe" stroke="#2563eb"/>
+    <text x="215" y="139" text-anchor="middle" font-size="10.5">命令帧 #N（tx_seq=T）</text>
+    <rect x="470" y="124" width="170" height="22" fill="#dbeafe" stroke="#2563eb"/>
+    <text x="555" y="139" text-anchor="middle" font-size="10.5">命令帧 #N+1</text>
+    <!-- MISO -->
+    <text x="30" y="190">MISO(GP7)</text>
+    <rect x="130" y="174" width="170" height="22" fill="#f1f5f9" stroke="#94a3b8"/>
+    <text x="215" y="189" text-anchor="middle" font-size="10.5" fill="#64748b">陈旧响应（丢弃）</text>
+    <rect x="470" y="174" width="170" height="22" fill="#f0fdf4" stroke="#059669"/>
+    <text x="555" y="189" text-anchor="middle" font-size="10.5" fill="#047857">命令 #N 的真实响应</text>
+    <!-- DATA_READY -->
+    <text x="30" y="240">DATA_READY</text>
+    <path d="M100 230 H300 V250 H430 V230 H560 V250 H800" fill="none" stroke="#dc2626" stroke-width="2"/>
+    <text x="305" y="272" font-size="10.5" fill="#b91c1c">↓PB6 下降沿：GD32 有数据（ISR 置位 + 任务通知精确唤醒）</text>
+  </g>
+  <g font-size="12" fill="#334155">
+    <text x="680" y="120" font-weight="bold" fill="#1d4ed8">延迟一拍协议：</text>
+    <text x="680" y="140" font-size="11">第 N 次 CS 事务读回的是第 N-1 次</text>
+    <text x="680" y="156" font-size="11">命令的响应。GD32 在 CS 释放 ISR</text>
+    <text x="680" y="172" font-size="11">内 µs 级装载下一响应，ESP32 发完</text>
+    <text x="680" y="188" font-size="11">命令后由 poll 状态机按 DATA_READY</text>
+    <text x="680" y="204" font-size="11">边沿驱动补读真实响应（两步法）。</text>
+    <text x="680" y="234" font-size="11" fill="#64748b">CS 建立/保持加长：cs_ena_pretrans=64</text>
+    <text x="680" y="250" font-size="11" fill="#64748b">cs_ena_posttrans=32；事务间隔 ≥1ms</text>
+  </g>
+</svg>
+<figcaption><b>图 5-2 五线时序与延迟一拍</b>：所以 transact 分两步——先发命令（丢弃本笔陈旧 RX），再 poll 等真实响应；CS 事务间最小 1ms 防 GD32 EXTI re-arm 窗口被撞（0.4.5 撕裂根因修复）</figcaption>
+</figure>
+
+<h3>5.3 信用流控（Credit）与背压</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 260" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect x="60" y="40" width="180" height="120" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="150" y="66" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">ESP32 发送门</text>
+  <text x="150" y="92" text-anchor="middle" font-size="11.5" fill="#1e40af">remoteCredit = 对端帧头 CREDIT</text>
+  <text x="150" y="112" text-anchor="middle" font-size="11.5" fill="#1e40af">初值 8 · 随每帧更新</text>
+  <text x="150" y="140" text-anchor="middle" font-size="11.5" fill="#b91c1c">= 0 时禁发新 REQUEST</text>
+
+  <rect x="560" y="40" width="180" height="120" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="650" y="66" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">GD32 接收窗</text>
+  <text x="650" y="92" text-anchor="middle" font-size="11.5" fill="#065f46">响应缓冲 → 处理 → 释放</text>
+  <text x="650" y="112" text-anchor="middle" font-size="11.5" fill="#065f46">credit 随每帧帧头回传</text>
+  <text x="650" y="140" text-anchor="middle" font-size="11.5" fill="#065f46">空闲后不再主动发帧</text>
+
+  <path d="M 240 80 C 380 60 460 80 560 88" fill="none" stroke="#059669" stroke-width="2" marker-end="url(#ar7)"/>
+  <text x="400" y="62" text-anchor="middle" font-size="11" fill="#047857">数据/请求（credit 字段 = 本端剩余接收能力）</text>
+  <path d="M 560 130 C 460 160 380 150 240 128" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#ar7)"/>
+  <text x="400" y="170" text-anchor="middle" font-size="11" fill="#b45309">credit=0 → ESP32 循环 waitSpiDataReady(5ms) 等 PB6 / CREDIT_UPDATE(0x7E)</text>
+
+  <rect x="150" y="190" width="660" height="52" rx="9" fill="#fffbeb" stroke="#d97706"/>
+  <text x="480" y="212" text-anchor="middle" font-size="11.5" fill="#92400e">死锁破除：PB6 高 = GD32 无待发数据 = 响应缓冲已释放 → 陈旧 credit=0，强制 m_remoteCredit=1 放行</text>
+  <text x="480" y="230" text-anchor="middle" font-size="11" fill="#b45309">credit 更新必须在 session 校验之后（失配帧的 credit 不可信）；半会话终止用 resetCredit() 复位 8/8（§11）</text>
+</svg>
+<figcaption><b>图 5-3 信用流控</b>：每帧帧头互报剩余接收能力，credit=0 触发发送背压；两处已知死锁（陈旧锁存 / 失配帧污染）各有针对性破除</figcaption>
+</figure>
+
+<h3>5.4 HELLO 建链与自动重同步</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 320" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <g font-size="12">
+    <rect x="40" y="40" width="240" height="88" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+    <text x="160" y="66" text-anchor="middle" font-weight="bold" fill="#1d4ed8">HELLO（TYPE 0x00）</text>
+    <text x="160" y="88" text-anchor="middle" font-size="11" fill="#1e40af">SESSION_ID = esp_random()|1（非零）</text>
+    <text x="160" y="106" text-anchor="middle" font-size="11" fill="#1e40af">FLAGS = REQUEST|RESET_SESSION</text>
+    <text x="160" y="122" text-anchor="middle" font-size="10.5" fill="#64748b">seq/credit 全零 · role_hint 载荷 1B</text>
+
+    <rect x="360" y="40" width="240" height="88" rx="10" fill="#f0fdf4" stroke="#059669" stroke-width="1.6"/>
+    <text x="480" y="66" text-anchor="middle" font-weight="bold" fill="#047857">HELLO_ACK 校验</text>
+    <text x="480" y="88" text-anchor="middle" font-size="11" fill="#065f46">type=0x00 · RESPONSE · session 回显一致</text>
+    <text x="480" y="106" text-anchor="middle" font-size="11" fill="#065f46">payload[4]=role(1=APP 2=BOOT)</text>
+    <text x="480" y="122" text-anchor="middle" font-size="10.5" fill="#64748b">payload[5]=对端 credit_max</text>
+
+    <rect x="680" y="40" width="240" height="88" rx="10" fill="#ecfdf5" stroke="#059669"/>
+    <text x="800" y="66" text-anchor="middle" font-weight="bold" fill="#047857">链路生效</text>
+    <text x="800" y="88" text-anchor="middle" font-size="11" fill="#065f46">v2Active=true · credit=8/8</text>
+    <text x="800" y="106" text-anchor="middle" font-size="11" fill="#065f46">APP 角色解析 16B 身份块②</text>
+    <text x="800" y="122" text-anchor="middle" font-size="10.5" fill="#64748b">0xA3 缓存失效 · resyncs++</text>
+  </g>
+  <line x1="280" y1="84" x2="360" y2="84" stroke="#2563eb" stroke-width="2" marker-end="url(#ar8)" marker-start="url(#ar8)"/>
+  <text x="320" y="72" text-anchor="middle" font-size="10.5" fill="#475569">连发 2 次</text>
+  <line x1="600" y1="84" x2="680" y2="84" stroke="#059669" stroke-width="2" marker-end="url(#ar8)"/>
+
+  <g font-size="11.5" fill="#334155">
+    <text x="40" y="170" font-weight="bold">② 身份块 16B（HELLO_ACK 附加 / 0xA1 PING 同布局）：</text>
+    <text x="40" y="192" font-family="Consolas" font-size="11">[0..3] APP版本 major.minor.patch.build · [4..7] BOOT版本 · [8..11] uptime_ms · [12] feat_map_ver · [13..14] feature_flags · [15] init_state</text>
+    <text x="40" y="214" font-size="10.5" fill="#64748b">feature_flags：bit0 ADC反馈 · bit1 UART温度打印 · bit2 SPI_APP_LOG · bit3 CAN_BRS · bit4/5/6 CAN 通道0/1/2 · init_state：0=OK / 1=DEGRADED / 2=CRIT_FAIL / 0xFF=UNKNOWN</text>
+  </g>
+
+  <g font-size="12">
+    <rect x="40" y="238" width="880" height="76" rx="10" fill="#fffbeb" stroke="#d97706"/>
+    <text x="60" y="258" font-weight="bold" fill="#92400e">自动重同步三触发：</text>
+    <text x="60" y="276" font-size="11" fill="#92400e">① 收到 session=0 的响应（GD32 重启后 v2 未激活）→ 置 resyncPending；② worker 空闲期发现 resyncPending（5s 冷却）→ HELLO(role=any)</text>
+    <text x="60" y="294" font-size="11" fill="#92400e">③ GD32 复位导致 LINK_ERROR(0x7F) 后由业务重试自然触发 — 每次成功 HELLO 计入 spi_link.resyncs</text>
+  </g>
+  <text x="40" y="332" font-size="11" fill="#64748b">角色粘滞纠正：见 APP 独有 TYPE（0xC1/0xC3~0xC6/0xD0~0xD2）即把卡在 boot 的角色纠正回 APP，防止读预算用错 128/256</text>
+</svg>
+<figcaption><b>图 5-4 HELLO 建链</b>：延迟一拍连发两次取回 ACK；session 不匹配的 ACK 视为旧帧重发即可；ENTER_BOOT 前后各有专门的 HELLO/静默窗口</figcaption>
+</figure>
+
+<h3>5.5 transact 两步法与透明重试</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 380" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="ar9b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b45309"/>
+    </marker>
+  </defs>
+  <g font-size="12">
+    <rect x="40" y="34" width="200" height="52" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+    <text x="140" y="56" text-anchor="middle" font-weight="bold" fill="#1d4ed8">步骤 1：发送命令</text>
+    <text x="140" y="74" text-anchor="middle" font-size="10.5" fill="#1e40af">credit 背压检查 · 本笔 RX 丢弃</text>
+    <line x1="240" y1="60" x2="330" y2="60" stroke="#475569" stroke-width="1.6" marker-end="url(#ar9)"/>
+    <rect x="330" y="34" width="250" height="52" rx="9" fill="#fffbeb" stroke="#d97706"/>
+    <text x="455" y="56" text-anchor="middle" font-weight="bold" fill="#b45309">5ms 静默豁免判定</text>
+    <text x="455" y="74" text-anchor="middle" font-size="10.5" fill="#92400e">isAppIsrFastRespType → 免静默，边沿唤醒</text>
+    <line x1="580" y1="60" x2="670" y2="60" stroke="#475569" stroke-width="1.6" marker-end="url(#ar9)"/>
+    <rect x="670" y="34" width="250" height="52" rx="9" fill="#f0fdf4" stroke="#059669" stroke-width="1.6"/>
+    <text x="795" y="56" text-anchor="middle" font-weight="bold" fill="#047857">步骤 2：poll 响应</text>
+    <text x="795" y="74" text-anchor="middle" font-size="10.5" fill="#065f46">DATA_READY 优先 · 盲读受 no_blind 约束</text>
+    <!-- 白名单框 -->
+    <rect x="330" y="98" width="590" height="70" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+    <text x="345" y="118" font-size="11" fill="#334155" font-weight="bold">快速类型白名单（GD32 APP ISR µs 级装载）：0xA1 0xA3 0xC0 0xC1 0xC2 0xC3 0xC4 0xC5 0xC7 0xD1 0xF7</text>
+    <text x="345" y="136" font-size="10.5" fill="#64748b">仅 BOOT 主循环处理的 OTA 命令（0x01/0x02/0x03）保留 5ms 静默</text>
+    <text x="345" y="152" font-size="10.5" fill="#64748b">——过早盲读会打断 BOOT 的 EXTI/DMA 时序（实测 CHALLENGE 超时）</text>
+  </g>
+  <path d="M 795 86 L 795 98" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#ar9)"/>
+
+  <!-- poll 细节 -->
+  <g font-size="11.5">
+    <rect x="40" y="170" width="430" height="76" rx="9" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="56" y="192" fill="#1d4ed8" font-weight="bold">poll 规则</text>
+    <text x="56" y="210" fill="#1e40af" font-size="11">· no_blind（快速类型）：禁盲读，纯等 PB6 电平</text>
+    <text x="56" y="226" fill="#1e40af" font-size="11">· 否则：前 2 轮盲读 → 每 8 轮一次 → deadline 末强制</text>
+    <text x="56" y="242" fill="#1e40af" font-size="11">· 读预算 = min(短响应 96B, 角色预算 128/256B)</text>
+    <rect x="490" y="170" width="430" height="76" rx="9" fill="#fef2f2" stroke="#dc2626"/>
+    <text x="506" y="192" fill="#b91c1c" font-weight="bold">盲读为何危险（0.4.4 实测）</text>
+    <text x="506" y="210" fill="#991b1b" font-size="11">PB6 未低时强打 256 时钟 0xFF，若 GD32 CS EXTI 被</text>
+    <text x="506" y="226" fill="#991b1b" font-size="11">ECAT/CAN 中断压住未 re-arm → RX DMA mid-pulse 重装</text>
+    <text x="506" y="242" fill="#991b1b" font-size="11">→ 撕裂 0x82 0xE8 → 迟到帧被偷读 → 偷读风暴</text>
+  </g>
+
+  <!-- 重试 -->
+  <g font-size="12">
+    <rect x="40" y="266" width="880" height="94" rx="10" fill="#fffbeb" stroke="#d97706"/>
+    <text x="60" y="290" font-weight="bold" fill="#92400e">透明重试 kTxRetryMax=3（1 首发 + 2 重发，同 TX_SEQ）：仅当「未读到任何有效响应」时重发</text>
+    <text x="60" y="312" font-size="11.5" fill="#92400e">· 失败路径 seq 不推进 → GD32 按 DUP-SEQ 去重缓存回放，杜绝重复执行 · 读到任何帧（WAIT/ACK/ERROR/陈旧）即返回，GD32 明确拒绝（0x82）不重试</text>
+    <text x="60" y="332" font-size="11.5" fill="#92400e">· 耗尽 → tx_fail++ / tx_fail_last_type=type / 熔断计数（3 连败 → 链路离线，2s 冷却后放一笔探针；HELLO/OTA 关键命令不受限）</text>
+    <text x="60" y="352" font-size="11" fill="#64748b">0xC0 发送另有陈旧 WAIT 排空：读到 WAIT(0x81) 必为上轮电机 OTA 残留，循环最多 4 次直到真 ACK/ERROR，防「失败一次就再也发不出」</text>
+  </g>
+</svg>
+<figcaption><b>图 5-5 transact 流程</b>：发送 →（静默豁免）→ poll →（透明重试）；所有业务共用此路径，调用方无感知</figcaption>
+</figure>
+
+<h3>5.6 序号 / 会话失配与「偷读」修复</h3>
+<table>
+<tr><th>机制</th><th>规则</th></tr>
+<tr><td>seq 推进</td><td>发送成功且非陈旧读 → <code>m_txSeq++</code>；poll 读到 ACK/WAIT/ERROR 且 ack_seq==lastSent → 推进；<b>WAIT 也必须推进</b>（否则同 seq 重发被判重，feedTask 卡首 chunk）</td></tr>
+<tr><td>迟到响应偷读</td><td>poll 超时放弃后 GD32 迟到响应拉低 PB6 被 worker 按铃读走（帧已上时钟无法退回）→ <b>同样必须推进 seq</b>（0.4.2 修复，否则下条命令复用旧序号被 GD32 判重吞掉，业务永远读到旧 0x82）</td></tr>
+<tr><td>失配帧处理</td><td>CRC+session 合法的 RESPONSE 一律交调用方（帧已被读走、GD32 已清 pending，丢弃会死等），由 <code>m_lastRxAckMatched</code> 标记归属，业务以结构化 payload 终判</td></tr>
+<tr><td>session 失配</td><td>EVENT 帧放行；session=0 的响应放行（GD32 重启语义）并置重同步；其余拒收且不更新 credit</td></tr>
+<tr><td>撕裂诊断</td><td><code>ring_steal_diag</code>：偷读计数/最后类型/ack 归属/payload 签名 [rxLen, rb0, rb1]（0xE8 撕裂时 rb0=A5 rb1=5A 为期望值，255=未找到 SOF）；0x82 归因 rsp_err_last_req/p0..p5，全部进 /system/status</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s6">6. 安全握手与加密算法（GD32 OTA 数据面）</h2>
+
+<section class="block">
+<p>GD32 固件转发采用<b>预共享主密钥 + 挑战-应答</b>派生会话密钥，会话内数据 AES-128-ECB 加密。实现于 <code>OtaRelay::doChallengeAndAuth()</code> 与 <code>Protocol</code>（nonce 搅拌生成 / 会话密钥管理）。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 960 430" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="ar10g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#059669"/>
+    </marker>
+  </defs>
+  <!-- 泳道头 -->
+  <rect x="120" y="24" width="220" height="34" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="230" y="46" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">ESP32（OtaRelay）</text>
+  <rect x="600" y="24" width="220" height="34" rx="8" fill="#ecfdf5" stroke="#059669"/>
+  <text x="710" y="46" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">GD32 Bootloader</text>
+  <line x1="230" y1="58" x2="230" y2="400" stroke="#cbd5e1" stroke-dasharray="4 4"/>
+  <line x1="710" y1="58" x2="710" y2="400" stroke="#cbd5e1" stroke-dasharray="4 4"/>
+
+  <!-- 步骤 0 -->
+  <g font-size="11.5">
+    <text x="60" y="84" fill="#334155">前置：进入 BOOT（ENTER_BOOT 0xB0，ACK=0xB5，最多 3 次 + 整链重同步 + 100ms 静默）</text>
+    <text x="60" y="108" fill="#334155">nonce_server = scrambleGenerate(tickcount, &amp;栈地址, 0x12345678) ⊗ 每次开机硬件 RNG 的 SCRAMBLE_CONST[16]</text>
+  </g>
+  <!-- 步骤 1 握手 -->
+  <g font-size="11.5">
+    <rect x="120" y="124" width="180" height="40" rx="7" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="210" y="141" text-anchor="middle" fill="#1d4ed8" font-weight="bold">① 0x00 0xAC（握手请求）</text>
+    <text x="210" y="157" text-anchor="middle" font-size="10" fill="#1e40af">重试 20 次×1.6s · 每 5 次 HELLO 重同步</text>
+    <line x1="300" y1="144" x2="600" y2="144" stroke="#1d4ed8" stroke-width="1.8" marker-end="url(#ar10)"/>
+  </g>
+  <!-- 步骤 2 challenge -->
+  <g font-size="11.5">
+    <rect x="560" y="176" width="260" height="72" rx="7" fill="#ecfdf5" stroke="#059669"/>
+    <text x="690" y="196" text-anchor="middle" fill="#047857" font-weight="bold">② Challenge 36B</text>
+    <text x="690" y="214" text-anchor="middle" font-size="10.5" fill="#065f46">[0..11] GD32 UID 12B（禁全 0/全 FF）</text>
+    <text x="690" y="230" text-anchor="middle" font-size="10.5" fill="#065f46">[12..19] nonce_server[8..15] 回显 8B</text>
+    <text x="690" y="246" text-anchor="middle" font-size="10.5" fill="#065f46">[20..35] AES-ECB(MASTER_KEY, K_session) 16B</text>
+    <line x1="560" y1="212" x2="300" y2="212" stroke="#059669" stroke-width="1.8" marker-end="url(#ar10g)"/>
+  </g>
+  <!-- 验证 -->
+  <g font-size="11.5">
+    <rect x="120" y="262" width="300" height="54" rx="7" fill="#fff7ed" stroke="#ea580c"/>
+    <text x="270" y="282" text-anchor="middle" fill="#c2410c" font-weight="bold">③ 本地验证与派生</text>
+    <text x="270" y="300" text-anchor="middle" font-size="10.5" fill="#9a3412">K_session = AES-128-ECB_encrypt(MASTER_KEY, nonce_server)</text>
+    <text x="270" y="314" text-anchor="middle" font-size="10.5" fill="#9a3412">重算 AES(MASTER_KEY, K_session) 与 [20..35] 比对；nonce 片段绑定本会话防重放</text>
+  </g>
+  <!-- confirm -->
+  <g font-size="11.5">
+    <rect x="120" y="332" width="240" height="40" rx="7" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="240" y="349" text-anchor="middle" fill="#1d4ed8" font-weight="bold">④ CONFIRM：AES(K_session, nonce^0x55)</text>
+    <text x="240" y="365" text-anchor="middle" font-size="10" fill="#1e40af">transact 3s · poll 1s×8+8</text>
+    <line x1="360" y1="352" x2="600" y2="352" stroke="#1d4ed8" stroke-width="1.8" marker-end="url(#ar10)"/>
+    <rect x="600" y="332" width="180" height="40" rx="7" fill="#f0fdf4" stroke="#059669"/>
+    <text x="690" y="349" text-anchor="middle" fill="#047857" font-weight="bold">⑤ 明文 ACK 0xBA 0xC0</text>
+    <text x="690" y="365" text-anchor="middle" font-size="10" fill="#065f46">会话生效 · 数据包 K_session 加密</text>
+  </g>
+  <text x="480" y="408" text-anchor="middle" font-size="11" fill="#64748b">任一步失败 → ERR_TIMEOUT / ERR_AUTH → 状态机 ERROR；会话结束/复位时 volatile 逐字节擦除密钥（抗优化清零）</text>
+</svg>
+<figcaption><b>图 6-1 挑战-应答握手（字节级）</b>：MASTER_KEY 预共享（当前为占位值，§19），K_session 每次 OTA 重新派生，nonce 片段回显绑定会话</figcaption>
+</figure>
+
+<div class="note"><b>Nonce 搅拌算法（scrambleGenerate）</b>：非标准 KDF，仅作握手 nonce——以 tick 计数、栈地址、固定种子 0x12345678 三输入混合每次开机由硬件 RNG 随机生成的 16B 扰码常数，输出 16B。协议实现另有 PC 端 golden-vector 自测（<code>SPI_LINK_V2_SELFTEST</code>）交叉锁定帧字节。</div>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s7">7. OTA 体系（协调器 / 中继 / 本机 / 存储）</h2>
+
+<section class="block">
+<h3>7.1 OtaCoordinator — 系统级 9 状态协调器</h3>
+<p>单例 + FreeRTOS 互斥（100ms 锁超时），是 WiFi/BLE 传输层到 OTA 执行体的<b>唯一权威入口</b>；同时承担忙态看门狗自愈、epoch 会话保护、BLE 射频共存通知、CAN 反馈暂停与电机 OTA 互斥。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 960 360" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <!-- GD32 分支 -->
+  <g font-size="12">
+    <rect x="60" y="40" width="130" height="44" rx="9" fill="#f1f5f9" stroke="#64748b" stroke-width="1.6"/>
+    <text x="125" y="66" text-anchor="middle" font-weight="bold" fill="#334155">OTA_SYS_IDLE</text>
+    <rect x="250" y="40" width="170" height="44" rx="9" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="335" y="60" text-anchor="middle" font-weight="bold" fill="#b45309">GD32_STORING</text>
+    <text x="335" y="76" text-anchor="middle" font-size="10.5" fill="#92400e">收流写 Flash（忙）</text>
+    <rect x="480" y="40" width="150" height="44" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="555" y="66" text-anchor="middle" font-weight="bold" fill="#047857">GD32_STORED</text>
+    <rect x="690" y="40" width="160" height="44" rx="9" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+    <text x="770" y="60" text-anchor="middle" font-weight="bold" fill="#1d4ed8">GD32_RELAYING</text>
+    <text x="770" y="76" text-anchor="middle" font-size="10.5" fill="#1e40af">SPI 转发中（忙）</text>
+    <rect x="480" y="120" width="180" height="44" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
+    <text x="570" y="146" text-anchor="middle" font-weight="bold" fill="#166534">GD32_COMPLETE</text>
+  </g>
+  <g stroke="#475569" stroke-width="1.6" fill="none">
+    <line x1="190" y1="62" x2="250" y2="62" marker-end="url(#ar11)"/>
+    <line x1="420" y1="62" x2="480" y2="62" marker-end="url(#ar11)"/>
+    <line x1="630" y1="62" x2="690" y2="62" marker-end="url(#ar11)"/>
+    <path d="M 770 84 L 770 142 L 660 142" marker-end="url(#ar11)"/>
+  </g>
+  <text x="672" y="130" font-size="10" fill="#475569" text-anchor="end">notifyRelayComplete(true)</text>
+  <!-- ESP32 分支 -->
+  <g font-size="12">
+    <rect x="250" y="120" width="170" height="44" rx="9" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="335" y="140" text-anchor="middle" font-weight="bold" fill="#b45309">ESP32_RECEIVING</text>
+    <text x="335" y="156" text-anchor="middle" font-size="10.5" fill="#92400e">收流写 AB 分区（忙）</text>
+    <rect x="60" y="120" width="150" height="44" rx="9" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+    <text x="135" y="140" text-anchor="middle" font-weight="bold" fill="#1d4ed8">ESP32_FINALIZING</text>
+    <text x="135" y="156" text-anchor="middle" font-size="10.5" fill="#1e40af">SHA+end+set_boot（忙）</text>
+    <rect x="60" y="200" width="150" height="44" rx="9" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.6"/>
+    <text x="135" y="226" text-anchor="middle" font-weight="bold" fill="#6d28d9">ESP32_REBOOTING</text>
+  </g>
+  <g stroke="#475569" stroke-width="1.6" fill="none">
+    <line x1="250" y1="142" x2="210" y2="142" marker-end="url(#ar11)"/>
+    <line x1="135" y1="164" x2="135" y2="200" marker-end="url(#ar11)"/>
+  </g>
+  <!-- ERROR -->
+  <rect x="700" y="200" width="150" height="44" rx="9" fill="#fef2f2" stroke="#dc2626" stroke-width="1.6"/>
+  <text x="775" y="226" text-anchor="middle" font-size="12" font-weight="bold" fill="#b91c1c">OTA_SYS_ERROR</text>
+  <g stroke="#dc2626" stroke-width="1.3" fill="none" stroke-dasharray="5 3">
+    <path d="M 420 74 C 480 185 590 228 700 222" marker-end="url(#ar11)"/>
+    <path d="M 420 150 C 530 195 610 212 700 220" marker-end="url(#ar11)"/>
+    <path d="M 770 84 C 800 130 790 170 772 200" marker-end="url(#ar11)"/>
+  </g>
+  <text x="430" y="252" font-size="10.5" fill="#b91c1c" text-anchor="middle">任意阶段失败 → ERROR（isIdleState 不含它，但可被新请求/软清恢复）</text>
+
+  <!-- 底部机制 -->
+  <rect x="60" y="270" width="850" height="76" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <g font-size="11" fill="#334155">
+    <text x="78" y="292">· <tspan font-weight="bold">忙态看门狗 150s</tspan>（&gt;中继预算 120s+余量）：STORING/RELAYING/RECEIVING/FINALIZING 超时 → abort 自愈回 IDLE；FINALIZING 假占用（core 已空闲）直接复位</text>
+    <text x="78" y="310">· <tspan font-weight="bold">epoch</tspan>：每次 begin 递增；上传失败清理仅当 epoch 匹配才执行，防旧会话清理误杀新会话 · 开机检测 NVS 完整固件自动进 STORED</text>
+    <text x="78" y="328">· 入口互斥：电机 OTA 活跃时拒绝一切 GD32/ESP32 OTA（gd32_ota 分区共用）；REBOOTING 不入看门狗且拒绝 abort（防与重启竞态）</text>
+  </g>
+</svg>
+<figcaption><b>图 7-1 OtaCoordinator 9 状态</b>：GD32 与 ESP32 两条 OTA 路径互斥推进，任意异常收敛到 ERROR/IDLE 并自愈</figcaption>
+</figure>
+
+<h3>7.2 OtaRelay — GD32 转发事件驱动状态机（7 状态）</h3>
+<p>独立任务（栈 2560B）+ dispatch/result 队列（深度 4）。收到调度信号先 <code>setSuppressRingService(true)</code>（防 SPI worker 把 OTA 响应当 EVENT 偷读——线上事故根因），全程 RAII 持有抑制引用。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 960 316" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <g font-size="12.5" font-weight="bold" text-anchor="middle">
+    <rect x="30"  y="70" width="120" height="48" rx="9" fill="#f1f5f9" stroke="#64748b"/><text x="90"  y="99" fill="#334155">RELAY_IDLE</text>
+    <rect x="180" y="70" width="160" height="48" rx="9" fill="#fffbeb" stroke="#d97706"/><text x="260" y="92" fill="#b45309">HANDSHAKING</text><text x="260" y="108" font-size="10" font-weight="normal" fill="#92400e">进BOOT+握手+认证</text>
+    <rect x="370" y="70" width="150" height="48" rx="9" fill="#fffbeb" stroke="#d97706"/><text x="445" y="92" fill="#b45309">SIZE_NEG</text><text x="445" y="108" font-size="10" font-weight="normal" fill="#92400e">发大小·GD32擦Flash</text>
+    <rect x="550" y="70" width="160" height="48" rx="9" fill="#dbeafe" stroke="#2563eb"/><text x="630" y="92" fill="#1d4ed8">TRANSFERRING</text><text x="630" y="108" font-size="10" font-weight="normal" fill="#1e40af">逐包加密转发</text>
+    <rect x="740" y="70" width="130" height="48" rx="9" fill="#ecfdf5" stroke="#059669"/><text x="805" y="92" fill="#047857">FINISHING</text><text x="805" y="108" font-size="10" font-weight="normal" fill="#065f46">FINISH+APP验证</text>
+  </g>
+  <g stroke="#475569" stroke-width="1.8" fill="none">
+    <line x1="150" y1="94" x2="180" y2="94" marker-end="url(#ar12)"/>
+    <line x1="340" y1="94" x2="370" y2="94" marker-end="url(#ar12)"/>
+    <line x1="520" y1="94" x2="550" y2="94" marker-end="url(#ar12)"/>
+    <line x1="710" y1="94" x2="740" y2="94" marker-end="url(#ar12)"/>
+    <path d="M 870 94 C 905 94 905 170 860 178" marker-end="url(#ar12)"/>
+  </g>
+  <rect x="700" y="168" width="150" height="42" rx="9" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="775" y="194" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#166534">RELAY_DONE</text>
+  <rect x="440" y="168" width="150" height="42" rx="9" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="515" y="194" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b91c1c">RELAY_ERROR</text>
+  <g stroke="#dc2626" stroke-width="1.4" fill="none" stroke-dasharray="5 3">
+    <path d="M 260 118 L 480 168" marker-end="url(#ar12)"/>
+    <path d="M 445 118 L 500 168" marker-end="url(#ar12)"/>
+    <path d="M 630 118 L 540 168" marker-end="url(#ar12)"/>
+    <path d="M 805 118 L 560 172" marker-end="url(#ar12)"/>
+  </g>
+  <g stroke="#64748b" stroke-width="1.4" fill="none">
+    <path d="M 90 118 C 90 160 380 210 440 190" marker-end="url(#ar12)"/>
+    <path d="M 515 210 C 300 250 120 200 95 118" marker-end="url(#ar12)"/>
+  </g>
+  <text x="150" y="236" font-size="10.5" fill="#64748b">ERROR/DONE 经 EVT_START 复位回 IDLE；所有失败路径 abortRemoteAndReset(true)（先 SPI CANCEL 0x03 清 GD32 半会话，失败仅告警）</text>
+
+  <rect x="30" y="250" width="890" height="54" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="480" y="270" text-anchor="middle" font-size="10.5" fill="#334155">关键时序：握手 20×1.6s（每 5 次 HELLO 重同步）· CHALLENGE 5s · SIZE poll 500ms×120+40（擦 Flash 长 WAIT）</text>
+  <text x="480" y="290" text-anchor="middle" font-size="10.5" fill="#334155">转发预算 10s+25ms/包 上限 120s · 卡死检测 10s 无成功帧 · FINISH 10s×10 重试 · APP 存活 = 静默 500ms + PING 1000ms×20 轮（禁 HELLO 快路径，必须 PING 实证）</text>
+</svg>
+<figcaption><b>图 7-2 OtaRelay 状态机</b>：6 事件（START/RESP_OK/RESP_ERROR/TIMEOUT/HEALTH_CRIT/ABORT）驱动；结果码 -1~-7（TIMEOUT/CRC/AUTH/STORAGE/GD32/HEALTH/USER_ABORT）</figcaption>
+</figure>
+
+<h3>7.3 64 字节 OTA 数据包与单包重试</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 210" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="40" y="40" width="90" height="52" fill="#eff6ff" stroke="#2563eb"/><text x="85" y="60">session 4B</text><text x="85" y="78" font-size="10" fill="#1e40af">=nonce[0..3]</text>
+    <rect x="130" y="40" width="60" height="52" fill="#dbeafe" stroke="#2563eb"/><text x="160" y="60">seq 2B</text><text x="160" y="78" font-size="10" fill="#1e40af">LE</text>
+    <rect x="190" y="40" width="60" height="52" fill="#f1f5f9" stroke="#94a3b8"/><text x="220" y="66">保留 2B</text>
+    <rect x="250" y="40" width="290" height="52" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="395" y="60" fill="#047857" font-weight="bold">AES-128-ECB(K_session, plain48) 48B</text>
+    <text x="395" y="78" font-size="10" fill="#065f46">3 块连加密 · 末包 0xFF 填充</text>
+    <rect x="540" y="40" width="110" height="52" fill="#dbeafe" stroke="#2563eb"/><text x="595" y="60">if_end 4B</text><text x="595" y="78" font-size="10" fill="#1e40af">末包 FFFFFFFF</text>
+    <rect x="650" y="40" width="120" height="52" fill="#fff7ed" stroke="#ea580c"/>
+    <text x="710" y="60">CRC32 4B LE</text><text x="710" y="78" font-size="10" fill="#9a3412">覆盖 K_session+plain48</text>
+  </g>
+  <text x="40" y="30" font-size="12.5" font-weight="bold" fill="#334155">SPI_OTA_CMD_DATA(0x02) 载荷 = 64B（GD32_OTA_PACKET_SIZE=48 有效载荷，key 混入 CRC）</text>
+  <text x="40" y="120" font-size="11" fill="#64748b">明文来源：Gd32FlashStore 按需读 gd32_ota 分区（读失败 → ERR_STORAGE）；总包数 = ceil(total/48)；双 64B tx 槽流水线预组下一包隐藏读 Flash+AES 延迟</text>
+
+  <!-- ACK 时序 -->
+  <g font-size="10.5" font-family="Consolas">
+    <text x="40" y="150" font-family="inherit" font-weight="bold" fill="#334155">单包重试（sendRelayPacketWithRetry）：</text>
+    <text x="40" y="170" fill="#475569">DATA(seq=T) → WAIT(0x81)「从机已收」→ ACK(0xBAC0+seq=T+1)；50ms 未到 ACK → 重发同 seq DUP-DATA</text>
+    <text x="40" y="188" fill="#475569">（GD32 去重缓存回放最终 ACK，重发安全）；每包最多 5 次 DATA · 末包期望 ACK seq=0xF0F0F0F0</text>
+    <text x="40" y="208" fill="#b91c1c">结构化错误帧：0xBAC0+seq+err——0x04=CRC 错立即放弃整包；其他错误允许带错重发；ACK 每 32 包触发健康检查</text>
+  </g>
+</svg>
+<figcaption><b>图 7-3 数据包结构与重试</b>：GD32 对已写入包号去重（只回 ACK 不二次写 Flash），使「见 WAIT 后重发」安全——旧逻辑 ACK 丢失即永久丢失</figcaption>
+</figure>
+
+<h3>7.4 ESP32 本机 OTA（WiFi + BLE 共用）</h3>
+<table>
+<tr><th>步骤</th><th>实现</th><th>要点</th></tr>
+<tr><td>begin</td><td>选非当前启动分区（优先 ota_0）· <code>esp_ota_begin(OTA_WITH_SEQUENTIAL_WRITES)</code> 边写边擦</td><td>整区预擦 1.25MB 会堵死 HTTP TCP 窗口（进度卡开头）；begin 同时 <code>setSpiPaused(true)</code>——写 Flash 时 cache 反复失效会拖慢 SPI worker 甚至 Cache error；使能回滚时先 <code>invalidate_inactive_ota_data_slot()</code></td></tr>
+<tr><td>write</td><td><code>esp_ota_write</code> 循环 + 喂狗</td><td>不做增量 SHA；httpd 侧 4KB RAII 接收缓冲（会话内 malloc），堆紧时 pacing（&lt;8KB 减速）</td></tr>
+<tr><td>finalize</td><td>分区读回算 SHA-256（1024B 静态缓冲，每 16 块喂狗）→ 与前端 SHA 大小写不敏感比对 → <code>esp_ota_end</code> → <code>set_boot_partition</code></td><td>不匹配返回 ESP_ERR_INVALID_VERSION 并回传设备 SHA 供前端核对；<code>m_ended</code> 标志防 end 后误 abort</td></tr>
+<tr><td>回滚保护</td><td>任务启动完成后 <code>esp_ota_mark_app_valid_cancel_rollback()</code></td><td>新固件标记前崩溃 → bootloader 自动回退上一有效分区</td></tr>
+</table>
+
+<h3>7.5 Gd32FlashStore — 存储层</h3>
+<table>
+<tr><th>能力</th><th>实现细节</th></tr>
+<tr><td>按需擦除（水位）</td><td><code>beginWriteSession(false)</code> 复位水位；<code>ensureErasedForWrite</code> 仅从水位向高地址顺序擦 4KB 扇区（跳空一并擦），禁止重擦已写扇区；每扇区擦后喂狗+yield 让 WiFi/LWIP 有机会运行</td></tr>
+<tr><td>整区强制擦除</td><td>电机 OTA 上传 <code>beginWriteSession(true)</code> 全擦 252KB——NOR「只能 1→0」与残留固件叠加会造成静默单 bit 翻转（实测 0x19→0x18 根因）</td></tr>
+<tr><td>NVS 元数据</td><td>命名空间 <code>ota_meta</code>：total_size / stored_size / last_seq / checksum(blob 32B)；读-改-写全程持锁防丢失更新；仅 ACK checkpoint 持久化（NVS commit 毫秒级，不能每包一次）</td></tr>
+<tr><td>SHA-256</td><td>收流收尾统一 <code>metaFinalizeChecksum</code>；relay 门控：checksum 非全零则信任跳过二次全盘 SHA；全零则兜底 <code>metaVerifyChecksum</code>（全零不容忍，防 meta 被清零掩盖损坏）</td></tr>
+<tr><td>对齐缓冲</td><td>OTA 会话 begin 时 calloc(4KB+8)，end/abort 释放——消除每非对齐块 malloc/free 堆抖动，非 OTA 期零占用</td></tr>
+</table>
+
+<h3>7.6 包级防呆：固件身份校验（0.3.81）</h3>
+<div class="warnbox">SHA-256 只能证明「传对了」，不能证明「传的是<b>对的包</b>」。把 BOOT 包（或 ESP32 镜像/任意文件）中继进 GD32 APP 区会擦掉好固件。<code>validateStoredImageIdentity()</code> 读分区头 8B Cortex-M 向量表：初始 MSP 必须落在 GD32 SRAM（0x20000000~0x2001FFFF）；复位向量（清 Thumb 位）落在 APP 区 → <b>kApp</b> 放行；落在 BOOT 区（0x08000000~0x08011FFF）→ <b>kBootloader 拒绝</b>；判据与 GD32 BOOT 侧 <code>validateApplication()</code> 完全一致（两侧需同步修改）。<code>/ota/relay</code> 与 BLE 0xF7 都强制 kApp 才放行（BLE 错误码 0x87 ERR_FW_IDENTITY）。</div>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s8">8. BLE OTA（NimBLE）</h2>
+
+<section class="block">
+<h3>8.1 GATT 服务</h3>
+<table>
+<tr><th>UUID</th><th>特征</th><th>属性</th><th>用途 / 格式</th></tr>
+<tr><td>0xFFFF</td><td>OTA Service</td><td>Primary</td><td>服务主入口（设备名 ESP32-OTA-RELAY · MTU 512 · 不做 bonding）</td></tr>
+<tr><td>0x0001</td><td>CTRL</td><td>Write</td><td>命令字：0xF7 触发 GD32 中继（≥35B：SHA32+session2）· 0xF8 ESP32 收尾（≥33B：SHA32）· 0xFA 重启 · 0xFB 中止（RELAYING/FINALIZING 拒绝）· 0xF9 SHA 预检<b>仅定义未实现</b></td></tr>
+<tr><td>0x0002</td><td>DATA_IN</td><td>Write + WriteNoRsp</td><td>固件包：cmd 1B（0x00 GD32/0x01 ESP32）+ seq u16 LE + total_size u32 LE（仅 seq=0 有效）+ payload ≤480B；无 CRC（BLE 链路层已有）</td></tr>
+<tr><td>0x0003</td><td>DATA_OUT</td><td>Notify</td><td>0xA1 窗口 ACK 8B（cmd+seq+completed_bytes）· 0xB1 FINISH 6B（stage+value）· 0xC1 SHA-256 35B</td></tr>
+<tr><td>0x0004</td><td>VERSION</td><td>Read</td><td>固件版本 + 构建时间字符串</td></tr>
+</table>
+<p>FINISH stage：0x02 DONE · 0x07 REBOOT_NOW · 0x10 RELAY_START · 0x11 RELAY_DONE · 0x20 ABORTED；错误码 0x80 BUSY / 0x81 ERR_FINALIZE / 0x83 ERR_MUTEX / 0x84 ERR_GD32_SIZE / 0x85 ERR_SHA_MISMATCH / 0x86 ERR_GD32_RELAY / 0x87 ERR_FW_IDENTITY。连接参数：高速分支 7.5~10ms 间隔 + 2M PHY 请求，Windows 兼容回退 10~12.5ms。</p>
+
+<h3>8.2 窗口 ACK、乱序重排与内存池</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 352" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <!-- 前端窗口 -->
+  <text x="30" y="30" font-size="12.5" font-weight="bold" fill="#334155">前端发送窗口（BLE_OTA_ACK_WINDOW = 64）与设备端乱序重排（REORDER_WINDOW = 64）</text>
+  <g font-size="10.5" font-family="Consolas">
+    <!-- 24 slots visual -->
+    <g text-anchor="middle">
+      <rect x="40"  y="44" width="34" height="30" fill="#ecfdf5" stroke="#059669"/><text x="57"  y="63">0✓</text>
+      <rect x="74"  y="44" width="34" height="30" fill="#ecfdf5" stroke="#059669"/><text x="91"  y="63">1✓</text>
+      <rect x="108" y="44" width="34" height="30" fill="#ecfdf5" stroke="#059669"/><text x="125" y="63">2✓</text>
+      <rect x="142" y="44" width="34" height="30" fill="#fef9c3" stroke="#ca8a04"/><text x="159" y="63">5暂存</text>
+      <rect x="176" y="44" width="34" height="30" fill="#fef9c3" stroke="#ca8a04"/><text x="193" y="63">6暂存</text>
+      <rect x="210" y="44" width="34" height="30" fill="#fff" stroke="#cbd5e1"/><text x="227" y="63">3缺口</text>
+      <rect x="244" y="44" width="34" height="30" fill="#fef9c3" stroke="#ca8a04"/><text x="261" y="63">7暂存</text>
+      <rect x="278" y="44" width="34" height="30" fill="#fff" stroke="#cbd5e1"/><text x="295" y="63">4缺口</text>
+      <rect x="312" y="44" width="34" height="30" fill="#fff" stroke="#cbd5e1" stroke-dasharray="4 2"/><text x="329" y="63">…64</text>
+    </g>
+    <text x="380" y="63" font-family="inherit" font-size="11" fill="#475569">窗口内乱序包暂存 slot（lazy malloc ≤480B），3 到达后 flush 连续补齐并 free</text>
+  </g>
+  <g font-size="11" fill="#334155">
+    <text x="40" y="100">· seq&lt;expected 重复丢弃（静默，ACK 字节不增长会被前端误判丢包）；seq==expected 写 Flash + 连续 flush；seq 超窗 → 丢弃 + ACK 报缺口</text>
+    <text x="40" y="120">· ACK 内容 = expected-1（最近连续落盘序号）+ 累计字节；触发：跨 64 边界 / 尾包（&lt;480B）/ seq=0 首包就绪 / flush 跨界</text>
+    <text x="40" y="140">· 续传：前端 resumeSeq = ceil(completed_bytes / 480)；负 ACK（丢包/队列满）节流 64 包或 200ms 一条，ackSeq=expected-1 供续传</text>
+    <text x="40" y="160">· 合并包：NimBLE 可将多次 writeWithoutResponse 合并进同一 mbuf，4096B 静态缓冲内循环解析（≤8 包/批）</text>
+  </g>
+
+  <!-- 内存池 -->
+  <g font-size="11">
+    <rect x="40" y="180" width="400" height="66" rx="9" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="56" y="202" fill="#1d4ed8" font-weight="bold">DATA_IN 内存池 = 8 槽 × 512B = 4KB</text>
+    <text x="56" y="220" fill="#1e40af" font-size="10.5">一次 calloc 切分；曾为 32KB 致 OTA 收尾 0xF8 OOM</text>
+    <text x="56" y="236" fill="#1e40af" font-size="10.5">（0xF8 收尾需 image verify），缩至 4KB 并修池复用竞态</text>
+    <rect x="470" y="180" width="450" height="66" rx="9" fill="#fffbeb" stroke="#d97706"/>
+    <text x="486" y="202" fill="#92400e" font-weight="bold">数据队列深度 144（窗口×2+16）· worker prio 12 栈 2560</text>
+    <text x="486" y="220" fill="#92400e" font-size="10.5">收包即入队，Flash 操作全部在 worker（NimBLE host 栈仅</text>
+    <text x="486" y="236" fill="#92400e" font-size="10.5">4096B，阻塞会断连）；&gt;512B 合并批回退 malloc</text>
+  </g>
+
+  <!-- GD32 路径 -->
+  <rect x="40" y="262" width="880" height="66" rx="9" fill="#ecfdf5" stroke="#059669"/>
+  <text x="60" y="282" font-size="11" fill="#065f46" font-weight="bold">GD32 数据路径（cmd=0x00）无 reorder、严格按序写：</text>
+  <text x="60" y="300" font-size="10.5" fill="#065f46">乱序丢弃 + 节流 ACK；ACK checkpoint（seq==0 / 每 64 包边界 / 尾包）同时是 NVS meta 持久化点</text>
+  <text x="60" y="316" font-size="10.5" fill="#065f46">收完自动推 0xC1 设备 SHA，CTRL 0xF7 才触发中继（前端 SHA 三方比对 + 身份校验 → RELAY_START/DONE/0x86）</text>
+  <text x="480" y="344" text-anchor="middle" font-size="10.5" fill="#64748b">ESP32 路径（cmd=0x01）收尾：0xF8+SHA → 补发最终窗口 ACK → 150ms → finalizeForReboot → 0xC1 SHA 通知 → DONE 0x02 → REBOOT_NOW 0x07</text>
+</svg>
+<figcaption><b>图 8-1 BLE 窗口传输机制</b>：writeWithoutResponse 即发即忘 + 窗口 ACK 兜底 + reorder 吸收乱序；负 ACK 支持断点续传</figcaption>
+</figure>
+
+<h3>8.3 BLE/WiFi 射频共存（ESP32-C3 单射频）</h3>
+<table>
+<tr><th>方向</th><th>机制</th></tr>
+<tr><td>WiFi OTA 开始 → 挂起 BLE</td><td><b>软挂起 suspendStack</b>：停广播 → 断连接（等 30ms）→ CTRL/DATA_IN 拒写（ATT 错误）→ 清数据队列；<b>不 deinit 协议栈</b>（硬 deinit 会打挂共存导致上传失联）；挂起期 CONNECT/ADV_COMPLETE 被拒绝/抑制</td></tr>
+<tr><td>OTA 中继结束/中止 → 恢复 BLE</td><td>resumeStack：重新开广播；仅曾 hard-deinit 才完整 serverStart。/ota/relay 失败路径也会 resume</td></tr>
+<tr><td>BLE OTA 期间 → WiFi 让步</td><td>保持 WIFI_PS_NONE，仅<b>暂停 RSSI 轮询</b>（射频活动干扰 BLE 连接事件）；标志防重入；断连按系统状态清理会话（GD32_RELAYING/REBOOTING 保留等自然结束，WiFi 通道会话不误杀）</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s9">9. WiFi 管理与 HTTP API</h2>
+
+<section class="block">
+<h3>9.1 STA → AP 自动降级</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 310" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <g font-size="12">
+    <rect x="30" y="40" width="180" height="70" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+    <text x="120" y="66" text-anchor="middle" font-weight="bold" fill="#1d4ed8">STA 优先（编译期）</text>
+    <text x="120" y="86" text-anchor="middle" font-size="10.5" fill="#1e40af">SSID「004舰桥」· FAST_SCAN</text>
+    <text x="120" y="102" text-anchor="middle" font-size="10.5" fill="#1e40af">国家码 CN（信道 1-13）· WPA2</text>
+    <rect x="280" y="40" width="200" height="70" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="380" y="64" text-anchor="middle" font-weight="bold" fill="#b45309">重连任务（独立，防死锁）</text>
+    <text x="380" y="84" text-anchor="middle" font-size="10.5" fill="#92400e">冷启动 retry≤3：退避 2s×retry</text>
+    <text x="380" y="100" text-anchor="middle" font-size="10.5" fill="#92400e">否则 1s 固定 · 5 次耗尽 → 放弃</text>
+    <rect x="550" y="40" width="190" height="70" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="1.6"/>
+    <text x="645" y="64" text-anchor="middle" font-weight="bold" fill="#b91c1c">30s 连接超时</text>
+    <text x="645" y="86" text-anchor="middle" font-size="10.5" fill="#991b1b">waitStaConnected 每 1s 轮询</text>
+    <text x="645" y="102" text-anchor="middle" font-size="10.5" fill="#991b1b">耗尽立即返回超时</text>
+    <rect x="790" y="40" width="150" height="70" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="865" y="60" text-anchor="middle" font-weight="bold" fill="#047857">AP 模式</text>
+    <text x="865" y="78" text-anchor="middle" font-size="9.5" fill="#065f46">ESP32_OTA_RELAY</text>
+    <text x="865" y="92" text-anchor="middle" font-size="9.5" fill="#065f46">12345678 · 192.168.31.1</text>
+    <text x="865" y="106" text-anchor="middle" font-size="9.5" fill="#065f46">信道 6 · ≤4 台</text>
+  </g>
+  <g stroke="#475569" stroke-width="1.8" fill="none">
+    <line x1="210" y1="75" x2="280" y2="75" marker-end="url(#ar14)"/>
+    <line x1="480" y1="75" x2="550" y2="75" marker-end="url(#ar14)"/>
+    <line x1="740" y1="75" x2="790" y2="75" marker-end="url(#ar14)"/>
+  </g>
+  <text x="765" y="64" font-size="10" fill="#991b1b" text-anchor="middle">超时</text>
+  <g font-size="11" fill="#334155">
+    <text x="30" y="146">降级切换：esp_wifi_stop → deinit → init → <tspan font-weight="bold">重新注册 WIFI/IP 事件回调</tspan>（deinit 会丢失）→ initAp()</text>
+    <text x="30" y="164">GOT_IP 经信号量通知（DHCP）；AP 模式先停 DHCP server、设静态 192.168.31.1/24 再启动</text>
+    <text x="30" y="186">事件回调仅 xTaskNotifyGive 唤醒重连任务（回调里直接 esp_wifi_connect 会死锁）；RSSI 每 10s 喂健康监控（BLE OTA 期间暂停）；WIFI_PS_NONE 保吞吐</text>
+  </g>
+  <rect x="30" y="204" width="910" height="72" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+  <g font-size="10.5" fill="#334155">
+    <text x="46" y="226">冷启动（POWERON/BROWNOUT）：统一等 400ms 再初始化 NVS/WiFi（STA 路径 esp_wifi_start 前再等 300ms）</text>
+    <text x="46" y="244">清 NVS <tspan font-family="Consolas">nvs.net80211</tspan> 连接缓存，欠压复位额外清 <tspan font-family="Consolas">phy</tspan> 强制重校准；NVS 损坏自动擦除重建</text>
+    <text x="46" y="262">扫描用 WIFI_FAST_SCAN（扫到即连）——全信道扫描会让 OTA 重启后页面恢复多等 3~8s；listen_interval=3；无 mDNS，访问靠固定 IP</text>
+  </g>
+</svg>
+<figcaption><b>图 9-1 WiFi 模式管理</b>：STA 优先 + 有界退避重连 + 30s 超时降级 AP；事件驱动 + 独立重连任务避免死锁</figcaption>
+</figure>
+
+<h3>9.2 HTTP 服务器与路由表（22 条路由 / 21 个唯一路径）</h3>
+<p>httpd 端口 80 · httpd 栈 7168B · max_uri_handlers 48（22 条 handler 路由 / 21 个唯一路径，另为每个 path 注册 OPTIONS CORS）· max_open_sockets 6（约束 ≤ LWIP 12 − 内部 3）· LRU 踢除 · recv/send 5s 超时 + keep-alive 探针。<b>无任何认证</b>（见 §19）；CORS 全放开（前端本地托管跨源调用）。错误响应统一 <code>{"status":"error","code":"snake_case","message":...}</code>。</p>
+<table>
+<tr><th>方法</th><th>路径</th><th>功能</th></tr>
+<tr><td>POST</td><td><code>/ota/upload</code></td><td>固件上传（JSON 头 <code>{"type":"esp32"|"gd32","total_size":N}</code> + 二进制流式）；GD32 路径流式写 gd32_ota + NVS meta + 收尾算 SHA；chunked 拒绝</td></tr>
+<tr><td>POST</td><td><code>/ota/update</code></td><td>ESP32 OTA 收尾 <code>{"sha256","verify_only"}</code>；SHA 不匹配回 error 并带 device SHA；成功后 100ms 重启</td></tr>
+<tr><td>POST</td><td><code>/ota/relay</code></td><td>触发 GD32 中继：校验前端 SHA-256 + 身份 kApp → 投递 dispatch；失败恢复 BLE</td></tr>
+<tr><td>POST</td><td><code>/restart</code></td><td>重启 ESP32</td></tr>
+<tr><td>GET</td><td><code>/logs</code></td><td>日志环 JSON chunked 流式（512B 栈缓冲攒块，替代 4KB malloc；堆 &lt;4KB 返回 []）</td></tr>
+<tr><td>GET</td><td><code>/system/status</code></td><td>全量状态（<code>?lite=1</code> 轻量、<code>?layout=1</code> 加内存布局）；堆极紧自动降级简包</td></tr>
+<tr><td>GET</td><td><code>/system/probe</code></td><td>单次 GD32 APP 存活探测（HELLO/PING），返回版本/uptime</td></tr>
+<tr><td>GET</td><td><code>/system/heap_low_log</code></td><td>最近一条「堆创新低」快照（alloc hook 最后一击归因）</td></tr>
+<tr><td>POST</td><td><code>/can/send_batch</code></td><td>CAN 发送唯一入口，1~128 帧，512B 滚动缓冲流式解析；单帧 1200ms / 多帧 80ms/帧；SPI 失败或 0xE2/0xE3 致命中止并报 skipped</td></tr>
+<tr><td>POST</td><td><code>/can/send_burst</code></td><td>0xC7 跨通道突发（≤24 帧，按容量分块背靠背；id=(node&lt;&lt;16)|suffix）</td></tr>
+<tr><td>GET</td><td><code>/can/feedback</code></td><td>0xC1 按需查询三路统计+ID 快照（<code>?lite=1</code> 轻量）</td></tr>
+<tr><td>GET/POST</td><td><code>/can/mode</code></td><td>查询/切换接收模式 0 全收 / 1 过滤 / 2 CAN0→1/2 桥接</td></tr>
+<tr><td>POST</td><td><code>/can/silent</code></td><td>0xC8 通道收发器 Silent 只听不发（OTA/send_batch 独占 SPI 期间拒绝）</td></tr>
+<tr><td>POST</td><td><code>/spi/send</code></td><td>原始 SPI 帧透传 <code>{"type","data","timeout_ms"}</code></td></tr>
+<tr><td>GET</td><td><code>/motor/state</code></td><td>电机状态缓存（0xC5；<code>?bin=1</code> 二进制协议 12B 头 + 92B/节点，省 66% 体积）</td></tr>
+<tr><td>GET</td><td><code>/motor/version</code></td><td>电机版本缓存（0xC6 事件推送）</td></tr>
+<tr><td>POST</td><td><code>/motor/ota</code></td><td>电机固件上传（<code>?ch=N</code>；整区强制擦除；SHA 随响应返回）</td></tr>
+<tr><td>POST</td><td><code>/motor/ota/relay</code></td><td>触发电机 OTA（SPI 0xD0 START + feedTask）</td></tr>
+<tr><td>GET</td><td><code>/motor/ota/status</code></td><td>电机 OTA 状态机进度（0xD2 缓存）</td></tr>
+<tr><td>POST</td><td><code>/motor/ota/cancel</code></td><td>取消（异步 cancel task，先 resetCredit 再 CANCEL）</td></tr>
+<tr><td>GET</td><td><code>/spi/speedtest</code></td><td>SPI 性能测试（0xA1 PING 探针，RTT 直方图/5 段细分；临时功能标记可删）</td></tr>
+</table>
+<div class="note"><b>共享 JSON 工作区</b>：3KB .bss 缓冲 + 惰性互斥供 /system/status、/can/feedback、/motor/state(JSON) 等串行复用，避免峰值堆叠 malloc；/system/status 分 4 块 chunked 发送。motor.html 三条轮询链路（/motor/state、/can/feedback、/system/status）服务端保证互不阻塞。</div>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s10">10. CANFD 桥接（0xC0~0xC8）</h2>
+
+<section class="block">
+<p>ESP32 不直接接触 CAN 总线：HTTP/BLE 请求翻译为 SPI 命令，GD32 驱动三路 TCAN1057AV 收发器。帧约定 <code>[通道 1B][扩展 ID 4B 大端][数据 0~64B]</code>。</p>
+
+<h3>10.1 命令族</h3>
+<table>
+<tr><th>TYPE</th><th>名称</th><th>载荷 / 行为</th></tr>
+<tr><td>0xC0</td><td>CAN 单帧发送</td><td>req = ch + id(4B BE) + data（最短 5B，DLC=0）；GD32 回 ACK 或错误码 E0~E7（payload[0]）</td></tr>
+<tr><td>0xC1</td><td>统计 + ID 快照页</td><td>req=[ch,page]；resp = 28B 固定头（含 mode/snapshot_seq/rx/tx/rx_drop/error/tec/rec/<b>bus_state</b>）+ 条目 (8+dlc)=id 4LE+dlc+flags(FD/BRS/ESI)+rsv+data；快照上限 16 条，page0=条目 0~7、page1=8~15；GD32 亦可 1Hz 主动推送（现默认请求驱动，§12.2）</td></tr>
+<tr><td>0xC2</td><td>设置接收模式</td><td>0=全收 · 1=按 ID/掩码过滤 · 2=<b>CAN0→CAN1/CAN2 桥接</b>（每帧按原格式自动转发）；回实际生效模式</td></tr>
+<tr><td>0xC3</td><td>ID 快照完整版</td><td>固定头 4B + 条目 (16+dlc)，含 seq/rx_count；响应可长，不进短响应读预算白名单</td></tr>
+<tr><td>0xC7</td><td>跨通道突发发送</td><td>多电机同步：4B 头 [count][dlc][suffix_hi][suffix_lo] + count×(chnode(1B=(ch&lt;&lt;4)|node)+data)；单次 ≤16 帧（容量 = min(16,(236−4)/(1+dlc))）</td></tr>
+<tr><td>0xC8</td><td>收发器 Silent</td><td>req=[ch, silent 0/1]；回 [ch 回显][actual][ch_en]；错误 E0 过短/E1 通道非法/E2 S 脚回读不符（标志已回滚）</td></tr>
+</table>
+
+<h3>10.2 0xC7 突发同步原理（多电机同发）</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 260" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect x="40" y="60" width="180" height="90" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="130" y="88" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1d4ed8">ESP32</text>
+  <text x="130" y="112" text-anchor="middle" font-size="11" fill="#1e40af">一条 0xC7 装载 N 帧</text>
+  <text x="130" y="132" text-anchor="middle" font-size="11" fill="#1e40af">只等「一个」ACK</text>
+  <rect x="330" y="52" width="260" height="106" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="460" y="78" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#047857">GD32 CS 释放 ISR 内</text>
+  <text x="460" y="100" text-anchor="middle" font-size="11" fill="#065f46">对每帧调非阻塞 transmitFrame（仅装载邮箱）</text>
+  <text x="460" y="120" text-anchor="middle" font-size="11" fill="#065f46">全部装载完成后才回一个 ACK</text>
+  <text x="460" y="142" text-anchor="middle" font-size="11" fill="#065f46">ACK payload = 实际 count + 每帧 CanTxResult</text>
+  <rect x="700" y="40" width="220" height="60" rx="9" fill="#fffbeb" stroke="#d97706"/>
+  <text x="810" y="64" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#b45309">CAN0 邮箱 → 上线</text>
+  <text x="810" y="84" text-anchor="middle" font-size="10.5" fill="#92400e">CAN1 邮箱 → 上线（偏差 &lt;1ms）</text>
+  <rect x="700" y="112" width="220" height="60" rx="9" fill="#fffbeb" stroke="#d97706"/>
+  <text x="810" y="136" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#b45309">CAN2 邮箱 → 上线</text>
+  <text x="810" y="156" text-anchor="middle" font-size="10.5" fill="#92400e">组内近同时 · 组间背靠背</text>
+  <line x1="220" y1="105" x2="330" y2="105" stroke="#2563eb" stroke-width="2" marker-end="url(#ar15)" marker-start="url(#ar15)"/>
+  <line x1="590" y1="70" x2="700" y2="70" stroke="#059669" stroke-width="2" marker-end="url(#ar15)"/>
+  <line x1="590" y1="142" x2="700" y2="142" stroke="#059669" stroke-width="2" marker-end="url(#ar15)"/>
+  <g font-size="11" fill="#334155">
+    <text x="40" y="196">HTTP 层 /can/send_burst：单请求 ≤24 帧，超出单次容量按 canBurstCapacity(dlc) 分块、块间背靠背 SPI 事务（&lt;1ms）；CAN ID = (node&lt;&lt;16)|suffix（CMD=0x0200）。</text>
+    <text x="40" y="216">单帧总线故障（0xE2 BUS_OFF / 0xE3 TEC&gt;96）视为 fatal 中止剩余帧，由 skipped/abort_code 告知前端；0xE4 邮箱满按帧透传状态由前端冷却重试。</text>
+  </g>
+</svg>
+<figcaption><b>图 10-1 0xC7 跨通道突发</b>：装载在 ISR 内完成 + 单 ACK 确认，是「组内近同时」的保证；对比逐帧 0xC0 有帧间调度抖动</figcaption>
+</figure>
+
+<h3>10.3 0xC0 错误码（GD32 细分）</h3>
+<table>
+<tr><th>码</th><th>含义</th><th>ESP32/HTTP 处理</th></tr>
+<tr><td>E0</td><td>payload 过短（&lt;5B）</td><td>参数错误</td></tr>
+<tr><td>E1</td><td>通道非法</td><td>参数错误</td></tr>
+<tr><td>E2</td><td>BUS_OFF</td><td><b>fatal</b>：批量/突发中止剩余帧</td></tr>
+<tr><td>E3</td><td>TEC&gt;96（对端 ACK 失败率高）</td><td><b>fatal</b>：同上</td></tr>
+<tr><td>E4</td><td>邮箱满</td><td>按帧透传，前端冷却重试</td></tr>
+<tr><td>E5</td><td>参数无效 / 电机 OTA 会话残留（0xD0 语境）</td><td>motorOtaStart 收到 E5 自动 CANCEL→resetCredit→重试 START 自愈</td></tr>
+<tr><td>E6</td><td>通道处于 Silent（入口即拒）</td><td>不计错误计数</td></tr>
+<tr><td>E7</td><td>通道被电机 OTA 独占（跨总线排他）</td><td>OTA 结束自动恢复，不计错误计数</td></tr>
+</table>
+
+<h3>10.4 0xC8 收发器 Silent（只听不发，0.5.2）</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 220" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect x="40" y="50" width="200" height="120" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="140" y="78" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#047857">GD32 GPIO（S 脚）</text>
+  <text x="140" y="102" text-anchor="middle" font-size="11" fill="#065f46">CAN0=PA8 · CAN1=PB14 · CAN2=PB9</text>
+  <text x="140" y="124" text-anchor="middle" font-size="11" fill="#065f46">S=1 驱动器关断 / S=0 Normal</text>
+  <text x="140" y="148" text-anchor="middle" font-size="10.5" fill="#64748b">S 内部上拉：MCU 复位即 Silent</text>
+  <rect x="330" y="50" width="220" height="120" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+  <text x="440" y="78" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b45309">TCAN1057AV</text>
+  <text x="440" y="102" text-anchor="middle" font-size="11" fill="#92400e">TXD 关断（驱动器禁发）</text>
+  <text x="440" y="122" text-anchor="middle" font-size="11" fill="#92400e">RXD 仍镜像总线（接收照常）</text>
+  <text x="440" y="148" text-anchor="middle" font-size="10.5" fill="#64748b">退 Silent 忙等 tMODE=20µs 再放行</text>
+  <rect x="640" y="50" width="280" height="120" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="780" y="78" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1d4ed8">语义与状态</text>
+  <text x="780" y="102" text-anchor="middle" font-size="11" fill="#1e40af">静默通道一切发送回 E6（不计错）</text>
+  <text x="780" y="122" text-anchor="middle" font-size="11" fill="#1e40af">0xC1 接收上报不受影响</text>
+  <text x="780" y="142" text-anchor="middle" font-size="11" fill="#1e40af">bus_state bit5=tx_silent · 不持久化（上电 Normal）</text>
+  <line x1="240" y1="110" x2="330" y2="110" stroke="#059669" stroke-width="2" marker-end="url(#ar16)"/>
+  <line x1="550" y1="110" x2="640" y2="110" stroke="#d97706" stroke-width="2" marker-end="url(#ar16)"/>
+  <text x="480" y="200" text-anchor="middle" font-size="11" fill="#64748b">进 Silent 前 GD32 先 abort 本通道 PENDING 邮箱（驱动器已关，留着只涨 TEC）；GD32 在 CS EXTI ISR 内直接回 ACK/ERROR 不回 WAIT</text>
+</svg>
+<figcaption><b>图 10-2 Silent 模式原理</b>：收发器级只听（总线无负载注入），用于总线监听/故障排查；HTTP 端点 <code>POST /can/silent {"ch":0,"on":1}</code></figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s11">11. 电机 OTA 中继（0xD0~0xD2）</h2>
+
+<section class="block">
+<p>电机节点固件（≤48KB）经 GD32 的 CAN 总线二次烧写。两段式：前端先上传到 gd32_ota 分区（与 GD32 固件共用，上传前 abortCurrent + 清 meta + 整区强制擦除），再触发 relay 由 feedTask 经 SPI 喂给 GD32。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 960 384" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1d4ed8"/>
+    </marker>
+  </defs>
+  <!-- 阶段条 -->
+  <g font-size="11" text-anchor="middle">
+    <rect x="30"  y="40" width="170" height="52" rx="9" fill="#f5f3ff" stroke="#7c3aed"/>
+    <text x="115" y="60" fill="#5b21b6" font-weight="bold">① POST /motor/ota?ch=N</text>
+    <text x="115" y="78" font-size="10" fill="#6b21a8">流式写 gd32_ota + meta</text>
+    <rect x="230" y="40" width="180" height="52" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+    <text x="320" y="60" fill="#1d4ed8" font-weight="bold">② /motor/ota/relay</text>
+    <text x="320" y="78" font-size="10" fill="#1e40af">0xD0 START{cmd,ch,fw_size}</text>
+    <rect x="440" y="40" width="200" height="52" rx="9" fill="#fffbeb" stroke="#d97706"/>
+    <text x="540" y="60" fill="#b45309" font-weight="bold">③ feedTask（prio 7，栈 4096）</text>
+    <text x="540" y="78" font-size="10" fill="#92400e">0xD1 {offset + data ≤232B} 逐块喂</text>
+    <rect x="670" y="40" width="260" height="52" rx="9" fill="#ecfdf5" stroke="#059669"/>
+    <text x="800" y="60" fill="#047857" font-weight="bold">④ GD32 → CAN 烧写电机 → 0xD2 上报</text>
+    <text x="800" y="78" font-size="10" fill="#065f46">12B：state/err/acked/total/fw_size/used</text>
+  </g>
+  <g stroke="#475569" stroke-width="1.6" fill="none">
+    <line x1="200" y1="66" x2="230" y2="66" marker-end="url(#ar17)"/>
+    <line x1="410" y1="66" x2="440" y2="66" marker-end="url(#ar17)"/>
+    <line x1="640" y1="66" x2="670" y2="66" marker-end="url(#ar17)"/>
+  </g>
+
+  <!-- 机制 -->
+  <g font-size="10.5" fill="#334155">
+    <rect x="30" y="110" width="440" height="88" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+    <text x="46" y="130" font-weight="bold">feedTask 韧性设计</text>
+    <text x="46" y="150">· 整体超时 120s 强制退出（防永久占用 motorOtaIsActive）</text>
+    <text x="46" y="168">· 喂料期间 suppress ring（否则吞吐 5→1.5 chunks/s）；代价是</text>
+    <text x="46" y="184">  0xD2 不更新，改主动探测：8 次 SPI 失败 / 150 次 WAIT → QUERY</text>
+    <rect x="490" y="110" width="440" height="88" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+    <text x="506" y="130" font-weight="bold">偏移幂等与握手门控</text>
+    <text x="506" y="150">· 帧带绝对 offset → SPI 超时重传幂等，GD32 重复追加不刷坏</text>
+    <text x="506" y="168">· 每 8 个 ACK QUERY 一次，确认进 ERASE/TRANSFER 才标「传输中」</text>
+    <text x="506" y="184">  （握手阶段 GD32 也收预填充数据，防 UI 误显示 N/912）</text>
+  </g>
+
+  <!-- credit 死锁 -->
+  <rect x="30" y="214" width="900" height="142" rx="10" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="50" y="236" font-size="12" font-weight="bold" fill="#b91c1c">credit 死锁与修复（线上事故沉淀）</text>
+  <g font-size="10.5" fill="#991b1b">
+    <text x="50" y="258">死锁机理：取消的典型时机恰是传输卡住——最后一帧合法响应 credit=0 被锁存；GD32 resetToIdle 转空闲后不再发帧，</text>
+    <text x="50" y="276">relay 又跑在 APP（无 session=0 帧）→ 没有入口能把 credit 送回 → 后续一切 transact 被背压拒绝 → 网页消息全断。</text>
+    <text x="50" y="294">修复：SpiMaster::resetCredit() 双侧复位 8/8。三处先复位再动：① motorOtaCancel（resetCredit → 0xD0 CANCEL → 失败重试 → 收尾再对齐）</text>
+    <text x="50" y="312">② motorOtaStart 收 0xE5 残留会话（resetCredit→CANCEL→resetCredit→重试 START）；③ OOM 降级同步取消路径</text>
+    <text x="50" y="330">取消异步化：motorOtaCancel 立即返回（前端不卡 "Failed to fetch"），耗时收尾由 ota_cancel task（prio 4）执行，等 feedTask 退出上限 10s，</text>
+    <text x="50" y="348" fill="#b91c1c">超时强删并补 setSuppressRingService(false)（否则 ring 永久关闭、收不到任何推送）。</text>
+  </g>
+  <text x="480" y="372" text-anchor="middle" font-size="10.5" fill="#64748b">GD32 侧状态机：IDLE→握手×3→ERASE→TRANSFER→FINISH_OTA→（等新 APP 自主发 0x0A 0xAC 运行确认）→FINISHED；另含 PRE_CANCEL/WAIT_APP_RUN</text>
+</svg>
+<figcaption><b>图 11-1 电机 OTA 中继</b>：fire-and-forget START（ACK 常被延迟一拍吞掉但 GD32 已收，重发会被 0xE5 拒）+ 幂等喂数 + credit 自愈</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s12">12. 监控与可观测性</h2>
+
+<section class="block">
+<h3>12.1 健康监控（HealthMonitor）</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 250" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <g font-size="12" text-anchor="middle" font-weight="bold">
+    <rect x="60"  y="60" width="180" height="54" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+    <text x="150" y="82" fill="#047857">SYS_NORMAL (0)</text><text x="150" y="100" font-size="10" font-weight="normal" fill="#065f46">允许一切 OTA</text>
+    <rect x="300" y="60" width="180" height="54" rx="9" fill="#fffbeb" stroke="#d97706" stroke-width="1.8"/>
+    <text x="390" y="82" fill="#b45309">SYS_WARNING (1)</text><text x="390" y="100" font-size="10" font-weight="normal" fill="#92400e">允许（带警告）</text>
+    <rect x="540" y="60" width="180" height="54" rx="9" fill="#fef2f2" stroke="#dc2626" stroke-width="1.8"/>
+    <text x="630" y="82" fill="#b91c1c">SYS_CRITICAL (2)</text><text x="630" y="100" font-size="10" font-weight="normal" fill="#991b1b">ESP32 OTA 禁止</text>
+    <rect x="760" y="60" width="170" height="54" rx="9" fill="#7f1d1d" stroke="#7f1d1d"/>
+    <text x="845" y="82" fill="#fff">SAFE_SHUTDOWN (3)</text><text x="845" y="100" font-size="10" font-weight="normal" fill="#fecaca">一切 OTA 禁止·不可逆</text>
+  </g>
+  <g stroke="#475569" stroke-width="1.6" fill="none">
+    <line x1="240" y1="87" x2="300" y2="87" marker-end="url(#ar18)"/>
+    <line x1="480" y1="87" x2="540" y2="87" marker-end="url(#ar18)"/>
+    <line x1="720" y1="87" x2="760" y2="87" marker-end="url(#ar18)"/>
+    <path d="M 630 60 C 630 30 480 30 392 58" stroke="#16a34a" marker-end="url(#ar18)"/>
+    <path d="M 390 60 C 390 20 590 16 626 58" stroke="#16a34a" marker-end="url(#ar18)"/>
+  </g>
+  <text x="300" y="40" text-anchor="middle" font-size="10.5" fill="#16a34a">恢复：RSSI ≥ -80 逐级回 NORMAL（任意状态可恢复）</text>
+  <g font-size="10.5" fill="#334155">
+    <text x="60" y="158">触发阈值：温度 ≥80°C → WARNING；RSSI &lt;-80dBm → WARNING / &lt;-85 → CRITICAL；温度 ≥100°C → SAFE_SHUTDOWN（不可逆）；堆 &lt;10KB 告警</text>
+    <text x="60" y="176">巡检周期：温度 esp_timer 1s（量程 20~80°C）· 主循环 5s（栈溢出标志/堆低水位快照/任务栈告警 20%）· RSSI 由 WiFi 任务 10s 喂入</text>
+    <text x="60" y="194">OTA 门控：checkBeforeOta() 全检（SAFE_SHUTDOWN/CRITICAL 拒；RSSI ≤15s 时效 &lt;-88 拒）；checkBeforeOtaRelay() 仅温度（中继不依赖 WiFi）</text>
+    <text x="60" y="212">堆 alloc hook：armed 后 malloc 只减不增记近似空闲，破新低记「最后一击」（size/caller/类别），供 heap_low_log 归因「碎片 vs 系统级紧」</text>
+  </g>
+</svg>
+<figcaption><b>图 12-1 健康状态机</b>：四级状态 + OTA 门控；温度超 100°C 不可逆关机保护</figcaption>
+</figure>
+
+<h3>12.2 GD32 遥测（can_fb 任务，请求驱动架构）</h3>
+<table>
+<tr><th>数据源</th><th>SPI 命令</th><th>机制</th><th>内容</th></tr>
+<tr><td>电机状态</td><td>0xC5</td><td>ESP32 每 <b>250ms</b> 逐页查询 ×14 页（page0 头部 active_count&amp;0x7F 在线数、bit7 boot_active）</td><td>9 节点 × 3 通道 = 27 槽（node×ch 双键）；每条目 92B：STATUS data[48]（字节 32~35=InitStatus）+ CONFIG data[24] + rx/seq 计数</td></tr>
+<tr><td>GD32 ADC</td><td>0xC4</td><td>ESP32 每 <b>1s</b> 查询</td><td>20B：temp×100 / vdda_mV / vin_mV / raw 等；VCC = vin_adc × (47k+4.7k)/4.7k = ×11 分压反推；5s 内算 fresh</td></tr>
+<tr><td>电机版本</td><td>0xC6</td><td>GD32 事件推送（收到电机 0x00FF 应答后按铃）→ can_fb 任务 takeEvent 消费</td><td>29B/条目 ×9 节点</td></tr>
+<tr><td>电机 OTA 进度</td><td>0xD2</td><td>GD32 ring push 事件 → 同上消费</td><td>12B 进度帧</td></tr>
+<tr><td>GD32 初始化状态</td><td>0xA3</td><td>身份块 [15] 惰性查询，10s 失败退避</td><td>13 模块各 1B 故障码 + module_mask/critical_fail_mask</td></tr>
+</table>
+<div class="note"><b>为什么改为请求驱动（2026-08）</b>：原 GD32 主动按铃推送（0xC5 250ms/0xC4 1Hz）在 OTA 期间会撞上 ESP32 的 ring 抑制窗口，产生「按铃超时取消」刷屏。改为 ESP32 周期查询后按铃只剩真正的事件（0xC6/0xD2），OTA 期间 can_fb 任务被 <code>pauseCanFeedbackTask</code> 暂停，电机 OTA 期间也自动暂停避让 0xD1。0xC1 CAN 反馈则完全由 HTTP 请求时按需查询（APP 查询 0 时保持静默）。</div>
+
+<h3>12.3 日志系统（DebugLog）三路输出</h3>
+<figure class="fig">
+<svg viewBox="0 0 960 240" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect x="30" y="70" width="200" height="100" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="130" y="98" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">DebugLog::log()</text>
+  <text x="130" y="120" text-anchor="middle" font-size="11" fill="#1e40af">级别 ERR/WARN/INFO/DBG</text>
+  <text x="130" y="140" text-anchor="middle" font-size="11" fill="#1e40af">单条 ≤128B · 堆门控分级丢弃</text>
+  <text x="130" y="158" text-anchor="middle" font-size="10.5" fill="#64748b">ERR/WARN 永不丢弃</text>
+
+  <rect x="330" y="30" width="250" height="60" rx="9" fill="#ecfdf5" stroke="#059669"/>
+  <text x="455" y="52" text-anchor="middle" font-size="12" font-weight="bold" fill="#047857">① UART0 直写（TX21/RX20）</text>
+  <text x="455" y="72" text-anchor="middle" font-size="10.5" fill="#065f46">3Mbps · uart_tx_chars 非阻塞，满则丢</text>
+  <rect x="330" y="104" width="250" height="60" rx="9" fill="#fffbeb" stroke="#d97706"/>
+  <text x="455" y="126" text-anchor="middle" font-size="12" font-weight="bold" fill="#b45309">② UDP 单播 192.168.31.3:6666</text>
+  <text x="455" y="146" text-anchor="middle" font-size="10.5" fill="#92400e">socket 延迟创建 · 8 连败销毁 + 10s 冷却重建</text>
+  <rect x="330" y="178" width="250" height="56" rx="9" fill="#f5f3ff" stroke="#7c3aed"/>
+  <text x="455" y="200" text-anchor="middle" font-size="12" font-weight="bold" fill="#6d28d9">③ 环形缓冲 64 槽→开机后缩 16 槽</text>
+  <text x="455" y="220" text-anchor="middle" font-size="10.5" fill="#6b21a8">满环覆盖优先牺牲 I/D 保 ERR/WARN</text>
+
+  <rect x="700" y="104" width="230" height="60" rx="9" fill="#dbeafe" stroke="#2563eb" stroke-width="1.8"/>
+  <text x="815" y="128" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1d4ed8">网页 /logs 面板</text>
+  <text x="815" y="148" text-anchor="middle" font-size="10.5" fill="#1e40af">HTTP 轮询 · chunked 512B 栈缓冲</text>
+  <line x1="230" y1="90" x2="330" y2="60" stroke="#059669" stroke-width="1.6" marker-end="url(#ar19)"/>
+  <line x1="230" y1="120" x2="330" y2="130" stroke="#b45309" stroke-width="1.6" marker-end="url(#ar19)"/>
+  <line x1="230" y1="150" x2="330" y2="200" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar19)"/>
+  <line x1="580" y1="206" x2="700" y2="150" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar19)"/>
+  <text x="480" y="20" text-anchor="middle" font-size="10.5" fill="#64748b">UART0 RX 泵任务（prio 1）：把 GPIO20 收到的外部串口行（GD32 日志并线 H1/H2）按行转进 ring → 网页可见</text>
+</svg>
+<figcaption><b>图 12-2 日志三路</b>：历史教训——UART 同步阻塞写 5-8ms/条曾拖爆 OTA ACK 窗口（12/777 重发），现全部非阻塞/有界</figcaption>
+</figure>
+
+<h3>12.4 其它诊断模块</h3>
+<table>
+<tr><th>模块</th><th>功能</th></tr>
+<tr><td>cpu_stats</td><td>1Hz FreeRTOS runtime stats：总占用率 + 每任务 delta 占用（≤20 任务）；httpd 只读静态快照，不在 httpd 线程遍历任务表</td></tr>
+<tr><td>task_stack</td><td>10 项任务栈水位表（创建大小/high watermark/峰值）；栈溢出 hook 硬写 UART「STACK OVERFLOW」后 abort（OTA 末尾溢出若不 abort 前端会停在 100%）</td></tr>
+<tr><td>gd32_adc_feedback</td><td>0xC4 快照缓存（单快照覆盖写 + recv_ms 年龄）；互斥懒创建，取锁 20ms 超时不阻塞查询节奏</td></tr>
+<tr><td>motor_state / motor_version</td><td>同上缓存模型；motor_state 整表拷贝在锁内一次完成，读方永远拿到一致快照（防撕裂）</td></tr>
+<tr><td>spi_speed_test</td><td>GET /spi/speedtest：0xA1 PING 探针走真实 worker 路径，RTT 直方图 7 档 + 单帧 5 段细分（提交/发送/等应答/读响应/唤醒）+ 等效吞吐；文件头注明删除步骤</td></tr>
+<tr><td>build_info</td><td>构建系统自动生成编译时间（fwBuildTime()），旧手写 BUILD_TIME 曾被误判为 OTA 回退</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s13">13. 诊断与容错机制总表</h2>
+<section class="block">
+<table>
+<tr><th>层级</th><th>机制</th><th>参数</th><th>针对的问题（事故沉淀）</th></tr>
+<tr><td rowspan="5">SPI 链路</td><td>透明重试</td><td>kTxRetryMax=3，同 TX_SEQ，间隔 3ms</td><td>瞬时无响应；DUP-SEQ 去重保安全</td></tr>
+<tr><td>链路熔断</td><td>3 连败 → 离线，2s 冷却放一笔探针</td><td>SPI 不通时周期查询死循环阻塞/耗尽</td></tr>
+<tr><td>HELLO 重同步</td><td>session=0 触发 + 5s 冷却</td><td>GD32 重启后全命令超时死循环</td></tr>
+<tr><td>credit 自愈</td><td>PB6 高强制置 1；resetCredit()</td><td>credit=0 锁存死锁（§11）</td></tr>
+<tr><td>撕裂防护</td><td>CS 间隔 ≥1ms · 快速类型禁盲读 · 读预算收紧</td><td>RX DMA mid-pulse 重装 → 0x82 0xE8 → 偷读风暴</td></tr>
+<tr><td rowspan="3">OTA 协调</td><td>忙态看门狗</td><td>150s（&gt;中继预算 120s）</td><td>异常退出导致系统永久「忙」</td></tr>
+<tr><td>epoch 会话保护</td><td>begin 递增，清理校验 epoch</td><td>旧上传失败清理误杀新会话</td></tr>
+<tr><td>半会话清理</td><td>abort 必发 SPI CANCEL 0x03</td><td>GD32 停在 WAITING_* 半会话</td></tr>
+<tr><td rowspan="3">数据完整性</td><td>SHA-256 双端比对</td><td>前端算 / 设备读回算 / meta 存</td><td>传输错误静默落盘</td></tr>
+<tr><td>包身份校验</td><td>向量表区间判定 kApp</td><td>BOOT 包刷进 APP 区（§7.6）</td></tr>
+<tr><td>NOR 全擦</td><td>电机 OTA 整区预擦</td><td>残留位叠加单 bit 翻转</td></tr>
+<tr><td rowspan="2">资源保护</td><td>池化/会话内分配</td><td>BLE 池 4KB · 上传 4KB RAII · 对齐缓冲 OTA 期 calloc</td><td>BLE 收尾 0xF8 OOM（曾 32KB 池）</td></tr>
+<tr><td>栈水位收敛</td><td>S ≈ 峰值 + 1.5~2KB</td><td>OTA 末尾 httpd 栈溢出假死</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s14">14. 关键配置常量速查</h2>
+<section class="block">
+<table>
+<tr><th>类别</th><th>常量 = 值</th></tr>
+<tr><td>SPI</td><td><code>CONFIG_DCU_SPI_CLOCK_HZ=13333333</code> · Mode 0 · 队列 4 · <code>SPI_OTA_FRAME_MAX=256</code> · BOOT/APP TX 缓冲 128/256 · V2_MAX_PAYLOAD=236 · 读预算 96（短响应）· credit 8/8 · kTxRetryMax=3 · 熔断 3 败/2s · CS 间隔 1ms · poll backoff 1ms</td></tr>
+<tr><td>GD32 OTA</td><td><code>OTA_MAX_FIRMWARE_SIZE</code>=216KB · 包载荷 48B（帧 64B）· <code>OTA_BLOCK_SIZE</code>=4096（RAII）· 每 32 包健康检查 · 预算 10s+25ms/包 ≤120s · 卡死 10s · 协调器看门狗 150s</td></tr>
+<tr><td>电机 OTA</td><td><code>MOTOR_OTA_MAX_FW_SIZE</code>=48KB(0xC000) · 帧 ≤236B（4B offset + ≤232B data）· feed 120s 整体超时 · 8 败/150 WAIT → QUERY · 退出轮询 8s/150ms</td></tr>
+<tr><td>BLE</td><td>MTU 512 · 载荷 480B · <b>ACK 窗口 64</b> · reorder 64 槽 · DATA_IN 池 8×512B · 队列 144 · 高速连接 7.5~10ms（回退 10~12.5ms）· 中继等待 120s · 负 ACK 节流 64 包/200ms</td></tr>
+<tr><td>WiFi/HTTP</td><td>STA 超时 30s · 重试 5（冷启动退避 2s×retry≤3，否则 1s）· AP 192.168.31.1/6/4 台 · 端口 80 · httpd 栈 7168 · sockets 6/LWIP 12 · TCP_WND 8192 / SND 5760 · RSSI 采样 10s</td></tr>
+<tr><td>健康</td><td>温度 80/100°C · RSSI -80/-85/-88dBm（15s 时效）· 堆 10KB · 栈告警 20% · 巡检 5s · 温度采样 1s</td></tr>
+<tr><td>日志</td><td>UART0 3Mbps(TX21/RX20) · UDP 192.168.31.3:6666 · 环 64→16 槽 ×128B · 门控 6KB/10KB/4KB · <code>CONFIG_SPI_DEBUG_LOG_LEVEL=2</code>（编译期裁 SPI DBG/INFO）</td></tr>
+<tr><td>任务栈</td><td>http_server 7168 / wifi_ota 3072 / ota_relay 2560 / spi_worker 5120 / ble_ota 2560 / ble_worker 2560(p12) / health_mon 3072 / cpu_stats 3072 / wifi_reconnect 2560 / can_fb 4096 / motor_feed 4096 / ota_cancel 3072 / uart_rx 3072</td></tr>
+<tr><td>欠压/Flash</td><td>Brownout LVL7(~2.8V) · Flash DIO（禁 QIO）· FreeRTOS runtime stats 开启</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s15">15. 目录结构</h2>
+<section class="block">
+<pre><code>ESP32_COMM/
+├── CMakeLists.txt                  # project(ESP32_COMM)
+├── sdkconfig(.defaults)            # SPI 时钟/欠压 LVL7/LWIP/NimBLE/FreeRTOS stats 等
+├── config/partitions.csv           # 4MB 分区表（§2.2）
+├── main/
+│   ├── include/                    # app_config.h（统一常量）/ version.h（0.5.2）/ build_info.h
+│   ├── core/                       # main.cpp 启动编排 · system_boot.cpp 16 位自检 · build_info
+│   ├── server/                     # wifi_ota（STA/AP+路由表）· http_handlers（22 端点）· ble_ota*（GATT/窗口/reorder/池）
+│   ├── ota/                        # ota_coordinator（9 态单例）· esp32_ota_core（本机 OTA）
+│   ├── relay/                      # ota_relay（7 态事件状态机 + 安全握手 + 逐包转发）
+│   ├── storage/                    # gd32_flash_store（分区读写/擦除水位/NVS meta/SHA/身份校验）
+│   ├── transport/                  # spi_master（Link v2 链路+worker）· protocol（AES/nonce）· canfd_bridge（0xC0~C8 桥）
+│   └── monitor/                    # health_monitor · debug_log（3 路+RX泵）· can_feedback_task（0xC4/C5 周期查询）
+│                                   # motor_ota_relay（电机 OTA feed）· motor_state/motor_version/gd32_adc_feedback
+│                                   # cpu_stats · task_stack · spi_speed_test · spi_ring_cache.h
+├── components/transport/           # 组件封装（CMakeLists）
+├── docs/                           # can_protocol.md · frontend_architecture.md · 架构评审 · 本文件
+├── spi_link/（兄弟目录）            # 三工程共享 SPI Link v2 协议真源 + golden-vector 自测（../../../spi_link/）
+└── tools/（已移出仓库）             # 网页控制台；快照在 .cache/ws_era_frontend_backup/（§17）</code></pre>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s16">16. 构建与烧录</h2>
+<section class="block">
+<h3>16.1 编译（ESP-IDF v6.0，Windows PowerShell）</h3>
+<pre><code># 设置工具链环境（IDF_TOOLS_PATH / IDF_PATH / PATH，见仓库历史 README 或 .devcontainer）
+Set-Location "G:\Robot_v2\DCU\ESP32_COMM"
+python "F:\.espressif\v6.0\esp-idf\tools\idf.py" build
+# 产物：build/ESP32_COMM.bin + bootloader + partition-table（零 error/warning 基线）</code></pre>
+<p>版本发布流程：手动递增 <code>main/include/version.h</code> 的 MAJOR/MINOR/PATCH 与 FW_VERSION_STRING（并把变更摘要写进该文件注释），GIT_HASH 填 <code>git rev-parse --short HEAD</code>；编译时间自动生成。</p>
+<h3>16.2 三条烧录路径</h3>
+<table>
+<tr><th>路径</th><th>流程</th></tr>
+<tr><td>串口（首次/恢复）</td><td><code>idf.py -p COM15 flash monitor</code>；固件反复重启等严重故障时唯一恢复手段</td></tr>
+<tr><td>WiFi OTA（ESP32 自升级）</td><td>网页控制台选 <code>build/ESP32_COMM.bin</code> → 前端算 SHA → /ota/upload → /ota/update（SHA 比对→set_boot→重启）→ 前端按 banner「启动」正则判定恢复（uptime&lt;120s 判重启完成）</td></tr>
+<tr><td>BLE OTA</td><td>Web Bluetooth（Chrome/Edge）：DATA_IN 480B 包 ×64 窗口 → 0xF8+SHA 收尾重启；0xFB 可中止</td></tr>
+<tr><td>GD32 中继</td><td>上传 .bin/.hex 到 gd32_ota → /ota/relay（或 BLE 0xF7）→ 六阶段转发 → PING 确认 APP 存活；可重复触发（STORED/COMPLETE 均可）</td></tr>
+<tr><td>电机节点</td><td>/motor/ota?ch=N 上传 → /motor/ota/relay → 0xD0/0xD1 经 GD32 CAN 烧写 → /motor/ota/status 轮询</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s17">17. 网页控制台前端</h2>
+<section class="block">
+<p><b>托管方式</b>：Web 资源不嵌入固件，由 <code>tools/serve.bat</code>（<code>python -m http.server 8080</code>）本地托管，浏览器跨源调用 ESP32 REST API——改网页无需重编固件。零构建原生 ES Modules（ES module 有 file:// CORS 限制，必须经 http 访问）。<b>tools/ 目录已移出本仓库</b>（历史快照在 <code>.cache/ws_era_frontend_backup/</code>），约定文档见 <code>docs/frontend_architecture.md</code>。</p>
+<table>
+<tr><th>页面</th><th>功能</th></tr>
+<tr><td>index.html（OTA 控制台）</td><td>WiFi/BLE 双通道切换 · GD32/ESP32 目标选择（GD32 支持 .hex 自动转换）· 上传/SHA/阶段流程条驱动 · 设备状态（含启动自检面板 = SystemBoot 位图）· 运行指标（ESP32 温度/GD32 温度 0xC4/输入 VCC 分压反推/GD32 APP·BOOT 版本）· 日志面板（/logs 轮询 + 级别过滤）· 「堆与任务栈」抽屉（CPU 条形/水位/任务表）· CAN/电机页入口</td></tr>
+<tr><td>motor.html（电机控制台）</td><td>独立 seed 主题；节点总览 1Hz · CMD 控制/周期重发 · CONFIG/PID · 版本查询 · NodeID 设置 · 电机 OTA relay（进度 0xD2）· 波形显示；三条轮询链路互不阻塞</td></tr>
+<tr><td>can.html / can_monitor.html</td><td>DBC 导入解析 · 报文/信号编辑 · 单发/批量发送 · 发送历史与会话持久化 · 接收监控（独立页/抽屉，0xC1 快照分页）</td></tr>
+</table>
+<p>关键约定：JS import 不带 <code>?v=</code>（版本戳只放 HTML 标签）；统一 <code>data-action</code> 事件委托禁内联 onclick；<code>js/ble/*</code>（Web Bluetooth 时序）与 <code>js/ota/*</code>（OTA 状态机/window.* 总线）为红线区；重启完成判定 = banner 正则 + uptime&lt;120s。</p>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s18">18. 遗留与临时项（补充 §1.2 功能一览）</h2>
+<section class="block">
+<table>
+<tr><th>项</th><th>状态</th><th>说明</th></tr>
+<tr><td>BLE CTRL 0xF9（SHA 预检）</td><td><span class="chip no">未实现</span></td><td>仅 app_config.h 定义常量，CTRL 回调无处理分支；WiFi 侧 /ota/update 有 verify_only 等价功能</td></tr>
+<tr><td>0xC3 ID 快照完整版（ESP32 侧）</td><td><span class="chip part">协议就绪/桥未主动调用</span></td><td>canfd_bridge.h 有常量与条目布局定义；GD32 侧已实现；ESP32 HTTP 无独立端点</td></tr>
+<tr><td>0xC1 GD32 1Hz 主动推送</td><td><span class="chip part">保留</span></td><td>协议支持但现架构默认请求驱动（§12.2）</td></tr>
+<tr><td>/spi/speedtest</td><td><span class="chip part">临时功能</span></td><td>性能剖析用，代码标注可整行删除（3 处挂接点）</td></tr>
+<tr><td>HTTP 认证 / 凭据治理</td><td><span class="chip no">未实现</span></td><td>见 §19</td></tr>
+<tr><td>mDNS</td><td><span class="chip no">不存在</span></td><td>历史 README 讹误；仅 lwIP 编译项支持 mDNS 解析</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s19">19. 安全审计与已知限制</h2>
+<section class="block">
+<div class="warnbox"><b>2026-08-16 安全审计结论（待整改）</b>：当前固件面向可信局域网设计，存在以下已知风险——
+<b>① 零认证</b>：HTTP 22 个端点全部无鉴权（含固件上传、重启、CAN 发送），仅靠局域网边界；Bearer token 方案已设计未实施。
+<b>② 凭据硬编码</b>：WiFi SSID/密码、MASTER_KEY 占位值（01 23 45 67 89 AB CD EF FE DC BA 98 76 54 32 10）明文入仓，建议迁 NVS/Kconfig 并做 CI 扫描。
+<b>③ 无固件签名</b>：ESP32 侧仅 SHA-256 完整性校验（非来源认证）；GD32 侧依赖预共享 MASTER_KEY 的挑战-应答（对称密钥，ESP32 泄露即整链泄露）。
+<b>④ AES-ECB 模式</b>：OTA 数据包逐 16B 块独立加密（确定性模式），相同明文块产生相同密文块。
+缓解现状：BLE 需物理接近；GD32 固件包身份校验防误刷；nonce 每会话随机绑定防重放；诊断统计（0x82 归因/偷读签名/熔断计数）全部可观测。</div>
+<p>其他工程性限制：<b>SPI 13.33MHz</b> 为实测上限（≥16MHz 全双工不可行；12M 与 13.33M 重发率相当，时钟非重发主因）；<b>Flash 必须 DIO</b>（QIO 读回 SHA 必错）；CANFD 数据字段 64B 不可压缩（用户明确使用长帧）；GD32 包修复依赖三工程协议同步（<code>spi_link/</code> 兄弟目录 + 两侧判据成对修改）。</p>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s20">20. 版本演进摘要（0.3.x → 0.5.2）</h2>
+<section class="block">
+<table>
+<tr><th>版本</th><th>要点</th></tr>
+<tr><td>0.3.81~0.3.85</td><td>GD32 OTA 包级防呆（向量表身份）· UART0 RX 泵（/logs 汇聚外部串口）· GD32 APP 初始化状态可视化（0xA3）· 模块级故障码 hex · CAN 反馈请求驱动改造（0xC5/0xC4 改周期查询）</td></tr>
+<tr><td>0.4.2</td><td>serviceRing 偷读迟到 RESPONSE 的 seq 失配修复（「一直读到 0x82」根因）</td></tr>
+<tr><td>0.4.3~0.4.8</td><td>0x82 量化归因插桩 · 快速类型禁盲读 · CS 事务间隔 1ms · ring_steal_diag 撕裂形态签名</td></tr>
+<tr><td>0.4.9</td><td>tx_total/tx_retry/tx_fail 计数进 /system/status（透明重试不再静默）</td></tr>
+<tr><td>0.5.0</td><td>SPI 链路稳健性 + OTA 内存（上传 4KB RAII）+ 状态诊断</td></tr>
+<tr><td>0.5.1</td><td>SPI 调试日志编译期门 <code>CONFIG_SPI_DEBUG_LOG_LEVEL</code>（84 条 DBG/INFO 裁剪）</td></tr>
+<tr><td>0.5.2</td><td>SPI 0xC8 通道收发器 Silent + <code>POST /can/silent</code> · 0xC1 bus_state 新增 bit5=tx_silent · 静默通道发送回 0xE6</td></tr>
+</table>
+</section>
+
+<!-- ================================================================ -->
+<h2 id="s21">21. 文档同步说明（HTML ↔ README）</h2>
+<section class="block">
+<p>本文件（<code>docs/project_introduction.html</code>）是项目的<b>完整介绍白皮书</b>：算法细节、协议字节级定义、状态机与事故沉淀。根目录 <code>README.md</code> 是它的<b>浓缩版</b>（快速上手 + 速查表），两者内容同源。</p>
+<div class="note"><b>同步规则（请后续维护者遵守）</b>：
+① 任何影响「功能清单、协议/常量数值、状态机、端点表、实现状态」的代码变更，须<b>同时更新两份文档</b>；
+② 变更摘要写入 <code>main/include/version.h</code> 注释，文档头部版本行随之更新；
+③ HTML 偏重原理与完整参数，README 偏重速查与上手，细节以 HTML 为准；
+④ 两文件顶部均带「文档同步版本」（当前 <b>0.5.2 / 2026-10-11</b>），修改后同步递增日期。</div>
+</section>
+
+<footer>
+  ESP32_COMM 项目全景介绍 · 固件 v0.5.2（git 770ae14）· 文档版本 2026-10-11 ·
+  与 README.md 同步维护 · 本文所有数据以源码为准（main/ · spi_link/ · config/）
+</footer>
+
+</div>
+</body>
+</html>
