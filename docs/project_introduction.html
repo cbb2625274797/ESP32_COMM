@@ -1545,6 +1545,13 @@ python "F:\.espressif\v6.0\esp-idf\tools\idf.py" build
 </section>
 
 <!-- ================================================================ -->
+<div class="warnbox" style="border-left-color:#7c3aed;background:#f5f3ff"><b>2026-10-19 复核更新（专家评审，基线 af1f682 / v0.5.2）</b>：上方 2026-08-16 四项结论原文保留，复核结果如下——
+<br>① 零认证：<b>仍存在</b>，且发现 <code>/spi/send</code> 可原样透传任意 SPI 帧类型、<code>timeout_ms</code> 无上限，升级为<b>致命</b>（评审 F-01 / S-12）。
+<br>② 凭据硬编码：<b>仍存在</b>，且 STA 口令为真实口令、已进入 git 历史，需轮换（S-08）。
+<br>③ 无固件签名：<b>仍存在</b>；另发现 ESP32 回滚保护取消过早、回滚开关所在 <code>config/sdkconfig.defaults</code> 未被构建引用（S-01 / S-02）。
+<br>④ AES-ECB：<b>仍存在</b>。
+<br>“缓解现状”中“nonce 每会话随机绑定防重放”<b>不成立</b>：nonce 仅 4 字节 tick 变化且明文写入日志（S-06）。新增：BLE GATT 无配对/加密（S-09）。
+<br>完整问题清单、既有评审跟踪与修复路线图见 <a href="review/ESP32_COMM_专家评审_2026-10-19.html">docs/review/ESP32_COMM_专家评审_2026-10-19.html</a>；历史评审原文已恢复至 <code>docs/review/archive/</code>。</div>
 <h2 id="s20">20. 版本演进摘要（0.3.x → 0.5.2）</h2>
 <section class="block">
 <table>
